@@ -96,12 +96,16 @@ describe("scout /stream", () => {
   it("returns ranked, clean, cached streams with /play proxy URLs and a bingeGroup", async () => {
     const res = await call(`/${BLOB}/stream/movie/tt1234567.json`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { streams: Array<{ name: string; title: string; url: string; behaviorHints: { bingeGroup: string } }> };
+    const body = (await res.json()) as {
+      streams: Array<{ name: string; title: string; url: string; behaviorHints: { bingeGroup: string }; attributes: { label: string } }>;
+    };
 
     // CAM dropped (excludeCam), only cached rows, 4K ranked above 1080p.
     expect(body.streams).toHaveLength(2);
-    expect(body.streams[0].title).toBe("4K • WEB-DL • HDR • 18 GB");
-    expect(body.streams[1].title).toBe("1080p • WEB-DL • 8.0 GB");
+    // title is the raw release name; the clean summary lives in attributes.label.
+    expect(body.streams[0].title).toBe("Movie 2160p WEB-DL HDR");
+    expect(body.streams[1].title).toBe("Movie 1080p WEB-DL");
+    expect(body.streams[0].attributes.label).toBe("4K • WEB-DL • HDR • 18 GB");
 
     const first = body.streams[0];
     expect(first.name).toBe("Den Scout");

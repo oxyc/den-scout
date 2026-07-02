@@ -23,7 +23,6 @@ import { CONFIGURE_PAGE } from "./configure.js";
 import { parseStreamId, type StreamId } from "./id.js";
 import { rankStreams, realDebridBlocked, type RawStream } from "./rank.js";
 import { streamAttributes } from "./attributes.js";
-import { cleanLabel } from "./label.js";
 import { decodePlayToken, encodePlayToken } from "./play.js";
 import { scrapeAll } from "./scrape/index.js";
 import type { FetchLike, Scraper } from "./scrape/types.js";
@@ -182,7 +181,9 @@ function toStremioStream(s: RawStream, sid: StreamId, origin: string, configBlob
   const token = encodePlayToken({ infoHash: s.infoHash, fileIdx: s.fileIdx, season: sid.season, episode: sid.episode });
   return {
     name: "Den Scout",
-    title: cleanLabel(s),
+    // The raw release title (filename) so the client can show WHICH release; the clean summary
+    // ("4K • WEB-DL • HDR • 18 GB") is available in attributes.label for clients that prefer it.
+    title: s.title,
     url: `${origin}/${configBlob}/play/${token}`,
     // Pre-parsed attributes so Den renders quality/resolution/HDR/source badges without re-parsing
     // the title on-device. A custom field; standard Stremio clients ignore it.
