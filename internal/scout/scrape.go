@@ -119,13 +119,17 @@ func firstMeaningfulLine(text string) string {
 
 func parseStremioStreams(body []byte, source string) []RawStream {
 	var parsed struct {
-		Streams []wireStream `json:"streams"`
+		Streams []json.RawMessage `json:"streams"`
 	}
 	if json.Unmarshal(body, &parsed) != nil {
 		return nil
 	}
 	var out []RawStream
-	for _, s := range parsed.Streams {
+	for _, raw := range parsed.Streams {
+		var s wireStream
+		if json.Unmarshal(raw, &s) != nil {
+			continue // tolerate a non-object element
+		}
 		hash, ok := normalizeHash(s.InfoHash)
 		if !ok {
 			continue
@@ -198,7 +202,7 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s http %d", s.indexer, resp.StatusCode)
 	}

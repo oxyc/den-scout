@@ -83,7 +83,7 @@ func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) map[strin
 			if err != nil {
 				return nil
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != http.StatusOK {
 				return nil
 			}
@@ -126,7 +126,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	if s.cache != nil {
 		if raw, ok := s.cache.Get(key); ok {
 			var e torboxResolveEntry
-			if json.Unmarshal([]byte(raw), &e) == nil && !(needFiles && len(e.Files) == 0) {
+			if json.Unmarshal([]byte(raw), &e) == nil && (!needFiles || len(e.Files) > 0) {
 				if link, err := s.requestDownload(ctx, e.TorrentID, selectFileID(e.Files, t)); err == nil {
 					return link, nil
 				}
@@ -143,7 +143,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		files = s.listFiles(ctx, torrentID)
 	}
 	// audit #3: don't cache an empty file list when we needed one (avoids poisoning the pack for 6h).
-	if s.cache != nil && !(needFiles && len(files) == 0) {
+	if s.cache != nil && (!needFiles || len(files) > 0) {
 		if b, e := json.Marshal(torboxResolveEntry{TorrentID: torrentID, Files: files}); e == nil {
 			s.cache.Put(key, string(b), resolveCacheTTL)
 		}
@@ -163,7 +163,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d", resp.StatusCode)}
 	}
@@ -183,7 +183,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) []TorrentFil
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil
 	}
@@ -230,7 +230,7 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", &DeadLinkError{fmt.Sprintf("torbox requestdl http %d", resp.StatusCode)}
 	}
@@ -305,7 +305,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	}
 	dec := json.NewDecoder(addResp.Body)
 	_ = dec.Decode(&added)
-	addResp.Body.Close()
+	_ = addResp.Body.Close()
 	if addResp.StatusCode < 200 || addResp.StatusCode >= 300 || added.ID == "" {
 		return "", &DeadLinkError{"realdebrid no torrent id"}
 	}
@@ -334,7 +334,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if err != nil {
 		return "", err
 	}
-	sel.Body.Close()
+	_ = sel.Body.Close()
 	if sel.StatusCode < 200 || sel.StatusCode >= 300 {
 		return "", &DeadLinkError{fmt.Sprintf("realdebrid selectFiles http %d", sel.StatusCode)}
 	}
@@ -355,7 +355,7 @@ func (s *realDebridStore) info(ctx context.Context, id string) (*rdInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, &DeadLinkError{fmt.Sprintf("realdebrid info http %d", resp.StatusCode)}
 	}
@@ -371,7 +371,7 @@ func (s *realDebridStore) unrestrict(ctx context.Context, link string) (string, 
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &DeadLinkError{fmt.Sprintf("realdebrid unrestrict http %d", resp.StatusCode)}
 	}
@@ -437,7 +437,7 @@ func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) map[s
 			if err != nil {
 				return nil
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != http.StatusOK {
 				return nil
 			}
@@ -476,7 +476,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d", resp.StatusCode)}
 	}
