@@ -40,9 +40,10 @@ type Deps struct {
 	PublicURL     string // audit #8: fixed public origin; when empty, fall back to forwarded headers
 	MakeScrapers  func(*Config) []scraper
 	MakeStores    func(*Config) []Store
-	// MetaYear resolves an id → release year (movies only) so mistagged torrents can be dropped. Optional
-	// (nil = no year filter); a lookup failure returns ok=false and the list is served unfiltered.
-	MetaYear func(ctx context.Context, typ, imdb string) (int, bool)
+	// Meta resolves an id → title + release year (movies only) so mistagged torrents can be dropped.
+	// Optional (nil = no year/title filter); a lookup failure returns ok=false and the list is served
+	// unfiltered.
+	Meta func(ctx context.Context, typ, imdb string) (cineMeta, bool)
 }
 
 type handler struct {
@@ -239,25 +240,33 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		seeds = kept
 	}
 
-	// Expected release year (movies) → drop torrents mistagged with another film's id. Best-effort: a
-	// lookup failure just means no year filter.
+	// Expected title + release year (movies) → drop torrents mistagged with another film's id. Best-effort:
+	// a lookup failure just means no year/title filter.
 	var expectedYear *int
-	if h.deps.MetaYear != nil {
-		if y, ok := h.deps.MetaYear(ctx, sid.Type, sid.IMDb); ok {
-			expectedYear = &y
+	var expectedTitleTokens map[string]bool
+	if h.deps.Meta != nil {
+		if m, ok := h.deps.Meta(ctx, sid.Type, sid.IMDb); ok {
+			if m.Year != 0 {
+				y := m.Year
+				expectedYear = &y
+			}
+			if m.Title != "" {
+				expectedTitleTokens = titleTokens(m.Title)
+			}
 		}
 	}
 
 	ranked := rankStreams(seeds, rankFilters{
-		ExcludeCam:   config.Filters.ExcludeCam,
-		Resolutions:  config.Filters.Resolutions,
-		HDROnly:      config.Filters.HDROnly,
-		MinSeeders:   config.Filters.MinSeeders,
-		MaxSizeGB:    config.Filters.MaxSizeGB,
-		ExcludeRegex: config.Filters.ExcludeRegex,
-		CachedOnly:   effCachedOnly,
-		ResultCap:    config.ResultCap,
-		ExpectedYear: expectedYear,
+		ExcludeCam:          config.Filters.ExcludeCam,
+		Resolutions:         config.Filters.Resolutions,
+		HDROnly:             config.Filters.HDROnly,
+		MinSeeders:          config.Filters.MinSeeders,
+		MaxSizeGB:           config.Filters.MaxSizeGB,
+		ExcludeRegex:        config.Filters.ExcludeRegex,
+		CachedOnly:          effCachedOnly,
+		ResultCap:           config.ResultCap,
+		ExpectedYear:        expectedYear,
+		ExpectedTitleTokens: expectedTitleTokens,
 	})
 
 	out := make([]streamOut, 0, len(ranked))

@@ -294,6 +294,58 @@ type rankFilters struct {
 	// mistag a torrent with another title's IMDb id. Year survives translation (a Spanish-titled release
 	// of the same film keeps the year); title matching would wrongly drop it. nil = no year filter.
 	ExpectedYear *int
+	// ExpectedTitleTokens (movies): significant tokens of the requested title. Applied ONLY to a release
+	// with no parseable year — where ExpectedYear can't judge it — requiring at least one token overlap.
+	// This drops title-less junk ("B-Bead.mp4") that a mistagged id surfaces once excludeCam removes the
+	// real releases, while keeping foreign-language releases (which carry the year, or a name/number
+	// token). Empty = no title filter (best-effort; a Cinemeta lookup failure serves unfiltered).
+	ExpectedTitleTokens map[string]bool
+}
+
+// titleTokenRe splits a release/title into alphanumeric tokens.
+var titleTokenRe = regexp.MustCompile(`[a-z0-9]+`)
+
+// titleStop are tokens ignored when comparing a release name to the requested title: release metadata
+// (resolution/codec/source/container/language) and stopwords that would create false overlaps.
+var titleStop = map[string]bool{
+	"the": true, "a": true, "an": true, "of": true, "and": true, "to": true, "in": true, "el": true,
+	"la": true, "los": true, "las": true, "de": true, "le": true, "il": true,
+	"2160p": true, "1080p": true, "720p": true, "480p": true, "4k": true, "uhd": true, "hd": true,
+	"x264": true, "x265": true, "h264": true, "h265": true, "hevc": true, "av1": true, "xvid": true,
+	"web": true, "webdl": true, "webrip": true, "bluray": true, "bdrip": true, "brrip": true,
+	"hdtv": true, "hdts": true, "hdtc": true, "remux": true, "cam": true, "camrip": true, "ts": true,
+	"hdr": true, "hdr10": true, "dv": true, "sdr": true, "aac": true, "ac3": true, "dts": true,
+	"atmos": true, "ddp": true, "mp4": true, "mkv": true, "avi": true, "esp": true, "eng": true,
+	"lat": true, "dub": true, "dubbed": true, "sub": true, "subs": true, "multi": true, "dual": true,
+}
+
+// titleTokens splits a title into significant lowercase tokens (stopwords / format-codec noise removed,
+// bare years and single-letter noise dropped). Used to sanity-check a year-less release against the request.
+func titleTokens(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, tok := range titleTokenRe.FindAllString(strings.ToLower(s), -1) {
+		if titleStop[tok] {
+			continue
+		}
+		if len(tok) == 4 && yearToken.MatchString(tok) {
+			continue // a bare year
+		}
+		if len(tok) < 2 && (tok < "0" || tok > "9") {
+			continue // single-letter noise (keep single digits, e.g. "5" in "Toy Story 5")
+		}
+		out[tok] = true
+	}
+	return out
+}
+
+// titleOverlap reports whether the release shares at least one significant token with the expected title.
+func titleOverlap(releaseTitle string, expected map[string]bool) bool {
+	for tok := range titleTokens(releaseTitle) {
+		if expected[tok] {
+			return true
+		}
+	}
+	return false
 }
 
 // yearToken matches a plausible 4-digit film year (1900–2039); releaseYears then rejects matches that
@@ -371,6 +423,13 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		}
 		// Drop a mistagged torrent (another film's IMDb id) — its release year is clearly wrong.
 		if f.ExpectedYear != nil && yearMismatch(s.Title, *f.ExpectedYear) {
+			continue
+		}
+		// A release with no parseable year can't be year-checked; if we know the title, require at least
+		// one significant-token overlap so year-less junk ("B-Bead.mp4") is dropped. Foreign-language
+		// releases survive on the year gate above, or on a shared name/number token.
+		if len(f.ExpectedTitleTokens) > 0 && len(releaseYears(s.Title)) == 0 &&
+			!titleOverlap(s.Title, f.ExpectedTitleTokens) {
 			continue
 		}
 		if len(allowed) > 0 {

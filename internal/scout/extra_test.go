@@ -62,21 +62,44 @@ func TestRankDropsYearMistag(t *testing.T) {
 	}
 }
 
-func TestCinemetaYear(t *testing.T) {
-	ok := cinemetaYear(mockDoer{fn: func(*http.Request) (*http.Response, error) {
+func TestCinemetaMeta(t *testing.T) {
+	ok := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) {
 		return resp(200, `{"meta":{"id":"tt1","name":"Disclosure Day","year":"2026"}}`), nil
 	}}, "https://cinemeta.example")
-	if y, found := ok(context.Background(), "movie", "tt15047880"); !found || y != 2026 {
-		t.Errorf("movie year: %d found=%v", y, found)
+	if m, found := ok(context.Background(), "movie", "tt15047880"); !found || m.Year != 2026 || m.Title != "Disclosure Day" {
+		t.Errorf("movie meta: %+v found=%v", m, found)
 	}
 	// series → not year-filtered
 	if _, found := ok(context.Background(), "series", "tt1"); found {
 		t.Error("series should return found=false")
 	}
 	// upstream failure → found=false (list served unfiltered)
-	bad := cinemetaYear(mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(500, ""), nil }}, "x")
+	bad := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(500, ""), nil }}, "x")
 	if _, found := bad(context.Background(), "movie", "tt1"); found {
 		t.Error("cinemeta failure should return found=false")
+	}
+}
+
+func TestRankDropsYearlessJunk(t *testing.T) {
+	streams := []RawStream{
+		rs("B-Bead.mp4", func(s *RawStream) { s.InfoHash = repeat("a", 40) }),                    // no year, no overlap → drop
+		rs("Random Junk File", func(s *RawStream) { s.InfoHash = repeat("b", 40) }),              // no year, no overlap → drop
+		rs("Los Backrooms HDTV Lat", func(s *RawStream) { s.InfoHash = repeat("c", 40) }),        // no year, shares "backrooms" → keep (foreign-lang)
+		rs("Backrooms.2026.1080p.WEB.h265", func(s *RawStream) { s.InfoHash = repeat("d", 40) }), // has matching year → keep
+	}
+	y := 2026
+	out := rankStreams(streams, rankFilters{
+		ExpectedYear:        &y,
+		ExpectedTitleTokens: titleTokens("Backrooms"),
+		ResultCap:           10,
+	})
+	if len(out) != 2 {
+		t.Fatalf("want 2 (year-less junk dropped, foreign-lang + matching-year kept), got %d: %+v", len(out), out)
+	}
+	for _, s := range out {
+		if strings.Contains(s.Title, "B-Bead") || strings.Contains(s.Title, "Random Junk") {
+			t.Errorf("year-less junk survived: %q", s.Title)
+		}
 	}
 }
 

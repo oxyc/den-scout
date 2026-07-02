@@ -46,7 +46,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		PublicURL:     settings.PublicURL,
 		MakeScrapers:  func(c *Config) []scraper { return makeScrapers(c, client, settings.IndexerURLs) },
 		MakeStores:    func(c *Config) []Store { return buildStores(c, client, cache) },
-		MetaYear:      cinemetaYear(client, settings.CinemetaURL),
+		Meta:          cinemetaMeta(client, settings.CinemetaURL),
 	}
 }
 
