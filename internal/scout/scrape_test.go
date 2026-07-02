@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,15 +53,20 @@ func TestParseSizeSeeders(t *testing.T) {
 }
 
 func TestScraperURL(t *testing.T) {
-	var seenURL string
+	var seenURL, seenUA string
 	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 		seenURL = r.URL.String()
+		seenUA = r.Header.Get("user-agent")
 		return resp(200, `{"streams":[]}`), nil
 	}}
 	sc := &stremioScraper{indexer: "torrentio", baseURL: "https://torrentio.strem.fun", client: client}
 	_, _ = sc.scrape(context.Background(), scrapeQuery{Type: "movie", IMDb: "tt1234567"})
 	if seenURL != "https://torrentio.strem.fun/stream/movie/tt1234567.json" {
 		t.Errorf("movie url: %s", seenURL)
+	}
+	// A non-default User-Agent is required — Torrentio 403s Go-http-client (regression guard).
+	if seenUA == "" || strings.Contains(seenUA, "Go-http-client") {
+		t.Errorf("scrape must send a browser-like User-Agent, got %q", seenUA)
 	}
 	sc2 := &stremioScraper{indexer: "comet", baseURL: "https://comet.example/", client: client}
 	_, _ = sc2.scrape(context.Background(), scrapeQuery{Type: "series", IMDb: "tt99", Season: 2, Episode: 5, HasEp: true})

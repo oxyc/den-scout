@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -19,6 +20,9 @@ import (
 // per-indexer timeout, gather-what-responded, dedupe by infohash.
 
 const maxScrapeBytes = 2 << 20 // 2 MiB cap on an addon response body (a stream list is far smaller)
+
+// scrapeUserAgent is a browser-like UA: Torrentio & co. 403 the default Go-http-client signature.
+const scrapeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 // doer is the injectable HTTP client (an *http.Client, or a test double).
 type doer interface {
@@ -198,12 +202,19 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 		return nil, err
 	}
 	req.Header.Set("accept", "application/json")
+	// Torrentio (and peers) 403 the default Go-http-client User-Agent as a bot signature — send a
+	// browser UA so the scrape isn't rejected. Without this every indexer returns 403 → zero streams.
+	req.Header.Set("user-agent", scrapeUserAgent)
 	resp, err := s.client.Do(req)
 	if err != nil {
+		// Log the indexer name + reason (never the URL — MediaFusion's carries its encrypted config) so a
+		// scrape outage is visible in the server log instead of silently becoming an empty stream list.
+		log.Printf("scout: %s indexer unreachable", s.indexer)
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("scout: %s indexer returned http %d", s.indexer, resp.StatusCode)
 		return nil, fmt.Errorf("%s http %d", s.indexer, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeBytes))
