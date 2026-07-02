@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { junkClass, qualityScore, rankStreams, detectResolution, type RawStream } from "../src/rank.js";
+import { junkClass, qualityScore, rankStreams, detectResolution, realDebridBlocked, type RawStream } from "../src/rank.js";
 
 function stream(title: string, over: Partial<RawStream> = {}): RawStream {
   return { infoHash: "h", title, cached: false, source: "torrentio", ...over };
@@ -121,5 +121,32 @@ describe("scout ranker — scoring + filtering", () => {
     expect(detectResolution("x 576p y")).toBe("480p");
     expect(detectResolution("x 720p y")).toBe("720p");
     expect(detectResolution("no res here")).toBeNull();
+  });
+
+  it("breaks quality ties by seeders", () => {
+    const low = stream("Movie 1080p WEB-DL", { cached: true, seeders: 5 });
+    const high = stream("Movie 1080p WEB-DL", { cached: true, seeders: 500 });
+    const ranked = rankStreams([low, high], { excludeCam: true, cachedOnly: true, resultCap: 5 });
+    expect(ranked[0].seeders).toBe(500);
+  });
+});
+
+describe("real-debrid filename block", () => {
+  it("blocks Type-1 substrings anywhere (case-insensitive)", () => {
+    for (const t of ["Movie.2024.WEB-DL.x265", "Show.WEBRip.720p", "X.BDRip.1080p", "Y.HDRip", "Z.DVDRip"]) {
+      expect(realDebridBlocked(t)).toBe(true);
+    }
+  });
+
+  it("blocks Type-2 dot-adjacent Source.Codec", () => {
+    for (const t of ["Movie.2024.BluRay.x264-GRP", "Show.HDTV.x264", "Show.HDTV.XviD", "Clip.WEB.x264", "Clip.WEB.h264"]) {
+      expect(realDebridBlocked(t)).toBe(true);
+    }
+  });
+
+  it("does not block clean releases (remux, x265, spaced bluray)", () => {
+    expect(realDebridBlocked("Movie.2024.2160p.BluRay.REMUX.HEVC")).toBe(false);
+    expect(realDebridBlocked("Movie.2024.WEB.x265")).toBe(false); // web.x265 isn't in the list
+    expect(realDebridBlocked("Movie 2024 BluRay x264")).toBe(false); // not dot-adjacent
   });
 });

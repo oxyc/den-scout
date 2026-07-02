@@ -7,6 +7,7 @@
 import type { DebridService } from "../config.js";
 import { type FetchLike, type ResolveTarget, type Store, DeadLinkError, allUncached, magnetFor } from "./types.js";
 import { pickEpisodeFile, type TorrentFile } from "../season.js";
+import { realDebridBlocked } from "../rank.js";
 
 const API = "https://api.real-debrid.com/rest/1.0";
 
@@ -44,6 +45,11 @@ export class RealDebridStore implements Store {
     const files = (info.files ?? []).map<TorrentFile>((f) => ({ index: f.id, name: f.path, sizeBytes: f.bytes }));
     const fileId = this.pickFileId(files, target);
     if (fileId == null) throw new DeadLinkError("realdebrid no file");
+
+    // RD rejects anti-piracy-matched filenames — fail fast so the pool falls through to another store
+    // (a blocked release can still play if TorBox/Premiumize has it cached).
+    const picked = files.find((f) => f.index === fileId);
+    if (picked && realDebridBlocked(picked.name)) throw new DeadLinkError("realdebrid blocked filename");
 
     await this.selectFiles(id, fileId);
     const ready = await this.info(id);

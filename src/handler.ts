@@ -21,7 +21,7 @@ import { decodeConfig, type ScoutConfig } from "./config.js";
 import { buildManifest } from "./manifest.js";
 import { CONFIGURE_PAGE } from "./configure.js";
 import { parseStreamId, type StreamId } from "./id.js";
-import { rankStreams, type RawStream } from "./rank.js";
+import { rankStreams, realDebridBlocked, type RawStream } from "./rank.js";
 import { cleanLabel } from "./label.js";
 import { decodePlayToken, encodePlayToken } from "./play.js";
 import { scrapeAll } from "./scrape/index.js";
@@ -95,7 +95,12 @@ async function handleStream(
 
   const pool = new StorePool(deps.makeStores(config, deps.fetch));
   const truth = await pool.cacheCheck(seeds.map((s) => s.infoHash));
-  const streams: RawStream[] = seeds.map((s) => ({ ...s, cached: truth.get(s.infoHash) ?? false }));
+  let streams: RawStream[] = seeds.map((s) => ({ ...s, cached: truth.get(s.infoHash) ?? false }));
+
+  // Real-Debrid blocks ~1/3 of releases by filename. Drop those ONLY when RD is the sole store —
+  // with TorBox/Premiumize also configured, another store serves the file and RD is skipped for it.
+  const rdOnly = config.debrid.length > 0 && config.debrid.every((d) => d.service === "realdebrid");
+  if (rdOnly) streams = streams.filter((s) => !realDebridBlocked(s.title));
 
   const ranked = rankStreams(streams, {
     excludeCam: config.filters.excludeCam,

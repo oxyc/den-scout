@@ -125,6 +125,25 @@ export function qualityScore(s: RawStream): number {
   return score;
 }
 
+// MARK: - Real-Debrid filename block
+
+/**
+ * Real-Debrid refuses to serve releases whose filename matches its anti-piracy patterns, so an
+ * RD-only user must never be offered them (they'd 404 at resolve). Two forms, case-insensitive:
+ *   1. substring anywhere: web-dl, webrip, bdrip, hdrip, dvdrip
+ *   2. dot-adjacent Source.Codec: bluray.x264, hdtv.x264, hdtv.xvid, web.x264, web.h264
+ * ~34% of PirateBay releases hit this. TorBox/Premiumize don't block, so this is applied only when
+ * Real-Debrid is the ONLY store (else another store serves the file and RD is skipped for it).
+ */
+const RD_BLOCK_SUBSTRINGS = ["web-dl", "webrip", "bdrip", "hdrip", "dvdrip"] as const;
+const RD_BLOCK_DOT_ADJACENT = ["bluray.x264", "hdtv.x264", "hdtv.xvid", "web.x264", "web.h264"] as const;
+
+export function realDebridBlocked(title: string): boolean {
+  const t = title.toLowerCase();
+  // The dot-adjacent forms embed literal dots, so a lowercased substring test is exactly the rule.
+  return RD_BLOCK_SUBSTRINGS.some((s) => t.includes(s)) || RD_BLOCK_DOT_ADJACENT.some((s) => t.includes(s));
+}
+
 // MARK: - Filter + rank
 
 interface RankFilters {
@@ -171,7 +190,9 @@ export function rankStreams(streams: RawStream[], filters: RankFilters): RawStre
 
   return out
     .map((s, index) => ({ s, index, score: qualityScore(s) }))
-    .sort((a, b) => b.score - a.score || a.index - b.index)
+    // Quality first; seeders break ties (a healthier swarm resolves/streams more reliably when a
+    // title isn't cached); original order is the final stable tiebreak.
+    .sort((a, b) => b.score - a.score || (b.s.seeders ?? 0) - (a.s.seeders ?? 0) || a.index - b.index)
     .slice(0, filters.resultCap)
     .map((x) => x.s);
 }

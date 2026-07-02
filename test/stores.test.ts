@@ -107,6 +107,16 @@ describe("RealDebridStore", () => {
     expect(link).toBe("https://real-debrid/dl.mkv");
   });
 
+  it("resolve refuses an RD-blocked filename (so the pool falls through)", async () => {
+    const fetch: FetchLike = async (url) => {
+      if (url.includes("addMagnet")) return new Response(JSON.stringify({ id: "t1" }), { status: 201 });
+      if (url.includes("/torrents/info/"))
+        return new Response(JSON.stringify({ files: [{ id: 1, path: "Movie.WEB-DL.x264.mkv", bytes: 999 }], links: [] }));
+      throw new Error(`unexpected ${url}`);
+    };
+    await expect(new RealDebridStore("tok", fetch).resolve({ infoHash: H })).rejects.toBeInstanceOf(DeadLinkError);
+  });
+
   it("resolve throws DeadLinkError when the torrent has no files", async () => {
     const fetch: FetchLike = async (url) => {
       if (url.includes("addMagnet")) return new Response(JSON.stringify({ id: "t1" }), { status: 201 });

@@ -112,6 +112,26 @@ describe("scout /stream", () => {
     expect(res.headers.get("cache-control")).toBe("public, max-age=120");
   });
 
+  it("filters RD-blocked releases when Real-Debrid is the only debrid", async () => {
+    const rdConfig: ScoutConfig = {
+      debrid: [{ service: "realdebrid", token: "rd" }],
+      indexers: ["torrentio"],
+      filters: { excludeCam: true },
+      cachedOnly: false,
+      resultCap: 20,
+    };
+    const rdBlob = encodeConfig(rdConfig);
+    const rdSeeds: RawStreamSeed[] = [
+      { infoHash: "a".repeat(40), title: "Movie.2160p.BluRay.x264-GRP", sizeBytes: 10 * 1_073_741_824, seeders: 10, source: "torrentio", fileIdx: 0 },
+      { infoHash: "b".repeat(40), title: "Movie.2160p.BluRay.REMUX", sizeBytes: 40 * 1_073_741_824, seeders: 10, source: "torrentio", fileIdx: 0 },
+    ];
+    const d = deps({ makeScrapers: () => [{ id: "torrentio", scrape: async () => rdSeeds }] });
+    const res = await handleScout(new Request(`https://scout.example/${rdBlob}/stream/movie/tt5.json`), d);
+    const body = (await res.json()) as { streams: Array<{ title: string }> };
+    expect(body.streams).toHaveLength(1);
+    expect(body.streams[0].title).toContain("REMUX");
+  });
+
   it("serves the second call from cache (scraper runs once)", async () => {
     const scrape = vi.fn(async () => SEEDS);
     const d = deps({ makeScrapers: () => [{ id: "torrentio", scrape }] });
