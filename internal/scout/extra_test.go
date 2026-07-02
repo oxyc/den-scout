@@ -3,9 +3,82 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 )
+
+func TestParseTitleIsReleaseNotIndexerLabel(t *testing.T) {
+	// A stream with the indexer label as `name`, no behaviorHints, and a foreign release title: the
+	// parsed title must be the release name, never the indexer label ("Torrentio").
+	body := `{"streams":[{"name":"Torrentio","infoHash":"` + repeat("a", 40) +
+		`","title":"El día de la Revelación (Spielberg's 2026) HdTScr Lat\n👤 5 💾 1.7 GB ⚙️ x"}]}`
+	seeds := parseStremioStreams([]byte(body), "torrentio")
+	if len(seeds) != 1 {
+		t.Fatalf("want 1 seed, got %d", len(seeds))
+	}
+	if strings.Contains(seeds[0].Title, "Torrentio") || !strings.Contains(seeds[0].Title, "Revelaci") {
+		t.Errorf("title should be the release name, got %q", seeds[0].Title)
+	}
+}
+
+func TestReleaseYearsAndMismatch(t *testing.T) {
+	if got := releaseYears("Movie 1920x1080 x264 2160p"); len(got) != 0 {
+		t.Errorf("resolution/codec digits parsed as years: %v", got)
+	}
+	if got := releaseYears("Steven Spielberg (2024) [HDTV 1080p]"); len(got) != 1 || got[0] != 2024 {
+		t.Errorf("want [2024], got %v", got)
+	}
+	// A Spanish-titled 2026 release must NOT be flagged for expected 2026 (title differs, year matches).
+	if yearMismatch("El día de la Revelación (Spielberg's 2026) HdTScr", 2026) {
+		t.Error("matching-year release flagged as mismatch")
+	}
+	if !yearMismatch("Steven Spielberg (2024) doc", 2026) {
+		t.Error("2024 mistag should mismatch expected 2026")
+	}
+	if yearMismatch("Some Release WEB-DL", 2026) {
+		t.Error("no-year title must not be a mismatch (can't tell → keep)")
+	}
+	if yearMismatch("Movie (2025)", 2026) {
+		t.Error("±1 year should be tolerated")
+	}
+}
+
+func TestRankDropsYearMistag(t *testing.T) {
+	streams := []RawStream{
+		rs("Steven Spielberg el rey midas de Hollywood (2024) [HDTV 1080p]", func(s *RawStream) { s.InfoHash = repeat("a", 40) }),
+		rs("El día de la Revelación (Spielberg's 2026) HdTScr Lat", func(s *RawStream) { s.InfoHash = repeat("b", 40) }),
+		rs("Disclosure Day (2026) CinemaCity", func(s *RawStream) { s.InfoHash = repeat("c", 40) }),
+	}
+	y := 2026
+	out := rankStreams(streams, rankFilters{ExpectedYear: &y, ResultCap: 10})
+	if len(out) != 2 {
+		t.Fatalf("want 2 (2024 mistag dropped, both 2026 kept), got %d: %+v", len(out), out)
+	}
+	for _, s := range out {
+		if strings.Contains(s.Title, "2024") {
+			t.Errorf("mistagged 2024 stream survived: %q", s.Title)
+		}
+	}
+}
+
+func TestCinemetaYear(t *testing.T) {
+	ok := cinemetaYear(mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		return resp(200, `{"meta":{"id":"tt1","name":"Disclosure Day","year":"2026"}}`), nil
+	}}, "https://cinemeta.example")
+	if y, found := ok(context.Background(), "movie", "tt15047880"); !found || y != 2026 {
+		t.Errorf("movie year: %d found=%v", y, found)
+	}
+	// series → not year-filtered
+	if _, found := ok(context.Background(), "series", "tt1"); found {
+		t.Error("series should return found=false")
+	}
+	// upstream failure → found=false (list served unfiltered)
+	bad := cinemetaYear(mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(500, ""), nil }}, "x")
+	if _, found := bad(context.Background(), "movie", "tt1"); found {
+		t.Error("cinemeta failure should return found=false")
+	}
+}
 
 func TestDetectAudioCodecBranches(t *testing.T) {
 	audio := map[string]string{

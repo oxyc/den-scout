@@ -4,6 +4,7 @@ import (
 	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/dlclark/regexp2"
@@ -289,6 +290,54 @@ type rankFilters struct {
 	ExcludeRegex string
 	CachedOnly   bool
 	ResultCap    int
+	// ExpectedYear (movies): drop a release whose parsed year is clearly different — trackers sometimes
+	// mistag a torrent with another title's IMDb id. Year survives translation (a Spanish-titled release
+	// of the same film keeps the year); title matching would wrongly drop it. nil = no year filter.
+	ExpectedYear *int
+}
+
+// yearToken matches a plausible 4-digit film year (1900–2039); releaseYears then rejects matches that
+// are actually resolution/codec digits (1920x1080, 2160p, x264) by checking the neighbouring chars.
+var yearToken = regexp.MustCompile(`19\d\d|20[0-3]\d`)
+
+// releaseYears returns every plausible year in a release name (usually just one, e.g. "(2026)").
+func releaseYears(title string) []int {
+	t := strings.ToLower(title)
+	var out []int
+	for _, loc := range yearToken.FindAllStringIndex(t, -1) {
+		var before, after byte = ' ', ' '
+		if loc[0] > 0 {
+			before = t[loc[0]-1]
+		}
+		if loc[1] < len(t) {
+			after = t[loc[1]]
+		}
+		if (before >= '0' && before <= '9') || before == 'x' {
+			continue // trailing digits of a bigger number / a resolution like 1920x…
+		}
+		if (after >= '0' && after <= '9') || after == 'p' || after == 'i' || after == 'x' {
+			continue // 2160p, 1920x…, etc.
+		}
+		if y, err := strconv.Atoi(t[loc[0]:loc[1]]); err == nil {
+			out = append(out, y)
+		}
+	}
+	return out
+}
+
+// yearMismatch reports whether a title has a parseable year and none of them is within ±1 of want.
+// No parseable year → not a mismatch (we can't tell, so keep the stream).
+func yearMismatch(title string, want int) bool {
+	years := releaseYears(title)
+	if len(years) == 0 {
+		return false
+	}
+	for _, y := range years {
+		if y >= want-1 && y <= want+1 {
+			return false
+		}
+	}
+	return true
 }
 
 // rankStreams filters then sorts by qualityScore (seeders tiebreak, stable), then caps. Single pass
@@ -318,6 +367,10 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 			continue
 		}
 		if excludeRe != nil && excludeRe.MatchString(s.Title) {
+			continue
+		}
+		// Drop a mistagged torrent (another film's IMDb id) — its release year is clearly wrong.
+		if f.ExpectedYear != nil && yearMismatch(s.Title, *f.ExpectedYear) {
 			continue
 		}
 		if len(allowed) > 0 {

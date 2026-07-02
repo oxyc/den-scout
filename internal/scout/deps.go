@@ -15,7 +15,8 @@ type Settings struct {
 	ListTTL       time.Duration
 	PublicURL     string // audit #8
 	IndexerURLs   map[Indexer]string
-	CacheBytes    int // audit #1: byte budget for the in-memory cache
+	CacheBytes    int    // audit #1: byte budget for the in-memory cache
+	CinemetaURL   string // metadata source for the year mistag filter (default: public Cinemeta)
 }
 
 func SettingsFromEnv(get func(string) string) Settings {
@@ -32,6 +33,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 		PublicURL:     get("SCOUT_PUBLIC_URL"),
 		IndexerURLs:   urls,
 		CacheBytes:    intEnv(get("SCOUT_CACHE_BYTES"), 48<<20), // 48 MiB
+		CinemetaURL:   orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
 	}
 }
 
@@ -44,6 +46,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		PublicURL:     settings.PublicURL,
 		MakeScrapers:  func(c *Config) []scraper { return makeScrapers(c, client, settings.IndexerURLs) },
 		MakeStores:    func(c *Config) []Store { return buildStores(c, client, cache) },
+		MetaYear:      cinemetaYear(client, settings.CinemetaURL),
 	}
 }
 

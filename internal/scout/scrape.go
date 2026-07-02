@@ -138,7 +138,10 @@ func parseStremioStreams(body []byte, source string) []RawStream {
 		if !ok {
 			continue
 		}
-		text := strings.Join(nonEmpty(s.Name, s.Title, s.Description), "\n")
+		// Title/metadata come from the release fields only — NOT s.Name, which is the indexer's label
+		// ("Torrentio", "Torrentio\n1080p"): feeding it in made the title fall back to "Torrentio" when
+		// no line looked like a release name.
+		text := strings.Join(nonEmpty(s.Title, s.Description), "\n")
 		title := ""
 		if s.BehaviorHints != nil {
 			title = strings.TrimSpace(s.BehaviorHints.Filename)

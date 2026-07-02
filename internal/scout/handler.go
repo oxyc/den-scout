@@ -40,6 +40,9 @@ type Deps struct {
 	PublicURL     string // audit #8: fixed public origin; when empty, fall back to forwarded headers
 	MakeScrapers  func(*Config) []scraper
 	MakeStores    func(*Config) []Store
+	// MetaYear resolves an id → release year (movies only) so mistagged torrents can be dropped. Optional
+	// (nil = no year filter); a lookup failure returns ok=false and the list is served unfiltered.
+	MetaYear func(ctx context.Context, typ, imdb string) (int, bool)
 }
 
 type handler struct {
@@ -236,6 +239,15 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		seeds = kept
 	}
 
+	// Expected release year (movies) → drop torrents mistagged with another film's id. Best-effort: a
+	// lookup failure just means no year filter.
+	var expectedYear *int
+	if h.deps.MetaYear != nil {
+		if y, ok := h.deps.MetaYear(ctx, sid.Type, sid.IMDb); ok {
+			expectedYear = &y
+		}
+	}
+
 	ranked := rankStreams(seeds, rankFilters{
 		ExcludeCam:   config.Filters.ExcludeCam,
 		Resolutions:  config.Filters.Resolutions,
@@ -245,6 +257,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		ExcludeRegex: config.Filters.ExcludeRegex,
 		CachedOnly:   effCachedOnly,
 		ResultCap:    config.ResultCap,
+		ExpectedYear: expectedYear,
 	})
 
 	out := make([]streamOut, 0, len(ranked))
