@@ -6,6 +6,7 @@ import { StorePool, buildStores } from "../src/stores/index.js";
 import { DeadLinkError, type Store } from "../src/stores/types.js";
 import type { FetchLike } from "../src/scrape/types.js";
 import type { ScoutConfig } from "../src/config.js";
+import { MemoryCache } from "../src/cache.js";
 
 /** A fetch double that dispatches on (method, url-substring) → JSON body. Records calls. */
 function router(routes: Array<{ match: string; method?: string; status?: number; body: unknown }>): {
@@ -71,6 +72,59 @@ describe("TorBoxStore", () => {
     const link = await new TorBoxStore("tok", fetch).resolve({ infoHash: H, season: 1, episode: 2 });
     expect(link).toBe("https://cdn.torbox/ep2.mkv");
     expect(urls.some((u) => u.includes("file_id=1"))).toBe(true);
+  });
+
+  it("caches torrent id + files so binge episodes 2..N skip createtorrent + mylist", async () => {
+    const cache = new MemoryCache();
+    let creates = 0;
+    let lists = 0;
+    let dls = 0;
+    const fetch: FetchLike = async (url, init) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("createtorrent") && method === "POST") {
+        creates++;
+        return new Response(JSON.stringify({ data: { torrent_id: 9 } }), { status: 200 });
+      }
+      if (url.includes("mylist")) {
+        lists++;
+        return new Response(
+          JSON.stringify({ data: { files: [{ id: 0, name: "S01E01.mkv", size: 10 }, { id: 1, name: "S01E02.mkv", size: 20 }] } }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("requestdl")) {
+        dls++;
+        return new Response(JSON.stringify({ success: true, data: `https://cdn/${new URL(url).searchParams.get("file_id")}` }), { status: 200 });
+      }
+      throw new Error(`unrouted ${url}`);
+    };
+    const store = new TorBoxStore("tok", fetch, cache);
+    const ep1 = await store.resolve({ infoHash: H, season: 1, episode: 1 });
+    const ep2 = await store.resolve({ infoHash: H, season: 1, episode: 2 });
+    expect(ep1).toBe("https://cdn/0");
+    expect(ep2).toBe("https://cdn/1");
+    expect(creates).toBe(1); // ep2 reused the cached torrent id
+    expect(lists).toBe(1); // ep2 reused the cached file list
+    expect(dls).toBe(2);
+  });
+
+  it("falls through to a fresh add when the cached torrent id is stale", async () => {
+    const cache = new MemoryCache();
+    await cache.put(`torbox:resolve:${H}`, JSON.stringify({ torrentId: 999, files: [] }), 3600);
+    let creates = 0;
+    const fetch: FetchLike = async (url, init) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("requestdl") && url.includes("torrent_id=999")) return new Response("gone", { status: 404 });
+      if (url.includes("createtorrent") && method === "POST") {
+        creates++;
+        return new Response(JSON.stringify({ data: { torrent_id: 5 } }), { status: 200 });
+      }
+      if (url.includes("requestdl")) return new Response(JSON.stringify({ success: true, data: "https://cdn/fresh" }), { status: 200 });
+      throw new Error(`unrouted ${url}`);
+    };
+    const link = await new TorBoxStore("tok", fetch, cache).resolve({ infoHash: H, fileIdx: 0 });
+    expect(link).toBe("https://cdn/fresh");
+    expect(creates).toBe(1);
   });
 
   it("resolve throws DeadLinkError when TorBox has no link", async () => {

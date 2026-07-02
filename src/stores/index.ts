@@ -10,15 +10,19 @@ import { type FetchLike, type ResolveTarget, type Store, DeadLinkError } from ".
 import { TorBoxStore } from "./torbox.js";
 import { RealDebridStore } from "./realdebrid.js";
 import { PremiumizeStore } from "./premiumize.js";
+import type { Cache } from "../cache.js";
 
-/** One store per account, ordered by `DEBRID_SERVICES` (TorBox first) regardless of config order. */
-export function buildStores(config: ScoutConfig, fetch: FetchLike): Store[] {
+/**
+ * One store per account, ordered by `DEBRID_SERVICES` (TorBox first) regardless of config order. The
+ * cache (when given) lets TorBox reuse a torrent's id + file list across a season pack's episodes.
+ */
+export function buildStores(config: ScoutConfig, fetch: FetchLike, cache?: Cache): Store[] {
   const byService = new Map(config.debrid.map((d) => [d.service, d.token]));
   const stores: Store[] = [];
   for (const service of DEBRID_SERVICES) {
     const token = byService.get(service);
     if (!token) continue;
-    if (service === "torbox") stores.push(new TorBoxStore(token, fetch));
+    if (service === "torbox") stores.push(new TorBoxStore(token, fetch, cache));
     else if (service === "realdebrid") stores.push(new RealDebridStore(token, fetch));
     else if (service === "premiumize") stores.push(new PremiumizeStore(token, fetch));
   }

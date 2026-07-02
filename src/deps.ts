@@ -35,7 +35,7 @@ export function buildDeps(fetchImpl: FetchLike, settings: ScoutSettings, cache: 
     fetch: fetchImpl,
     cache,
     makeScrapers: (config, fetch) => makeScrapers(config, fetch, settings.indexerUrls),
-    makeStores: (config, fetch) => buildStores(config, fetch),
+    makeStores: (config, fetch) => buildStores(config, fetch, cache),
     scrapeTimeoutMs: settings.scrapeTimeoutMs,
     listTtlSeconds: settings.listTtlSeconds,
   };

@@ -7,10 +7,14 @@
 import type { DebridService } from "../config.js";
 import { type FetchLike, type ResolveTarget, type Store, DeadLinkError, magnetFor } from "./types.js";
 import { pickEpisodeFile, type TorrentFile } from "../season.js";
+import type { Cache } from "../cache.js";
 
 const API = "https://api.torbox.app/v1/api";
 // TorBox accepts up to 500 hashes per checkcached call; 100 keeps the GET URL comfortably short.
 const CACHE_BATCH = 100;
+// A torrent's id + file layout are stable while it's in the account; cache them so binge episodes 2..N
+// on the same season-pack infohash skip createtorrent + mylist and go straight to requestdl.
+const RESOLVE_CACHE_TTL = 6 * 3600;
 
 interface TbFile {
   id: number;
@@ -19,12 +23,18 @@ interface TbFile {
   size?: number;
 }
 
+interface ResolveEntry {
+  torrentId: number;
+  files: TorrentFile[];
+}
+
 export class TorBoxStore implements Store {
   readonly service: DebridService = "torbox";
 
   constructor(
     private readonly token: string,
     private readonly fetch: FetchLike,
+    private readonly cache?: Cache,
     private readonly api: string = API,
   ) {}
 
@@ -56,8 +66,28 @@ export class TorBoxStore implements Store {
   }
 
   async resolve(target: ResolveTarget): Promise<string> {
+    // Fast path: a warm resolve entry (from an earlier episode of the same pack) → one requestdl call,
+    // no createtorrent + mylist. If the cached id is stale (requestdl fails), fall through to a fresh add.
+    const cacheKey = `torbox:resolve:${target.infoHash}`;
+    const cached = await this.readEntry(cacheKey);
+    if (cached) {
+      try {
+        return await this.requestDownload(cached.torrentId, selectFileId(cached.files, target));
+      } catch {
+        // stale torrent id / link — rebuild below
+      }
+    }
+
     const torrentId = await this.addMagnet(target.infoHash);
-    const fileId = await this.resolveFileId(torrentId, target);
+    // List files only when we need them to pick an episode from a pack; a movie/explicit-fileIdx doesn't.
+    const files = target.fileIdx == null && target.season != null && target.episode != null
+      ? await this.listFiles(torrentId)
+      : [];
+    await this.writeEntry(cacheKey, { torrentId, files });
+    return this.requestDownload(torrentId, selectFileId(files, target));
+  }
+
+  private async requestDownload(torrentId: number, fileId: number | undefined): Promise<string> {
     const params = new URLSearchParams({ token: this.token, torrent_id: String(torrentId) });
     if (fileId != null) params.set("file_id", String(fileId));
     const res = await this.fetch(`${this.api}/torrents/requestdl?${params}`, { headers: this.authHeaders });
@@ -66,6 +96,21 @@ export class TorBoxStore implements Store {
     const link = typeof body.data === "string" ? body.data : undefined;
     if (!body.success || !link) throw new DeadLinkError("torbox no link");
     return link;
+  }
+
+  private async readEntry(key: string): Promise<ResolveEntry | null> {
+    if (!this.cache) return null;
+    const raw = await this.cache.get(key);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as ResolveEntry;
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeEntry(key: string, entry: ResolveEntry): Promise<void> {
+    await this.cache?.put(key, JSON.stringify(entry), RESOLVE_CACHE_TTL);
   }
 
   private async addMagnet(infoHash: string): Promise<number> {
@@ -82,16 +127,6 @@ export class TorBoxStore implements Store {
     return id;
   }
 
-  /** File index for the requested file: the explicit `fileIdx`, else the episode pick from the pack. */
-  private async resolveFileId(torrentId: number, target: ResolveTarget): Promise<number | undefined> {
-    if (target.fileIdx != null) return target.fileIdx;
-    if (target.season == null || target.episode == null) return undefined; // movie → the whole torrent
-    const files = await this.listFiles(torrentId);
-    if (files.length === 0) return undefined;
-    const picked = pickEpisodeFile(files, target.season, target.episode);
-    return picked ?? undefined;
-  }
-
   private async listFiles(torrentId: number): Promise<TorrentFile[]> {
     const res = await this.fetch(`${this.api}/torrents/mylist?id=${torrentId}&bypass_cache=true`, {
       headers: this.authHeaders,
@@ -102,4 +137,12 @@ export class TorBoxStore implements Store {
     const files = entry?.files ?? [];
     return files.map((f) => ({ index: f.id, name: f.name ?? f.short_name ?? "", sizeBytes: f.size }));
   }
+}
+
+/** The file index for a target given an already-loaded file list (pure — no I/O). */
+function selectFileId(files: TorrentFile[], target: ResolveTarget): number | undefined {
+  if (target.fileIdx != null) return target.fileIdx; // explicit file
+  if (target.season == null || target.episode == null) return undefined; // movie → the whole torrent
+  if (files.length === 0) return undefined;
+  return pickEpisodeFile(files, target.season, target.episode) ?? undefined;
 }
