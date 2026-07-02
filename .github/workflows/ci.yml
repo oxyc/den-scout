@@ -30,6 +30,9 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          # Build golangci-lint from source with this job's Go (1.26) — a prebuilt binary built with an
+          # older Go refuses a module whose go directive targets 1.26.
+          install-mode: goinstall
 
       - name: build
         run: go build ./...
