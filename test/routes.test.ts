@@ -205,6 +205,10 @@ describe("scout /play", () => {
     expect(res.headers.get("location")).toBe(`https://cdn.torbox/${"a".repeat(40)}.mkv`);
     // The redirect must never be cached — RD/TorBox links are freshly minted and IP-bound.
     expect(res.headers.get("cache-control")).toBe("no-store");
+    // Standard bodyless 302: explicit zero length so the Node layer doesn't send chunked (which
+    // strict redirect-followers read as an empty body and fail on), and no text/plain content-type.
+    expect(res.headers.get("content-length")).toBe("0");
+    expect(res.headers.get("content-type") ?? "").toBe("");
   });
 
   it("bad token → 400", async () => {

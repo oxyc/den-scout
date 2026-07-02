@@ -162,9 +162,15 @@ async function handlePlay(config: ScoutConfig, parts: string[], deps: ScoutDeps)
   const pool = new StorePool(deps.makeStores(config, deps.fetch));
   try {
     const link = await pool.resolve(target);
-    // 302 (not 301) + no-store — the debrid link is freshly minted per play and IP-bound; a client or
-    // proxy that cached this redirect would replay a stale/dead link.
-    return new Response(null, { status: 302, headers: { location: link, "cache-control": NO_STORE } });
+    // A STANDARD 302: explicit Content-Length: 0 (else the Node layer sends Transfer-Encoding: chunked
+    // with an empty chunked body, which strict redirect-followers — e.g. AVPlayer/FFmpeg AVIOReader —
+    // read as 0 bytes and fail instead of following Location), and a blanked Content-Type so no
+    // text/plain rides along. 302 (not 301) + no-store: the debrid link is freshly minted per play and
+    // IP-bound; a cached redirect would replay a stale/dead link.
+    return new Response(null, {
+      status: 302,
+      headers: { location: link, "cache-control": NO_STORE, "content-length": "0", "content-type": "" },
+    });
   } catch {
     // The pool has already tried every store; nothing could deliver the file → dead link. 404 lets
     // the Stremio client fall through to the next stream instead of hard-failing playback.
