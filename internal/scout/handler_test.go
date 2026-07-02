@@ -192,6 +192,27 @@ func streamsLen(rr *httptest.ResponseRecorder) int {
 	return len(body.Streams)
 }
 
+func TestHealthDegradedOnScrapeOutage(t *testing.T) {
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) { return nil, context.Canceled }}}
+		}
+	}))
+	if rr := do(h, "/health", nil); !strings.Contains(rr.Body.String(), `"ok"`) {
+		t.Fatalf("health should start ok: %s", rr.Body.String())
+	}
+	for i := 0; i < scrapeFailThreshold; i++ {
+		do(h, "/"+validBlob+"/stream/movie/tt"+string(rune('0'+i))+".json", nil) // distinct titles → each builds
+	}
+	rr := do(h, "/health", nil)
+	if rr.Code != 200 {
+		t.Errorf("health must stay 200 (liveness), got %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "degraded") {
+		t.Errorf("health should be degraded after %d scrape failures: %s", scrapeFailThreshold, rr.Body.String())
+	}
+}
+
 func TestRoutesDegradedScrapeNotCached(t *testing.T) {
 	// When every indexer fails, the empty list must NOT be cached — a later healthy request rebuilds.
 	var healthy int32

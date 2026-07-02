@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -45,11 +46,18 @@ type handler struct {
 	deps Deps
 	sf   singleflight.Group
 
+	// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
+	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
+	scrapeFails atomic.Int32
+
 	// Precomputed static responses (audit #15 — no per-request rebuild/rehash).
 	manifestUnconf     string
 	manifestUnconfETag string
 	configureETag      string
 }
+
+// After this many consecutive builds where no indexer responded, /health reports "degraded".
+const scrapeFailThreshold = 3
 
 // NewHandler builds the scout HTTP handler.
 func NewHandler(deps Deps) http.Handler {
@@ -81,7 +89,13 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		h.conditional(w, r, configurePage, h.configureETag, htmlType, staticCache)
 		return
 	case "/health":
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"}, noStore)
+		// Stays 200 (liveness — don't trip the container HEALTHCHECK), but reports the degraded scrape
+		// state so a monitor sees a total-indexer outage instead of just "empty results".
+		status := map[string]string{"status": "ok"}
+		if h.scrapeFails.Load() >= scrapeFailThreshold {
+			status = map[string]string{"status": "degraded", "reason": "indexers"}
+		}
+		writeJSON(w, http.StatusOK, status, noStore)
 		return
 	case "/manifest.json":
 		h.conditional(w, r, h.manifestUnconf, h.manifestUnconfETag, jsonType, staticCache)
@@ -192,6 +206,13 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
 	// misleading empty/partial list; return it for this request but don't cache it, so the next request
 	// retries instead of serving the blip for the whole TTL.
+	// Track consecutive total-scrape failures for /health (reset on any successful scrape).
+	if scrapeOK {
+		h.scrapeFails.Store(0)
+	} else {
+		h.scrapeFails.Add(1)
+	}
+
 	truthDegraded := hasCacheTruth(config) && !truthOK
 	degradedReason := ""
 	if !scrapeOK {
