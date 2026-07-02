@@ -74,6 +74,12 @@ describe("scout routes — pages + manifest", () => {
     expect((await call("/@@@/manifest.json")).status).toBe(400);
     expect((await call(`/${BLOB}/bogus`)).status).toBe(404);
   });
+
+  it("sets cache headers: static for manifest/configure, no-store for health", async () => {
+    expect((await call("/configure")).headers.get("cache-control")).toBe("public, max-age=3600");
+    expect((await call(`/${BLOB}/manifest.json`)).headers.get("cache-control")).toBe("public, max-age=3600");
+    expect((await call("/health")).headers.get("cache-control")).toBe("no-store");
+  });
 });
 
 describe("scout /stream", () => {
@@ -101,6 +107,11 @@ describe("scout /stream", () => {
     expect((await call(`/${BLOB}/stream/movie/nope.json`)).status).toBe(400);
   });
 
+  it("stream list is client-cacheable for the server-side TTL", async () => {
+    const res = await call(`/${BLOB}/stream/movie/tt9.json`, deps({ listTtlSeconds: 120 }));
+    expect(res.headers.get("cache-control")).toBe("public, max-age=120");
+  });
+
   it("serves the second call from cache (scraper runs once)", async () => {
     const scrape = vi.fn(async () => SEEDS);
     const d = deps({ makeScrapers: () => [{ id: "torrentio", scrape }] });
@@ -126,6 +137,8 @@ describe("scout /play", () => {
     const res = await call(playPath);
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe(`https://cdn.torbox/${"a".repeat(40)}.mkv`);
+    // The redirect must never be cached — RD/TorBox links are freshly minted and IP-bound.
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 
   it("bad token → 400", async () => {

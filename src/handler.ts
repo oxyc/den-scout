@@ -17,7 +17,7 @@
  *   GET /<config>/stream/<type>/<id>.json  → ranked, clean, cached streams
  *   GET /<config>/play/<token>             → 302 to the debrid link (only place the token is used)
  */
-import { decodeConfig, type Indexer, type ScoutConfig } from "./config.js";
+import { decodeConfig, type ScoutConfig } from "./config.js";
 import { buildManifest } from "./manifest.js";
 import { CONFIGURE_PAGE } from "./configure.js";
 import { parseStreamId, type StreamId } from "./id.js";
@@ -34,7 +34,8 @@ import { fnv1a, html, json } from "./util.js";
 export interface ScoutDeps {
   fetch: FetchLike;
   cache: Cache;
-  makeScrapers: (indexers: Indexer[], fetch: FetchLike) => Scraper[];
+  /** Build the scrapers from the whole config so each indexer's options can be derived (Torrentio). */
+  makeScrapers: (config: ScoutConfig, fetch: FetchLike) => Scraper[];
   makeStores: (config: ScoutConfig, fetch: FetchLike) => Store[];
   /** Per-indexer scrape timeout (ms). */
   scrapeTimeoutMs: number;
@@ -42,24 +43,29 @@ export interface ScoutDeps {
   listTtlSeconds: number;
 }
 
+/** Static, non-secret responses (manifest, configure page) cache for an hour. */
+const STATIC_CACHE = "public, max-age=3600";
+/** Freshly-minted / mutable responses (health, the /play redirect, errors) must never be cached. */
+const NO_STORE = "no-store";
+
 export async function handleScout(request: Request, deps: ScoutDeps): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  if (path === "/" || path === "/configure" || path === "/configure/") return html(CONFIGURE_PAGE);
-  if (path === "/health") return json({ status: "ok" });
-  if (path === "/manifest.json") return json(buildManifest(null));
+  if (path === "/" || path === "/configure" || path === "/configure/") return html(CONFIGURE_PAGE, STATIC_CACHE);
+  if (path === "/health") return json({ status: "ok" }, 200, NO_STORE);
+  if (path === "/manifest.json") return json(buildManifest(null), 200, STATIC_CACHE);
 
   const parts = path.split("/").filter(Boolean); // ["<config>", "stream"|"play"|"manifest.json", ...]
   const configBlob = parts[0] ?? "";
   const config = decodeConfig(configBlob);
-  if (!config) return json({ error: "bad_config" }, 400);
+  if (!config) return json({ error: "bad_config" }, 400, NO_STORE);
 
   const resource = parts[1];
-  if (resource === "manifest.json") return json(buildManifest(config));
+  if (resource === "manifest.json") return json(buildManifest(config), 200, STATIC_CACHE);
   if (resource === "stream") return handleStream(request, config, configBlob, parts, deps);
   if (resource === "play") return handlePlay(config, parts, deps);
-  return json({ error: "not_found" }, 404);
+  return json({ error: "not_found" }, 404, NO_STORE);
 }
 
 async function handleStream(
@@ -70,14 +76,17 @@ async function handleStream(
   deps: ScoutDeps,
 ): Promise<Response> {
   const sid = parseStreamId(parts[2] ?? "", parts[3] ?? "");
-  if (!sid) return json({ error: "bad_id" }, 400);
+  if (!sid) return json({ error: "bad_id" }, 400, NO_STORE);
 
+  // Clients may cache a stream list for as long as we hold it server-side; the /play URLs inside
+  // carry no debrid token (only an opaque play target), so a shared cache keyed by the full URL is safe.
+  const listCache = `public, max-age=${deps.listTtlSeconds}`;
   // Key the cache by the FNV of the config blob, NOT the token — the cache holds no secret.
   const cacheKey = `list:${fnv1a(configBlob)}:${streamCacheId(sid)}`;
   const hit = await deps.cache.get(cacheKey);
-  if (hit) return json(JSON.parse(hit));
+  if (hit) return json(JSON.parse(hit), 200, listCache);
 
-  const scrapers = deps.makeScrapers(config.indexers, deps.fetch);
+  const scrapers = deps.makeScrapers(config, deps.fetch);
   const seeds = await scrapeAll(
     scrapers,
     { type: sid.type, imdbId: sid.imdbId, season: sid.season, episode: sid.episode },
@@ -102,22 +111,23 @@ async function handleStream(
   const origin = publicOrigin(request, new URL(request.url));
   const body = { streams: ranked.map((s) => toStremioStream(s, sid, origin, configBlob)) };
   await deps.cache.put(cacheKey, JSON.stringify(body), deps.listTtlSeconds);
-  return json(body);
+  return json(body, 200, listCache);
 }
 
 async function handlePlay(config: ScoutConfig, parts: string[], deps: ScoutDeps): Promise<Response> {
   const target = decodePlayToken(parts[2] ?? "");
-  if (!target) return json({ error: "bad_token" }, 400);
+  if (!target) return json({ error: "bad_token" }, 400, NO_STORE);
 
   const pool = new StorePool(deps.makeStores(config, deps.fetch));
   try {
     const link = await pool.resolve(target);
-    // 302 (not 301) — the debrid link is freshly minted per play and must not be cached by the client.
-    return new Response(null, { status: 302, headers: { location: link } });
+    // 302 (not 301) + no-store — the debrid link is freshly minted per play and IP-bound; a client or
+    // proxy that cached this redirect would replay a stale/dead link.
+    return new Response(null, { status: 302, headers: { location: link, "cache-control": NO_STORE } });
   } catch {
     // The pool has already tried every store; nothing could deliver the file → dead link. 404 lets
     // the Stremio client fall through to the next stream instead of hard-failing playback.
-    return json({ error: "dead_link" }, 404);
+    return json({ error: "dead_link" }, 404, NO_STORE);
   }
 }
 

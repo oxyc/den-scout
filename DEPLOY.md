@@ -1,12 +1,14 @@
 # Deploying den-scout on the homelab
 
 den-scout runs as a Docker service **beside the trailer service** (`github.com/oxyc/cameras`
-→ `homelab/docker`), fronted by the same Caddy for TLS + a stable domain. Unlike the trailer service
-(LAN-only), Scout is reachable over https at a stable name so the Den app's `https`-only addon check
-passes, and it egresses from a **fixed IP** so Real-Debrid (which pins tokens to an IP) keeps working.
+→ `homelab/docker`). The image is built + pushed to `ghcr.io/oxyc/den-scout` by this repo's
+`docker-publish` workflow; the homelab just pulls a tag.
 
-The image is built + pushed to `ghcr.io/oxyc/den-scout` by this repo's `docker-publish` workflow;
-the homelab just pulls a tag.
+**LAN-only for now (like the trailer service).** Den's `NSAllowsLocalNetworking` exempts LAN hosts
+from the https-only addon check, so Den reaches Scout directly at `http://<lxc-ip>:8080` — no cert
+needed. Egress is the box's single fixed WAN IP, which is what Real-Debrid pins tokens to, so RD
+resolve works. The Caddy `scout.<domain>` route (below) is the eventual **public-https** path and is
+harmless to leave configured meanwhile; you only need it when Den runs off-LAN.
 
 ## 1. Compose service (homelab `docker/compose.yml`)
 
@@ -75,19 +77,19 @@ DEN_SCOUT_VERSION=latest                # ghcr.io/oxyc/den-scout (profile: scout
 docker compose --profile scout pull
 docker compose --profile scout up -d
 
-# health (from the box)
-curl -fsS https://scout.<domain>/health                 # {"status":"ok"}
+# --- LAN (now) — <lxc-ip> is the Docker LXC's IP, e.g. 192.168.86.193 ---
+curl -fsS http://<lxc-ip>:8080/health                        # {"status":"ok"}
+curl -fsS http://<lxc-ip>:8080/configure | grep "Configure Den Scout"
 
-# configure page loads
-curl -fsS https://scout.<domain>/configure | grep "Configure Den Scout"
+# build <config> at http://<lxc-ip>:8080/configure (pick your debrid, paste the token) then:
+curl -fsS "http://<lxc-ip>:8080/<config>/stream/movie/tt0111161.json" | jq '.streams[0]'
+curl -sS -o /dev/null -w "%{http_code} %{redirect_url}\n" "http://<lxc-ip>:8080/<config>/play/<token>"
 
-# a configured stream request returns cached streams (build <config> at /configure with a real token)
-curl -fsS "https://scout.<domain>/<config>/stream/movie/tt0111161.json" | jq '.streams[0]'
-
-# /play 302s to a debrid link (grab a url from the stream response above)
-curl -sS -o /dev/null -w "%{http_code} %{redirect_url}\n" "https://scout.<domain>/<config>/play/<token>"
+# --- Public https (later, via Caddy) — same paths under https://scout.<domain> ---
 ```
 
-Then in Den: **Settings → Streaming source**, paste `https://scout.<domain>/<config>/manifest.json`
-(or build it in the app's Streaming-source screen). A title should resolve to cached streams and play
-through the 302 with no CAM/TS/screener rows.
+Then in Den: **Settings → Streaming source** → enter `http://<lxc-ip>:8080` as the server, pick your
+debrid, paste the token (or paste the whole `http://<lxc-ip>:8080/<config>/manifest.json` built at
+`/configure`). A title should resolve to cached streams and play through the 302 with no CAM/TS/screener
+rows. In DEBUG you can instead drop that manifest URL into Den's gitignored `App/Config/dev-addons.json`,
+right next to the trailer service's `http://<lxc-ip>:8092/manifest.json`.

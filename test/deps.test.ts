@@ -37,10 +37,9 @@ describe("settingsFromEnv", () => {
 describe("buildDeps", () => {
   it("wires real scraper + store factories from settings", () => {
     const deps = buildDeps(fetchStub, settingsFromEnv({}), new MemoryCache());
-    const scrapers = deps.makeScrapers(["torrentio", "comet"], fetchStub);
+    const config: ScoutConfig = { debrid: [{ service: "torbox", token: "t" }], indexers: ["torrentio", "comet"], filters: { excludeCam: true }, cachedOnly: true, resultCap: 20 };
+    const scrapers = deps.makeScrapers(config, fetchStub);
     expect(scrapers.map((s) => s.id)).toEqual(["torrentio", "comet"]);
-
-    const config: ScoutConfig = { debrid: [{ service: "torbox", token: "t" }], indexers: ["torrentio"], filters: { excludeCam: true }, cachedOnly: true, resultCap: 20 };
     expect(deps.makeStores(config, fetchStub).map((s) => s.service)).toEqual(["torbox"]);
     expect(deps.scrapeTimeoutMs).toBe(8000);
   });

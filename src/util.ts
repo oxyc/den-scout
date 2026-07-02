@@ -10,17 +10,18 @@ export function fnv1a(input: string): string {
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-/** JSON `Response` with the right content-type. */
-export function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+/** JSON `Response` with the right content-type and an optional `Cache-Control`. */
+export function json(body: unknown, status = 200, cacheControl?: string): Response {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (cacheControl) headers["cache-control"] = cacheControl;
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
-/** HTML `Response`. */
-export function html(body: string): Response {
-  return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
+/** HTML `Response` with an optional `Cache-Control`. */
+export function html(body: string, cacheControl?: string): Response {
+  const headers: Record<string, string> = { "content-type": "text/html; charset=utf-8" };
+  if (cacheControl) headers["cache-control"] = cacheControl;
+  return new Response(body, { headers });
 }
 
 /**

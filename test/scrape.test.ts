@@ -2,8 +2,9 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StremioAddonScraper } from "../src/scrape/addon.js";
-import { makeScrapers, scrapeAll, dedupe, DEFAULT_INDEXER_URLS } from "../src/scrape/index.js";
+import { makeScrapers, scrapeAll, dedupe } from "../src/scrape/index.js";
 import type { FetchLike, RawStreamSeed, Scraper, ScrapeQuery } from "../src/scrape/types.js";
+import type { ScoutConfig } from "../src/config.js";
 
 function fixture(name: string): unknown {
   return JSON.parse(readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)), "utf8"));
@@ -54,10 +55,43 @@ describe("StremioAddonScraper vs fixtures", () => {
 });
 
 describe("makeScrapers", () => {
-  it("uses defaults and honors per-indexer overrides", () => {
-    const scrapers = makeScrapers(["torrentio", "mediafusion"], jsonFetch({}), { mediafusion: "https://mf.self/CONFIG" });
+  const cfg = (over: Partial<ScoutConfig> = {}): ScoutConfig => ({
+    debrid: [{ service: "torbox", token: "t" }],
+    indexers: ["torrentio", "mediafusion"],
+    filters: { excludeCam: true },
+    cachedOnly: true,
+    resultCap: 20,
+    ...over,
+  });
+
+  it("automates Torrentio options from config; env override is used verbatim for others", async () => {
+    let torrentioURL = "";
+    let mfURL = "";
+    const fetch: FetchLike = async (url) => {
+      if (url.includes("torrentio")) torrentioURL = url;
+      else mfURL = url;
+      return new Response(JSON.stringify({ streams: [] }), { status: 200 });
+    };
+    const scrapers = makeScrapers(cfg(), fetch, { mediafusion: "https://mf.self/CONFIG" });
     expect(scrapers.map((s) => s.id)).toEqual(["torrentio", "mediafusion"]);
-    expect(DEFAULT_INDEXER_URLS.torrentio).toContain("torrentio");
+    const signal = new AbortController().signal;
+    await scrapers[0].scrape({ type: "movie", imdbId: "tt1" }, signal);
+    await scrapers[1].scrape({ type: "movie", imdbId: "tt1" }, signal);
+    // No debrid token in the Torrentio URL — Scout resolves the raw infohashes itself.
+    expect(torrentioURL).toBe("https://torrentio.strem.fun/sort=qualitysize|qualityfilter=cam,scr/stream/movie/tt1.json");
+    expect(torrentioURL).not.toContain("realdebrid");
+    expect(mfURL).toBe("https://mf.self/CONFIG/stream/movie/tt1.json");
+  });
+
+  it("drops the qualityfilter when excludeCam is off (user wants everything)", async () => {
+    let url = "";
+    const fetch: FetchLike = async (u) => {
+      url = u;
+      return new Response(JSON.stringify({ streams: [] }), { status: 200 });
+    };
+    const scrapers = makeScrapers(cfg({ indexers: ["torrentio"], filters: { excludeCam: false } }), fetch);
+    await scrapers[0].scrape({ type: "movie", imdbId: "tt1" }, new AbortController().signal);
+    expect(url).toBe("https://torrentio.strem.fun/sort=qualitysize/stream/movie/tt1.json");
   });
 });
 
