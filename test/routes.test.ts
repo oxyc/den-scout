@@ -117,6 +117,17 @@ describe("scout /stream", () => {
     expect((await call(`/${BLOB}/stream/movie/nope.json`)).status).toBe(400);
   });
 
+  it("includes pre-parsed attributes on each stream (so the app doesn't re-parse titles)", async () => {
+    const res = await call(`/${BLOB}/stream/movie/tt1234567.json`);
+    const body = (await res.json()) as { streams: Array<{ attributes: Record<string, unknown> }> };
+    expect(body.streams[0].attributes).toMatchObject({
+      resolution: "2160p",
+      source: "webdl",
+      hdr: true,
+      cached: true,
+    });
+  });
+
   it("stream list is client-cacheable for the TTL with SWR/stale-if-error", async () => {
     const res = await call(`/${BLOB}/stream/movie/tt9.json`, deps({ listTtlSeconds: 120 }));
     expect(res.headers.get("cache-control")).toBe("public, max-age=120, stale-while-revalidate=120, stale-if-error=86400");

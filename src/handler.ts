@@ -22,6 +22,7 @@ import { buildManifest } from "./manifest.js";
 import { CONFIGURE_PAGE } from "./configure.js";
 import { parseStreamId, type StreamId } from "./id.js";
 import { rankStreams, realDebridBlocked, type RawStream } from "./rank.js";
+import { streamAttributes } from "./attributes.js";
 import { cleanLabel } from "./label.js";
 import { decodePlayToken, encodePlayToken } from "./play.js";
 import { scrapeAll } from "./scrape/index.js";
@@ -183,6 +184,9 @@ function toStremioStream(s: RawStream, sid: StreamId, origin: string, configBlob
     name: "Den Scout",
     title: cleanLabel(s),
     url: `${origin}/${configBlob}/play/${token}`,
+    // Pre-parsed attributes so Den renders quality/resolution/HDR/source badges without re-parsing
+    // the title on-device. A custom field; standard Stremio clients ignore it.
+    attributes: streamAttributes(s),
     behaviorHints: {
       // Group a show's episodes so Den's Up-Next (V2-03) auto-advances within the same source.
       bingeGroup: `den-scout-${sid.imdbId}`,
