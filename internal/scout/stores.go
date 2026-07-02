@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,6 +12,10 @@ import (
 
 	"golang.org/x/sync/errgroup"
 )
+
+// maxStoreBytes caps a debrid API response body — these JSON payloads are small; the limit stops a
+// hostile/misbehaving store from OOMing the container (mirrors maxScrapeBytes for indexers).
+const maxStoreBytes = 4 << 20
 
 // Debrid stores (ported from src/stores/*). Two ops: CacheCheck (which hashes are cached?) and Resolve
 // (infohash → playable https link). Scout resolves server-side; the token never leaves the server.
@@ -23,12 +28,18 @@ type ResolveTarget struct {
 	Episode  *int
 }
 
-// Store is a debrid backend. CacheCheck MUST map missing/failed hashes to false, never error.
+// Store is a debrid backend. CacheCheck always returns a full map (missing hashes → false); the error
+// is non-nil only when the check itself could not be performed (API unreachable/non-200 for every
+// batch), which lets the pool distinguish "not cached" from "couldn't tell" and avoid caching an
+// empty list built during a store outage.
 type Store interface {
 	Service() DebridService
-	CacheCheck(ctx context.Context, hashes []string) map[string]bool
+	CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error)
 	Resolve(ctx context.Context, t ResolveTarget) (string, error)
 }
+
+// errCheckFailed marks a cache check that could not reach the store at all.
+var errCheckFailed = &DeadLinkError{"cache check failed"}
 
 // DeadLinkError — nothing could deliver the file → the route answers 404 so the client falls through.
 type DeadLinkError struct{ Reason string }
@@ -63,12 +74,16 @@ func (s *torBoxStore) get(ctx context.Context, u string) (*http.Response, error)
 	return s.client.Do(req)
 }
 
-func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) map[string]bool {
+func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
 	for _, h := range hashes {
 		result[h] = false
 	}
+	if len(hashes) == 0 {
+		return result, nil
+	}
 	cached := make([]bool, len(hashes)) // distinct-index writes → concurrency-safe without a lock
+	batchOK := make([]bool, (len(hashes)+cacheBatch-1)/cacheBatch)
 	g, gctx := errgroup.WithContext(ctx)
 	for start := 0; start < len(hashes); start += cacheBatch {
 		start := start
@@ -90,9 +105,10 @@ func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) map[strin
 			var body struct {
 				Data map[string]json.RawMessage `json:"data"`
 			}
-			if json.NewDecoder(resp.Body).Decode(&body) != nil {
+			if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
 				return nil
 			}
+			batchOK[start/cacheBatch] = true
 			for i, h := range batch {
 				if _, ok := body.Data[h]; ok {
 					cached[start+i] = true
@@ -109,7 +125,17 @@ func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) map[strin
 			result[h] = true
 		}
 	}
-	return result
+	return result, batchesFailed(batchOK)
+}
+
+// batchesFailed reports errCheckFailed only when every batch failed (none returned usable data).
+func batchesFailed(batchOK []bool) error {
+	for _, ok := range batchOK {
+		if ok {
+			return nil
+		}
+	}
+	return errCheckFailed
 }
 
 type torboxResolveEntry struct {
@@ -172,7 +198,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 			TorrentID *int `json:"torrent_id"`
 		} `json:"data"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&body) != nil || body.Data == nil || body.Data.TorrentID == nil {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Data == nil || body.Data.TorrentID == nil {
 		return 0, &DeadLinkError{"torbox no torrent_id"}
 	}
 	return *body.Data.TorrentID, nil
@@ -190,7 +216,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) []TorrentFil
 	var body struct {
 		Data json.RawMessage `json:"data"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&body) != nil {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
 		return nil
 	}
 	type tbFile struct {
@@ -238,7 +264,7 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 		Success bool   `json:"success"`
 		Data    string `json:"data"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&body) != nil || !body.Success || body.Data == "" {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || !body.Success || body.Data == "" {
 		return "", &DeadLinkError{"torbox no link"}
 	}
 	return body.Data, nil
@@ -267,13 +293,14 @@ type realDebridStore struct {
 
 func (s *realDebridStore) Service() DebridService { return ServiceRealDebrid }
 
-// CacheCheck: RD has no usable cache API → all-false (TorBox/Premiumize provide cache truth).
-func (s *realDebridStore) CacheCheck(_ context.Context, hashes []string) map[string]bool {
+// CacheCheck: RD has no usable cache API → all-false, and nil error (this is authoritative "nothing
+// known cached via RD", not a failure — RD contributes no cache truth by design).
+func (s *realDebridStore) CacheCheck(_ context.Context, hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
 	for _, h := range hashes {
 		result[h] = false
 	}
-	return result
+	return result, nil
 }
 
 func (s *realDebridStore) post(ctx context.Context, path string, form url.Values) (*http.Response, error) {
@@ -303,7 +330,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	var added struct {
 		ID string `json:"id"`
 	}
-	dec := json.NewDecoder(addResp.Body)
+	dec := json.NewDecoder(io.LimitReader(addResp.Body, maxStoreBytes))
 	_ = dec.Decode(&added)
 	_ = addResp.Body.Close()
 	if addResp.StatusCode < 200 || addResp.StatusCode >= 300 || added.ID == "" {
@@ -349,7 +376,12 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 }
 
 func (s *realDebridStore) info(ctx context.Context, id string) (*rdInfo, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.api+"/torrents/info/"+id, nil)
+	// PathEscape + a checked error: id comes from RD's addMagnet response (untrusted); a stray byte
+	// would otherwise make NewRequest return a nil *Request and the next line panic.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.api+"/torrents/info/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, &DeadLinkError{"realdebrid bad torrent id"}
+	}
 	req.Header.Set("authorization", "Bearer "+s.token)
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -360,7 +392,7 @@ func (s *realDebridStore) info(ctx context.Context, id string) (*rdInfo, error) 
 		return nil, &DeadLinkError{fmt.Sprintf("realdebrid info http %d", resp.StatusCode)}
 	}
 	var info rdInfo
-	if json.NewDecoder(resp.Body).Decode(&info) != nil {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&info) != nil {
 		return nil, &DeadLinkError{"realdebrid bad info"}
 	}
 	return &info, nil
@@ -378,7 +410,7 @@ func (s *realDebridStore) unrestrict(ctx context.Context, link string) (string, 
 	var body struct {
 		Download string `json:"download"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&body) != nil || body.Download == "" {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Download == "" {
 		return "", &DeadLinkError{"realdebrid no download"}
 	}
 	return body.Download, nil
@@ -413,12 +445,16 @@ type premiumizeStore struct {
 
 func (s *premiumizeStore) Service() DebridService { return ServicePremiumize }
 
-func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) map[string]bool {
+func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
 	for _, h := range hashes {
 		result[h] = false
 	}
+	if len(hashes) == 0 {
+		return result, nil
+	}
 	cached := make([]bool, len(hashes))
+	batchOK := make([]bool, (len(hashes)+cacheBatch-1)/cacheBatch)
 	g, gctx := errgroup.WithContext(ctx)
 	for start := 0; start < len(hashes); start += cacheBatch {
 		start := start
@@ -445,9 +481,10 @@ func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) map[s
 				Status   string `json:"status"`
 				Response []bool `json:"response"`
 			}
-			if json.NewDecoder(resp.Body).Decode(&body) != nil || body.Status != "success" {
+			if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Status != "success" {
 				return nil
 			}
+			batchOK[start/cacheBatch] = true
 			for i := range batch {
 				if i < len(body.Response) && body.Response[i] {
 					cached[start+i] = true
@@ -462,7 +499,7 @@ func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) map[s
 			result[h] = true
 		}
 	}
-	return result
+	return result, batchesFailed(batchOK)
 }
 
 func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
@@ -488,7 +525,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			Size *int   `json:"size"`
 		} `json:"content"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&body) != nil || body.Status != "success" || len(body.Content) == 0 {
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Status != "success" || len(body.Content) == 0 {
 		return "", &DeadLinkError{"premiumize no content"}
 	}
 	files := make([]TorrentFile, len(body.Content))
@@ -544,31 +581,49 @@ func buildStores(config *Config, client doer, cache Cache) []Store {
 	return stores
 }
 
-func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) map[string]bool {
-	result := make(map[string]bool, len(hashes))
+// CacheCheck unions every store's cache truth. truthOK reports whether at least one cache-truth store
+// (TorBox/Premiumize) answered successfully; when false during an outage the handler skips the
+// cached-only filter (rather than dropping everything) and declines to cache the degraded list.
+func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (result map[string]bool, truthOK bool) {
+	result = make(map[string]bool, len(hashes))
 	for _, h := range hashes {
 		result[h] = false
 	}
 	if len(hashes) == 0 {
-		return result
+		return result, true
 	}
-	// Independent per store; run concurrently and union. Each store's CacheCheck is failure-tolerant
-	// (returns a map, never errors), so one slow/failing store can't 500 the request (audit #5).
+	// Independent per store; run concurrently and union. A store error can't 500 the request (audit #5)
+	// — it only withholds that store's truth.
 	maps := make([]map[string]bool, len(p.stores))
+	ok := make([]bool, len(p.stores))
 	var g errgroup.Group
 	for i, st := range p.stores {
 		i, st := i, st
-		g.Go(func() error { maps[i] = st.CacheCheck(ctx, hashes); return nil })
+		g.Go(func() error {
+			m, err := st.CacheCheck(ctx, hashes)
+			maps[i] = m
+			if err == nil && isCacheTruthService(st.Service()) {
+				ok[i] = true
+			}
+			return nil
+		})
 	}
 	_ = g.Wait()
-	for _, m := range maps {
+	for i, m := range maps {
+		if ok[i] {
+			truthOK = true
+		}
 		for h, c := range m {
 			if c {
 				result[h] = true
 			}
 		}
 	}
-	return result
+	return result, truthOK
+}
+
+func isCacheTruthService(svc DebridService) bool {
+	return svc == ServiceTorBox || svc == ServicePremiumize
 }
 
 func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
@@ -584,7 +639,7 @@ func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error
 // false (RD-only), the handler skips the cached-only filter so the list isn't always empty (audit #4).
 func hasCacheTruth(config *Config) bool {
 	for _, d := range config.Debrid {
-		if d.Service == ServiceTorBox || d.Service == ServicePremiumize {
+		if isCacheTruthService(d.Service) {
 			return true
 		}
 	}

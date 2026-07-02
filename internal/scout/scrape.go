@@ -18,7 +18,7 @@ import (
 // Indexer scrapers (ported from src/scrape/*). One shared Stremio-protocol client; fan-out with a
 // per-indexer timeout, gather-what-responded, dedupe by infohash.
 
-const maxScrapeBytes = 4 << 20 // 4 MiB cap on an addon response body
+const maxScrapeBytes = 2 << 20 // 2 MiB cap on an addon response body (a stream list is far smaller)
 
 // doer is the injectable HTTP client (an *http.Client, or a test double).
 type doer interface {
@@ -245,9 +245,12 @@ func baseURLFor(id Indexer, config *Config, urls map[Indexer]string) string {
 }
 
 // scrapeAll runs every scraper concurrently under a per-indexer timeout; drops those that error/time
-// out; then dedupes by infohash.
-func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration) []RawStream {
+// out; then dedupes by infohash. The bool reports whether at least one scraper responded — a false
+// (every indexer failed/timed out) means an empty result is a degraded blip, not a genuine "no
+// torrents", so the caller must not cache it.
+func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration) ([]RawStream, bool) {
 	results := make([][]RawStream, len(scrapers))
+	respok := make([]bool, len(scrapers))
 	g, gctx := errgroup.WithContext(ctx)
 	for i, sc := range scrapers {
 		i, sc := i, sc
@@ -256,16 +259,21 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 			defer cancel()
 			if r, err := sc.scrape(cctx, q); err == nil {
 				results[i] = r
+				respok[i] = true
 			}
 			return nil // never fail the group — gather what responded
 		})
 	}
 	_ = g.Wait()
 	var all []RawStream
-	for _, r := range results {
+	anyOK := len(scrapers) == 0 // no indexers configured is a config issue, not a scrape failure
+	for i, r := range results {
 		all = append(all, r...)
+		if respok[i] {
+			anyOK = true
+		}
 	}
-	return dedupe(all)
+	return dedupe(all), anyOK
 }
 
 // dedupe by infohash, merging the richest facts (fill missing fileIdx/size, max seeders); first-seen

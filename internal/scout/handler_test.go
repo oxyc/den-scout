@@ -184,6 +184,58 @@ func TestRoutesPlay(t *testing.T) {
 	}
 }
 
+func streamsLen(rr *httptest.ResponseRecorder) int {
+	var body struct {
+		Streams []json.RawMessage `json:"streams"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	return len(body.Streams)
+}
+
+func TestRoutesDegradedScrapeNotCached(t *testing.T) {
+	// When every indexer fails, the empty list must NOT be cached — a later healthy request rebuilds.
+	var healthy int32
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				if atomic.LoadInt32(&healthy) == 0 {
+					return nil, context.Canceled
+				}
+				return testSeeds(), nil
+			}}}
+		}
+	}))
+	if n := streamsLen(do(h, "/"+validBlob+"/stream/movie/tt42.json", nil)); n != 0 {
+		t.Fatalf("degraded scrape should yield 0 streams, got %d", n)
+	}
+	atomic.StoreInt32(&healthy, 1)
+	if n := streamsLen(do(h, "/"+validBlob+"/stream/movie/tt42.json", nil)); n == 0 {
+		t.Error("empty degraded list was cached — a later healthy request should rebuild and return streams")
+	}
+}
+
+func TestRoutesCacheTruthOutageSkipsCachedOnly(t *testing.T) {
+	// TorBox present + cachedOnly, but its check errors (outage). The list must not be emptied — the
+	// cached-only filter is skipped for the request (streams shown), and the degraded list isn't cached.
+	var down int32 = 1
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store {
+			if atomic.LoadInt32(&down) == 1 {
+				return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{}, checkErr: errCheckFailed}}
+			}
+			return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{repeat("a", 40): true, repeat("b", 40): true}}}
+		}
+	}))
+	if n := streamsLen(do(h, "/"+validBlob+"/stream/movie/tt43.json", nil)); n == 0 {
+		t.Error("cache-truth outage should skip cachedOnly (show streams), not drop everything")
+	}
+	// not cached while degraded: once the store recovers, the request reflects real cache truth
+	atomic.StoreInt32(&down, 0)
+	if n := streamsLen(do(h, "/"+validBlob+"/stream/movie/tt43.json", nil)); n != 2 {
+		t.Errorf("after recovery want 2 cached streams (cam dropped), got %d", n)
+	}
+}
+
 func TestRoutesRDOnlyReturnsStreams(t *testing.T) {
 	// audit #4: RD-only + cachedOnly:true would return empty; the fix skips cachedOnly so streams show.
 	rdBlob := blob(`{"debrid":[{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}`)

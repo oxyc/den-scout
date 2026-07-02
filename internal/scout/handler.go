@@ -21,6 +21,11 @@ const (
 	htmlType       = "text/html; charset=utf-8"
 	defaultTimeout = 8 * time.Second
 	defaultListTTL = 5 * time.Minute
+	// Headroom over the scrape timeout for the cache-check phase of a detached list build.
+	listBuildSlack = 20 * time.Second
+	// Hard cap on a /play resolve (addMagnet→select→unrestrict across stores) so a slow debrid account
+	// can't pin a goroutine/connection indefinitely.
+	resolveBudget = 45 * time.Second
 )
 
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
@@ -128,8 +133,13 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		return
 	}
 
+	// Detach the shared build from the request: a client disconnect (Stremio routinely races and cancels
+	// addon requests) must not cancel the scrape mid-flight and let an empty list get cached and served
+	// to every follower. WithoutCancel keeps request values; the timeout bounds the work.
+	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
+	defer cancel()
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		return h.buildStreamList(r.Context(), config, configBlob, sid, origin, cacheKey), nil
+		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey), nil
 	})
 	etag, body := splitCached(v.(string))
 	h.conditional(w, r, body, etag, jsonType, listCache)
@@ -138,20 +148,27 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 // buildStreamList scrapes → cache-checks → ranks → serializes, caches "<etag>\x00<body>", returns it.
 func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) string {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
-	seeds := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
+	seeds, scrapeOK := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
 
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
 	hashes := make([]string, len(seeds))
 	for i, s := range seeds {
 		hashes[i] = s.InfoHash
 	}
-	truth := pool.CacheCheck(ctx, hashes)
+	truth, truthOK := pool.CacheCheck(ctx, hashes)
 	for i := range seeds {
 		seeds[i].Cached = truth[seeds[i].InfoHash]
 	}
 
-	// audit #4: with no cache-truth store (RD-only), the cached-only filter would drop everything.
-	effCachedOnly := config.CachedOnly && hasCacheTruth(config)
+	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
+	// misleading empty/partial list; return it for this request but don't cache it, so the next request
+	// retries instead of serving the blip for the whole TTL.
+	truthDegraded := hasCacheTruth(config) && !truthOK
+	degraded := !scrapeOK || truthDegraded
+
+	// audit #4: with no cache-truth store (RD-only), the cached-only filter would drop everything. Also
+	// skip it when the cache-truth stores are unreachable this request (don't drop everything on a blip).
+	effCachedOnly := config.CachedOnly && hasCacheTruth(config) && !truthDegraded
 	// RD-only: drop releases RD blocks by filename (they'd 404 at resolve).
 	if rdOnly(config) {
 		var kept []RawStream
@@ -181,7 +198,9 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	body, _ := json.Marshal(streamsResponse{Streams: out})
 	etag := etagFor(string(body))
 	value := etag + "\x00" + string(body)
-	h.deps.Cache.Put(cacheKey, value, h.deps.ListTTL)
+	if !degraded {
+		h.deps.Cache.Put(cacheKey, value, h.deps.ListTTL)
+	}
 	return value
 }
 
@@ -197,7 +216,9 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		return
 	}
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
-	link, err := pool.Resolve(r.Context(), ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode})
+	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
+	defer cancel()
+	link, err := pool.Resolve(ctx, ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode})
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
 		return

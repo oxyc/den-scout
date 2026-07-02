@@ -15,9 +15,15 @@ func TestTorBoxCacheCheck(t *testing.T) {
 		return resp(200, `{"data":{"`+H+`":{"name":"x"}}}`), nil
 	}}
 	s := &torBoxStore{token: "t", client: d, api: torboxAPI}
-	m := s.CacheCheck(context.Background(), []string{H, other})
-	if !m[H] || m[other] {
-		t.Errorf("cacheCheck: %v", m)
+	m, err := s.CacheCheck(context.Background(), []string{H, other})
+	if err != nil || !m[H] || m[other] {
+		t.Errorf("cacheCheck: %v err=%v", m, err)
+	}
+
+	// every batch failing → errCheckFailed (lets the pool detect an outage)
+	boom := &torBoxStore{token: "t", client: mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(503, "down"), nil }}, api: torboxAPI}
+	if _, err := boom.CacheCheck(context.Background(), []string{H}); err == nil {
+		t.Error("all-batch failure should return an error")
 	}
 }
 
@@ -108,9 +114,9 @@ func TestTorBoxDeadLink(t *testing.T) {
 }
 
 func TestRealDebrid(t *testing.T) {
-	m := (&realDebridStore{}).CacheCheck(context.Background(), []string{H})
-	if m[H] {
-		t.Error("RD cacheCheck should be all-false")
+	m, err := (&realDebridStore{}).CacheCheck(context.Background(), []string{H})
+	if err != nil || m[H] {
+		t.Errorf("RD cacheCheck should be all-false, no error: %v %v", m, err)
 	}
 
 	infoCalls := 0
@@ -153,9 +159,9 @@ func TestPremiumize(t *testing.T) {
 	dc := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 		return resp(200, `{"status":"success","response":[true,false]}`), nil
 	}}
-	m := (&premiumizeStore{token: "t", client: dc, api: premiumizeAPI}).CacheCheck(context.Background(), []string{H, other})
-	if !m[H] || m[other] {
-		t.Errorf("PM cacheCheck: %v", m)
+	m, err := (&premiumizeStore{token: "t", client: dc, api: premiumizeAPI}).CacheCheck(context.Background(), []string{H, other})
+	if err != nil || !m[H] || m[other] {
+		t.Errorf("PM cacheCheck: %v err=%v", m, err)
 	}
 	dr := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 		return resp(200, `{"status":"success","content":[{"path":"S01E01.mkv","link":"https://pm/1","size":10},{"path":"S01E02.mkv","link":"https://pm/2","size":20}]}`), nil
@@ -167,13 +173,16 @@ func TestPremiumize(t *testing.T) {
 }
 
 type fakeStore struct {
-	svc     DebridService
-	check   map[string]bool
-	resolve func() (string, error)
+	svc      DebridService
+	check    map[string]bool
+	checkErr error
+	resolve  func() (string, error)
 }
 
-func (f fakeStore) Service() DebridService                                 { return f.svc }
-func (f fakeStore) CacheCheck(context.Context, []string) map[string]bool   { return f.check }
+func (f fakeStore) Service() DebridService { return f.svc }
+func (f fakeStore) CacheCheck(context.Context, []string) (map[string]bool, error) {
+	return f.check, f.checkErr
+}
 func (f fakeStore) Resolve(context.Context, ResolveTarget) (string, error) { return f.resolve() }
 
 func TestStorePool(t *testing.T) {
@@ -189,9 +198,23 @@ func TestStorePool(t *testing.T) {
 		fakeStore{svc: ServiceTorBox, check: map[string]bool{H: true, other: false}},
 		fakeStore{svc: ServicePremiumize, check: map[string]bool{H: false, other: true}},
 	}}
-	m := pool.CacheCheck(context.Background(), []string{H, other})
+	m, truthOK := pool.CacheCheck(context.Background(), []string{H, other})
 	if !m[H] || !m[other] {
 		t.Errorf("pool union: %v", m)
+	}
+	if !truthOK {
+		t.Error("pool truthOK should be true when a cache-truth store succeeded")
+	}
+
+	// all cache-truth stores erroring → truthOK false (an outage the handler must not cache)
+	down := &StorePool{stores: []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{H: false}, checkErr: errCheckFailed}}}
+	if _, ok := down.CacheCheck(context.Background(), []string{H}); ok {
+		t.Error("truthOK should be false when every cache-truth store failed")
+	}
+	// RD succeeding is not cache truth → truthOK false
+	rd := &StorePool{stores: []Store{fakeStore{svc: ServiceRealDebrid, check: map[string]bool{H: false}}}}
+	if _, ok := rd.CacheCheck(context.Background(), []string{H}); ok {
+		t.Error("RD success is not cache truth")
 	}
 
 	deadOnly := &StorePool{stores: []Store{fakeStore{resolve: func() (string, error) { return "", &DeadLinkError{"x"} }}}}

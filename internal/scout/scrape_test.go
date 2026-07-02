@@ -108,9 +108,17 @@ func TestScrapeAll(t *testing.T) {
 	}}
 	boom := fakeScraper{"comet", func(context.Context) ([]RawStream, error) { return nil, context.Canceled }}
 	hang := fakeScraper{"torz", func(ctx context.Context) ([]RawStream, error) { <-ctx.Done(); return nil, ctx.Err() }}
-	out := scrapeAll(context.Background(), []scraper{ok, boom, hang}, scrapeQuery{}, 30*time.Millisecond)
+	out, anyOK := scrapeAll(context.Background(), []scraper{ok, boom, hang}, scrapeQuery{}, 30*time.Millisecond)
 	if len(out) != 1 || out[0].InfoHash != repeat("a", 40) {
 		t.Errorf("scrapeAll gather-what-responded: %+v", out)
+	}
+	if !anyOK {
+		t.Error("anyOK should be true when a scraper responded")
+	}
+
+	// every scraper failing → anyOK false (a degraded blip, not a genuine empty)
+	if _, ok := scrapeAll(context.Background(), []scraper{boom}, scrapeQuery{}, 30*time.Millisecond); ok {
+		t.Error("anyOK should be false when every scraper failed")
 	}
 
 	// dedupe merges facts across indexers
@@ -120,7 +128,7 @@ func TestScrapeAll(t *testing.T) {
 	b := fakeScraper{"comet", func(context.Context) ([]RawStream, error) {
 		return []RawStream{{InfoHash: repeat("h", 40), Title: "second", Seeders: intp(99), FileIdx: intp(3), SizeBytes: intp(500)}}, nil
 	}}
-	merged := scrapeAll(context.Background(), []scraper{a, b}, scrapeQuery{}, time.Second)
+	merged, _ := scrapeAll(context.Background(), []scraper{a, b}, scrapeQuery{}, time.Second)
 	if len(merged) != 1 || merged[0].Title != "first" || intOr(merged[0].Seeders, 0) != 99 || merged[0].FileIdx == nil || merged[0].SizeBytes == nil {
 		t.Errorf("dedupe merge: %+v", merged[0])
 	}
