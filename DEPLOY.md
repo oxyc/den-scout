@@ -35,12 +35,14 @@ Added under `profiles: ["scout"]` so a plain `docker compose up` doesn't start i
 ```
 
 - **No secrets in env** — the debrid token is per-install, encoded in the addon URL, never here.
-- The image already runs as the non-root `node` user; `read_only` + `no-new-privileges` + `cap_drop`
-  harden it further (it only needs outbound https + the listen socket).
-- **Cache backend**: the in-container `MemoryCache` (TTL, per-process) is the default and is right
-  for a single replica — stream lists live for minutes. If you ever scale to >1 replica, add a
-  `redis` service and back the cache with it (the `Cache` seam in `src/cache.ts` is a drop-in); a
-  SQLite volume is the alternative. Not needed for the homelab's single container.
+- The distroless/static image runs as non-root (uid 65532) with no shell or libc; `read_only` +
+  `no-new-privileges` + `cap_drop` harden it further (it only needs outbound https + the listen
+  socket). The single static Go binary idles well under the 256 MiB `mem_limit`.
+- **Cache backend**: the in-container byte-bounded `MemoryCache` (TTL, per-process, sized by
+  `SCOUT_CACHE_BYTES`, default 48 MiB) is the default and is right for a single replica — stream
+  lists live for minutes. If you ever scale to >1 replica, add a `redis` service and back the cache
+  with it (the `Cache` interface in `internal/scout/cache.go` is a drop-in); a SQLite volume is the
+  alternative. Not needed for the homelab's single container.
 
 ## 2. Caddy route (homelab `docker/caddy/Caddyfile`)
 
@@ -53,8 +55,9 @@ Added under `profiles: ["scout"]` so a plain `docker compose up` doesn't start i
 
 Caddy already issues a real wildcard cert for `*.{$CADDY_LOCAL_DOMAIN}` via Cloudflare DNS-01, so
 `https://scout.<domain>` gets a valid cert with no ATS exception in Den. Caddy forwards `Host` +
-`X-Forwarded-Proto`, and `handleScout` honors them to build correct `https://scout.<domain>/play/…`
-URLs.
+`X-Forwarded-Proto`, and the handler honors them to build correct `https://scout.<domain>/play/…`
+URLs. Set `SCOUT_PUBLIC_URL=https://scout.<domain>` to pin the origin explicitly (then the forwarded
+headers are ignored) — recommended once the public path is the only one clients use.
 
 ### Fixed egress IP (Real-Debrid)
 

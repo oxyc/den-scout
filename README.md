@@ -27,14 +27,14 @@ resolve to a server you control, so the app just renders what comes back.
 1. **Config in the URL** (Torrentio-style): a base64url blob — debrid service + token, indexers,
    filters — rides in the addon path. Build it at `/configure`. It is a bearer credential; the Den
    app stores it in the Keychain and never logs it. (A future hardening swaps it for an opaque
-   `configId`; the decode/validate seam in `src/config.ts` + `src/play.ts` is the only thing that
-   changes.)
+   `configId`; the decode/validate seam in `internal/scout/config.go` + `internal/scout/play.go` is
+   the only thing that changes.)
 2. **Scrape** the configured indexers concurrently (Torrentio, Comet, MediaFusion, Torz), each under
    its own timeout — a slow indexer never blocks the rest. Dedupe by infohash.
 3. **Cache-check** the debrid store(s). TorBox has a real batched cache API and is the default;
    Real-Debrid and Premiumize are also supported (Premiumize also has a real cache API; RD has no
    usable one, so a hash cached on TorBox still wins for an RD+TorBox user).
-4. **Rank** (`src/rank.ts`) — sink CAM/TS/screeners far below any legit source, cached above uncached,
+4. **Rank** (`internal/scout/rank.go`) — sink CAM/TS/screeners far below any legit source, cached above uncached,
    then resolution/source/HDR/audio/size. Return the top N as clean `https` streams.
 5. **`/play`** decodes the opaque token → `store.resolve` → **302** to the freshly-minted cached
    link. Dead link → 404 so the client falls through to the next stream. Season packs map `tt…:S:E`
@@ -57,15 +57,16 @@ Den bridges TMDB → IMDb before it asks for streams.
 
 ## Run
 
+A single static Go binary, no runtime dependencies.
+
 ```
-npm install
-npm run dev            # tsx watch on :8080
-npm test               # vitest
-npm run test:cov       # coverage (gated ≥90% lines on src/)
-npm run build && npm start
+go run ./cmd/den-scout            # serves :8080
+go test ./...                     # all tests
+go test -cover ./internal/...     # coverage (gated ≥90% on the logic package)
+go build -o den-scout ./cmd/den-scout
 ```
 
-Docker (what the homelab runs):
+Docker (what the homelab runs) — distroless/static, ~15 MB, non-root:
 
 ```
 docker build -t den-scout .
@@ -76,16 +77,22 @@ docker run -p 8080:8080 den-scout
 
 den-scout holds **no** debrid secret — the token is per-install, in the addon URL, not the server.
 Env only tunes runtime behavior (see `.env.example`): `PORT`, `SCOUT_SCRAPE_TIMEOUT_MS`,
-`SCOUT_LIST_TTL_SECONDS`, and per-indexer base-URL overrides `SCOUT_{TORRENTIO,COMET,MEDIAFUSION,TORZ}_URL`
-(point MediaFusion at a base that includes its encrypted-config segment).
+`SCOUT_LIST_TTL_SECONDS`, `SCOUT_CACHE_BYTES` (in-memory list-cache byte budget), `SCOUT_PUBLIC_URL`
+(the external origin used to mint `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored), and
+per-indexer base-URL overrides `SCOUT_{TORRENTIO,COMET,MEDIAFUSION,TORZ}_URL` (point MediaFusion at a
+base that includes its encrypted-config segment).
 
-## Runtime portability
+## Architecture
 
-The core is a single `handleScout(request, deps)` over Web `Request`/`Response` (`src/handler.ts`),
-so it runs on **Node** (`src/server.ts`, via `@hono/node-server`), **Bun** (same `app.fetch`), or a
-**Cloudflare Worker** (`src/worker.ts`, reference entry). `deps` injects `fetch`, the cache backend,
-and the scraper/store factories — which is also how the tests run everything against fixtures with a
-mocked `fetch`.
+The core is `NewHandler(Deps)` (`internal/scout/handler.go`), an `http.Handler` where `Deps` injects
+the HTTP client, cache backend, and scraper/store factories — which is also how the tests drive
+everything against fixtures with a mock `doer`. `cmd/den-scout` is a thin `main()` that wires the
+env-configured deps and calls `ListenAndServe`; `den-scout -healthcheck` probes `/health` and exits
+0/1 for the container HEALTHCHECK (no second runtime process).
+
+User-supplied `excludeRegex` runs on Go's stdlib `regexp` (RE2 — linear-time, no catastrophic
+backtracking). The internal quality/season patterns that need lookaround use `dlclark/regexp2`;
+user input is never routed through it.
 
 ## Deploy
 
