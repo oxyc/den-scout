@@ -145,7 +145,10 @@ type torboxResolveEntry struct {
 
 func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
 	needFiles := t.FileIdx == nil && t.Season != nil && t.Episode != nil
-	key := "torbox:resolve:" + t.InfoHash
+	// Scope by the debrid token: the cached value is a TorBox torrent_id, which is account-scoped.
+	// Every per-install store shares one process-global cache, so an infohash-only key would let one
+	// user's cached torrent_id be used with another user's token (→ wrong/other-account content).
+	key := "torbox:resolve:" + keyHash(s.token) + ":" + t.InfoHash
 
 	// Fast path: a warm entry from an earlier episode of the same pack. Skip it when episode-select is
 	// needed but the cached file list is empty (audit #3 — a transient blip would otherwise mis-serve).
