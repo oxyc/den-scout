@@ -121,6 +121,50 @@ func TestPickEpisodeFile(t *testing.T) {
 	}
 }
 
+func TestSelectFileIDTorBox(t *testing.T) {
+	// TorBox file ids (Index) are NOT positions in Torrentio's list, so a series episode must be
+	// name-matched, never resolved via the passed-through fileIdx (FOLLOWUP #13).
+	pack := []TorrentFile{
+		{Index: 50, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
+		{Index: 55, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
+	}
+	s1, e2, wrong := 1, 2, 99
+	if got := selectFileID(pack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); got == nil || *got != 55 {
+		t.Errorf("episode name-match wins over fileIdx: got %v want 55 (TorBox id)", got)
+	}
+	// fileIdx-only → POSITION in the list mapped to TorBox's file id (files[1].Index == 55).
+	one := 1
+	if got := selectFileID(pack, ResolveTarget{FileIdx: &one}); got == nil || *got != 55 {
+		t.Errorf("fileIdx position → TorBox id: got %v want 55", got)
+	}
+	// fileIdx-only with no file list (single-file fast path / list failure) → raw passthrough.
+	seven := 7
+	if got := selectFileID(nil, ResolveTarget{FileIdx: &seven}); got == nil || *got != 7 {
+		t.Errorf("fileIdx passthrough when no list: got %v want 7", got)
+	}
+	if got := selectFileID(pack, ResolveTarget{}); got != nil {
+		t.Errorf("no selector → nil, got %v", got)
+	}
+}
+
+func TestPickFileIDPrefersEpisodeMatch(t *testing.T) {
+	s1, e2, wrong := 1, 2, 0 // fileIdx=0 would (wrongly) point at E01 by position
+	rdPack := []TorrentFile{
+		{Index: 10, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
+		{Index: 20, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
+	}
+	if got := (&realDebridStore{}).pickFileID(rdPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); got == nil || *got != 20 {
+		t.Errorf("RD episode match over fileIdx: got %v want 20", got)
+	}
+	pmPack := []TorrentFile{ // Premiumize index == position
+		{Index: 0, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
+		{Index: 1, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
+	}
+	if got := (&premiumizeStore{}).pickIndex(pmPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); got == nil || *got != 1 {
+		t.Errorf("PM episode match over fileIdx: got %v want 1", got)
+	}
+}
+
 func TestCleanLabelAndSize(t *testing.T) {
 	s := RawStream{Title: "Movie 2160p WEB-DL HDR Atmos", SizeBytes: intp(18 * gib)}
 	if got := cleanLabel(s); got != "4K • WEB-DL • HDR • Atmos • 18 GB" {

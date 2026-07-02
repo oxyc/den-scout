@@ -144,7 +144,9 @@ type torboxResolveEntry struct {
 }
 
 func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
-	needFiles := t.FileIdx == nil && t.Season != nil && t.Episode != nil
+	// List the pack's files for any series episode (even when a fileIdx is present) so we can name-match
+	// the episode — Torrentio's fileIdx and TorBox's file ids/order aren't guaranteed to agree.
+	needFiles := t.Season != nil && t.Episode != nil
 	// Scope by the debrid token: the cached value is a TorBox torrent_id, which is account-scoped.
 	// Every per-install store shares one process-global cache, so an infohash-only key would let one
 	// user's cached torrent_id be used with another user's token (→ wrong/other-account content).
@@ -273,15 +275,23 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 	return body.Data, nil
 }
 
-// selectFileID: explicit fileIdx, else the episode pick from an already-loaded file list.
+// selectFileID picks TorBox's own file id for the requested file. For a series episode it name-matches
+// the pack first (most reliable); a fileIdx is a POSITION in the torrent's file list, so it's mapped to
+// TorBox's file id via the loaded list. Without a file list (single-file fast path / list failure) the
+// raw fileIdx is passed through best-effort — TorBox ignores file_id for a single-file torrent.
 func selectFileID(files []TorrentFile, t ResolveTarget) *int {
+	if t.Season != nil && t.Episode != nil {
+		if id := pickEpisodeFile(files, *t.Season, *t.Episode); id != nil {
+			return id
+		}
+	}
 	if t.FileIdx != nil {
+		if *t.FileIdx >= 0 && *t.FileIdx < len(files) {
+			return &files[*t.FileIdx].Index
+		}
 		return t.FileIdx
 	}
-	if t.Season == nil || t.Episode == nil || len(files) == 0 {
-		return nil
-	}
-	return pickEpisodeFile(files, *t.Season, *t.Episode)
+	return nil
 }
 
 // --- Real-Debrid ---
@@ -423,14 +433,18 @@ func (s *realDebridStore) pickFileID(files []TorrentFile, t ResolveTarget) *int 
 	if len(files) == 0 {
 		return nil
 	}
+	// Series episode: name-match against the pack first — Torrentio's fileIdx and RD's file order aren't
+	// guaranteed to agree, so a positional index can pick the wrong episode.
+	if t.Season != nil && t.Episode != nil {
+		if id := pickEpisodeFile(files, *t.Season, *t.Episode); id != nil {
+			return id
+		}
+	}
 	if t.FileIdx != nil {
 		if *t.FileIdx >= 0 && *t.FileIdx < len(files) {
 			return &files[*t.FileIdx].Index
 		}
 		return &files[0].Index
-	}
-	if t.Season != nil && t.Episode != nil {
-		return pickEpisodeFile(files, *t.Season, *t.Episode)
 	}
 	idx := largest(files).Index
 	return &idx
@@ -549,11 +563,15 @@ func (s *premiumizeStore) pickIndex(files []TorrentFile, t ResolveTarget) *int {
 	if len(files) == 0 {
 		return nil
 	}
+	// Series episode: name-match against the pack first — Torrentio's fileIdx and Premiumize's content
+	// order aren't guaranteed to agree, so a positional index can pick the wrong episode.
+	if t.Season != nil && t.Episode != nil {
+		if id := pickEpisodeFile(files, *t.Season, *t.Episode); id != nil {
+			return id
+		}
+	}
 	if t.FileIdx != nil && *t.FileIdx >= 0 && *t.FileIdx < len(files) {
 		return t.FileIdx
-	}
-	if t.Season != nil && t.Episode != nil {
-		return pickEpisodeFile(files, *t.Season, *t.Episode)
 	}
 	idx := largest(files).Index
 	return &idx
