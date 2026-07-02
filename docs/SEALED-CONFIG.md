@@ -1,8 +1,10 @@
 # GOAL: sealed config-in-URL (get BYOK secrets out of plaintext addon URLs)
 
-**Status:** den-scout **server side DONE** (commit `e1d7994`) — accepts + resolves sealed URLs,
-interop-proven, fails closed, +x/crypto only (6.99 MB binary, no cgo). Remaining: the *minter*
-(`/configure` in-browser sealing and/or den-app), then den-subtitles.
+**Status:** **den-scout DONE** (`e1d7994` server, `dbd257c` minter) — `/configure` seals in the browser
+and the addon resolves sealed URLs end-to-end; legacy plaintext still works; token never logged; +x/crypto
++ a 23 KB embedded JS bundle only. Both interop gates pass (libsodium→Go via PyNaCl; JS→Go). Activate on a
+deployment by setting `SCOUT_CONFIG_KEY` (a base64 32-byte X25519 private key); unset = sealed disabled,
+legacy still works. **Remaining:** den-subtitles (P2), den-app minter (P3).
 **Reference impl:** den-scout · **Also:** den-subtitles, den-app
 
 ## Progress
@@ -13,11 +15,9 @@ interop-proven, fails closed, +x/crypto only (6.99 MB binary, no cgo). Remaining
       decode branch in `decodeConfig` (sealed `0x01` vs legacy JSON), fail-closed, `GET /config-key`,
       never-log. `TestDecodeConfigSealed` + `TestRoutesSealedConfig` prove a sealed URL resolves
       manifest+streams end-to-end and legacy still resolves.
-- [ ] **P1 (minter)** `/configure` seals in the browser. Needs a small crypto bundle that matches
-      libsodium crypto_box_seal: **tweetnacl** (`nacl.box`, 18 KB) + a standalone **blake2b** for the
-      nonce = `blake2b_24(eph_pub‖recipient_pub)`, then `seg = base64url(0x01 ‖ eph_pub ‖ box)`. Fetch
-      `/config-key` first; fall back to plaintext when it 404s. Verify by feeding one JS-minted segment
-      to a Go test (JS→Go vector), same as the PyNaCl gate. (den-app P3 is an alternative minter.)
+- [x] **P1 (minter)** `/configure` fetches `/config-key` and seals the config to it (tweetnacl `nacl.box`
+      + blakejs blake2b, esbuild IIFE ~23 KB, inlined — no CDN); falls back to plaintext when no key.
+      `TestSealJSInteropVector` opens a real browser-bundle-minted segment in Go (JS→Go gate).
 - [ ] **P2** den-subtitles mirror (Rust `crypto_box` sealedbox).
 - [ ] **P3** den-app in-app sealing (Swift CryptoKit Curve25519 + crypto_box_seal).
 - [ ] **P4** rollout / migration.
