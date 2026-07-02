@@ -1,6 +1,28 @@
 # GOAL: sealed config-in-URL (get BYOK secrets out of plaintext addon URLs)
 
-**Status:** planned · **Reference impl:** den-scout · **Also:** den-subtitles, den-app
+**Status:** den-scout **server side DONE** (commit `e1d7994`) — accepts + resolves sealed URLs,
+interop-proven, fails closed, +x/crypto only (6.99 MB binary, no cgo). Remaining: the *minter*
+(`/configure` in-browser sealing and/or den-app), then den-subtitles.
+**Reference impl:** den-scout · **Also:** den-subtitles, den-app
+
+## Progress
+- [x] **P0** crypto module `seal.go` (crypto_box_seal over nacl/box+blake2b) + the libsodium interop
+      gate (`TestSealInteropVector` opens a real PyNaCl ciphertext + matches the derived pubkey) +
+      round-trip / fail-closed / rotation tests.
+- [x] **P1 (server)** keyring from env (`SCOUT_CONFIG_KEY`/`SCOUT_CONFIG_KEYS_PREV`), version-byte
+      decode branch in `decodeConfig` (sealed `0x01` vs legacy JSON), fail-closed, `GET /config-key`,
+      never-log. `TestDecodeConfigSealed` + `TestRoutesSealedConfig` prove a sealed URL resolves
+      manifest+streams end-to-end and legacy still resolves.
+- [ ] **P1 (minter)** `/configure` seals in the browser. Needs a small crypto bundle that matches
+      libsodium crypto_box_seal: **tweetnacl** (`nacl.box`, 18 KB) + a standalone **blake2b** for the
+      nonce = `blake2b_24(eph_pub‖recipient_pub)`, then `seg = base64url(0x01 ‖ eph_pub ‖ box)`. Fetch
+      `/config-key` first; fall back to plaintext when it 404s. Verify by feeding one JS-minted segment
+      to a Go test (JS→Go vector), same as the PyNaCl gate. (den-app P3 is an alternative minter.)
+- [ ] **P2** den-subtitles mirror (Rust `crypto_box` sealedbox).
+- [ ] **P3** den-app in-app sealing (Swift CryptoKit Curve25519 + crypto_box_seal).
+- [ ] **P4** rollout / migration.
+
+
 
 ## Goal (one line)
 Keep the single paste-one-URL Stremio install flow, but make the config bytes in the URL **ciphertext

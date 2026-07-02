@@ -34,6 +34,19 @@ func TestSealInteropVector(t *testing.T) {
 	}
 }
 
+// A fixed segment MINTED by the /configure browser bundle (tweetnacl + blake2b crypto_box_seal) to
+// vecPub — the JS→Go interop gate, complementing the PyNaCl (libsodium→Go) vector above. Regenerate with
+// scratch/sealsrc/entry.js's denSeal() if the wire format ever changes.
+const vecJSSeg = "AZx6VE32YvP8XAhp0oq6d-gAODZb0o9i7TKBCHudMDxiregenxybtd2DLQc4VKyX7wAeyiAu2LHHYs2k3Pj51dqEvZzc-Fmaa2_uvca4IMMyHMMP6hANKv6f9F8TF7vYyrLDPvdOjDK7wzl8Kg"
+
+func TestSealJSInteropVector(t *testing.T) {
+	kr, _ := parseSealKeyring(vecPrivB64, "")
+	c, ok := decodeConfig(kr, vecJSSeg)
+	if !ok || len(c.Debrid) != 1 || c.Debrid[0].Token != "JS-SEALED-OK" {
+		t.Fatalf("browser-minted segment didn't open: %+v ok=%v", c, ok)
+	}
+}
+
 func TestSealRoundTrip(t *testing.T) {
 	kr, err := parseSealKeyring(vecPrivB64, "")
 	if err != nil {
