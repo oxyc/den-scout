@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,6 +18,10 @@ type Settings struct {
 	IndexerURLs   map[Indexer]string
 	CacheBytes    int    // audit #1: byte budget for the in-memory cache
 	CinemetaURL   string // metadata source for the year mistag filter (default: public Cinemeta)
+	// Sealed config-in-URL (docs/SEALED-CONFIG.md). ConfigKey = current X25519 private key (base64);
+	// ConfigKeysPrev = comma-separated prior keys (rotation). Empty ConfigKey → sealed URLs disabled.
+	ConfigKey      string
+	ConfigKeysPrev string
 }
 
 func SettingsFromEnv(get func(string) string) Settings {
@@ -27,13 +32,15 @@ func SettingsFromEnv(get func(string) string) Settings {
 		}
 	}
 	return Settings{
-		Port:          orDefault(get("PORT"), "8080"),
-		ScrapeTimeout: durEnv(get("SCOUT_SCRAPE_TIMEOUT_MS"), time.Millisecond, defaultTimeout),
-		ListTTL:       durEnv(get("SCOUT_LIST_TTL_SECONDS"), time.Second, defaultListTTL),
-		PublicURL:     get("SCOUT_PUBLIC_URL"),
-		IndexerURLs:   urls,
-		CacheBytes:    intEnv(get("SCOUT_CACHE_BYTES"), 48<<20), // 48 MiB
-		CinemetaURL:   orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
+		Port:           orDefault(get("PORT"), "8080"),
+		ScrapeTimeout:  durEnv(get("SCOUT_SCRAPE_TIMEOUT_MS"), time.Millisecond, defaultTimeout),
+		ListTTL:        durEnv(get("SCOUT_LIST_TTL_SECONDS"), time.Second, defaultListTTL),
+		PublicURL:      get("SCOUT_PUBLIC_URL"),
+		IndexerURLs:    urls,
+		CacheBytes:     intEnv(get("SCOUT_CACHE_BYTES"), 48<<20), // 48 MiB
+		CinemetaURL:    orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
+		ConfigKey:      get("SCOUT_CONFIG_KEY"),
+		ConfigKeysPrev: get("SCOUT_CONFIG_KEYS_PREV"),
 	}
 }
 
@@ -47,7 +54,19 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		MakeScrapers:  func(c *Config) []scraper { return makeScrapers(c, client, settings.IndexerURLs) },
 		MakeStores:    func(c *Config) []Store { return buildStores(c, client, cache) },
 		Meta:          cinemetaMeta(client, settings.CinemetaURL),
+		SealKeyring:   buildKeyring(settings.ConfigKey, settings.ConfigKeysPrev),
 	}
+}
+
+// buildKeyring parses the sealed-config keyring from env. A malformed key disables sealed URLs (legacy
+// plaintext keeps working) and logs loudly rather than crashing the addon.
+func buildKeyring(current, prev string) *sealKeyring {
+	kr, err := parseSealKeyring(current, prev)
+	if err != nil {
+		log.Printf("den-scout: SCOUT_CONFIG_KEY invalid — sealed configs disabled: %v", err)
+		return nil
+	}
+	return kr
 }
 
 func orDefault(v, d string) string {

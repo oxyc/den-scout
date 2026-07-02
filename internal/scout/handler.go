@@ -44,6 +44,9 @@ type Deps struct {
 	// Optional (nil = no year/title filter); a lookup failure returns ok=false and the list is served
 	// unfiltered.
 	Meta func(ctx context.Context, typ, imdb string) (cineMeta, bool)
+	// SealKeyring decrypts a sealed config path segment (docs/SEALED-CONFIG.md). nil = sealed URLs
+	// disabled (legacy plaintext still works); the current key's public half is served at /config-key.
+	SealKeyring *sealKeyring
 }
 
 type handler struct {
@@ -104,6 +107,15 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	case "/manifest.json":
 		h.conditional(w, r, h.manifestUnconf, h.manifestUnconfETag, jsonType, staticCache)
 		return
+	case "/config-key":
+		// The current X25519 public key (base64) so /configure (or den-app) can seal the config to it.
+		// 404 when sealed configs are disabled (no key configured) — the page then keeps plaintext.
+		if pub := h.deps.SealKeyring.currentPubBase64(); pub != "" {
+			writeJSON(w, http.StatusOK, map[string]string{"key": pub}, staticCache)
+		} else {
+			writeJSON(w, http.StatusNotFound, errBody("no_key"), noStore)
+		}
+		return
 	}
 
 	parts := splitPath(path) // ["<config>", "stream"|"play"|"manifest.json", ...]
@@ -118,7 +130,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 
 	switch resource {
 	case "manifest.json":
-		config, ok := decodeConfig(configBlob)
+		config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 		if !ok {
 			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 			return
@@ -154,7 +166,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	}
 
 	// Miss: decode now (#16 — a warm hit never pays decode/validate).
-	config, ok := decodeConfig(configBlob)
+	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 		return
@@ -288,7 +300,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		writeJSON(w, http.StatusBadRequest, errBody("bad_token"), noStore)
 		return
 	}
-	config, ok := decodeConfig(configBlob)
+	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 		return

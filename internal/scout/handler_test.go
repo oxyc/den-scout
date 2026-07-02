@@ -76,6 +76,39 @@ func TestRoutesPagesAndManifest(t *testing.T) {
 	}
 }
 
+func TestRoutesSealedConfig(t *testing.T) {
+	kr, _ := parseSealKeyring(vecPrivB64, "")
+	// Same config as validBlob, but sealed to the addon's key.
+	cfgJSON := []byte(`{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}`)
+	sealed, _ := seal(&kr.keys[0].pub, cfgJSON)
+	seg := b64urlEncode(append([]byte{sealedVersion}, sealed...))
+	h := NewHandler(testDeps(func(d *Deps) { d.SealKeyring = kr }))
+
+	// /config-key serves the current public key so a client can seal to it.
+	if rr := do(h, "/config-key", nil); rr.Code != 200 || !strings.Contains(rr.Body.String(), vecPubB64) {
+		t.Errorf("config-key: %d %s", rr.Code, rr.Body.String())
+	}
+	// A SEALED URL resolves manifest + streams identically to the plaintext blob.
+	if rr := do(h, "/"+seg+"/manifest.json", nil); rr.Code != 200 || !strings.Contains(rr.Body.String(), `"configurationRequired":false`) {
+		t.Errorf("sealed manifest: %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(h, "/"+seg+"/stream/movie/tt1234567.json", nil); rr.Code != 200 || streamsLen(rr) != 2 {
+		t.Errorf("sealed stream: %d n=%d", rr.Code, streamsLen(rr))
+	}
+	// Fail CLOSED: a sealed URL against a handler with no keyring → 400; /config-key → 404.
+	noKey := NewHandler(testDeps(nil))
+	if rr := do(noKey, "/"+seg+"/manifest.json", nil); rr.Code != 400 {
+		t.Errorf("sealed with no keyring should 400: %d", rr.Code)
+	}
+	if rr := do(noKey, "/config-key", nil); rr.Code != 404 {
+		t.Errorf("config-key without keyring should 404: %d", rr.Code)
+	}
+	// Back-compat: legacy plaintext still resolves when a keyring IS configured.
+	if rr := do(h, "/"+validBlob+"/manifest.json", nil); rr.Code != 200 {
+		t.Errorf("legacy plaintext with keyring: %d", rr.Code)
+	}
+}
+
 func TestRoutesStream(t *testing.T) {
 	h := NewHandler(testDeps(nil))
 	rr := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil)

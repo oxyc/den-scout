@@ -8,7 +8,7 @@ import (
 func blob(jsonStr string) string { return b64urlEncode([]byte(jsonStr)) }
 
 func TestDecodeConfig(t *testing.T) {
-	c, ok := decodeConfig(blob(`{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}`))
+	c, ok := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"tb-secret"}],"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}`))
 	if !ok || len(c.Debrid) != 1 || c.Debrid[0].Service != ServiceTorBox || c.Debrid[0].Token != "tb-secret" || !c.CachedOnly {
 		t.Fatalf("valid config: %+v ok=%v", c, ok)
 	}
@@ -19,22 +19,22 @@ func TestDecodeConfig(t *testing.T) {
 		`{"debrid":[{"service":"nope","token":"x"}]}`,
 		`{"debrid":[{"service":"torbox","token":""}]}`,
 	} {
-		if _, ok := decodeConfig(blob(bad)); ok {
+		if _, ok := decodeConfig(nil, blob(bad)); ok {
 			t.Errorf("expected reject: %s", bad)
 		}
 	}
-	if _, ok := decodeConfig("!!!not-base64!!!"); ok {
+	if _, ok := decodeConfig(nil, "!!!not-base64!!!"); ok {
 		t.Error("garbage blob should be rejected")
 	}
 
 	// clamp + drop unknown; #12: minSeeders:-5 becomes nil (no filter), not 0.
-	c, ok = decodeConfig(blob(`{"debrid":[{"service":"realdebrid","token":"rd"}],"resultCap":9999,"filters":{"excludeRegex":"` + repeat("x", 400) + `","minSeeders":-5},"evil":"ignored"}`))
+	c, ok = decodeConfig(nil, blob(`{"debrid":[{"service":"realdebrid","token":"rd"}],"resultCap":9999,"filters":{"excludeRegex":"`+repeat("x", 400)+`","minSeeders":-5},"evil":"ignored"}`))
 	if !ok || c.ResultCap != 200 || len(c.Filters.ExcludeRegex) != 256 || c.Filters.MinSeeders != nil {
 		t.Fatalf("clamp: resultCap=%d regexLen=%d minSeeders=%v", c.ResultCap, len(c.Filters.ExcludeRegex), c.Filters.MinSeeders)
 	}
 
 	// valid optional filters + dedupe indexers (#10) + drop bogus
-	c, _ = decodeConfig(blob(`{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","bogus","comet","torrentio"],"filters":{"resolutions":["2160p","nope","1080p"],"hdrOnly":true,"maxSizeGB":40}}`))
+	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","bogus","comet","torrentio"],"filters":{"resolutions":["2160p","nope","1080p"],"hdrOnly":true,"maxSizeGB":40}}`))
 	if len(c.Indexers) != 2 || c.Indexers[0] != "torrentio" || c.Indexers[1] != "comet" {
 		t.Errorf("indexers: %v", c.Indexers)
 	}
@@ -43,12 +43,12 @@ func TestDecodeConfig(t *testing.T) {
 	}
 
 	// defaults
-	c, _ = decodeConfig(blob(`{"debrid":[{"service":"torbox","token":"t"}]}`))
+	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}]}`))
 	if !c.Filters.ExcludeCam || !c.CachedOnly || len(c.Indexers) != 4 {
 		t.Errorf("defaults: %+v", c)
 	}
 	// explicit off
-	c, _ = decodeConfig(blob(`{"debrid":[{"service":"torbox","token":"t"}],"cachedOnly":false,"filters":{"excludeCam":false}}`))
+	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"cachedOnly":false,"filters":{"excludeCam":false}}`))
 	if c.Filters.ExcludeCam || c.CachedOnly {
 		t.Errorf("explicit off not honored: %+v", c)
 	}

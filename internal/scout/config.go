@@ -63,11 +63,24 @@ type rawConfig struct {
 	ResultCap  *float64 `json:"resultCap"`
 }
 
-// decodeConfig decodes the base64url blob into a validated config, or ok=false (→ 400).
-func decodeConfig(blob string) (*Config, bool) {
+// decodeConfig decodes the config path segment into a validated config, or ok=false (→ 400). The segment
+// is base64url; the decoded bytes are either a SEALED blob (first byte == sealedVersion → decrypt with the
+// keyring) or a legacy plaintext JSON config (first byte '{'). Sealed with no keyring, or a decrypt
+// failure, fails CLOSED — never falls through to an empty/partial config. See docs/SEALED-CONFIG.md.
+func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
 	data, err := b64urlDecode(blob)
-	if err != nil {
+	if err != nil || len(data) == 0 {
 		return nil, false
+	}
+	if data[0] == sealedVersion {
+		if kr == nil {
+			return nil, false // sealed URL but no key configured → can't open; refuse
+		}
+		pt, err := kr.open(data[1:])
+		if err != nil {
+			return nil, false
+		}
+		data = pt
 	}
 	var raw rawConfig
 	if json.Unmarshal(data, &raw) != nil {
