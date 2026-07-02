@@ -22,6 +22,7 @@ Added under `profiles: ["scout"]` so a plain `docker compose up` doesn't start i
     profiles: ["scout"]
     environment:
       PORT: "8080"
+      GOMEMLIMIT: "230MiB"                                   # soft heap ceiling ≈ mem_limit; keep in sync
       SCOUT_SCRAPE_TIMEOUT_MS: "${SCOUT_SCRAPE_TIMEOUT_MS:-8000}"
       SCOUT_LIST_TTL_SECONDS: "${SCOUT_LIST_TTL_SECONDS:-300}"
       SCOUT_MEDIAFUSION_URL: "${SCOUT_MEDIAFUSION_URL:-}"   # base incl. its encrypted-config segment

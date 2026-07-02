@@ -29,7 +29,7 @@ func main() {
 		Transport: &http.Transport{
 			Proxy:               http.ProxyFromEnvironment,
 			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 8,
+			MaxIdleConnsPerHost: 32, // several users can resolve via the same debrid host at once
 			IdleConnTimeout:     90 * time.Second,
 			ForceAttemptHTTP2:   true,
 		},
@@ -41,6 +41,10 @@ func main() {
 		Addr:              ":" + settings.Port,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bound the full response so a slow/stuck client (or a slow debrid write) can't pin a goroutine
+		// and connection indefinitely. Comfortably above the handler's own list-build/resolve budgets.
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 	log.Printf("den-scout listening on :%s", settings.Port)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
