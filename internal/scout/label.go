@@ -73,8 +73,10 @@ func sizeLabel(bytes int) string {
 }
 
 // cleanLabel is the bullet-joined quality summary shown as attributes.label.
-func cleanLabel(s RawStream) string {
-	t := strings.ToLower(s.Title)
+func cleanLabel(s RawStream) string { return cleanLabelLower(strings.ToLower(s.Title), s) }
+
+// cleanLabelLower is cleanLabel when the caller already has the lowercased title.
+func cleanLabelLower(t string, s RawStream) string {
 	var parts []string
 	if res := resolutionLabel(t, s.SizeBytes); res != "" {
 		parts = append(parts, res)

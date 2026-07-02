@@ -328,7 +328,10 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		if f.HDROnly && !reHDROnly.match(lower) {
 			continue
 		}
-		if f.MinSeeders != nil && intOr(s.Seeders, 0) < *f.MinSeeders {
+		// Only drop when the seeder count is actually known — many indexer entries omit it, and treating
+		// missing as 0 would discard otherwise-good (even cached) results (mirrors the size filter, which
+		// keeps unknown sizes).
+		if f.MinSeeders != nil && s.Seeders != nil && *s.Seeders < *f.MinSeeders {
 			continue
 		}
 		if f.MaxSizeGB != nil && intOr(s.SizeBytes, 0) > *f.MaxSizeGB*gib {

@@ -25,8 +25,10 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 		fmt.Sprintf(`s0*%d[ ._-]*e0*%d(?!\d)`, season, episode),
 		fmt.Sprintf(`\b0*%dx0*%d(?!\d)`, season, episode),
 		fmt.Sprintf(`season[ ._-]*0*%d[ ._-]*episode[ ._-]*0*%d(?!\d)`, season, episode),
-		fmt.Sprintf(`\b%d%02d(?!\d)`, season, episode),
-		fmt.Sprintf(`\b%02d%02d(?!\d)`, season, episode),
+		// Bare concatenated forms (102 = S1E02) must not swallow a resolution token: a trailing p/i
+		// makes "720" (S7E20) match "720p", so exclude those as well as a following digit.
+		fmt.Sprintf(`\b%d%02d(?![\dpi])`, season, episode),
+		fmt.Sprintf(`\b%02d%02d(?![\dpi])`, season, episode),
 	}
 	out := make([]*regexp2.Regexp, 0, len(specs))
 	for _, s := range specs {

@@ -130,7 +130,7 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		cachedOnly = *raw.CachedOnly
 	}
 	resultCap := 20
-	if raw.ResultCap != nil {
+	if raw.ResultCap != nil && isFinite(*raw.ResultCap) {
 		resultCap = clampInt(int(math.Round(*raw.ResultCap)), 1, 200)
 	}
 

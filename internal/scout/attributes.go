@@ -29,9 +29,9 @@ var (
 )
 
 func detectSourceAttr(t string) string {
-	switch junkClassOf(t) {
+	switch j := junkClassOf(t); j {
 	case "cam", "telesync", "screener":
-		return junkClassOf(t)
+		return j
 	}
 	switch {
 	case reRemux.match(t):
@@ -100,7 +100,7 @@ func streamAttributes(s RawStream) StreamAttributes {
 		SizeBytes:   s.SizeBytes,
 		Seeders:     s.Seeders,
 		Cached:      s.Cached,
-		Label:       cleanLabel(s),
+		Label:       cleanLabelLower(t, s), // reuse the title we already lowercased
 	}
 }
 

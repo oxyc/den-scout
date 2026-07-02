@@ -62,6 +62,30 @@ func TestLabelBranches(t *testing.T) {
 	}
 }
 
+func TestSeasonAbsoluteNumberingNoResolutionMatch(t *testing.T) {
+	p := episodePatterns(7, 20) // concatenated form is "720"
+	if matchesEpisode("Show.720p.WEB-DL.x264.mkv", p) {
+		t.Error("S7E20 must not match a 720p resolution token")
+	}
+	if !matchesEpisode("Show.720.mkv", p) {
+		t.Error("S7E20 should still match a bare 720 episode token")
+	}
+	if !matchesEpisode("Show.S07E20.1080p.mkv", episodePatterns(7, 20)) {
+		t.Error("S07E20 form should still match")
+	}
+}
+
+func TestRankMinSeedersKeepsUnknown(t *testing.T) {
+	streams := []RawStream{
+		rs("Movie 1080p WEB", func(s *RawStream) { s.InfoHash = repeat("a", 40) }),                     // seeders unknown
+		rs("Movie 720p WEB", func(s *RawStream) { s.InfoHash = repeat("b", 40); s.Seeders = intp(1) }), // known, below threshold
+	}
+	out := rankStreams(streams, rankFilters{MinSeeders: intp(5), ResultCap: 10})
+	if len(out) != 1 || out[0].InfoHash != repeat("a", 40) {
+		t.Errorf("minSeeders should keep unknown-seeder streams and drop known-below-threshold: %+v", out)
+	}
+}
+
 func TestSeriesStreamAndForwardedOrigin(t *testing.T) {
 	h := NewHandler(testDeps(func(d *Deps) {
 		d.MakeScrapers = func(*Config) []scraper {
