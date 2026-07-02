@@ -205,8 +205,12 @@ func TestRoutesDegradedScrapeNotCached(t *testing.T) {
 			}}}
 		}
 	}))
-	if n := streamsLen(do(h, "/"+validBlob+"/stream/movie/tt42.json", nil)); n != 0 {
+	degradedRR := do(h, "/"+validBlob+"/stream/movie/tt42.json", nil)
+	if n := streamsLen(degradedRR); n != 0 {
 		t.Fatalf("degraded scrape should yield 0 streams, got %d", n)
+	}
+	if got := degradedRR.Header().Get("X-Scout-Degraded"); got != "indexers" {
+		t.Errorf("degraded scrape should set X-Scout-Degraded: indexers, got %q", got)
 	}
 	atomic.StoreInt32(&healthy, 1)
 	if n := streamsLen(do(h, "/"+validBlob+"/stream/movie/tt42.json", nil)); n == 0 {

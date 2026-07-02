@@ -468,7 +468,10 @@ func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) (map[
 			for _, h := range batch {
 				q.Add("items[]", h)
 			}
-			req, _ := http.NewRequestWithContext(gctx, http.MethodGet, s.api+"/cache/check?"+q.Encode(), nil)
+			req, err := http.NewRequestWithContext(gctx, http.MethodGet, s.api+"/cache/check?"+q.Encode(), nil)
+			if err != nil {
+				return nil
+			}
 			resp, err := s.client.Do(req)
 			if err != nil {
 				return nil

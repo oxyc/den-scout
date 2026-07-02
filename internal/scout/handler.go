@@ -26,6 +26,8 @@ const (
 	// Hard cap on a /play resolve (addMagnet→select→unrestrict across stores) so a slow debrid account
 	// can't pin a goroutine/connection indefinitely.
 	resolveBudget = 45 * time.Second
+	// Upper bound on scraped seeds fed into the cache-check fan-out (guards outbound amplification).
+	maxSeeds = 500
 )
 
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
@@ -66,6 +68,13 @@ func NewHandler(deps Deps) http.Handler {
 }
 
 func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
+	// Convert any unforeseen panic into a clean 500 instead of a dropped connection (net/http would
+	// recover it, but the client would see a reset). No-op if the response was already partly written.
+	defer func() {
+		if rec := recover(); rec != nil {
+			writeJSON(w, http.StatusInternalServerError, errBody("internal"), noStore)
+		}
+	}()
 	path := r.URL.Path
 	switch path {
 	case "/", "/configure", "/configure/":
@@ -139,16 +148,36 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey), nil
+		value, degraded := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey)
+		return buildResult{value: value, degraded: degraded}, nil
 	})
-	etag, body := splitCached(v.(string))
+	res := v.(buildResult)
+	// Signal a degraded build so the app can say "sources temporarily unavailable" rather than treating
+	// an empty list as "no results" (a total indexer/cache-check outage otherwise looks identical).
+	if res.degraded != "" {
+		w.Header().Set("X-Scout-Degraded", res.degraded)
+	}
+	etag, body := splitCached(res.value)
 	h.conditional(w, r, body, etag, jsonType, listCache)
 }
 
+// buildResult carries the singleflight build's body plus a degraded reason ("" when healthy).
+type buildResult struct {
+	value    string
+	degraded string
+}
+
 // buildStreamList scrapes → cache-checks → ranks → serializes, caches "<etag>\x00<body>", returns it.
-func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) string {
+func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) (string, string) {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	seeds, scrapeOK := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
+
+	// Cap the seed set before the cache-check fan-out: a misbehaving/hostile indexer returning thousands
+	// of tiny stream objects would otherwise mean hundreds of concurrent outbound debrid requests. The
+	// cap is well above any real title's stream count, so it can't drop meaningful results.
+	if len(seeds) > maxSeeds {
+		seeds = seeds[:maxSeeds]
+	}
 
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
 	hashes := make([]string, len(seeds))
@@ -164,7 +193,13 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// misleading empty/partial list; return it for this request but don't cache it, so the next request
 	// retries instead of serving the blip for the whole TTL.
 	truthDegraded := hasCacheTruth(config) && !truthOK
-	degraded := !scrapeOK || truthDegraded
+	degradedReason := ""
+	if !scrapeOK {
+		degradedReason = "indexers"
+	} else if truthDegraded {
+		degradedReason = "cache-check"
+	}
+	degraded := degradedReason != ""
 
 	// audit #4: with no cache-truth store (RD-only), the cached-only filter would drop everything. Also
 	// skip it when the cache-truth stores are unreachable this request (don't drop everything on a blip).
@@ -201,7 +236,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	if !degraded {
 		h.deps.Cache.Put(cacheKey, value, h.deps.ListTTL)
 	}
-	return value
+	return value, degradedReason
 }
 
 func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob string, parts []string) {
