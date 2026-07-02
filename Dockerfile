@@ -1,32 +1,27 @@
-# den-scout — multi-stage: compile TS → run the plain-JS output as a non-root Node process.
-# No native deps (all I/O is global fetch), so the runtime image is just node:slim + dist + prod deps.
+# den-scout — a single static Go binary on distroless/static (no shell, no libc, non-root).
+# All I/O is net/http, so nothing links to the C library: CGO_ENABLED=0 gives a fully static
+# binary and the runtime image is just the ~2MB distroless base + the binary (~15MB total).
 
-FROM node:22-bookworm-slim AS build
-WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
-COPY tsconfig.json tsconfig.build.json ./
-COPY src ./src
-RUN npm run build && npm prune --omit=dev
+# Build on the native builder arch, cross-compile to the target (set by `docker build --platform`;
+# the homelab publishes linux/amd64). CGO off → a fully static binary regardless of target.
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# Trim the binary (-s -w strips the symbol/DWARF tables).
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -trimpath -ldflags='-s -w' -o /den-scout ./cmd/den-scout
 
-FROM node:22-bookworm-slim AS runtime
-# Cap V8's old space below the container mem_limit (256m) so GC runs before the kernel OOM-kills us —
-# Node doesn't reliably size the heap to a cgroup limit on its own.
-ENV NODE_ENV=production \
-    PORT=8080 \
-    NODE_OPTIONS=--max-old-space-size=192
-WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json ./
-
-# node:*-slim ships an unprivileged `node` user (uid 1000) — run as it, never root.
-USER node
+# :nonroot runs as uid 65532 and carries CA certs for the outbound HTTPS scrape/debrid calls.
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+COPY --from=build /den-scout /den-scout
 EXPOSE 8080
 
-# curl isn't in the slim image; Node's global fetch does the healthcheck. 60s interval keeps the
-# every-tick cold-start of a second V8 from competing with the server under the hard mem_limit.
+# Distroless has no shell, so the probe execs the binary itself (audit #2 — no second runtime).
 HEALTHCHECK --interval=60s --timeout=5s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD ["/den-scout", "-healthcheck"]
 
-CMD ["node", "dist/server.js"]
+ENTRYPOINT ["/den-scout"]

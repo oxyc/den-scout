@@ -1,9 +1,7 @@
 .git
 .github
-node_modules
-dist
+golden
 coverage
-test
 *.md
 !README.md
 .env

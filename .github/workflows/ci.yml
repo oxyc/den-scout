@@ -11,11 +11,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-go@v5
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      # Coverage is gated ≥90% lines in vitest.config.ts — a regression fails CI here.
-      - run: npm run test:cov
+          go-version: "1.26"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test ./...
+
+      # Coverage gate on the logic package (mirrors the old vitest ≥90% gate over src/;
+      # cmd/den-scout is a thin main() shim that ListenAndServe can't unit-test).
+      - name: coverage gate (>=90%)
+        run: |
+          go test -coverprofile=cover.out ./internal/...
+          pct=$(go tool cover -func=cover.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "internal coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 90) ? 0 : 1 }' || {
+            echo "coverage ${pct}% is below the 90% gate"; exit 1;
+          }
