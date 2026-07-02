@@ -80,6 +80,16 @@ describe("scout routes — pages + manifest", () => {
     expect((await call(`/${BLOB}/manifest.json`)).headers.get("cache-control")).toBe("public, max-age=3600");
     expect((await call("/health")).headers.get("cache-control")).toBe("no-store");
   });
+
+  it("revalidates manifest via ETag → 304 (empty body, cache-control preserved)", async () => {
+    const first = await call(`/${BLOB}/manifest.json`);
+    const etag = first.headers.get("etag");
+    expect(etag).toMatch(/^"[0-9a-f]{8}"$/);
+    const second = await call(`/${BLOB}/manifest.json`, deps(), { headers: { "if-none-match": etag! } });
+    expect(second.status).toBe(304);
+    expect(await second.text()).toBe("");
+    expect(second.headers.get("cache-control")).toBe("public, max-age=3600");
+  });
 });
 
 describe("scout /stream", () => {
@@ -110,6 +120,15 @@ describe("scout /stream", () => {
   it("stream list is client-cacheable for the server-side TTL", async () => {
     const res = await call(`/${BLOB}/stream/movie/tt9.json`, deps({ listTtlSeconds: 120 }));
     expect(res.headers.get("cache-control")).toBe("public, max-age=120");
+  });
+
+  it("stream list supports ETag revalidation → 304", async () => {
+    const d = deps();
+    const first = await call(`/${BLOB}/stream/movie/tt1.json`, d);
+    const etag = first.headers.get("etag");
+    expect(etag).toBeTruthy();
+    const second = await call(`/${BLOB}/stream/movie/tt1.json`, d, { headers: { "if-none-match": etag! } });
+    expect(second.status).toBe(304);
   });
 
   it("filters RD-blocked releases when Real-Debrid is the only debrid", async () => {

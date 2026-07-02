@@ -29,7 +29,10 @@ import type { FetchLike, Scraper } from "./scrape/types.js";
 import { StorePool } from "./stores/index.js";
 import type { Store } from "./stores/types.js";
 import type { Cache } from "./cache.js";
-import { fnv1a, html, json } from "./util.js";
+import { conditionalResponse, fnv1a, json } from "./util.js";
+
+const JSON_TYPE = "application/json";
+const HTML_TYPE = "text/html; charset=utf-8";
 
 export interface ScoutDeps {
   fetch: FetchLike;
@@ -52,9 +55,11 @@ export async function handleScout(request: Request, deps: ScoutDeps): Promise<Re
   const url = new URL(request.url);
   const path = url.pathname;
 
-  if (path === "/" || path === "/configure" || path === "/configure/") return html(CONFIGURE_PAGE, STATIC_CACHE);
+  if (path === "/" || path === "/configure" || path === "/configure/") {
+    return conditionalResponse(request, CONFIGURE_PAGE, HTML_TYPE, STATIC_CACHE);
+  }
   if (path === "/health") return json({ status: "ok" }, 200, NO_STORE);
-  if (path === "/manifest.json") return json(buildManifest(null), 200, STATIC_CACHE);
+  if (path === "/manifest.json") return conditionalResponse(request, JSON.stringify(buildManifest(null)), JSON_TYPE, STATIC_CACHE);
 
   const parts = path.split("/").filter(Boolean); // ["<config>", "stream"|"play"|"manifest.json", ...]
   const configBlob = parts[0] ?? "";
@@ -62,7 +67,7 @@ export async function handleScout(request: Request, deps: ScoutDeps): Promise<Re
   if (!config) return json({ error: "bad_config" }, 400, NO_STORE);
 
   const resource = parts[1];
-  if (resource === "manifest.json") return json(buildManifest(config), 200, STATIC_CACHE);
+  if (resource === "manifest.json") return conditionalResponse(request, JSON.stringify(buildManifest(config)), JSON_TYPE, STATIC_CACHE);
   if (resource === "stream") return handleStream(request, config, configBlob, parts, deps);
   if (resource === "play") return handlePlay(config, parts, deps);
   return json({ error: "not_found" }, 404, NO_STORE);
@@ -84,7 +89,7 @@ async function handleStream(
   // Key the cache by the FNV of the config blob, NOT the token — the cache holds no secret.
   const cacheKey = `list:${fnv1a(configBlob)}:${streamCacheId(sid)}`;
   const hit = await deps.cache.get(cacheKey);
-  if (hit) return json(JSON.parse(hit), 200, listCache);
+  if (hit) return conditionalResponse(request, hit, JSON_TYPE, listCache);
 
   const scrapers = deps.makeScrapers(config, deps.fetch);
   const seeds = await scrapeAll(
@@ -114,9 +119,9 @@ async function handleStream(
   });
 
   const origin = publicOrigin(request, new URL(request.url));
-  const body = { streams: ranked.map((s) => toStremioStream(s, sid, origin, configBlob)) };
-  await deps.cache.put(cacheKey, JSON.stringify(body), deps.listTtlSeconds);
-  return json(body, 200, listCache);
+  const body = JSON.stringify({ streams: ranked.map((s) => toStremioStream(s, sid, origin, configBlob)) });
+  await deps.cache.put(cacheKey, body, deps.listTtlSeconds);
+  return conditionalResponse(request, body, JSON_TYPE, listCache);
 }
 
 async function handlePlay(config: ScoutConfig, parts: string[], deps: ScoutDeps): Promise<Response> {
