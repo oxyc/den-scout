@@ -117,9 +117,21 @@ describe("scout /stream", () => {
     expect((await call(`/${BLOB}/stream/movie/nope.json`)).status).toBe(400);
   });
 
-  it("stream list is client-cacheable for the server-side TTL", async () => {
+  it("stream list is client-cacheable for the TTL with SWR/stale-if-error", async () => {
     const res = await call(`/${BLOB}/stream/movie/tt9.json`, deps({ listTtlSeconds: 120 }));
-    expect(res.headers.get("cache-control")).toBe("public, max-age=120");
+    expect(res.headers.get("cache-control")).toBe("public, max-age=120, stale-while-revalidate=120, stale-if-error=86400");
+  });
+
+  it("coalesces concurrent misses for the same title into a single scrape", async () => {
+    const scrape = vi.fn(async () => SEEDS);
+    const d = deps({ makeScrapers: () => [{ id: "torrentio", scrape }] });
+    const [a, b] = await Promise.all([
+      call(`/${BLOB}/stream/movie/tt777.json`, d),
+      call(`/${BLOB}/stream/movie/tt777.json`, d),
+    ]);
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    expect(scrape).toHaveBeenCalledTimes(1);
   });
 
   it("stream list supports ETag revalidation → 304", async () => {

@@ -26,20 +26,23 @@ export class PremiumizeStore implements Store {
 
   async cacheCheck(infoHashes: string[]): Promise<Map<string, boolean>> {
     const result = new Map<string, boolean>(infoHashes.map((h) => [h, false]));
-    for (let i = 0; i < infoHashes.length; i += CACHE_BATCH) {
-      const batch = infoHashes.slice(i, i + CACHE_BATCH);
-      const params = new URLSearchParams({ apikey: this.token });
-      for (const h of batch) params.append("items[]", h);
-      try {
-        const res = await this.fetch(`${this.api}/cache/check?${params}`, { headers: { accept: "application/json" } });
-        if (!res.ok) continue;
-        const body = (await res.json()) as { status?: string; response?: boolean[] };
-        if (body.status !== "success" || !Array.isArray(body.response)) continue;
-        batch.forEach((h, idx) => body.response![idx] && result.set(h, true));
-      } catch {
-        // leave this batch's hashes at false
-      }
-    }
+    const batches: string[][] = [];
+    for (let i = 0; i < infoHashes.length; i += CACHE_BATCH) batches.push(infoHashes.slice(i, i + CACHE_BATCH));
+    await Promise.all(
+      batches.map(async (batch) => {
+        const params = new URLSearchParams({ apikey: this.token });
+        for (const h of batch) params.append("items[]", h);
+        try {
+          const res = await this.fetch(`${this.api}/cache/check?${params}`, { headers: { accept: "application/json" } });
+          if (!res.ok) return;
+          const body = (await res.json()) as { status?: string; response?: boolean[] };
+          if (body.status !== "success" || !Array.isArray(body.response)) return;
+          batch.forEach((h, idx) => body.response![idx] && result.set(h, true));
+        } catch {
+          // leave this batch's hashes at false
+        }
+      }),
+    );
     return result;
   }
 

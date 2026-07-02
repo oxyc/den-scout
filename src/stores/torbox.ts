@@ -34,19 +34,24 @@ export class TorBoxStore implements Store {
 
   async cacheCheck(infoHashes: string[]): Promise<Map<string, boolean>> {
     const result = new Map<string, boolean>(infoHashes.map((h) => [h, false]));
-    for (let i = 0; i < infoHashes.length; i += CACHE_BATCH) {
-      const batch = infoHashes.slice(i, i + CACHE_BATCH);
-      try {
-        const url = `${this.api}/torrents/checkcached?hash=${batch.join(",")}&format=object&list_files=false`;
-        const res = await this.fetch(url, { headers: this.authHeaders });
-        if (!res.ok) continue; // a failed batch leaves those hashes at their `false` default
-        const body = (await res.json()) as { data?: Record<string, unknown> | null };
-        const data = body.data ?? {};
-        for (const hash of batch) if (data[hash] || data[hash.toUpperCase()]) result.set(hash, true);
-      } catch {
-        // Network blip on one batch must not sink the whole cache-check.
-      }
-    }
+    const batches: string[][] = [];
+    for (let i = 0; i < infoHashes.length; i += CACHE_BATCH) batches.push(infoHashes.slice(i, i + CACHE_BATCH));
+    // Batches are independent — run them concurrently so a >100-hash (season/large-swarm) check
+    // isn't serial round-trips.
+    await Promise.all(
+      batches.map(async (batch) => {
+        try {
+          const url = `${this.api}/torrents/checkcached?hash=${batch.join(",")}&format=object&list_files=false`;
+          const res = await this.fetch(url, { headers: this.authHeaders });
+          if (!res.ok) return; // a failed batch leaves those hashes at their `false` default
+          const body = (await res.json()) as { data?: Record<string, unknown> | null };
+          const data = body.data ?? {};
+          for (const hash of batch) if (data[hash] || data[hash.toUpperCase()]) result.set(hash, true);
+        } catch {
+          // Network blip on one batch must not sink the whole cache-check.
+        }
+      }),
+    );
     return result;
   }
 

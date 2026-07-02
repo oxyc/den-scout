@@ -23,4 +23,15 @@ describe("MemoryCache", () => {
   it("misses on an unknown key", async () => {
     expect(await new MemoryCache().get("nope")).toBeNull();
   });
+
+  it("evicts the least-recently-used entry past maxEntries", async () => {
+    const cache = new MemoryCache(() => 0, 2); // never expires; cap = 2
+    await cache.put("a", "1", 100);
+    await cache.put("b", "2", 100);
+    await cache.get("a"); // touch 'a' → 'b' is now least-recently-used
+    await cache.put("c", "3", 100); // over cap → evict 'b'
+    expect(await cache.get("b")).toBeNull();
+    expect(await cache.get("a")).toBe("1");
+    expect(await cache.get("c")).toBe("3");
+  });
 });

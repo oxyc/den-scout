@@ -73,6 +73,22 @@ export async function handleScout(request: Request, deps: ScoutDeps): Promise<Re
   return json({ error: "not_found" }, 404, NO_STORE);
 }
 
+/**
+ * In-flight stream-list builds, keyed by cache key. Collapses a thundering herd: N concurrent requests
+ * for the same uncached title (client retries, multiple devices, a burst at TTL expiry) share ONE
+ * scrape + cache-check fan-out instead of each hammering the indexers + debrid APIs. Per-process, which
+ * is exactly the scope of the in-process cache it fronts.
+ */
+const inflight = new Map<string, Promise<string>>();
+
+function coalesce(key: string, produce: () => Promise<string>): Promise<string> {
+  const existing = inflight.get(key);
+  if (existing) return existing;
+  const promise = produce().finally(() => inflight.delete(key));
+  inflight.set(key, promise);
+  return promise;
+}
+
 async function handleStream(
   request: Request,
   config: ScoutConfig,
@@ -83,14 +99,30 @@ async function handleStream(
   const sid = parseStreamId(parts[2] ?? "", parts[3] ?? "");
   if (!sid) return json({ error: "bad_id" }, 400, NO_STORE);
 
-  // Clients may cache a stream list for as long as we hold it server-side; the /play URLs inside
-  // carry no debrid token (only an opaque play target), so a shared cache keyed by the full URL is safe.
-  const listCache = `public, max-age=${deps.listTtlSeconds}`;
-  // Key the cache by the FNV of the config blob, NOT the token — the cache holds no secret.
-  const cacheKey = `list:${fnv1a(configBlob)}:${streamCacheId(sid)}`;
+  // Clients (and a future CDN/Caddy) may cache the list for the server-side TTL; the /play URLs inside
+  // carry no debrid token (only an opaque target), so this is safe. SWR/stale-if-error let a client
+  // serve the old list instantly while revalidating, and keep serving it if Scout is briefly down.
+  const listCache = `public, max-age=${deps.listTtlSeconds}, stale-while-revalidate=${deps.listTtlSeconds}, stale-if-error=86400`;
+  const origin = publicOrigin(request, new URL(request.url));
+  // Key by FNV of the config blob (never the token) + the origin (the body embeds origin-derived /play
+  // URLs, so a LAN-IP caller and a public-host caller must not share an entry) + the title.
+  const cacheKey = `list:${fnv1a(configBlob)}:${fnv1a(origin)}:${streamCacheId(sid)}`;
   const hit = await deps.cache.get(cacheKey);
   if (hit) return conditionalResponse(request, hit, JSON_TYPE, listCache);
 
+  const body = await coalesce(cacheKey, () => buildStreamList(config, configBlob, sid, origin, cacheKey, deps));
+  return conditionalResponse(request, body, JSON_TYPE, listCache);
+}
+
+/** Scrape → dedupe → cache-check → rank → serialize the stream list, and cache it. Returns the body. */
+async function buildStreamList(
+  config: ScoutConfig,
+  configBlob: string,
+  sid: StreamId,
+  origin: string,
+  cacheKey: string,
+  deps: ScoutDeps,
+): Promise<string> {
   const scrapers = deps.makeScrapers(config, deps.fetch);
   const seeds = await scrapeAll(
     scrapers,
@@ -118,10 +150,9 @@ async function handleStream(
     resultCap: config.resultCap,
   });
 
-  const origin = publicOrigin(request, new URL(request.url));
   const body = JSON.stringify({ streams: ranked.map((s) => toStremioStream(s, sid, origin, configBlob)) });
   await deps.cache.put(cacheKey, body, deps.listTtlSeconds);
-  return conditionalResponse(request, body, JSON_TYPE, listCache);
+  return body;
 }
 
 async function handlePlay(config: ScoutConfig, parts: string[], deps: ScoutDeps): Promise<Response> {

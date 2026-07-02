@@ -31,10 +31,10 @@ export class StorePool {
   async cacheCheck(infoHashes: string[]): Promise<Map<string, boolean>> {
     const result = new Map<string, boolean>(infoHashes.map((h) => [h, false]));
     if (infoHashes.length === 0) return result;
-    for (const store of this.stores) {
-      const map = await store.cacheCheck(infoHashes);
-      for (const [hash, cached] of map) if (cached) result.set(hash, true);
-    }
+    // Stores are independent (the result is a union), and each cacheCheck is failure-tolerant, so run
+    // them concurrently — a TorBox+Premiumize user pays the slower store's latency, not the sum.
+    const maps = await Promise.all(this.stores.map((store) => store.cacheCheck(infoHashes)));
+    for (const map of maps) for (const [hash, cached] of map) if (cached) result.set(hash, true);
     return result;
   }
 
