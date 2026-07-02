@@ -1,0 +1,2 @@
+blob=eyJkZWJyaWQiOlt7InNlcnZpY2UiOiJ0b3Jib3giLCJ0b2tlbiI6IngifV0sImluZGV4ZXJzIjpbInRvcnJlbnRpbyJdLCJmaWx0ZXJzIjp7ImV4Y2x1ZGVDYW0iOnRydWV9LCJjYWNoZWRPbmx5Ijp0cnVlLCJyZXN1bHRDYXAiOjIwfQ
+Golden responses captured from the TS server (d79e810) for the Go wire-diff.

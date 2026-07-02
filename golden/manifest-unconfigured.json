@@ -1,0 +1,1 @@
+{"id":"com.den.scout","version":"0.1.0","name":"Den Scout","description":"Self-hosted stream aggregator for Den — configure to add your debrid token.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":true}}

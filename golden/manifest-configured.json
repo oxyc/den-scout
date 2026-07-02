@@ -1,0 +1,1 @@
+{"id":"com.den.scout","version":"0.1.0","name":"Den Scout","description":"Cached-first, ranked, junk-filtered streams via torbox.","resources":["stream"],"types":["movie","series"],"idPrefixes":["tt"],"catalogs":[],"behaviorHints":{"configurable":true,"configurationRequired":false}}
