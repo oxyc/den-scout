@@ -216,23 +216,23 @@ func qualityScoreLower(t string, s RawStream, junk string) int {
 		score += 18
 	}
 
+	// Audio scored by what Den DELIVERS, not the source spec: DD+/EAC3 stream-copies (and EAC3+JOC keeps
+	// real Atmos), while TrueHD / DTS / DTS-HD bridge down to EAC3 5.1 (a transcode, losing Atmos + 7.1).
+	// So a DD+ cut outranks a TrueHD/DTS cut of the same title even though the latter is "better" on paper.
+	atmos := reAtmos.match(t)
 	switch {
-	case reAtmos.match(t):
-		score += 26
-	case reDTSX.match(t):
-		score += 24
-	case reTrueHD.match(t):
-		score += 20
-	case reDTSHDMA.match(t):
-		score += 16
-	case reDTSHD.match(t):
-		score += 12
+	case reEAC3.match(t) && atmos:
+		score += 30 // DD+ Atmos — real Atmos, stream-copied on every route
 	case reEAC3.match(t):
-		score += 8
-	case reDTS.match(t):
-		score += 6
+		score += 20 // DD+ 5.1/7.1 — stream-copy, native (7.1 preserved)
 	case reAC3.match(t):
-		score += 4
+		score += 14 // AC3 — stream-copy, native 5.1
+	case reDTSX.match(t) || reTrueHD.match(t) || reDTSHDMA.match(t) || reDTSHD.match(t):
+		score += 12 // lossless/object source, but Den bridges → EAC3 5.1 (below native DD+)
+	case reDTS.match(t):
+		score += 8 // DTS core — bridged → 5.1
+	case atmos:
+		score += 20 // Atmos with no identifiable codec token — assume DD+ (most streaming Atmos is)
 	}
 
 	if s.SizeBytes != nil {

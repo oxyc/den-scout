@@ -207,6 +207,37 @@ func TestStreamAttributes(t *testing.T) {
 			t.Errorf("hdrFormat(%q)=%q want %q", title, got, want)
 		}
 	}
+
+	// Source-truth audio: normalized codec family + channel layout + atmos flag (so the client can
+	// compute what Den actually delivers). DDP5 1 (space) still resolves to 5.1.
+	type ac struct {
+		codec, channels string
+		atmos           bool
+	}
+	audioCases := map[string]ac{
+		"Movie 2160p WEB-DL DDP5.1 Atmos HEVC":    {"eac3", "5.1", true},
+		"Movie 2160p REMUX TrueHD.Atmos.7.1 HEVC": {"truehd", "7.1", true},
+		"Movie 1080p BluRay DTS-HD.MA.5.1 x264":   {"dtshdma", "5.1", false},
+		"Movie 2160p UHD BluRay DTS-X 7.1 HEVC":   {"dtsx", "7.1", false},
+		"Movie 2160p WEB-DL DDP5 1 HEVC":          {"eac3", "5.1", false},
+		"Movie 1080p BluRay AC3 2.0 x264":         {"ac3", "2.0", false},
+	}
+	for title, want := range audioCases {
+		g := streamAttributes(RawStream{Title: title})
+		codec, chans := "", ""
+		if g.AudioCodec != nil {
+			codec = *g.AudioCodec
+		}
+		if g.AudioChannels != nil {
+			chans = *g.AudioChannels
+		}
+		if codec != want.codec || chans != want.channels || g.Atmos != want.atmos {
+			t.Errorf("audio(%q)= {%q %q %v} want {%q %q %v}", title, codec, chans, g.Atmos, want.codec, want.channels, want.atmos)
+		}
+	}
+	if !streamAttributes(RawStream{Title: "Movie 2160p WEB-DL KORSUB HEVC"}).HardcodedSubs {
+		t.Error("KORSUB → hardcodedSubs")
+	}
 	sources := map[string]string{"X 1080p WEB-DL": "webdl", "X 1080p WEBRip": "webrip", "X 1080p BluRay": "bluray", "X 720p HDTV": "hdtv", "X DVDRip": "dvdrip", "X 2024 HDCAM": "cam"}
 	for title, want := range sources {
 		if s := streamAttributes(RawStream{Title: title}).Source; s == nil || *s != want {

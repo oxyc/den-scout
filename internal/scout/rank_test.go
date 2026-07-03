@@ -73,6 +73,14 @@ func TestQualityScore(t *testing.T) {
 	if qualityScore(rs("Movie 2160p REMUX Atmos", nil)) <= qualityScore(rs("Movie 2160p REMUX", nil)) {
 		t.Error("Atmos should be rewarded")
 	}
+	// Ranked by what Den DELIVERS: DD+ (stream-copy) over the same title in TrueHD/DTS (bridged to 5.1),
+	// and DD+ Atmos (real Atmos) over TrueHD Atmos (Atmos lost in the bridge).
+	if qualityScore(rs("Movie 2160p WEB-DL DDP5.1 Atmos", nil)) <= qualityScore(rs("Movie 2160p WEB-DL TrueHD Atmos 7.1", nil)) {
+		t.Error("DD+ Atmos (delivered) should outrank TrueHD Atmos (bridged to 5.1)")
+	}
+	if qualityScore(rs("Movie 1080p BluRay DDP5.1", nil)) <= qualityScore(rs("Movie 1080p BluRay DTS-HD MA 5.1", nil)) {
+		t.Error("DD+ (stream-copy) should outrank DTS-HD (bridged)")
+	}
 	small := qualityScore(rs("Movie 4K WEB", func(s *RawStream) { s.SizeBytes = intp(1 * gib) }))
 	large := qualityScore(rs("Movie 4K WEB", func(s *RawStream) { s.SizeBytes = intp(20 * gib) }))
 	if small >= large {
