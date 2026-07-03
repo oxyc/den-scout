@@ -56,7 +56,7 @@ func do(h http.Handler, path string, headers map[string]string) *httptest.Respon
 
 func TestRoutesPagesAndManifest(t *testing.T) {
 	h := NewHandler(testDeps(nil))
-	if rr := do(h, "/configure", nil); rr.Code != 200 || !strings.Contains(rr.Body.String(), "Configure Den Scout") || rr.Header().Get("cache-control") != staticCache {
+	if rr := do(h, "/configure", nil); rr.Code != 200 || !strings.Contains(rr.Body.String(), "Den Scout") || !strings.Contains(rr.Body.String(), "DenSeal") || rr.Header().Get("cache-control") != staticCache {
 		t.Errorf("configure: %d cc=%q", rr.Code, rr.Header().Get("cache-control"))
 	}
 	if rr := do(h, "/health", nil); rr.Code != 200 || rr.Header().Get("cache-control") != noStore {
