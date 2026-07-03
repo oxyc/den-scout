@@ -22,6 +22,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The manifest emits `manifestVersion` and the image tag is the git tag — so a v* release must
+      # equal v<manifestVersion> or the reported version would be a lie. Fail fast on a mismatch.
+      - name: Tag matches manifest version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(grep -oE 'manifestVersion = "[0-9]+\.[0-9]+\.[0-9]+"' internal/scout/manifest.go | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "manifestVersion=$v  tag=$GITHUB_REF_NAME"
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME != manifestVersion v$v — bump internal/scout/manifest.go before tagging"; exit 1; }
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
