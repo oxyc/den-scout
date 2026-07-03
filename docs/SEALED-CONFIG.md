@@ -1,12 +1,15 @@
 # GOAL: sealed config-in-URL (get BYOK secrets out of plaintext addon URLs)
 
-**Status:** **den-scout DONE** (`e1d7994`/`dbd257c`) + **den-subtitles DONE** (`1fe426a`). Both addons
-seal the config in the browser at `/configure` and resolve sealed URLs end-to-end; legacy plaintext still
-works; token never logged; tiny deps only. Interop proven every direction: **libsodium ↔ Go ↔ Rust** (via
-the fixed PyNaCl vector) and **JS (browser bundle) → Go and → Rust**. Activate per deployment by setting
-`SCOUT_CONFIG_KEY` / `SUBS_CONFIG_KEY` (base64 32-byte X25519 private key; unset = legacy, still works).
-**Remaining:** P3 (optional) den-app minter — the web `/configure` already mints, so this is a nicety.
-**Reference impl:** den-scout · **Also:** den-subtitles, den-app
+**Status:** **den-scout DONE** (`e1d7994`/`dbd257c`) + **den-subtitles DONE** (`1fe426a`) + **den-reel
+DONE** (`5e39112`). All three addons seal the config in the browser at `/configure` and resolve sealed
+URLs end-to-end; legacy plaintext still works; token never logged; tiny deps only. Interop proven every
+direction: **libsodium ↔ Go ↔ Rust** (via the fixed PyNaCl vector) and **JS (browser bundle) → Go and →
+Rust**. Activate per deployment by setting `SCOUT_CONFIG_KEY` / `SUBS_CONFIG_KEY` / `REEL_CONFIG_KEY`
+(base64 32-byte X25519 private key; unset = legacy, still works). den-reel additionally moved its former
+server-side `TMDB_KEY` into the sealed config (BYOK), keeping the env key only as a migration fallback.
+**Remaining:** P3 (optional) den-app minter — the web `/configure` already mints, so this is a nicety;
+for den-reel it's what lets the app inject its Keychain TMDB key so the server env key can be dropped.
+**Reference impl:** den-scout · **Also:** den-subtitles, den-reel, den-app
 
 ## Progress
 - [x] **P0** crypto module `seal.go` (crypto_box_seal over nacl/box+blake2b) + the libsodium interop
