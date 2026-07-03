@@ -35,7 +35,46 @@ for den-reel it's what lets the app inject its Keychain TMDB key so the server e
       test). Lives in the den-app repo (the "Add Den plugins" flow) — coordinate with the app agent.
 - [ ] **P4** rollout / migration.
 
+> **P3 is optional and NOT required for the feature.** Every addon's web `/configure` already mints
+> sealed URLs, and all three addons (den-scout, den-subtitles, den-reel) are user-installed by pasting a
+> manifest URL. So the paste-from-`/configure` flow *is* the sealing — no in-app Swift minter is needed.
+> P3 would only save re-typing the TMDB key into den-reel's `/configure` (the app already holds it in the
+> Keychain). Skip it unless that convenience is wanted.
 
+## Operator runbook — activating sealing (what to do per deployment)
+
+Sealing is **off until an env key is set**; with no key each addon keeps serving legacy plaintext URLs, so
+these steps are safe to do in any order and never break an existing install.
+
+**1. Generate a keypair-seed per addon** (a base64 32-byte X25519 private key):
+```
+head -c 32 /dev/urandom | base64
+```
+Do this once per addon. **Back each key up** in the homelab secret store — losing it makes every URL
+sealed to it un-decryptable (installs would have to be re-configured).
+
+**2. Set it in the homelab env** for that service, then let it redeploy:
+| addon | env var | rotation var |
+|---|---|---|
+| den-scout | `SCOUT_CONFIG_KEY` | `SCOUT_CONFIG_KEYS_PREV` |
+| den-subtitles | `SUBS_CONFIG_KEY` | `SUBS_CONFIG_KEYS_PREV` |
+| den-reel | `REEL_CONFIG_KEY` | `REEL_CONFIG_KEYS_PREV` |
+
+**3. Push each repo** (`git push` → CI builds → GHCR → the homelab watchtower auto-pulls the new image).
+Pushing is the deploy. Setting the env key first means sealing is live the moment the new image boots.
+
+**4. Re-configure each install** (turns an existing plaintext URL into a sealed one):
+open the addon's `/configure`, enter the key(s), copy the new URL (it now shows **🔒 Sealed**), and
+replace the old URL in the app under **Settings → Plugins**. For **den-reel** the key to enter is your
+**TMDB API key** (plus an optional KinoCheck key).
+
+**5. Drop the den-reel server keys** once its install is re-added sealed: remove `TMDB_KEY` /
+`KINOCHECK_KEY` from the den-reel env. They exist only as a migration fallback; after step 4 the key
+rides in the (sealed) URL and the server holds nothing.
+
+**Rotation:** move the current key into `*_CONFIG_KEYS_PREV`, set a fresh `*_CONFIG_KEY`, redeploy.
+Old URLs keep decrypting via the prev list; keep the rotated-out key in `_PREV` until every install is
+re-sealed and past the `/config-key` 1-hour cache (see the risk note below), then drop it.
 
 ## Goal (one line)
 Keep the single paste-one-URL Stremio install flow, but make the config bytes in the URL **ciphertext
