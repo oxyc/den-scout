@@ -52,6 +52,7 @@ button.primary{width:100%;margin-top:20px;padding:14px;background:#5b8cff;color:
 <div class="err" id="err"></div>
 <div id="out" class="hidden">
 <code id="url"></code>
+<p class="note" id="sealNote"></p>
 <div class="row"><button id="copy">Copy</button><a id="open" href="#">Open in Stremio</a></div>
 <p class="note">In Den: Settings → Plugins → Add, paste this link.</p>
 </div>
@@ -68,8 +69,10 @@ function num(id){var v=parseInt($(id).value,10);return isNaN(v)?undefined:v;}
 // URL). 404 / offline / any error → fall back to plaintext base64url so /configure always works.
 var sealPub=null;
 try{fetch('/config-key').then(function(r){return r.ok?r.json():null;}).then(function(j){if(j&&j.key)sealPub=j.key;}).catch(function(){});}catch(e){}
+var lastSealed=false;
 function segment(cfg){var json=JSON.stringify(cfg);
-  if(sealPub&&window.DenSeal){try{return DenSeal.denSeal(sealPub,json);}catch(e){}}
+  if(sealPub&&window.DenSeal){try{var s=DenSeal.denSeal(sealPub,json);lastSealed=true;return s;}catch(e){}}
+  lastSealed=false;
   return b64url(json);}
 function build(){
   var token=$('token').value.trim();
@@ -87,6 +90,10 @@ function build(){
   var origin=location.origin;
   var manifest=origin+'/'+segment(cfg)+'/manifest.json';
   url.textContent=manifest;out.classList.remove('hidden');
+  var note=$('sealNote');
+  if(note){note.textContent=lastSealed
+    ?'🔒 Sealed — your token is encrypted to this addon and is not readable in the link.'
+    :'⚠︎ Not sealed — this link carries your token in plain text. Keep it private.';}
   $('open').href='stremio://'+manifest.replace(/^https?:\/\//,'');
 }
 $('go').addEventListener('click',build);

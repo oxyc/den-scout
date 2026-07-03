@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"log"
 	"strings"
 
 	"golang.org/x/crypto/blake2b"
@@ -119,11 +120,13 @@ func parseSealKeyring(current, prev string) (*sealKeyring, error) {
 		return nil
 	}
 	if err := add(current); err != nil {
-		return nil, err
+		return nil, err // a bad CURRENT key is a real misconfig
 	}
+	// A malformed PRIOR key is skipped, not fatal — a typo in one rotation entry must not disable the
+	// whole ring (which would silently take sealing offline for the good current key too).
 	for _, p := range strings.Split(prev, ",") {
 		if err := add(p); err != nil {
-			return nil, err
+			log.Printf("den-scout: skipping a malformed SCOUT_CONFIG_KEYS_PREV entry: %v", err)
 		}
 	}
 	return kr, nil

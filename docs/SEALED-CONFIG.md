@@ -64,7 +64,9 @@ resolution (VortX's model) = the App-Store surface the neutral-addon pivot exist
 - **Primitive:** libsodium `crypto_box_seal` / `crypto_box_seal_open` (X25519 + XSalsa20-Poly1305,
   ephemeral sender key per message, nonce = `blake2b(eph_pub ‖ recipient_pub)` — not transmitted).
   Chosen because it interops identically across:
-  - **JS** (`/configure`): `libsodium-wrappers` `crypto_box_seal` — a static asset, not container weight.
+  - **JS** (`/configure`): a ~23 KB esbuild IIFE of tweetnacl (`nacl.box`) + blakejs (`blake2b`) that
+    reimplements `crypto_box_seal` — inlined into the page, not container weight. (Interop with libsodium
+    is proven by the JS→Go and JS→Rust vectors, so the hand-assembled seal is byte-identical.)
   - **Go** (den-scout): ~30 lines over `golang.org/x/crypto/nacl/box` + `.../blake2b` (pure Go, **no cgo**).
   - **Rust** (den-subtitles): `crypto_box` crate `sealedbox` (pure Rust).
 - **URL segment wire format** (base64url, no padding):
@@ -132,6 +134,10 @@ resolution (VortX's model) = the App-Store surface the neutral-addon pivot exist
   first; every impl must open it.
 - **Fail-open on decrypt error.** Must fail **closed** (no config → 400/empty), never fall back to serving
   with an empty/partial config.
+- **`/config-key` is cached `public, max-age=3600`.** After a rotation a browser may seal to the *previous*
+  pubkey for up to an hour — harmless **as long as the rotated-out key stays in `*_CONFIG_KEYS_PREV`** (the
+  keyring tries prior keys), which the rotation procedure already requires. Don't drop a key from `_PREV`
+  until well past the cache TTL.
 
 ## Not this / see also
 - `FOLLOWUP.md` #13 (debrid file selection) — **done** (commit `cfe8f1f`), separate from this.
