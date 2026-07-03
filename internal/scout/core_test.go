@@ -186,8 +186,26 @@ func TestStreamAttributes(t *testing.T) {
 	a := streamAttributes(RawStream{Title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos", SizeBytes: intp(40 * gib), Seeders: intp(12), Cached: true})
 	if a.Resolution == nil || *a.Resolution != "2160p" || a.Source == nil || *a.Source != "remux" ||
 		a.Codec == nil || *a.Codec != "hevc" || !a.HDR || !a.DolbyVision || a.Audio == nil || *a.Audio != "Atmos" ||
-		a.ThreeD || !a.Cached || a.Seeders == nil || *a.Seeders != 12 {
+		a.HDRFormat == nil || *a.HDRFormat != "HDR" || a.ThreeD || !a.Cached || a.Seeders == nil || *a.Seeders != 12 {
 		t.Errorf("rich attrs: %+v", a)
+	}
+	// HDR10-family variants are distinguished (a stream can be DV *and* carry an HDR10 base).
+	hdrCases := map[string]string{
+		"Movie 2160p WEB-DL DDP5.1 DV HDR10+ HEVC": "HDR10+", // HDR10+ beats a bare hdr10 token
+		"Movie 2160p WEB-DL HLG HEVC":              "HLG",
+		"Movie 2160p WEB-DL HDR10 HEVC":            "HDR10",
+		"Movie 2160p WEB-DL HDR HEVC":              "HDR",
+		"Movie 1080p BluRay x264":                  "",
+	}
+	for title, want := range hdrCases {
+		f := streamAttributes(RawStream{Title: title}).HDRFormat
+		got := ""
+		if f != nil {
+			got = *f
+		}
+		if got != want {
+			t.Errorf("hdrFormat(%q)=%q want %q", title, got, want)
+		}
 	}
 	sources := map[string]string{"X 1080p WEB-DL": "webdl", "X 1080p WEBRip": "webrip", "X 1080p BluRay": "bluray", "X 720p HDTV": "hdtv", "X DVDRip": "dvdrip", "X 2024 HDCAM": "cam"}
 	for title, want := range sources {

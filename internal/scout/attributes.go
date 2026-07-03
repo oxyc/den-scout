@@ -11,6 +11,11 @@ type StreamAttributes struct {
 	Codec       *string `json:"codec"`
 	HDR         bool    `json:"hdr"`
 	DolbyVision bool    `json:"dolbyVision"`
+	// The HDR10-family variant, so the client can badge it distinctly ("HDR10+", "HDR10", "HLG",
+	// "HDR"), or null. Independent of DolbyVision (a stream can be DV *and* carry an HDR10 base) — the
+	// client shows both. Note: Apple TV doesn't use HDR10+ dynamic metadata (it plays the HDR10 base),
+	// so this is a label, not a reason to rank HDR10+ above Dolby Vision.
+	HDRFormat   *string `json:"hdrFormat"`
 	Audio       *string `json:"audio"`
 	ThreeD      bool    `json:"threeD"`
 	SizeBytes   *int    `json:"sizeBytes"`
@@ -22,6 +27,9 @@ type StreamAttributes struct {
 var (
 	reDoViAttr = mustRE2(`dolby vision|dolbyvision|dovi|\bdv\b`)
 	reHDRExtra = mustRE2(`hdr10|\bhdr\b|\bhlg\b`)
+	reHLG      = mustRE2(`\bhlg\b`)
+	reHDR10any = mustRE2(`hdr10`) // matches "hdr10" and the "hdr10" in "hdr10+"; check reHDR10p first
+	reHDRPlain = mustRE2(`\bhdr\b`)
 	reHEVC     = mustRE2(`x265|h\.?265|hevc`)
 	reAVC      = mustRE2(`x264|h\.?264|\bavc\b`)
 	reDTSHDa   = mustRE2(`dts-hd|dts hd|dtshd`)
@@ -64,6 +72,23 @@ func detectCodec(t string) string {
 	return ""
 }
 
+// detectHDRFormat returns the HDR10-family label ("HDR10+", "HLG", "HDR10", "HDR") or "". Ordered so
+// HDR10+ wins over a bare "hdr10" token and HLG over generic "hdr". Dolby Vision is reported separately
+// (a stream can be both), so it's intentionally not returned here.
+func detectHDRFormat(t string) string {
+	switch {
+	case reHDR10p.match(t):
+		return "HDR10+"
+	case reHLG.match(t):
+		return "HLG"
+	case reHDR10any.match(t):
+		return "HDR10"
+	case reHDRPlain.match(t):
+		return "HDR"
+	}
+	return ""
+}
+
 func detectAudio(t string) string {
 	switch {
 	case reAtmos.match(t):
@@ -95,6 +120,7 @@ func streamAttributes(s RawStream) StreamAttributes {
 		Codec:       strPtr(detectCodec(t)),
 		HDR:         dolbyVision || reHDRExtra.match(t),
 		DolbyVision: dolbyVision,
+		HDRFormat:   strPtr(detectHDRFormat(t)),
 		Audio:       strPtr(detectAudio(t)),
 		ThreeD:      re3D.match(t),
 		SizeBytes:   s.SizeBytes,
