@@ -1,10 +1,11 @@
 # GOAL: sealed config-in-URL (get BYOK secrets out of plaintext addon URLs)
 
-**Status:** **den-scout DONE** (`e1d7994` server, `dbd257c` minter) — `/configure` seals in the browser
-and the addon resolves sealed URLs end-to-end; legacy plaintext still works; token never logged; +x/crypto
-+ a 23 KB embedded JS bundle only. Both interop gates pass (libsodium→Go via PyNaCl; JS→Go). Activate on a
-deployment by setting `SCOUT_CONFIG_KEY` (a base64 32-byte X25519 private key); unset = sealed disabled,
-legacy still works. **Remaining:** den-subtitles (P2), den-app minter (P3).
+**Status:** **den-scout DONE** (`e1d7994`/`dbd257c`) + **den-subtitles DONE** (`1fe426a`). Both addons
+seal the config in the browser at `/configure` and resolve sealed URLs end-to-end; legacy plaintext still
+works; token never logged; tiny deps only. Interop proven every direction: **libsodium ↔ Go ↔ Rust** (via
+the fixed PyNaCl vector) and **JS (browser bundle) → Go and → Rust**. Activate per deployment by setting
+`SCOUT_CONFIG_KEY` / `SUBS_CONFIG_KEY` (base64 32-byte X25519 private key; unset = legacy, still works).
+**Remaining:** P3 (optional) den-app minter — the web `/configure` already mints, so this is a nicety.
 **Reference impl:** den-scout · **Also:** den-subtitles, den-app
 
 ## Progress
@@ -18,8 +19,17 @@ legacy still works. **Remaining:** den-subtitles (P2), den-app minter (P3).
 - [x] **P1 (minter)** `/configure` fetches `/config-key` and seals the config to it (tweetnacl `nacl.box`
       + blakejs blake2b, esbuild IIFE ~23 KB, inlined — no CDN); falls back to plaintext when no key.
       `TestSealJSInteropVector` opens a real browser-bundle-minted segment in Go (JS→Go gate).
-- [ ] **P2** den-subtitles mirror (Rust `crypto_box` sealedbox).
-- [ ] **P3** den-app in-app sealing (Swift CryptoKit Curve25519 + crypto_box_seal).
+- [x] **P2** den-subtitles mirror (Rust `crypto_box` `seal` feature). `seal.rs` keyring + version-branch
+      `decode`, `/config-key`, `/configure` seals in-browser (same bundle), fail-closed, never-log.
+      Interop gated both ways: opens the same PyNaCl libsodium vector (libsodium→Rust) and a
+      browser-bundle-minted segment (JS→Rust). 27 tests + clippy clean. (den-subtitles commit `1fe426a`.)
+- [ ] **P3 (optional)** den-app in-app sealing — an *alternative* minter (the web `/configure` on both
+      addons already mints sealed URLs, so this isn't required). When the app builds an addon URL: fetch
+      the addon's `GET /config-key`, and seal `{secrets, prefs}` to it with crypto_box_seal
+      (`seg = base64url(0x01 ‖ eph_pub ‖ box)`, nonce = `blake2b_24(eph_pub‖recipient_pub)`). CryptoKit
+      has Curve25519 (X25519) but not XSalsa20-Poly1305/blake2b, so use a swift crypto_box/sodium package
+      or port the ~40-line seal. Verify with the same vector approach (mint in Swift → open in a Go/Rust
+      test). Lives in the den-app repo (the "Add Den plugins" flow) — coordinate with the app agent.
 - [ ] **P4** rollout / migration.
 
 
