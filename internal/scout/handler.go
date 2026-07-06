@@ -16,7 +16,10 @@ import (
 // the app never sees a torrent or a debrid token. Routes are served at the service root.
 
 const (
-	staticCache    = "public, max-age=3600"
+	staticCache = "public, max-age=3600"
+	// The sealing key can rotate, so keep its freshness window short — the ETag is the primary
+	// correctness mechanism (a rotated key changes the body hash and busts any stale cache).
+	keyCache       = "public, max-age=300"
 	noStore        = "no-store"
 	jsonType       = "application/json"
 	htmlType       = "text/html; charset=utf-8"
@@ -111,7 +114,10 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		// The current X25519 public key (base64) so /configure (or den-app) can seal the config to it.
 		// 404 when sealed configs are disabled (no key configured) — the page then keeps plaintext.
 		if pub := h.deps.SealKeyring.currentPubBase64(); pub != "" {
-			writeJSON(w, http.StatusOK, map[string]string{"key": pub}, staticCache)
+			// ETag over the key JSON so a rotated key isn't masked by a stale cache and If-None-Match
+			// yields 304, consistent with the other cacheable routes.
+			body, _ := json.Marshal(map[string]string{"key": pub})
+			h.conditional(w, r, string(body), etagFor(string(body)), jsonType, keyCache)
 		} else {
 			writeJSON(w, http.StatusNotFound, errBody("no_key"), noStore)
 		}
