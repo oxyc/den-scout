@@ -328,19 +328,31 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
 	defer cancel()
 	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode}
+
+	// Already known to be downloading? Answer from the status alone. A waiting client polls this URL for
+	// the whole fetch, and a full resolve is ~3 upstream calls (cache miss → add → link), so re-running it
+	// per poll is how an account gets itself throttled — and a throttled 5xx is exactly what a client
+	// cannot distinguish from a real answer.
+	if status, ok := pool.Status(ctx, rt); ok {
+		writeQueued(w, status)
+		return
+	}
+
 	link, err := pool.Resolve(ctx, rt)
 	if err != nil {
 		// Queued is not dead. An uncached release is added to the debrid by the Resolve above and then
-		// takes minutes to land; answering 404 for that made the client blacklist a perfectly good release
-		// (and every uncached one below it, since they all fail the same way). 202 says "coming", with
-		// whatever progress the store actually reports — the client polls this same URL and plays when it
-		// turns into the usual 302.
-		if status, ok := pool.Status(ctx, rt); ok {
-			body := map[string]any{"state": "downloading", "progress": status.Progress}
-			if status.ETASeconds != nil {
-				body["etaSeconds"] = *status.ETASeconds
-			}
-			writeJSON(w, http.StatusAccepted, body, noStore)
+		// takes minutes to land; answering 404 for that made the client remember a perfectly good release
+		// as dead (and every uncached one below it, since they all fail the same way). 202 says "coming",
+		// with whatever progress the store actually reports — the client polls this same URL and plays
+		// when it turns into the usual 302.
+		//
+		// A FRESH context: the resolve above may have failed by exhausting `resolveBudget` (a slow add on
+		// an uncached release is exactly that case), and reusing a spent context would turn every such
+		// wait into a 404.
+		statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(r.Context()), statusBudget)
+		defer statusCancel()
+		if status, ok := pool.Status(statusCtx, rt); ok {
+			writeQueued(w, status)
 			return
 		}
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)

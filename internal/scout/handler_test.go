@@ -245,6 +245,28 @@ func TestRoutesPlay(t *testing.T) {
 	if queuedBody.ETASeconds == nil || *queuedBody.ETASeconds != 420 {
 		t.Errorf("eta should be passed through only when the store reports one: %v", queuedBody.ETASeconds)
 	}
+
+	// A known-queued release answers from the status alone. A client polls this URL for the whole fetch,
+	// so re-resolving per poll (~3 upstream calls) is how the account gets itself throttled.
+	resolves := 0
+	polled := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store {
+			return []Store{fakeStore{
+				svc: ServiceTorBox,
+				resolve: func() (string, error) {
+					resolves++
+					return "", &DeadLinkError{"not ready"}
+				},
+				status: &StoreStatus{Progress: 0.5},
+			}}
+		}
+	}))
+	if rr := do(polled, playPath, nil); rr.Code != 202 {
+		t.Fatalf("poll should stay 202, got %d", rr.Code)
+	}
+	if resolves != 0 {
+		t.Errorf("a known-queued release re-resolved %d time(s); it should answer from status alone", resolves)
+	}
 }
 
 func streamsLen(rr *httptest.ResponseRecorder) int {
