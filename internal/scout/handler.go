@@ -27,6 +27,9 @@ const (
 	defaultListTTL = 5 * time.Minute
 	// Headroom over the scrape timeout for the cache-check phase of a detached list build.
 	listBuildSlack = 20 * time.Second
+	// A status read is one upstream call and runs on the client's poll cadence — keep it far under the
+	// resolve budget so a wait answers promptly instead of hanging the poll.
+	statusBudget = 8 * time.Second
 	// Hard cap on a /play resolve (addMagnet→select→unrestrict across stores) so a slow debrid account
 	// can't pin a goroutine/connection indefinitely.
 	resolveBudget = 45 * time.Second
@@ -300,6 +303,16 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	return value, degradedReason
 }
 
+// writeQueued — the "it's coming" answer: 202 plus whatever the store actually reported. `etaSeconds` is
+// omitted rather than guessed when the service doesn't supply one.
+func writeQueued(w http.ResponseWriter, status StoreStatus) {
+	body := map[string]any{"state": "downloading", "progress": status.Progress}
+	if status.ETASeconds != nil {
+		body["etaSeconds"] = *status.ETASeconds
+	}
+	writeJSON(w, http.StatusAccepted, body, noStore)
+}
+
 func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob string, parts []string) {
 	target, ok := decodePlayToken(at(parts, 2))
 	if !ok {
@@ -314,8 +327,22 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
 	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
 	defer cancel()
-	link, err := pool.Resolve(ctx, ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode})
+	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode}
+	link, err := pool.Resolve(ctx, rt)
 	if err != nil {
+		// Queued is not dead. An uncached release is added to the debrid by the Resolve above and then
+		// takes minutes to land; answering 404 for that made the client blacklist a perfectly good release
+		// (and every uncached one below it, since they all fail the same way). 202 says "coming", with
+		// whatever progress the store actually reports — the client polls this same URL and plays when it
+		// turns into the usual 302.
+		if status, ok := pool.Status(ctx, rt); ok {
+			body := map[string]any{"state": "downloading", "progress": status.Progress}
+			if status.ETASeconds != nil {
+				body["etaSeconds"] = *status.ETASeconds
+			}
+			writeJSON(w, http.StatusAccepted, body, noStore)
+			return
+		}
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
 		return
 	}

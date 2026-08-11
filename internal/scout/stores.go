@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,17 @@ type Store interface {
 	Service() DebridService
 	CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error)
 	Resolve(ctx context.Context, t ResolveTarget) (string, error)
+	// Status reports on a release the store has been ASKED for but could not deliver yet: it is
+	// downloading, not dead. Without this the two are the same 404 to the client, which then blacklists
+	// a perfectly good release. `ok` is false when this store knows nothing about the target.
+	Status(ctx context.Context, t ResolveTarget) (status StoreStatus, ok bool)
+}
+
+// StoreStatus — how far along a queued release is. Progress is 0…1; ETASeconds is nil unless the store
+// reports a real one (a made-up countdown is worse than none).
+type StoreStatus struct {
+	Progress   float64
+	ETASeconds *int
 }
 
 // errCheckFailed marks a cache check that could not reach the store at all.
@@ -138,6 +150,12 @@ func batchesFailed(batchOK []bool) error {
 	return errCheckFailed
 }
 
+// The torrent id alone, kept apart from the resolve entry so a queued torrent (no file list) is still
+// addressable by `Status`.
+func torrentIDKey(token, infoHash string) string {
+	return "torbox:torrent:" + keyHash(token) + ":" + infoHash
+}
+
 type torboxResolveEntry struct {
 	TorrentID int           `json:"torrentId"`
 	Files     []TorrentFile `json:"files"`
@@ -179,6 +197,12 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 			s.cache.Put(key, string(b), resolveCacheTTL)
 		}
 	}
+	// The torrent id is remembered separately and unconditionally, because `Status` needs it in exactly
+	// the case the entry above refuses to write: a just-queued torrent has no file list yet, and that is
+	// what makes an episode's first /play look "dead" instead of "downloading".
+	if s.cache != nil {
+		s.cache.Put(torrentIDKey(s.token, t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
+	}
 	return s.requestDownload(ctx, torrentID, selectFileID(files, t))
 }
 
@@ -207,6 +231,77 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		return 0, &DeadLinkError{"torbox no torrent_id"}
 	}
 	return *body.Data.TorrentID, nil
+}
+
+// Status — progress for a torrent this account has already been asked to fetch. Resolve records the
+// torrent id unconditionally, so a queued release (add succeeded, link not ready) is exactly the case
+// this answers.
+//
+// Reports ok=false unless TorBox positively describes an unfinished download. Anything less — a
+// `success:false` body, a `data:null` for a torrent the user deleted, a payload with neither progress nor
+// a finished flag — must read as "no wait to promise", or a genuinely dead release would answer
+// "downloading, 0%" forever.
+func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool) {
+	if s.cache == nil {
+		return StoreStatus{}, false
+	}
+	raw, ok := s.cache.Get(torrentIDKey(s.token, t.InfoHash))
+	if !ok {
+		return StoreStatus{}, false
+	}
+	torrentID, err := strconv.Atoi(raw)
+	if err != nil {
+		return StoreStatus{}, false
+	}
+	resp, err := s.get(ctx, fmt.Sprintf("%s/torrents/mylist?id=%d&bypass_cache=true", s.api, torrentID))
+	if err != nil {
+		return StoreStatus{}, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return StoreStatus{}, false
+	}
+	var body struct {
+		Success *bool           `json:"success"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+		return StoreStatus{}, false
+	}
+	// TorBox answers 200 with success:false / data:null for an id it no longer holds, and unmarshalling
+	// null into a struct succeeds silently — so both have to be rejected explicitly.
+	if body.Success != nil && !*body.Success {
+		return StoreStatus{}, false
+	}
+	type entryState struct {
+		Progress         *float64 `json:"progress"`
+		DownloadFinished *bool    `json:"download_finished"`
+		ETA              *int     `json:"eta"`
+	}
+	var st entryState
+	if len(body.Data) == 0 || json.Unmarshal(body.Data, &st) != nil {
+		var arr []entryState
+		if json.Unmarshal(body.Data, &arr) != nil || len(arr) == 0 {
+			return StoreStatus{}, false
+		}
+		st = arr[0]
+	}
+	// Finished but Resolve still failed → not a wait we can promise anything about; reads as dead.
+	if st.DownloadFinished != nil && *st.DownloadFinished {
+		return StoreStatus{}, false
+	}
+	// Nothing said about the download at all (an empty object, a deleted torrent) — not a wait either.
+	if st.Progress == nil && st.DownloadFinished == nil {
+		return StoreStatus{}, false
+	}
+	out := StoreStatus{}
+	if st.Progress != nil {
+		out.Progress = *st.Progress
+	}
+	if st.ETA != nil && *st.ETA > 0 {
+		out.ETASeconds = st.ETA
+	}
+	return out, true
 }
 
 func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) []TorrentFile {
@@ -333,6 +428,12 @@ type rdInfo struct {
 		Bytes int    `json:"bytes"`
 	} `json:"files"`
 	Links []string `json:"links"`
+}
+
+// Real-Debrid exposes no queue state we can poll per infohash here, so it never reports a wait — a
+// failure stays a failure rather than becoming a promise we can't keep.
+func (s *realDebridStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
 }
 
 func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
@@ -522,6 +623,11 @@ func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) (map[
 	return result, batchesFailed(batchOK)
 }
 
+// Premiumize likewise: cached or not, with no in-between to report.
+func (s *premiumizeStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}
+
 func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
 	form := url.Values{"apikey": {s.token}, "src": {magnetFor(t.InfoHash)}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/transfer/directdl", strings.NewReader(form.Encode()))
@@ -657,6 +763,17 @@ func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error
 		}
 	}
 	return "", &DeadLinkError{"no store could resolve"}
+}
+
+// Status — the first store that can say a queued release is still downloading. Only meaningful right
+// after a failed Resolve; ok=false means nobody is fetching it, i.e. genuinely dead.
+func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool) {
+	for _, st := range p.stores {
+		if status, ok := st.Status(ctx, t); ok {
+			return status, true
+		}
+	}
+	return StoreStatus{}, false
 }
 
 // hasCacheTruth reports whether any configured store has a real cache API (TorBox/Premiumize). When

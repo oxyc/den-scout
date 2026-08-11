@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 const H = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -177,6 +178,7 @@ type fakeStore struct {
 	check    map[string]bool
 	checkErr error
 	resolve  func() (string, error)
+	status   *StoreStatus
 }
 
 func (f fakeStore) Service() DebridService { return f.svc }
@@ -184,6 +186,12 @@ func (f fakeStore) CacheCheck(context.Context, []string) (map[string]bool, error
 	return f.check, f.checkErr
 }
 func (f fakeStore) Resolve(context.Context, ResolveTarget) (string, error) { return f.resolve() }
+func (f fakeStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	if f.status == nil {
+		return StoreStatus{}, false
+	}
+	return *f.status, true
+}
 
 func TestStorePool(t *testing.T) {
 	// buildStores orders TorBox first regardless of config order
@@ -242,5 +250,73 @@ func TestHasCacheTruthAndRDOnly(t *testing.T) {
 	}
 	if rdOnly(&Config{Debrid: []DebridAccount{{ServiceRealDebrid, "r"}, {ServiceTorBox, "t"}}}) {
 		t.Error("not rd-only when torbox present")
+	}
+}
+
+// A queued release is the whole point of Status: TorBox has been asked for it, the link isn't ready, and
+// the client must be told "downloading" rather than "dead". These cover the shapes that made that answer
+// wrong — a torrent the user deleted, an empty payload, and the series path, where the resolve entry is
+// deliberately NOT written because the file list isn't known yet.
+func TestTorBoxStatus(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantOK   bool
+		wantProg float64
+	}{
+		{"downloading", `{"success":true,"data":{"progress":0.42,"download_finished":false,"eta":300}}`, true, 0.42},
+		{"array payload", `{"success":true,"data":[{"progress":0.1,"download_finished":false}]}`, true, 0.1},
+		{"finished but unresolvable", `{"success":true,"data":{"progress":1,"download_finished":true}}`, false, 0},
+		{"deleted torrent", `{"success":false,"data":null}`, false, 0},
+		{"null payload", `{"success":true,"data":null}`, false, 0},
+		{"empty object", `{"success":true,"data":{}}`, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 16)
+			cache.Put(torrentIDKey("t", H), "7", time.Hour)
+			s := &torBoxStore{token: "t", cache: cache, api: torboxAPI, client: mockDoer{
+				fn: func(*http.Request) (*http.Response, error) { return resp(200, tc.body), nil },
+			}}
+			got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H})
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if ok && got.Progress != tc.wantProg {
+				t.Errorf("progress = %v, want %v", got.Progress, tc.wantProg)
+			}
+		})
+	}
+
+	// No torrent id remembered → nothing to report, rather than a promise we can't keep.
+	empty := &torBoxStore{token: "t", cache: NewMemoryCache(1 << 16), api: torboxAPI}
+	if _, ok := empty.Status(context.Background(), ResolveTarget{InfoHash: H}); ok {
+		t.Error("an unknown infohash must not report a download")
+	}
+}
+
+// The series path is the one that used to lose the torrent id: `Resolve` refuses to cache an entry whose
+// file list is empty, and a just-queued torrent has no files yet. The id must survive that anyway.
+func TestTorBoxRemembersTorrentIDForQueuedEpisode(t *testing.T) {
+	cache := NewMemoryCache(1 << 16)
+	s := &torBoxStore{token: "t", cache: cache, api: torboxAPI, client: mockDoer{
+		fn: func(r *http.Request) (*http.Response, error) {
+			switch {
+			case strings.Contains(r.URL.Path, "createtorrent"):
+				return resp(200, `{"data":{"torrent_id":7}}`), nil
+			case strings.Contains(r.URL.Path, "mylist"):
+				return resp(200, `{"success":true,"data":{"files":[]}}`), nil // queued: no files yet
+			default:
+				return resp(200, `{"success":false}`), nil // link not ready
+			}
+		},
+	}}
+	season, episode := 1, 3
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: &season, Episode: &episode})
+	if err == nil {
+		t.Fatal("expected the link request to fail while the torrent is still queued")
+	}
+	if _, ok := cache.Get(torrentIDKey("t", H)); !ok {
+		t.Error("the torrent id must be remembered so Status can report the download")
 	}
 }

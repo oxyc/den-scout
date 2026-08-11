@@ -215,6 +215,36 @@ func TestRoutesPlay(t *testing.T) {
 	if rr := do(dead, playPath, nil); rr.Code != 404 {
 		t.Errorf("dead link: %d", rr.Code)
 	}
+
+	// Queued is NOT dead. An uncached release resolves only after the debrid has fetched it; answering
+	// 404 in the meantime made the client blacklist the release (and every uncached one ranked below it,
+	// since they all fail identically). 202 + progress lets the client wait instead.
+	eta := 420
+	queued := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store {
+			return []Store{fakeStore{
+				svc:     ServiceTorBox,
+				resolve: func() (string, error) { return "", &DeadLinkError{"not ready"} },
+				status:  &StoreStatus{Progress: 0.34, ETASeconds: &eta},
+			}}
+		}
+	}))
+	rr = do(queued, playPath, nil)
+	if rr.Code != 202 {
+		t.Fatalf("queued release should be 202, got %d", rr.Code)
+	}
+	var queuedBody struct {
+		State      string  `json:"state"`
+		Progress   float64 `json:"progress"`
+		ETASeconds *int    `json:"etaSeconds"`
+	}
+	if json.Unmarshal(rr.Body.Bytes(), &queuedBody) != nil || queuedBody.State != "downloading" ||
+		queuedBody.Progress != 0.34 {
+		t.Errorf("queued body: %s", rr.Body.String())
+	}
+	if queuedBody.ETASeconds == nil || *queuedBody.ETASeconds != 420 {
+		t.Errorf("eta should be passed through only when the store reports one: %v", queuedBody.ETASeconds)
+	}
 }
 
 func streamsLen(rr *httptest.ResponseRecorder) int {
