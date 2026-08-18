@@ -42,9 +42,12 @@ func TestDecodeConfig(t *testing.T) {
 		t.Errorf("filters: %+v", c.Filters)
 	}
 
-	// defaults
+	// defaults. A config carrying only the account defers everything else to the server, which is what
+	// /configure builds by default — so these ARE the shipped defaults, not incidental fallbacks.
+	// cachedOnly is deliberately off: inheriting "hide anything not already fetched" can leave a title
+	// showing one scrap of a release, or nothing, while good ones sit a download away.
 	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}]}`))
-	if !c.Filters.ExcludeCam || !c.CachedOnly || len(c.Indexers) != 4 {
+	if !c.Filters.ExcludeCam || c.CachedOnly || len(c.Indexers) != 4 || c.ResultCap != 20 {
 		t.Errorf("defaults: %+v", c)
 	}
 	// explicit off
