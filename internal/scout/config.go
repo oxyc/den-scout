@@ -138,7 +138,11 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		}
 	}
 
-	cachedOnly := true
+	// Default OFF. A config that omits this is deferring to the server, and hiding everything the debrid
+	// hasn't already fetched is too strong a default to inherit silently: it can leave a title with one
+	// scrap of a release, or nothing at all, while several good ones sit a download away. An explicit
+	// `cachedOnly: true` still pins it for anyone who wants only instant playback.
+	cachedOnly := false
 	if raw.CachedOnly != nil {
 		cachedOnly = *raw.CachedOnly
 	}
