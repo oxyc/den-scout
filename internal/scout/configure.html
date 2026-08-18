@@ -61,17 +61,18 @@
   <label for="token">API token</label>
   <input id="token" type="password" autocomplete="off" placeholder="paste your debrid API key">
 </div>
+<h2>Sources</h2>
+<label class="chk"><input type="checkbox" id="useDefaults" checked> Use Den Scout's defaults</label>
+<p class="optional" id="defaultsNote">Your link carries only your debrid account, so everything else
+  follows this server — change the defaults here later and every link built this way follows, with no
+  re-configuring. Untick to see them and pin your own.</p>
+<div id="tunables">
 <h2>Indexers <span class="optional">(all if none)</span></h2>
 <label class="chk"><input type="checkbox" name="indexer" value="torrentio" checked> Torrentio</label>
 <label class="chk"><input type="checkbox" name="indexer" value="comet" checked> Comet</label>
 <label class="chk"><input type="checkbox" name="indexer" value="mediafusion" checked> MediaFusion</label>
 <label class="chk"><input type="checkbox" name="indexer" value="torz" checked> Torz</label>
 <h2>Filters</h2>
-<label class="chk"><input type="checkbox" id="useDefaultFilters" checked> Use Den Scout's defaults</label>
-<p class="note" id="defaultsNote">Leaves the filters out of your link entirely, so it follows this
-  server's defaults — change them here later and every device that used defaults follows, with no
-  re-configuring. Untick to pin your own.</p>
-<div id="filterFields">
 <label class="chk"><input type="checkbox" id="excludeCam" checked> Hide CAM / TS / screeners</label><br>
 <label class="chk"><input type="checkbox" id="cachedOnly"> Cached only (hide anything the debrid must fetch first)</label><br>
 <label class="chk"><input type="checkbox" id="hdrOnly"> HDR / Dolby Vision only</label>
@@ -88,9 +89,9 @@
   <input id="maxSizeGB" type="number" min="0" placeholder="e.g. 25"></div>
 <div class="field"><label for="minSeeders">Min seeders (blank = any)</label>
   <input id="minSeeders" type="number" min="0" placeholder="e.g. 3"></div>
-</div>
 <div class="field"><label for="resultCap">Max results</label>
   <input id="resultCap" type="number" min="1" max="200" value="20"></div>
+</div>
 <button id="go" class="primary">Build install link</button>
 <div class="err" id="err"></div>
 <div id="out" class="hidden">
@@ -3362,7 +3363,6 @@ var PRODUCT = "Den Scout";
 // Kept in step with `allIndexers` in internal/scout/config.go — the page has to know the full set to
 // tell "the user picked every one" (omit, and inherit future additions) from "the user picked these".
 var ALL_INDEXERS = ["torrentio", "comet", "mediafusion", "torz"];
-var INDEXER_COUNT = ALL_INDEXERS.length;
 var STORE_KEY = "den-scout.configure";
 var $ = function (id) { return document.getElementById(id); };
 
@@ -3378,18 +3378,14 @@ function collectConfig() {
   var token = $("token").value.trim();
   if (!token) { err.textContent = "Enter your debrid API token."; $("token").focus(); return null; }
   err.textContent = "";
-  var config = {
-    debrid: [{ service: $("service").value, token: token }],
-    resultCap: numVal("resultCap") || 20,
-  };
-  // Indexers are OMITTED when every one is picked, because the config token is a snapshot: an explicit
-  // list freezes today's set, so a source added to the addon later would never reach a link built now.
-  // Absent means "all of them, whatever they are" — the server resolves it per request.
-  var indexers = checkedVals("indexer");
-  if (indexers.length && indexers.length < INDEXER_COUNT) config.indexers = indexers;
-  // Same reasoning, one level up: leaving the filters out entirely defers to the server's defaults, so
-  // they can be changed centrally later without re-configuring every device that used them.
-  if (!$("useDefaultFilters").checked) {
+  // Defaults means the link carries ONLY the account: no indexers, no filters, no cap. The config token
+  // is a snapshot, so anything written into it is frozen for the life of that link — leaving a field out
+  // is the only way a link can follow a default that changes later. Untick and every field below is
+  // pinned instead, which is what someone who went to the trouble of setting them expects.
+  var config = { debrid: [{ service: $("service").value, token: token }] };
+  if (!$("useDefaults").checked) {
+    config.indexers = checkedVals("indexer");
+    config.resultCap = numVal("resultCap") || 20;
     config.filters = {
       excludeCam: $("excludeCam").checked,
       resolutions: checkedVals("res"),
@@ -3403,6 +3399,7 @@ function collectConfig() {
       var v = config.filters[k];
       if (v === undefined || (Array.isArray(v) && v.length === 0)) delete config.filters[k];
     });
+    if (!config.indexers.length) delete config.indexers;   // none ticked reads as "all", so say nothing
   }
   return config;
 }
@@ -3414,9 +3411,9 @@ function setChecks(name, values) {
     .forEach(function (el) { el.checked = !!wanted[el.value]; });
 }
 
-function syncDefaultFilters() {
-  var useDefaults = $("useDefaultFilters").checked;
-  $("filterFields").style.display = useDefaults ? "none" : "";
+function syncDefaults() {
+  var useDefaults = $("useDefaults").checked;
+  $("tunables").style.display = useDefaults ? "none" : "";
   $("defaultsNote").style.display = useDefaults ? "" : "none";
 }
 
@@ -3427,11 +3424,11 @@ function fillForm(s) {
   }
   // No indexer list means "all", which is how the page shows it too.
   setChecks("indexer", s.indexers && s.indexers.length ? s.indexers : ALL_INDEXERS);
-  // A link with no filters and no cachedOnly is one that opted into the defaults; show it that way
-  // rather than silently presenting the current defaults as if the user had pinned them.
-  var pinned = !!s.filters || typeof s.cachedOnly === "boolean";
-  $("useDefaultFilters").checked = !pinned;
-  syncDefaultFilters();
+  // A link carrying nothing but the account opted into the defaults; show it that way rather than
+  // presenting today's defaults as though they had been chosen. Anything pinned unfolds the fields.
+  var pinned = !!s.filters || typeof s.cachedOnly === "boolean" || !!s.indexers || s.resultCap != null;
+  $("useDefaults").checked = !pinned;
+  syncDefaults();
   var f = s.filters || {};
   if ("excludeCam" in f) $("excludeCam").checked = !!f.excludeCam;
   if (typeof s.cachedOnly === "boolean") $("cachedOnly").checked = s.cachedOnly;
@@ -3542,10 +3539,10 @@ function fillForm(s) {
   // The defaults switch hides the fields it overrides, so the page can't show pinned-looking values
   // for a link that won't carry them. Synced once here for a first visit (fillForm does it for a
   // restored one) and on every toggle.
-  var useDefaults = $("useDefaultFilters");
-  if (useDefaults && typeof syncDefaultFilters === "function") {
-    if (!saved) syncDefaultFilters();
-    useDefaults.addEventListener("change", syncDefaultFilters);
+  var useDefaults = $("useDefaults");
+  if (useDefaults && typeof syncDefaults === "function") {
+    if (!saved) syncDefaults();
+    useDefaults.addEventListener("change", syncDefaults);
   }
   $("go").addEventListener("click", build);
   $("copy").addEventListener("click", copyInstallURL);
