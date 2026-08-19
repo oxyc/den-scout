@@ -54,6 +54,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 	return Deps{
 		Cache:         cache,
+		ProbeClient:   client,
 		ScrapeTimeout: settings.ScrapeTimeout,
 		ListTTL:       settings.ListTTL,
 		PublicURL:     settings.PublicURL,

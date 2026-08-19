@@ -40,7 +40,10 @@ const (
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
 // (mocked in tests).
 type Deps struct {
-	Cache         Cache
+	Cache Cache
+	// Client for reading the head of a resolved link. Separate from the scraper client so a probe's
+	// longer body read can't tie up the timeouts tuned for indexer queries.
+	ProbeClient   *http.Client
 	ScrapeTimeout time.Duration
 	ListTTL       time.Duration
 	PublicURL     string // audit #8: fixed public origin; when empty, fall back to forwarded headers
@@ -289,6 +292,11 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		ExpectedYear:        expectedYear,
 		ExpectedTitleTokens: expectedTitleTokens,
 	})
+
+	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
+	// the viewer will see; before serialisation, so the answer rides along in the same response and the
+	// list is cached WITH it.
+	h.probeTop(ctx, config, ranked, sid)
 
 	out := make([]streamOut, 0, len(ranked))
 	for _, s := range ranked {

@@ -24,6 +24,9 @@ type RawStream struct {
 	Seeders   *int
 	Cached    bool
 	Source    string
+	// What the file itself said, when it was probed. nil means "not asked" — distinct from "asked and it
+	// told us nothing", so the client can tell an unprobed release from a genuinely featureless one.
+	Probe *Probe
 }
 
 // matcher unifies RE2 (stdlib) and regexp2 (for the one lookbehind pattern).

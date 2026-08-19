@@ -25,12 +25,18 @@ type StreamAttributes struct {
 	AudioChannels *string `json:"audioChannels"`
 	Atmos         bool    `json:"atmos"`
 	// Burned-in (hardcoded) subtitles — korsub/HC. A real gotcha, so the client can surface it.
-	HardcodedSubs bool   `json:"hardcodedSubs"`
-	ThreeD        bool   `json:"threeD"`
-	SizeBytes     *int   `json:"sizeBytes"`
-	Seeders       *int   `json:"seeders"`
-	Cached        bool   `json:"cached"`
-	Label         string `json:"label"`
+	HardcodedSubs bool `json:"hardcodedSubs"`
+	ThreeD        bool `json:"threeD"`
+	SizeBytes     *int `json:"sizeBytes"`
+	Seeders       *int `json:"seeders"`
+	Cached        bool `json:"cached"`
+	// Read from the file itself rather than its title, when the release was probed. Absent means it
+	// wasn't — which the client must not read as "has none": an unprobed release is unknown, not empty.
+	AudioLanguages    []string `json:"audioLanguages,omitempty"`
+	SubtitleLanguages []string `json:"subtitleLanguages,omitempty"`
+	UntaggedAudio     int      `json:"untaggedAudioTracks,omitempty"`
+	Probed            bool     `json:"probed,omitempty"`
+	Label             string   `json:"label"`
 }
 
 var (
@@ -164,7 +170,7 @@ func detectAudio(t string) string {
 func streamAttributes(s RawStream) StreamAttributes {
 	t := strings.ToLower(s.Title)
 	dolbyVision := reDoViAttr.match(t)
-	return StreamAttributes{
+	attrs := StreamAttributes{
 		Resolution:    strPtr(detectResolutionLower(t)),
 		Source:        strPtr(detectSourceAttr(t)),
 		Codec:         strPtr(detectCodec(t)),
@@ -182,6 +188,34 @@ func streamAttributes(s RawStream) StreamAttributes {
 		Cached:        s.Cached,
 		Label:         cleanLabelLower(t, s), // reuse the title we already lowercased
 	}
+	return withProbe(attrs, s.Probe)
+}
+
+// withProbe lets the FILE override the title wherever it has something to say. The title is what an
+// uploader typed; these are fields a muxer had to fill in — so codec and channel layout are corrected
+// where they disagree, and languages are added, since no title states them reliably.
+//
+// Only ever overrides with a non-empty value: a probe that couldn't read a field leaves the title's guess
+// standing rather than blanking it.
+func withProbe(attrs StreamAttributes, p *Probe) StreamAttributes {
+	if p == nil {
+		return attrs
+	}
+	attrs.Probed = true
+	attrs.AudioLanguages = p.Audio
+	attrs.SubtitleLanguages = p.Subtitles
+	attrs.UntaggedAudio = p.UntaggedAudio
+	if p.VideoCodec != "" {
+		attrs.Codec = strPtr(p.VideoCodec)
+	}
+	if p.AudioChannels != "" {
+		attrs.AudioChannels = strPtr(p.AudioChannels)
+	}
+	if p.DolbyVision {
+		attrs.DolbyVision = true
+		attrs.HDR = true
+	}
+	return attrs
 }
 
 func strPtr(s string) *string {
