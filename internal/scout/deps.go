@@ -3,6 +3,8 @@ package scout
 import (
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,8 +18,11 @@ type Settings struct {
 	ListTTL       time.Duration
 	PublicURL     string // audit #8
 	IndexerURLs   map[Indexer]string
-	CacheBytes    int    // audit #1: byte budget for the in-memory cache
-	CinemetaURL   string // metadata source for the year mistag filter (default: public Cinemeta)
+	CacheBytes    int // audit #1: byte budget for the in-memory cache
+	// Where the durable tier writes. Empty disables persistence. The container is redeployed on every
+	// image push, and a probe costs a debrid resolve to rebuild, so surviving a restart is worth a volume.
+	CacheDir    string
+	CinemetaURL string // metadata source for the year mistag filter (default: public Cinemeta)
 	// Sealed config-in-URL (docs/SEALED-CONFIG.md). ConfigKey = current X25519 private key (base64);
 	// ConfigKeysPrev = comma-separated prior keys (rotation). Empty ConfigKey → sealed URLs disabled.
 	ConfigKey      string
@@ -38,6 +43,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 		PublicURL:      get("SCOUT_PUBLIC_URL"),
 		IndexerURLs:    urls,
 		CacheBytes:     intEnv(get("SCOUT_CACHE_BYTES"), 48<<20), // 48 MiB
+		CacheDir:       strEnvOr(get("SCOUT_CACHE_DIR"), filepath.Join(os.TempDir(), "den-scout-cache")),
 		CinemetaURL:    orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
 		ConfigKey:      get("SCOUT_CONFIG_KEY"),
 		ConfigKeysPrev: get("SCOUT_CONFIG_KEYS_PREV"),
@@ -90,4 +96,12 @@ func intEnv(v string, d int) int {
 		return d
 	}
 	return n
+}
+
+// strEnvOr is the string counterpart of intEnv: an unset or blank variable takes the default.
+func strEnvOr(v, d string) string {
+	if v == "" {
+		return d
+	}
+	return v
 }

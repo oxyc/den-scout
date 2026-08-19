@@ -34,7 +34,7 @@ func main() {
 			ForceAttemptHTTP2:   true,
 		},
 	}
-	cache := scout.NewMemoryCache(settings.CacheBytes)
+	cache := scout.NewTieredCache(settings.CacheBytes, settings.CacheDir)
 	handler := scout.NewHandler(scout.BuildDeps(settings, client, cache))
 
 	srv := &http.Server{
