@@ -77,9 +77,18 @@ func ProbeTracks(ctx context.Context, client *http.Client, url string) (Probe, e
 	if err != nil {
 		return Probe{}, err
 	}
-	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
+	// Drain a BOUNDED amount before closing, never the whole body. Draining aids connection reuse, but an
+	// unbounded drain here would download an entire 20 GB remux to throw it away the moment a server
+	// ignored the Range header and answered 200 — turning a 1 MiB probe into the download it exists to
+	// avoid. The cap is the same megabyte we asked for.
+	defer func() { _, _ = io.CopyN(io.Discard, resp.Body, 1<<16); _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 		return Probe{}, fmt.Errorf("probe: unexpected status %d", resp.StatusCode)
+	}
+	// A 200 means the server disregarded the Range and is about to send the whole file. The head is still
+	// readable — it is the first megabyte either way — but nothing beyond it is worth a metered byte.
+	if resp.StatusCode == http.StatusOK && resp.ContentLength > probeBytes {
+		defer func() { _ = resp.Body.Close() }()
 	}
 	// Bounded regardless of what the server does with the Range header — a 200 means the whole file is
 	// coming, and reading all of a 20 GB remux to find a 5 KB header would be its own outage.

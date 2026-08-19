@@ -1,8 +1,12 @@
 package scout
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strconv"
 	"testing"
 )
 
@@ -84,5 +88,36 @@ func TestParseTrackEntry_ignoresVideo(t *testing.T) {
 	entry := []byte{idTrackType, 0x81, 0x01}
 	if _, lang := parseTrackEntry(entry); lang != "" {
 		t.Fatalf("video track reported language %q", lang)
+	}
+}
+
+// A server that ignores Range answers 200 and starts sending the whole file. The probe must still read
+// only its megabyte: an unbounded drain would download a 20 GB remux to discard it, which is precisely
+// the download this exists to avoid, and on a metered debrid account it is the expensive kind of bug.
+func TestProbeTracks_readsOnlyTheHeadWhenRangeIsIgnored(t *testing.T) {
+	const fileSize = 40 << 20
+	served := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(fileSize))
+		w.WriteHeader(http.StatusOK) // deliberately ignores the Range header
+		head, _ := os.ReadFile("testdata/tracks.mkv")
+		n, _ := w.Write(head)
+		served += n
+		buf := make([]byte, 1<<16)
+		for served < fileSize {
+			m, err := w.Write(buf)
+			served += m
+			if err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	if _, err := ProbeTracks(context.Background(), srv.Client(), srv.URL); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if served > 8<<20 {
+		t.Fatalf("pulled %d bytes for a 1 MiB probe — the drain is unbounded", served)
 	}
 }
