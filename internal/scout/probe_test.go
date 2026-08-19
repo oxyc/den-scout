@@ -18,8 +18,8 @@ func TestParseMatroskaTracks_realHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(got.Audio) != 1 || got.Audio[0] != "ita" {
-		t.Fatalf("audio = %v, want [ita]", got.Audio)
+	if len(got.Audio) != 1 || got.Audio[0] != "it" {
+		t.Fatalf("audio = %v, want [it]", got.Audio)
 	}
 	if len(got.Subtitles) != 0 {
 		t.Fatalf("subtitles = %v, want none", got.Subtitles)
@@ -42,20 +42,34 @@ func TestParseMatroskaTracks_noTracks(t *testing.T) {
 	}
 }
 
-// Matroska omits Language when the track is English, so an entry without the field is English by
-// specification — not unknown, and not something to hide from the viewer.
-func TestParseTrackEntry_defaultsToEnglish(t *testing.T) {
+// Matroska says an absent Language means "eng". Honouring that announced ENGLISH audio for an untagged
+// AC-3 track in a Swedish series — the tag was missing, not English. An honest unknown beats a confident
+// wrong answer, so untagged tracks are counted, never named.
+func TestParseTrackEntry_untaggedIsNotEnglish(t *testing.T) {
 	entry := []byte{idTrackType, 0x81, trackTypeAudio}
 	kind, lang := parseTrackEntry(entry)
-	if kind != trackTypeAudio || lang != "eng" {
-		t.Fatalf("kind=%d lang=%q, want audio/eng", kind, lang)
+	if kind != trackTypeAudio || lang != "und" {
+		t.Fatalf("kind=%d lang=%q, want audio/und", kind, lang)
+	}
+}
+
+// The same file carries both ISO 639-2 and BCP-47 for a track, and across a 30-release sweep the output
+// mixed "eng" with "en" — which no consumer can group on.
+func TestCleanLang_normalisesToTwoLetter(t *testing.T) {
+	for in, want := range map[string]string{
+		"swe": "sv", "eng": "en", "ger": "de", "deu": "de", "cze": "cs", "ces": "cs",
+		"en": "en", "sv": "sv", "klingon": "klingon",
+	} {
+		if got := cleanLang([]byte(in)); got != want {
+			t.Fatalf("cleanLang(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
 // A regional tag and its base language are the same shelf to someone picking a track.
 func TestCleanLang(t *testing.T) {
 	cases := map[string]string{
-		"swe\x00": "swe", "PT-BR": "pt", "en_US": "en", "und": "", "  ": "", "ita": "ita",
+		"swe\x00": "sv", "PT-BR": "pt", "en_US": "en", "und": "", "  ": "", "ita": "it",
 	}
 	for in, want := range cases {
 		if got := cleanLang([]byte(in)); got != want {
