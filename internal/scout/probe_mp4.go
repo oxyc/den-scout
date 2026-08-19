@@ -27,6 +27,16 @@ func parseMP4(head []byte) (Probe, bool) {
 		if codec := sampleCodec(mdia); codec != "" && kind == "vide" && p.VideoCodec == "" {
 			p.VideoCodec = codec
 		}
+		if kind == "soun" && p.AudioChannels == "" {
+			if n := mp4AudioChannels(mdia); n > 0 {
+				p.AudioChannels = channelLayout(n)
+			}
+		}
+		if kind == "vide" {
+			if mp4HasDolbyVision(mdia) {
+				p.DolbyVision = true
+			}
+		}
 		switch kind {
 		case "soun":
 			if lang == "" {
@@ -155,4 +165,48 @@ func boxes(buf []byte) []mp4Box {
 		i = end
 	}
 	return out
+}
+
+// mp4AudioChannels reads the channel count from the audio sample entry: 6 bytes reserved, 2 data-reference
+// index, 8 version/reserved, then channel count.
+func mp4AudioChannels(mdia []byte) int {
+	entry, ok := firstSampleEntry(mdia)
+	if !ok || len(entry) < 18 {
+		return 0
+	}
+	return int(binary.BigEndian.Uint16(entry[16:18]))
+}
+
+// mp4HasDolbyVision looks for the DV configuration box, whose presence is the signal.
+func mp4HasDolbyVision(mdia []byte) bool {
+	entry, ok := firstSampleEntry(mdia)
+	if !ok || len(entry) <= 78 {
+		return false
+	}
+	for _, b := range boxes(entry[78:]) {
+		if b.typ == "dvcC" || b.typ == "dvvC" {
+			return true
+		}
+	}
+	return false
+}
+
+func firstSampleEntry(mdia []byte) ([]byte, bool) {
+	minf, ok := findBox(mdia, "minf")
+	if !ok {
+		return nil, false
+	}
+	stbl, ok := findBox(minf, "stbl")
+	if !ok {
+		return nil, false
+	}
+	stsd, ok := findBox(stbl, "stsd")
+	if !ok || len(stsd) < 8 {
+		return nil, false
+	}
+	all := boxes(stsd[8:]) // skip version/flags + entry count
+	if len(all) == 0 {
+		return nil, false
+	}
+	return all[0].body, true
 }

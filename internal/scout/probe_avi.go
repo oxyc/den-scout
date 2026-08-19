@@ -13,6 +13,7 @@ func parseAVI(head []byte) (Probe, bool) {
 		return Probe{}, false
 	}
 	p := Probe{Container: "avi"}
+	var lastKind string
 	var walk func(buf []byte, start, end int)
 	walk = func(buf []byte, start, end int) {
 		i := start
@@ -30,6 +31,14 @@ func parseAVI(head []byte) (Probe, bool) {
 					stop = len(buf)
 				}
 				walk(buf, body+4, stop)
+			case "strf":
+				// Follows the strh it belongs to; for audio it is a WAVEFORMATEX whose second field is
+				// the channel count.
+				if lastKind == "auds" && p.AudioChannels == "" && body+4 <= len(buf) {
+					if n := int(binary.LittleEndian.Uint16(buf[body+2 : body+4])); n > 0 {
+						p.AudioChannels = channelLayout(n)
+					}
+				}
 			case "strh":
 				if body+8 <= len(buf) {
 					kind := string(buf[body : body+4])
@@ -43,6 +52,7 @@ func parseAVI(head []byte) (Probe, bool) {
 						// No language to read, but the track exists and the viewer should know it does.
 						p.UntaggedAudio++
 					}
+					lastKind = kind
 				}
 			}
 			i = body + size

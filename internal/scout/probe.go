@@ -20,10 +20,19 @@ type Probe struct {
 	// Which container this came from, and the video codec it declares. The codec is the reason AVI is
 	// parsed at all: an XviD rip has no hardware decoder on an Apple TV, and that costs the viewer the
 	// scrubber and the transport, not merely some quality.
-	Container  string   `json:"container,omitempty"`
-	VideoCodec string   `json:"videoCodec,omitempty"`
-	Audio      []string `json:"audioLanguages"`
-	Subtitles  []string `json:"subtitleLanguages"`
+	Container  string `json:"container,omitempty"`
+	VideoCodec string `json:"videoCodec,omitempty"`
+	// What the file itself says about its audio layout and colour, rather than what the release title
+	// claims. A title is written by whoever uploaded it; these are fields the muxer had to fill in.
+	//
+	// Atmos is deliberately absent: it lives inside the E-AC-3 JOC or TrueHD substream, not in any
+	// container box, so no amount of header parsing finds it — and Den reports DELIVERED audio anyway,
+	// where TrueHD and DTS are bridged down to EAC3 5.1 regardless of what the source carried.
+	AudioChannels string   `json:"audioChannels,omitempty"` // "2.0", "5.1", "7.1"
+	HDRFormat     string   `json:"hdrFormat,omitempty"`     // "HDR10", "HLG"
+	DolbyVision   bool     `json:"dolbyVision,omitempty"`
+	Audio         []string `json:"audioLanguages"`
+	Subtitles     []string `json:"subtitleLanguages"`
 	// How many tracks carried no language at all. A release can have audio whose language nobody wrote
 	// down, and "2 untagged audio tracks" is a different, more useful statement than "no audio".
 	UntaggedAudio     int `json:"untaggedAudioTracks"`
@@ -36,6 +45,11 @@ const (
 	idTracks       = 0x1654AE6B
 	idTrackEntry   = 0xAE
 	idTrackType    = 0x83
+	idCodecID      = 0x86
+	idVideo        = 0xE0
+	idAudio        = 0xE1
+	idChannels     = 0x9F
+	trackTypeVideo = 1
 	idLanguage     = 0x22B59C // ISO 639-2, the historical field; defaults to "eng" when absent
 	idLanguageBCP  = 0x22B59D // BCP-47, preferred when present
 	trackTypeAudio = 2
@@ -112,6 +126,7 @@ func ParseMatroskaTracks(head []byte) (Probe, error) {
 			break
 		}
 		if id == idTrackEntry {
+			readTrackFacts(body, &out)
 			kind, lang := parseTrackEntry(body)
 			switch {
 			case lang == "":
@@ -374,4 +389,134 @@ func uintFrom(b []byte) uint64 {
 		v = v<<8 | uint64(c)
 	}
 	return v
+}
+
+// readTrackFacts pulls the descriptive fields off a Matroska TrackEntry: the codec the video declares and
+// how many channels its audio carries.
+//
+// Audio takes the BEST layout present, not the first: a release carrying both 5.1 and 7.1 is a 7.1
+// release, and the track listed first is routinely the plainer one — one real file listed 5.1 ahead of
+// three 7.1 tracks.
+func readTrackFacts(entry []byte, out *Probe) {
+	var kind int
+	var codec string
+	for pos := 0; pos < len(entry); {
+		id, idLen := readID(entry[pos:])
+		if idLen == 0 {
+			return
+		}
+		body, next, ok := childPayload(entry, pos+idLen)
+		if !ok {
+			return
+		}
+		switch id {
+		case idTrackType:
+			kind = int(uintFrom(body))
+		case idCodecID:
+			codec = codecFromMatroskaID(string(body))
+		case idAudio:
+			if n := int(childUint(body, idChannels)); n > channelCount(out.AudioChannels) {
+				out.AudioChannels = channelLayout(n)
+			}
+
+		}
+		pos = next
+	}
+	if kind == trackTypeVideo && codec != "" && out.VideoCodec == "" {
+		out.VideoCodec = codec
+	}
+	// Dolby Vision rides as a block-addition mapping whose name is the configuration box. Matching the
+	// literal tag is enough to say it is present, which is all the list needs to know.
+	if kind == trackTypeVideo && (indexOfBytes(entry, []byte("dvcC")) >= 0 || indexOfBytes(entry, []byte("dvvC")) >= 0) {
+		out.DolbyVision = true
+	}
+}
+
+func findChild(buf []byte, want uint32) ([]byte, int, bool) {
+	for pos := 0; pos < len(buf); {
+		id, idLen := readID(buf[pos:])
+		if idLen == 0 {
+			return nil, 0, false
+		}
+		body, next, ok := childPayload(buf, pos+idLen)
+		if !ok {
+			return nil, 0, false
+		}
+		if id == want {
+			return body, next, true
+		}
+		pos = next
+	}
+	return nil, 0, false
+}
+
+func childUint(buf []byte, want uint32) uint64 {
+	if body, _, ok := findChild(buf, want); ok {
+		return uintFrom(body)
+	}
+	return 0
+}
+
+func indexOfBytes(hay, needle []byte) int {
+	for i := 0; i+len(needle) <= len(hay); i++ {
+		match := true
+		for j := range needle {
+			if hay[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// channelLayout names what a viewer recognises. 6 channels is 5.1 and 8 is 7.1 in every release that
+// turns up; the exact speaker mask is more than the list can show.
+func channelLayout(n int) string {
+	switch {
+	case n >= 8:
+		return "7.1"
+	case n >= 6:
+		return "5.1"
+	case n >= 2:
+		return "2.0"
+	case n == 1:
+		return "1.0"
+	}
+	return ""
+}
+
+// codecFromMatroskaID maps Matroska's CodecID strings to the families Den ranks on.
+func codecFromMatroskaID(id string) string {
+	switch {
+	case strings.HasPrefix(id, "V_MPEG4/ISO/AVC"):
+		return "h264"
+	case strings.HasPrefix(id, "V_MPEGH/ISO/HEVC"):
+		return "hevc"
+	case strings.HasPrefix(id, "V_AV1"):
+		return "av1"
+	case strings.HasPrefix(id, "V_VP9"):
+		return "vp9"
+	case strings.HasPrefix(id, "V_MPEG4"): // ASP / DivX / XviD in Matroska
+		return "mpeg4"
+	}
+	return ""
+}
+
+// channelCount is channelLayout's inverse, for comparing which layout is richer.
+func channelCount(layout string) int {
+	switch layout {
+	case "7.1":
+		return 8
+	case "5.1":
+		return 6
+	case "2.0":
+		return 2
+	case "1.0":
+		return 1
+	}
+	return 0
 }
