@@ -294,19 +294,6 @@ func appendUnique(list []string, v string) []string {
 	return append(list, v)
 }
 
-// indexOfID finds a 4-byte element id. Scanning beats walking the tree here: Segment routinely declares an
-// unknown size, and the elements before Tracks vary by muxer, so a walk has more ways to go wrong than a
-// search followed by a validating parse.
-func indexOfID(buf []byte, id uint32) int {
-	want := []byte{byte(id >> 24), byte(id >> 16), byte(id >> 8), byte(id)}
-	for i := 0; i+4 <= len(buf); i++ {
-		if buf[i] == want[0] && buf[i+1] == want[1] && buf[i+2] == want[2] && buf[i+3] == want[3] {
-			return i
-		}
-	}
-	return -1
-}
-
 // readID reads a variable-length element id, returning it and its byte length.
 func readID(buf []byte) (uint32, int) {
 	if len(buf) == 0 {
@@ -321,19 +308,6 @@ func readID(buf []byte) (uint32, int) {
 		id = id<<8 | uint32(buf[i])
 	}
 	return id, n
-}
-
-// elementPayload reads a size at p and returns the bytes it covers.
-func elementPayload(buf []byte, p int) ([]byte, bool) {
-	size, n, ok := readSize(buf, p)
-	if !ok {
-		return nil, false
-	}
-	end := p + n + size
-	if size < 0 || end > len(buf) || end < 0 {
-		return nil, false
-	}
-	return buf[p+n : end], true
 }
 
 // childPayload reads a size at p and returns the payload plus the offset just past it.
