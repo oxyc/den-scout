@@ -288,10 +288,49 @@ func TestTorBoxStatus(t *testing.T) {
 		})
 	}
 
-	// No torrent id remembered → nothing to report, rather than a promise we can't keep.
-	empty := &torBoxStore{token: "t", cache: NewMemoryCache(1 << 16), api: torboxAPI}
+	// No torrent id remembered, and the account doesn't hold it either → nothing to report, rather than
+	// a promise we can't keep.
+	empty := &torBoxStore{token: "t", cache: NewMemoryCache(1 << 16), api: torboxAPI, client: mockDoer{
+		fn: func(*http.Request) (*http.Response, error) { return resp(200, `{"data":[]}`), nil },
+	}}
 	if _, ok := empty.Status(context.Background(), ResolveTarget{InfoHash: H}); ok {
 		t.Error("an unknown infohash must not report a download")
+	}
+}
+
+// Losing the cached torrent id is not losing the download: a redeploy or a pruned cache used to turn a
+// perfectly healthy fetch into a 404, which a client can only read as a dead link. The id is rediscovered
+// from the account's own list — and remembered, so the next poll is a single-id lookup again.
+func TestTorBoxStatusRediscoversLostTorrentID(t *testing.T) {
+	var listCalls int
+	// The indexer's hash is upper-case, TorBox reports lower-case — so this covers the fold too.
+	target := strings.ToUpper(H)
+	cache := NewMemoryCache(1 << 16) // deliberately empty: the id was never written, or has expired
+	s := &torBoxStore{token: "t", cache: cache, api: torboxAPI, client: mockDoer{
+		fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.RawQuery, "id=") {
+				return resp(200, `{"data":{"progress":0.25,"download_finished":false}}`), nil
+			}
+			listCalls++
+			return resp(200, `{"data":[{"id":7,"hash":"`+H+`"}]}`), nil
+		},
+	}}
+	got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: target})
+	if !ok {
+		t.Fatal("a download the account is holding must be reported, cached id or not")
+	}
+	if got.Progress != 0.25 {
+		t.Errorf("progress = %v, want 0.25", got.Progress)
+	}
+	if raw, cached := cache.Get(torrentIDKey("t", target)); !cached || raw != "7" {
+		t.Errorf("the rediscovered id must be remembered; got %q cached=%v", raw, cached)
+	}
+	// Second call must reuse the cache rather than list the whole account again.
+	if _, ok := s.Status(context.Background(), ResolveTarget{InfoHash: target}); !ok {
+		t.Fatal("second status")
+	}
+	if listCalls != 1 {
+		t.Errorf("account listed %d times, want 1", listCalls)
 	}
 }
 

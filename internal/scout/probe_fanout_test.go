@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 )
 
 // Probing costs a debrid RESOLVE per release, so it must never happen by accident. A caller that hasn't
@@ -67,6 +68,39 @@ func TestProbeTop_cacheHitSkipsResolve(t *testing.T) {
 	}
 	if streams[0].Probe == nil || len(streams[0].Probe.Audio) != 1 || streams[0].Probe.Audio[0] != "it" {
 		t.Fatalf("cache hit not applied: %+v", streams[0].Probe)
+	}
+}
+
+// An uncached release must not delay the reply. Probing costs a debrid resolve plus a ranged read
+// apiece, which put ~12s on top of the scrape and timed clients out; the list now goes out first and the
+// probe warms the cache behind it, for the next request.
+func TestProbeTop_uncachedProbesBehindTheResponse(t *testing.T) {
+	resolved := make(chan struct{}, 1)
+	h := &handler{deps: Deps{
+		Cache:       NewMemoryCache(1 << 20),
+		ProbeClient: http.DefaultClient,
+		MakeStores: func(*Config) []Store {
+			return []Store{fakeStore{resolve: func() (string, error) {
+				select {
+				case resolved <- struct{}{}:
+				default:
+				}
+				return "", nil // no link → nothing to probe, but the attempt is what's under test
+			}}}
+		},
+	}}
+	streams := []RawStream{{InfoHash: "uncached-hash"}}
+	h.probeTop(context.Background(), &Config{}, streams, nil)
+
+	// Returned WITHOUT the probe: that is the whole point — the viewer gets the list now.
+	if streams[0].Probe != nil {
+		t.Fatalf("an uncached release was probed inline: %+v", streams[0].Probe)
+	}
+	// …and the work still happens, just not in the client's way.
+	select {
+	case <-resolved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the background probe never ran — the cache would never warm")
 	}
 }
 

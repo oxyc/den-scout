@@ -242,15 +242,8 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 // a finished flag — must read as "no wait to promise", or a genuinely dead release would answer
 // "downloading, 0%" forever.
 func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool) {
-	if s.cache == nil {
-		return StoreStatus{}, false
-	}
-	raw, ok := s.cache.Get(torrentIDKey(s.token, t.InfoHash))
+	torrentID, ok := s.torrentID(ctx, t.InfoHash)
 	if !ok {
-		return StoreStatus{}, false
-	}
-	torrentID, err := strconv.Atoi(raw)
-	if err != nil {
 		return StoreStatus{}, false
 	}
 	resp, err := s.get(ctx, fmt.Sprintf("%s/torrents/mylist?id=%d&bypass_cache=true", s.api, torrentID))
@@ -302,6 +295,64 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 		out.ETASeconds = st.ETA
 	}
 	return out, true
+}
+
+// torrentID finds the account's torrent id for an infohash: from the cache Resolve wrote, and failing
+// that by asking TorBox for the account's list and matching on hash.
+//
+// The fallback exists because the cached id is the ONLY thing that made a queued release describable, and
+// it is lost by any of a redeploy, a pruned cache, or an add that recorded nothing. Without it `Status`
+// answers "nothing here" while the file downloads perfectly well — which a client can only read as a dead
+// link. Rediscovering the id costs one list call, and only on the path that was previously a dead end.
+func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool) {
+	if s.cache != nil {
+		if raw, ok := s.cache.Get(torrentIDKey(s.token, infoHash)); ok {
+			if id, err := strconv.Atoi(raw); err == nil {
+				return id, true
+			}
+		}
+	}
+	id, ok := s.findTorrentByHash(ctx, infoHash)
+	if !ok {
+		return 0, false
+	}
+	// Remember it, so the next poll of this wait is a single-id lookup again rather than another list.
+	if s.cache != nil {
+		s.cache.Put(torrentIDKey(s.token, infoHash), strconv.Itoa(id), resolveCacheTTL)
+	}
+	return id, true
+}
+
+// findTorrentByHash scans the account's torrent list for an infohash. TorBox reports hashes lower-case;
+// indexers are inconsistent about it, so both sides are folded before comparing.
+func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (int, bool) {
+	if s.client == nil {
+		return 0, false
+	}
+	resp, err := s.get(ctx, s.api+"/torrents/mylist?bypass_cache=true")
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+	var body struct {
+		Data []struct {
+			ID   int    `json:"id"`
+			Hash string `json:"hash"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+		return 0, false
+	}
+	want := strings.ToLower(infoHash)
+	for _, e := range body.Data {
+		if strings.ToLower(e.Hash) == want {
+			return e.ID, true
+		}
+	}
+	return 0, false
 }
 
 func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) []TorrentFile {

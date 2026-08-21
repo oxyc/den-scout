@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
 )
 
@@ -96,17 +97,19 @@ func TestParseTrackEntry_ignoresVideo(t *testing.T) {
 // the download this exists to avoid, and on a metered debrid account it is the expensive kind of bug.
 func TestProbeTracks_readsOnlyTheHeadWhenRangeIsIgnored(t *testing.T) {
 	const fileSize = 40 << 20
-	served := 0
+	// Atomic: the handler goes on writing (that is the point — it ignores Range) while the assertion
+	// below reads the tally, so a plain int is a data race the -race build fails on.
+	var served atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(fileSize))
 		w.WriteHeader(http.StatusOK) // deliberately ignores the Range header
 		head, _ := os.ReadFile("testdata/tracks.mkv")
 		n, _ := w.Write(head)
-		served += n
+		served.Add(int64(n))
 		buf := make([]byte, 1<<16)
-		for served < fileSize {
+		for served.Load() < fileSize {
 			m, err := w.Write(buf)
-			served += m
+			served.Add(int64(m))
 			if err != nil {
 				return
 			}
@@ -117,7 +120,7 @@ func TestProbeTracks_readsOnlyTheHeadWhenRangeIsIgnored(t *testing.T) {
 	if _, err := ProbeTracks(context.Background(), srv.Client(), srv.URL); err != nil {
 		t.Fatalf("probe: %v", err)
 	}
-	if served > 8<<20 {
-		t.Fatalf("pulled %d bytes for a 1 MiB probe — the drain is unbounded", served)
+	if got := served.Load(); got > 8<<20 {
+		t.Fatalf("pulled %d bytes for a 1 MiB probe — the drain is unbounded", got)
 	}
 }
