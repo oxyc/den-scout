@@ -808,12 +808,78 @@ func isCacheTruthService(svc DebridService) bool {
 }
 
 func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
-	for _, st := range p.stores {
+	return p.ResolvePreferring(ctx, t, nil)
+}
+
+// ResolvePreferring resolves, trying the services in `preferred` before the rest.
+//
+// The point is not speed but WHAT ARRIVES: a release one service already holds plays now, while the same
+// release on another has to be downloaded first — minutes to hours. CacheCheck already learns which
+// services hold it and the union threw that away, so the fixed store order could send a viewer to
+// download a file that was sitting cached on their other account.
+func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
+	preferred []DebridService) (string, error) {
+	for _, st := range p.ordered(preferred) {
 		if link, err := st.Resolve(ctx, t); err == nil {
 			return link, nil
 		}
 	}
 	return "", &DeadLinkError{"no store could resolve"}
+}
+
+// ordered puts the preferred services first, keeping the configured order within each group so the
+// result stays deterministic — the same request must not resolve differently run to run.
+func (p *StorePool) ordered(preferred []DebridService) []Store {
+	if len(preferred) == 0 {
+		return p.stores
+	}
+	wanted := make(map[DebridService]bool, len(preferred))
+	for _, svc := range preferred {
+		wanted[svc] = true
+	}
+	out := make([]Store, 0, len(p.stores))
+	for _, st := range p.stores {
+		if wanted[st.Service()] {
+			out = append(out, st)
+		}
+	}
+	for _, st := range p.stores {
+		if !wanted[st.Service()] {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
+// CachedBy reports which services hold each hash. Same calls as CacheCheck — this keeps the per-service
+// detail that the union in CacheCheck discards, so /play can resolve from a service that already has it.
+func (p *StorePool) CachedBy(ctx context.Context, hashes []string) map[string][]DebridService {
+	byHash := make(map[string][]DebridService, len(hashes))
+	if len(hashes) == 0 {
+		return byHash
+	}
+	maps := make([]map[string]bool, len(p.stores))
+	var g errgroup.Group
+	for i, st := range p.stores {
+		i, st := i, st
+		g.Go(func() error {
+			m, err := st.CacheCheck(ctx, hashes)
+			if err == nil {
+				maps[i] = m
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	// Store order, so a hash held by several services lists them in the configured priority.
+	for i, m := range maps {
+		for hash, cached := range m {
+			if cached {
+				byHash[hash] = append(byHash[hash], p.stores[i].Service())
+			}
+		}
+	}
+	return byHash
 }
 
 // Status — the first store that can say a queued release is still downloading. Only meaningful right

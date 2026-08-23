@@ -346,7 +346,14 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		return
 	}
 
-	link, err := pool.Resolve(ctx, rt)
+	// Which services already hold it, so the resolve starts with one that can serve now rather than one
+	// that would have to download it. Only worth asking with more than one account configured — with one
+	// there is nothing to choose between, and it would be a wasted upstream call on every play.
+	var preferred []DebridService
+	if len(config.Debrid) > 1 {
+		preferred = pool.CachedBy(ctx, []string{target.InfoHash})[target.InfoHash]
+	}
+	link, err := pool.ResolvePreferring(ctx, rt, preferred)
 	if err != nil {
 		// Queued is not dead. An uncached release is added to the debrid by the Resolve above and then
 		// takes minutes to land; answering 404 for that made the client remember a perfectly good release
