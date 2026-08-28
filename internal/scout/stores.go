@@ -77,6 +77,31 @@ func (e *StoreUnavailableError) Error() string {
 	return "store_unavailable: " + string(e.Service) + " " + e.Reason
 }
 
+// readStoreError pulls the service's own explanation out of a failed response, as " (detail)" ready to
+// append to a message. TorBox answers `{"error":"ACTIVE_LIMIT","detail":"..."}`; anything unparseable
+// falls back to a clipped snippet of the raw body, because a truncated reason still beats none.
+func readStoreError(resp *http.Response) string {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	var body struct {
+		Error  any    `json:"error"`
+		Detail string `json:"detail"`
+	}
+	if json.Unmarshal(raw, &body) == nil {
+		switch {
+		case body.Detail != "" && body.Error != nil:
+			return fmt.Sprintf(" (%v: %s)", body.Error, body.Detail)
+		case body.Detail != "":
+			return " (" + body.Detail + ")"
+		case body.Error != nil:
+			return fmt.Sprintf(" (%v)", body.Error)
+		}
+	}
+	return " (" + strings.TrimSpace(string(raw[:min(len(raw), 200)])) + ")"
+}
+
 // storeRefusedUs reports whether an HTTP status is the service declining to serve this account right now —
 // a throttle or a fault on their side — rather than a verdict about the torrent.
 func storeRefusedUs(status int) bool {
@@ -266,12 +291,16 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if storeRefusedUs(resp.StatusCode) {
-		return 0, &StoreUnavailableError{ServiceTorBox,
-			fmt.Sprintf("createtorrent http %d", resp.StatusCode)}
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d", resp.StatusCode)}
+		// TorBox explains itself in the body — an account at its active-download limit and a malformed
+		// magnet are both a bare 400, and only the text says which. Discarding it left the status code as
+		// the entire diagnosis, which is how a hard refusal came to look like a slow download.
+		detail := readStoreError(resp)
+		if storeRefusedUs(resp.StatusCode) {
+			return 0, &StoreUnavailableError{ServiceTorBox,
+				fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
+		}
+		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d%s", resp.StatusCode, detail)}
 	}
 	var body struct {
 		Data *struct {
