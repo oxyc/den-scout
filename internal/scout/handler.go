@@ -357,6 +357,16 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, pool *
 		writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
 		return
 	}
+	// A refusal the store recorded moments ago outranks "nothing queued". Without this the probe reports
+	// a throttled account as an absence, which reads as a release nobody can deliver — and the client
+	// condemns a perfectly good one. The probe cannot discover a refusal itself (it never calls the API
+	// that refuses), so it reads the backoff the queueing path wrote.
+	if svc, reason, ok := pool.RecentRefusal(infoHash); ok {
+		log.Printf("scout: probe %s → 503, %s %s", shortHash(infoHash), svc, reason)
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
+		return
+	}
 	log.Printf("scout: probe %s → 404 not queued", shortHash(infoHash))
 	writeJSON(w, http.StatusNotFound, errBody("not_queued"), noStore)
 }

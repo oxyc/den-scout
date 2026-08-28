@@ -206,6 +206,51 @@ func torrentIDKey(token, infoHash string) string {
 	return "torbox:torrent:" + keyHash(token) + ":" + infoHash
 }
 
+// refusalReason renders an add failure for the backoff cache, keeping the service's own words where it
+// gave any — that string is what the probe route later reports and the log later prints.
+func refusalReason(err error) string {
+	var unavailable *StoreUnavailableError
+	if errors.As(err, &unavailable) {
+		return unavailable.Reason
+	}
+	var dead *DeadLinkError
+	if errors.As(err, &dead) {
+		return dead.Reason
+	}
+	return err.Error()
+}
+
+// refusalReporter — a store that can say it was recently refused for a hash. Optional, because only a
+// store with a cache can remember one; a store that doesn't implement it simply never reports a refusal.
+type refusalReporter interface {
+	RecentRefusal(infoHash string) (string, bool)
+}
+
+// RecentRefusal reports the first store that was turned away for this hash a moment ago, with its reason.
+//
+// The probe route needs this because it cannot discover a refusal on its own: it deliberately never calls
+// the endpoint that refuses. Without it a throttled account reads as "nothing is queued", which the client
+// cannot distinguish from a release nobody can deliver — and it condemns a healthy one.
+func (p *StorePool) RecentRefusal(infoHash string) (DebridService, string, bool) {
+	for _, st := range p.stores {
+		reporter, ok := st.(refusalReporter)
+		if !ok {
+			continue
+		}
+		if reason, refused := reporter.RecentRefusal(infoHash); refused {
+			return st.Service(), reason, true
+		}
+	}
+	return "", "", false
+}
+
+func (s *torBoxStore) RecentRefusal(infoHash string) (string, bool) {
+	if s.cache == nil {
+		return "", false
+	}
+	return s.cache.Get(refusedKey(s.token, infoHash))
+}
+
 // refusedKey marks a hash the service just declined to add for this account, so polls stop re-asking.
 func refusedKey(token, infoHash string) string {
 	return "torbox:refused:" + keyHash(token) + ":" + infoHash
@@ -235,8 +280,16 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		if raw, ok := s.cache.Get(key); ok {
 			var e torboxResolveEntry
 			if json.Unmarshal([]byte(raw), &e) == nil && (!needFiles || len(e.Files) > 0) {
-				if link, err := s.requestDownload(ctx, e.TorrentID, selectFileID(e.Files, t)); err == nil {
+				link, err := s.requestDownload(ctx, e.TorrentID, selectFileID(e.Files, t))
+				if err == nil {
 					return link, nil
+				}
+				// A throttled link request on a torrent this account ALREADY holds must not fall through
+				// to createtorrent: that turns a read into a write, on an account whose whole problem is
+				// that it has written too much.
+				var unavailable *StoreUnavailableError
+				if errors.As(err, &unavailable) {
+					return "", err
 				}
 			}
 		}
@@ -253,9 +306,11 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	}
 	torrentID, err := s.addMagnet(ctx, t.InfoHash)
 	if err != nil {
-		var unavailable *StoreUnavailableError
-		if errors.As(err, &unavailable) && s.cache != nil {
-			s.cache.Put(refusedKey(s.token, t.InfoHash), unavailable.Reason, refusalBackoff)
+		// Every refused add backs off, not only a 429. The refusal that caused the incident was a 400 —
+		// TorBox's answer for an account at its download limit — which is a `DeadLinkError`, so keying the
+		// backoff on the error TYPE left the one case that mattered re-adding on every poll.
+		if s.cache != nil {
+			s.cache.Put(refusedKey(s.token, t.InfoHash), refusalReason(err), refusalBackoff)
 		}
 		return "", err
 	}
