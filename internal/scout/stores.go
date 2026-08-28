@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -817,14 +818,28 @@ func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error
 // release on another has to be downloaded first — minutes to hours. CacheCheck already learns which
 // services hold it and the union threw that away, so the fixed store order could send a viewer to
 // download a file that was sitting cached on their other account.
+// Every store's failure is logged. The generic "no store could resolve" that replaced them said only that
+// something went wrong, which is indistinguishable from a dead release — and an add that never reached the
+// debrid (an expired token, a rejected magnet, an exhausted deadline) looks from the outside exactly like a
+// release nobody is seeding: the client waits on a download the service was never asked to start.
 func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	preferred []DebridService) (string, error) {
 	for _, st := range p.ordered(preferred) {
-		if link, err := st.Resolve(ctx, t); err == nil {
+		link, err := st.Resolve(ctx, t)
+		if err == nil {
 			return link, nil
 		}
+		log.Printf("scout: %s could not resolve %s: %v", st.Service(), shortHash(t.InfoHash), err)
 	}
 	return "", &DeadLinkError{"no store could resolve"}
+}
+
+// shortHash trims an infohash for logs — enough to correlate with the client's line, not the whole thing.
+func shortHash(h string) string {
+	if len(h) <= 12 {
+		return h
+	}
+	return h[:12]
 }
 
 // ordered puts the preferred services first, keeping the configured order within each group so the

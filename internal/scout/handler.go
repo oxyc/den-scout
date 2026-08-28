@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -370,6 +371,12 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 			writeQueued(w, status)
 			return
 		}
+		// The client reads this 404 as "still fetching" and polls for as long as the viewer will sit
+		// there, so it is worth saying which of the two happened: no store could add it, and no store
+		// admits to downloading it either. A wait with nothing behind it is the one case a spinner
+		// cannot distinguish from a slow release.
+		log.Printf("scout: play %s → 404, no store resolved it and none reports a download: %v",
+			shortHash(target.InfoHash), err)
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
 		return
 	}
