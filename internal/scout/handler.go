@@ -342,6 +342,25 @@ func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 	writeJSON(w, http.StatusAccepted, body, noStore)
 }
 
+// handleProbe answers "can this play yet?" without changing anything. Same vocabulary as /play so the
+// client reads one set of statuses: 202 while downloading, 200 once the store holds it, 404 when neither
+// is true — which here means "nothing has been queued", not "this release is dead".
+func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, pool *StorePool,
+	infoHash string, rt ResolveTarget) {
+	if status, ok := pool.Status(ctx, rt); ok {
+		writeQueued(w, infoHash, status)
+		return
+	}
+	// Cached is a read, not an add: the file is already there and /play would only mint a link for it.
+	if len(pool.CachedBy(ctx, []string{infoHash})[infoHash]) > 0 {
+		log.Printf("scout: probe %s → 200 ready", shortHash(infoHash))
+		writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
+		return
+	}
+	log.Printf("scout: probe %s → 404 not queued", shortHash(infoHash))
+	writeJSON(w, http.StatusNotFound, errBody("not_queued"), noStore)
+}
+
 func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob string, parts []string) {
 	target, ok := decodePlayToken(at(parts, 2))
 	if !ok {
@@ -357,6 +376,15 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
 	defer cancel()
 	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode}
+
+	// ?probe=1 — answer, don't act. Asking /play for an uncached release is what QUEUES it, so a client
+	// polling this URL to render a progress bar was adding the torrent again on every poll. TorBox allows
+	// 60 adds an hour; a single three-minute wait spent thirty-six of them, and the account was throttled
+	// out of playing anything at all. A probe reports what is true right now and starts nothing.
+	if r.URL.Query().Get("probe") == "1" {
+		h.handleProbe(w, ctx, pool, target.InfoHash, rt)
+		return
+	}
 
 	// Already known to be downloading? Answer from the status alone. A waiting client polls this URL for
 	// the whole fetch, and a full resolve is ~3 upstream calls (cache miss → add → link), so re-running it
