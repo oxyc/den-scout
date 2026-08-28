@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -314,10 +315,29 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 
 // writeQueued — the "it's coming" answer: 202 plus whatever the store actually reported. `etaSeconds` is
 // omitted rather than guessed when the service doesn't supply one.
-func writeQueued(w http.ResponseWriter, status StoreStatus) {
+func writeQueued(w http.ResponseWriter, hash string, status StoreStatus) {
+	// The wait, as the viewer sees it. A percentage alone can't distinguish a slow fetch from a dead
+	// swarm, so the rate is logged beside it — this is the line to read when someone says "it's stuck".
+	rate := "unknown"
+	if status.BytesPerSecond != nil {
+		rate = fmt.Sprintf("%.1f Mbps", float64(*status.BytesPerSecond)*8/1e6)
+	}
+	eta := "none"
+	if status.ETASeconds != nil {
+		eta = fmt.Sprintf("%ds", *status.ETASeconds)
+	}
+	log.Printf("scout: play %s → 202 downloading %.1f%% at %s, eta %s",
+		shortHash(hash), status.Progress*100, rate, eta)
+	writeQueuedBody(w, status)
+}
+
+func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 	body := map[string]any{"state": "downloading", "progress": status.Progress}
 	if status.ETASeconds != nil {
 		body["etaSeconds"] = *status.ETASeconds
+	}
+	if status.BytesPerSecond != nil {
+		body["bytesPerSecond"] = *status.BytesPerSecond
 	}
 	writeJSON(w, http.StatusAccepted, body, noStore)
 }
@@ -343,7 +363,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// per poll is how an account gets itself throttled — and a throttled 5xx is exactly what a client
 	// cannot distinguish from a real answer.
 	if status, ok := pool.Status(ctx, rt); ok {
-		writeQueued(w, status)
+		writeQueued(w, target.InfoHash, status)
 		return
 	}
 
@@ -368,7 +388,17 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(r.Context()), statusBudget)
 		defer statusCancel()
 		if status, ok := pool.Status(statusCtx, rt); ok {
-			writeQueued(w, status)
+			writeQueued(w, target.InfoHash, status)
+			return
+		}
+		// A debrid that throttled or faulted is not a dead release, and answering 404 made the two
+		// identical: the client fell through every remaining source collecting the same non-answer, then
+		// waited indefinitely on a download nothing had started. 503 says whose problem it is.
+		var unavailable *StoreUnavailableError
+		if errors.As(err, &unavailable) {
+			log.Printf("scout: play %s → 503, %v", shortHash(target.InfoHash), err)
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]any{"error": "store_unavailable", "service": unavailable.Service}, noStore)
 			return
 		}
 		// The client reads this 404 as "still fetching" and polls for as long as the viewer will sit

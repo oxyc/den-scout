@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -49,6 +50,10 @@ type Store interface {
 type StoreStatus struct {
 	Progress   float64
 	ETASeconds *int
+	// Bytes per second the service reports for this fetch. A percentage that moves slowly and one that
+	// has stopped look identical for minutes; the rate says which immediately, and zero says "stalled"
+	// while there is still time to pick something else.
+	BytesPerSecond *int64
 }
 
 // errCheckFailed marks a cache check that could not reach the store at all.
@@ -58,6 +63,25 @@ var errCheckFailed = &DeadLinkError{"cache check failed"}
 type DeadLinkError struct{ Reason string }
 
 func (e *DeadLinkError) Error() string { return "dead_link: " + e.Reason }
+
+// StoreUnavailableError — the SERVICE refused us, which says nothing about the release. A rate limit or a
+// 5xx answered as 404 told the client "this release is dead" and it fell through every remaining source
+// getting the same answer, then sat on a wait for a download nobody had started. Distinct so the route can
+// answer 503 and the app can say the debrid is the problem.
+type StoreUnavailableError struct {
+	Service DebridService
+	Reason  string
+}
+
+func (e *StoreUnavailableError) Error() string {
+	return "store_unavailable: " + string(e.Service) + " " + e.Reason
+}
+
+// storeRefusedUs reports whether an HTTP status is the service declining to serve this account right now —
+// a throttle or a fault on their side — rather than a verdict about the torrent.
+func storeRefusedUs(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
 
 func magnetFor(infoHash string) string { return "magnet:?xt=urn:btih:" + infoHash }
 
@@ -157,6 +181,15 @@ func torrentIDKey(token, infoHash string) string {
 	return "torbox:torrent:" + keyHash(token) + ":" + infoHash
 }
 
+// refusedKey marks a hash the service just declined to add for this account, so polls stop re-asking.
+func refusedKey(token, infoHash string) string {
+	return "torbox:refused:" + keyHash(token) + ":" + infoHash
+}
+
+// How long to stop asking after the service refuses. Long enough that a poll loop can't sustain a
+// throttle, short enough that a passing 500 doesn't cost the viewer a real wait.
+const refusalBackoff = time.Minute
+
 type torboxResolveEntry struct {
 	TorrentID int           `json:"torrentId"`
 	Files     []TorrentFile `json:"files"`
@@ -184,8 +217,21 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		}
 	}
 
+	// A client polls /play every few seconds for the whole fetch, and every poll that got this far ran a
+	// fresh createtorrent. Once TorBox starts throttling, that loop is what keeps it throttled: the add
+	// fails, nothing is cached, and the next poll adds again. Back off for a minute after a refusal so a
+	// wait costs one call rather than one per poll.
+	if s.cache != nil {
+		if reason, ok := s.cache.Get(refusedKey(s.token, t.InfoHash)); ok {
+			return "", &StoreUnavailableError{ServiceTorBox, reason + " (backing off)"}
+		}
+	}
 	torrentID, err := s.addMagnet(ctx, t.InfoHash)
 	if err != nil {
+		var unavailable *StoreUnavailableError
+		if errors.As(err, &unavailable) && s.cache != nil {
+			s.cache.Put(refusedKey(s.token, t.InfoHash), unavailable.Reason, refusalBackoff)
+		}
 		return "", err
 	}
 	var files []TorrentFile
@@ -220,6 +266,10 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if storeRefusedUs(resp.StatusCode) {
+		return 0, &StoreUnavailableError{ServiceTorBox,
+			fmt.Sprintf("createtorrent http %d", resp.StatusCode)}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d", resp.StatusCode)}
 	}
@@ -271,6 +321,7 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 		Progress         *float64 `json:"progress"`
 		DownloadFinished *bool    `json:"download_finished"`
 		ETA              *int     `json:"eta"`
+		DownloadSpeed    *int64   `json:"download_speed"`
 	}
 	var st entryState
 	if len(body.Data) == 0 || json.Unmarshal(body.Data, &st) != nil {
@@ -294,6 +345,10 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 	}
 	if st.ETA != nil && *st.ETA > 0 {
 		out.ETASeconds = st.ETA
+	}
+	// Zero is meaningful here — it is the stall — so only a missing or negative figure is dropped.
+	if st.DownloadSpeed != nil && *st.DownloadSpeed >= 0 {
+		out.BytesPerSecond = st.DownloadSpeed
 	}
 	return out, true
 }
@@ -409,6 +464,9 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if storeRefusedUs(resp.StatusCode) {
+		return "", &StoreUnavailableError{ServiceTorBox, fmt.Sprintf("requestdl http %d", resp.StatusCode)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", &DeadLinkError{fmt.Sprintf("torbox requestdl http %d", resp.StatusCode)}
 	}
@@ -824,12 +882,22 @@ func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error
 // release nobody is seeding: the client waits on a download the service was never asked to start.
 func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	preferred []DebridService) (string, error) {
+	var refused error
 	for _, st := range p.ordered(preferred) {
 		link, err := st.Resolve(ctx, t)
 		if err == nil {
 			return link, nil
 		}
 		log.Printf("scout: %s could not resolve %s: %v", st.Service(), shortHash(t.InfoHash), err)
+		// A service refusing US outranks a dead link as an explanation: if even one store was throttled
+		// or faulting, "this release is dead" is not a conclusion the evidence supports.
+		var unavailable *StoreUnavailableError
+		if errors.As(err, &unavailable) && refused == nil {
+			refused = err
+		}
+	}
+	if refused != nil {
+		return "", refused
 	}
 	return "", &DeadLinkError{"no store could resolve"}
 }
