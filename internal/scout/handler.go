@@ -716,7 +716,10 @@ func etagMatches(ifNoneMatch, etag string) bool {
 func splitCached(v string) (complete bool, etag, body string) {
 	first := strings.IndexByte(v, '\x00')
 	if first < 0 {
-		return true, "", v
+		// No separator at all: completeness unknown, so the same conservative answer as the legacy
+		// one-separator case below. Claiming completeness here while denying it three lines down would be
+		// two answers to one question.
+		return false, "", v
 	}
 	rest := v[first+1:]
 	second := strings.IndexByte(rest, '\x00')

@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1223,5 +1224,115 @@ func TestStoreRefusedUs_coversAnExpiredKey(t *testing.T) {
 	}
 	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "stale")); left < 49 {
 		t.Errorf("a stale key drained the allowance to %d", left)
+	}
+}
+
+// A pack Premiumize ALREADY HOLDS costs nothing, even when it cannot serve the episode asked for.
+//
+// The refund sat behind the file-selection checks, so the two failures a season pack actually produces —
+// the pack does not contain the requested episode, or the entry carries no link — returned before it.
+// Every poll charged another add while queueing nothing: twenty polls, twenty adds, the hourly allowance
+// gone in under two minutes, on the branch season packs always take. The movie branch was fine, and the
+// movie branch was all that was tested.
+func TestPremiumize_aHeldPackCostsNothingEvenWhenItCannotServeTheEpisode(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	// The account holds this pack; it just does not contain S01E09.
+	d := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		return resp(200, `{"status":"success","content":[
+			{"path":"Show.S01E01.mkv","link":"https://pm/1","size":9},
+			{"path":"Show.S01E02.mkv","link":"https://pm/2","size":9}]}`), nil
+	}}
+	s := &premiumizeStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: premiumizeAPI}
+	for i := 0; i < 20; i++ {
+		if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(9)}); err == nil {
+			t.Fatal("the pack does not hold that episode; it must not resolve")
+		}
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "tok")); left != 50 {
+		t.Errorf("allowance %d after twenty polls of a pack the account already holds", left)
+	}
+}
+
+// A key the service refuses is an ACCOUNT condition, so it backs the account off — not one release at a
+// time while every other release pays for the same 403.
+//
+// Keyed per infohash, sixty distinct releases made fifty calls and emptied the hourly allowance, and
+// replacing the key did not restore service because the budget stayed spent for the rest of the hour.
+func TestStoreRefusal_aRejectedKeyBacksOffTheWholeAccount(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	calls := 0
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: "stale", client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		calls++
+		return resp(403, `{"status":"error","message":"invalid apikey"}`), nil
+	}}, cache: cache, api: premiumizeAPI}
+
+	for i := 0; i < 60; i++ { // sixty DIFFERENT releases, as a browse would produce
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: fmt.Sprintf("%040x", i)})
+	}
+	if calls != 1 {
+		t.Errorf("asked a service that had rejected the key %d times", calls)
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "stale")); left < 49 {
+		t.Errorf("a rejected key drained the allowance to %d; replacing it would not restore service", left)
+	}
+	// A per-release refusal must still be per-release, or one dead torrent silences the account.
+	perRelease := NewMemoryCache(1 << 20)
+	recordRefusal(perRelease, ServiceTorBox, "tok", H, &StoreUnavailableError{ServiceTorBox, "createtorrent http 429"})
+	if _, off := backedOff(perRelease, ServiceTorBox, "tok", repeat("c", 40)); off {
+		t.Error("a 429 about one release backed off the whole account")
+	}
+}
+
+// The give-up deadline sits strictly inside the marker's life, or it can never be reached: the marker
+// expires first, the next poll queues the same doomed transfer, and "coming" becomes absorbing again.
+func TestPremiumize_giveUpHappensBeforeTheMarkerExpires(t *testing.T) {
+	if pendingGiveUp >= queuedTTL {
+		t.Fatalf("pendingGiveUp (%s) must be shorter than queuedTTL (%s), or the deadline is unreachable",
+			pendingGiveUp, queuedTTL)
+	}
+	cache := NewMemoryCache(1 << 20)
+	// Stamped a moment ago: still believable.
+	cache.Put(pmQueuedKey("tok", H), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+	if pendingTooLong(cache, "tok", H) {
+		t.Error("a transfer queued seconds ago has not had its chance yet")
+	}
+	// Stamped just inside the marker's life but past the deadline: no longer believable, and reachable.
+	old := time.Now().Add(-(queuedTTL - time.Minute))
+	cache.Put(pmQueuedKey("tok", H), strconv.FormatInt(old.Unix(), 10), queuedTTL)
+	if !pendingTooLong(cache, "tok", H) {
+		t.Error("a transfer still marked but long past its deadline is being reported as coming")
+	}
+}
+
+// Giving up on a stuck transfer is REMEMBERED, not merely reached.
+//
+// Without that, the marker expired at queuedTTL and the next poll queued the same doomed transfer for
+// another ten-minute window — and the client keeps polling a release it was told was dead, so it would.
+func TestPremiumize_theGiveUpVerdictIsRemembered(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `{"status":"success","content":[]}`), nil
+		}}}
+	// Queued long ago and still producing nothing.
+	old := time.Now().Add(-(queuedTTL - time.Minute))
+	cache.Put(pmQueuedKey("tok", H), strconv.FormatInt(old.Unix(), 10), queuedTTL)
+
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err == nil {
+		t.Fatal("a transfer past its deadline is not a success")
+	}
+	if _, off := backedOff(cache, ServicePremiumize, "tok", H); !off {
+		t.Error("the verdict was reached and thrown away; the next marker lifetime queues it all over again")
 	}
 }

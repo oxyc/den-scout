@@ -638,3 +638,21 @@ func TestSplitCached_readsAnOlderEntryConservatively(t *testing.T) {
 		t.Errorf("body with a separator was truncated: %q", weird)
 	}
 }
+
+// A cached value with NO separator has no completeness recorded either, and must be read the same
+// conservative way as the legacy one-separator form. Two answers to one question is how the format got
+// into trouble in the first place.
+func TestSplitCached_treatsEveryUnknownFormTheSameWay(t *testing.T) {
+	bare, oneSep := "just-a-body", "etag\x00body"
+	bareComplete, _, bareBody := splitCached(bare)
+	sepComplete, _, _ := splitCached(oneSep)
+	if bareComplete != sepComplete {
+		t.Errorf("unknown completeness answered %v with no separator and %v with one", bareComplete, sepComplete)
+	}
+	if bareComplete {
+		t.Error("completeness that was never recorded must not be assumed")
+	}
+	if bareBody != bare {
+		t.Errorf("a separator-less value must be served whole: %q", bareBody)
+	}
+}

@@ -475,12 +475,35 @@ func refusedKey(svc DebridService, token, infoHash string) string {
 	return string(svc) + ":refused:" + keyHash(token) + ":" + infoHash
 }
 
-// backedOff — this account was turned away for this hash a moment ago, with the reason.
+// accountRefusedKey — the service turned this ACCOUNT away, whatever was asked for.
+//
+// An expired or wrong API key is not a fact about one release, and remembering it per infohash meant a
+// stale token backed off one hash while the next release paid for the same 403 again: sixty releases,
+// fifty calls, the whole hourly allowance gone, and replacing the key did not restore service because
+// the budget stayed spent for the rest of the hour.
+func accountRefusedKey(svc DebridService, token string) string {
+	return string(svc) + ":refused-account:" + keyHash(token)
+}
+
+// backedOff — this account was turned away a moment ago, for this hash or outright.
 func backedOff(cache Cache, svc DebridService, token, infoHash string) (string, bool) {
 	if cache == nil {
 		return "", false
 	}
+	if reason, ok := cache.Get(accountRefusedKey(svc, token)); ok {
+		return reason, true
+	}
 	return cache.Get(refusedKey(svc, token, infoHash))
+}
+
+// refusalIsAboutTheAccount — a status the service returns about WHO is asking, not about what was asked
+// for. Anything else is remembered per release.
+func refusalIsAboutTheAccount(err error) bool {
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) {
+		return false
+	}
+	return strings.Contains(unavailable.Reason, "401") || strings.Contains(unavailable.Reason, "403")
 }
 
 // errScoutSide marks a refusal SCOUT made — its hourly allowance, or an add it already has in flight —
@@ -510,6 +533,11 @@ func scoutSideReason(err error) string {
 // be concluded from it.
 func recordRefusal(cache Cache, svc DebridService, token, infoHash string, err error) {
 	if cache == nil || isCancellation(err) || errors.Is(err, errScoutSide) || errors.Is(err, errAddInFlight) {
+		return
+	}
+	if refusalIsAboutTheAccount(err) {
+		cache.Put(accountRefusedKey(svc, token), refusalReason(err), refusalBackoff)
+		log.Printf("scout: %s refused the account itself (%s) — check the key", svc, refusalReason(err))
 		return
 	}
 	cache.Put(refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff)
@@ -1434,11 +1462,29 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		// cannot fall through to another release while it is being told one is on its way. Past the
 		// window the answer becomes a dead link, which is what it has turned out to be.
 		if pendingTooLong(s.cache, s.token, t.InfoHash) {
-			return "", &DeadLinkError{"premiumize queued this transfer and never produced anything"}
+			// Remember the verdict, not just reach it. Without this the marker expired at queuedTTL and
+			// the next poll queued the same doomed transfer again for another ten-minute window — and the
+			// client keeps polling a release it was told was dead, so it would.
+			dead := &DeadLinkError{"premiumize queued this transfer and never produced anything"}
+			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
+			return "", dead
 		}
 		return "", fmt.Errorf("%w: %w", errAddInFlight,
 			&StoreUnavailableError{ServicePremiumize, "the transfer is queued and has nothing to serve yet"})
 	}
+	// Content came back, so the account HOLDS this release: nothing was queued and this call was a read.
+	// The refund belongs HERE, before anything can return. Behind the file-selection checks below it was
+	// skipped by the two failures a season pack actually produces — the pack does not contain the
+	// requested episode, or the chosen entry carries no link — so every poll of such a pack charged
+	// another add while queueing nothing. Twenty polls, twenty adds, the hourly allowance gone in under
+	// two minutes, on the branch season packs always take.
+	//
+	// The transfer is likewise no longer pending, whatever we go on to make of its contents.
+	if !queued {
+		refundUnusedAdd(ServicePremiumize, s.token)
+	}
+	settleQueuedTransfer(s.cache, s.token, t.InfoHash)
+
 	files := make([]TorrentFile, len(body.Content))
 	for i, c := range body.Content {
 		files[i] = TorrentFile{Index: i, Name: c.Path, SizeBytes: c.Size}
@@ -1450,13 +1496,6 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if idx == nil || *idx < 0 || *idx >= len(body.Content) || body.Content[*idx].Link == "" {
 		return "", &DeadLinkError{"premiumize no link"}
 	}
-	// It has something to serve, so this call was a read, not a purchase: give the charge back. And the
-	// transfer is no longer pending, so a much later request is free to pay for it again if Premiumize
-	// has since dropped it.
-	if !queued {
-		refundUnusedAdd(ServicePremiumize, s.token)
-	}
-	settleQueuedTransfer(s.cache, s.token, t.InfoHash)
 	return body.Content[*idx].Link, nil
 }
 
