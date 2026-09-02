@@ -1681,9 +1681,14 @@ func (s *realDebridStore) pickFileID(files []TorrentFile, t ResolveTarget) (*int
 	// An index out of range is the indexer describing a file list that is not this one — it arrives
 	// unvalidated from the scrape and is never checked against what the debrid actually holds. Falling
 	// back to files[0] handed back whatever sorted first, which on a release with a Sample/ directory is
-	// the sample: a stream that plays, for one second. The largest file is the same guess Premiumize
-	// makes and the better one, and it is the answer for "no index at all" here already.
-	idx := largest(files).Index
+	// the sample: a stream that plays, for one second. The largest is the same guess Premiumize makes and
+	// the better one, and it is the answer for "no index at all" here already.
+	//
+	// Largest VIDEO, not largest file. pickEpisodeFile used to end in this same fallback over its
+	// video-only pool, so this tail was unreachable for a multi-file unlabelled pack; moving the fallback
+	// out here exposed it, and a pack whose biggest entry is a .iso or a .rar then resolved to that, with
+	// a 302 and no error.
+	idx := largestPlayable(files).Index
 	return &idx, nil
 }
 
@@ -1973,7 +1978,9 @@ func (s *premiumizeStore) pickIndex(files []TorrentFile, t ResolveTarget) (*int,
 	if t.FileIdx != nil && *t.FileIdx >= 0 && *t.FileIdx < len(files) {
 		return t.FileIdx, nil
 	}
-	idx := largest(files).Index
+	// Largest VIDEO — see the note on RD's tail: this fallback was unreachable for an unlabelled pack
+	// until pickEpisodeFile stopped answering for one, and it picks from every file, .iso included.
+	idx := largestPlayable(files).Index
 	return &idx, nil
 }
 

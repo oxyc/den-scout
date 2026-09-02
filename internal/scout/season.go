@@ -30,6 +30,11 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 		// makes "720" (S7E20) match "720p", so exclude those as well as a following digit.
 		fmt.Sprintf(`\b%d%02d(?![\dpi])`, season, episode),
 		fmt.Sprintf(`\b%02d%02d(?![\dpi])`, season, episode),
+		// The episode number standing alone as its own token: `[Grp] Show - 03 [1080p].mkv`, which is how
+		// most anime and a good deal of TV is packed. The delimiters must be real separators rather than
+		// "any non-digit", or `[Group8]` matches episode 8 — and the token must be the WHOLE digit run,
+		// which is what keeps 1080p, 720p, x264 and a year out of it.
+		fmt.Sprintf(`(?:^|[ ._\-\[\]()])0*%d(?:[ ._\-\[\]()]|$)`, episode),
 	}
 	out := make([]*regexp2.Regexp, 0, len(specs))
 	for _, s := range specs {
@@ -62,6 +67,12 @@ var errEpisodeNotInTorrent = errors.New("torrent holds no file for that episode"
 // the mismatch below is claimed only when a filename really does name a different episode.
 var labelledEpisodeRe = mustRE2(`(s\d{1,2}[ ._-]*e\d{1,3}|\b\d{1,2}x\d{2}\b|season[ ._-]*\d{1,2}[ ._-]*episode[ ._-]*\d{1,3})`)
 
+// bareNumberRe — does a filename carry a standalone 1-3 digit token, the `[Grp] Show - 03 [1080p].mkv`
+// shape? On its own that says nothing: a film can be "Part 2". Across a POOL it says a great deal, which
+// is why the caller counts rather than tests. The token must be the whole digit run between real
+// separators, so a year, 1080p, 720p, x264 and `[Group8]` are all excluded.
+var bareNumberRe = mustRE2(`(^|[ ._\-\[\]()])\d{1,3}([ ._\-\[\]()]|$)`)
+
 // pickEpisodeFile picks the file index for an episode: an SxxExx match among video files (largest on
 // ties), else the largest video file.
 //
@@ -77,20 +88,28 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 
 	patterns := episodePatterns(season, episode)
 	var matched []TorrentFile
-	labelled := false
+	labelled, numbered := false, 0
 	for _, f := range pool {
+		name := strings.ToLower(f.Name)
 		if matchesEpisode(f.Name, patterns) {
 			matched = append(matched, f)
 		}
-		if labelledEpisodeRe.match(strings.ToLower(f.Name)) {
+		if labelledEpisodeRe.match(name) {
 			labelled = true
+		}
+		if bareNumberRe.match(name) {
+			numbered++
 		}
 	}
 	if len(matched) > 0 {
 		idx := largest(matched).Index
 		return &idx, nil
 	}
-	if labelled {
+	// TWO or more files each carrying a standalone number is a numbered pack, and a pack that does not
+	// hold the episode asked for holds nothing to play — the same verdict a SxxExx pack gets. One such
+	// file is not evidence of anything ("Movie.Part.2.mkv" is a film), which is why the count matters:
+	// it makes the pack the subject, not the filename.
+	if labelled || numbered > 1 {
 		return nil, errEpisodeNotInTorrent
 	}
 	// No opinion, rather than a guess. The fallback below is sound only for a pool of ONE, where "the
@@ -131,4 +150,14 @@ func largest(files []TorrentFile) TorrentFile {
 		}
 	}
 	return best
+}
+
+// largestPlayable is largest() over the files that could be the feature — the same video-only pool
+// pickEpisodeFile picks from, so a store falling back on its own reaches the same kind of answer. Picking
+// over every file instead served a pack's `.iso` or `.rar` as the episode: a 302, no error, no video.
+func largestPlayable(files []TorrentFile) TorrentFile {
+	if pool := episodeFilePool(files); len(pool) > 0 {
+		return largest(pool)
+	}
+	return largest(files)
 }

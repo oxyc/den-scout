@@ -248,3 +248,71 @@ func TestDeadLinkErrorMessage(t *testing.T) {
 		t.Errorf("Error() = %q", got)
 	}
 }
+
+// The per-store fallbacks pick from the VIDEOS, the same pool pickEpisodeFile uses. RD's and Premiumize's
+// tails picked over every file, which was unreachable while pickEpisodeFile answered for an unlabelled
+// pack — and the moment it stopped, a pack whose biggest entry is an .iso resolved to that: a 302, no
+// error, no video.
+func TestStores_theFallbackNeverPicksANonVideo(t *testing.T) {
+	files := []TorrentFile{
+		file(0, "Show.S01.Extras.iso", 9000),
+		file(1, "Show.1080p.mkv", 4000),
+		file(2, "Sample/sample.mkv", 2),
+	}
+	for _, tc := range []struct {
+		name string
+		pick func(ResolveTarget) (*int, error)
+		// TorBox is excluded from the out-of-range case on purpose: an index past the list is handed back
+		// as a raw TorBox file id there, which is its own documented id space rather than a slice offset.
+		outOfRangeFallsBack bool
+	}{
+		{"torbox", func(t ResolveTarget) (*int, error) { return selectFileID(files, t) }, false},
+		{"realdebrid", func(t ResolveTarget) (*int, error) { return (&realDebridStore{}).pickFileID(files, t) }, true},
+		{"premiumize", func(t ResolveTarget) (*int, error) { return (&premiumizeStore{}).pickIndex(files, t) }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			targets := []ResolveTarget{{InfoHash: H, Season: intp(1), Episode: intp(3)}}
+			if tc.outOfRangeFallsBack {
+				targets = append(targets, ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(3), FileIdx: idx(42)})
+			}
+			for _, target := range targets {
+				got, err := tc.pick(target)
+				wantPick(t, got, err, 1, "the feature, not the .iso")
+			}
+		})
+	}
+	// A pool with no video at all still has to answer with something rather than nothing.
+	onlyOther := []TorrentFile{file(0, "Show.iso", 10), file(1, "Show.big.iso", 9000)}
+	got, err := (&realDebridStore{}).pickFileID(onlyOther, ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(3)})
+	wantPick(t, got, err, 1, "with no video anywhere, the largest is all there is")
+}
+
+// A pack numbered the way most anime and much TV is packed. The episode is found by its own number, and
+// a pack that does not hold the episode asked for is refused rather than answered with its biggest file
+// — the same verdict a SxxExx pack gets, reached by the evidence that a POOL of numbered files is a pack.
+func TestPickEpisodeFile_bareNumberedPacks(t *testing.T) {
+	pack := []TorrentFile{
+		file(0, "[Grp] Show - 01 [1080p].mkv", 900),
+		file(1, "[Grp] Show - 02 [1080p].mkv", 4000), // the largest: what the old fallback served
+		file(2, "[Grp] Show - 03 [1080p].mkv", 950),
+	}
+	got, err := pickEpisodeFile(pack, 1, 3)
+	wantPick(t, got, err, 2, "the episode is named by its own number")
+	got, err = pickEpisodeFile(pack, 1, 1)
+	wantPick(t, got, err, 0, "and so is the first one")
+	got, err = pickEpisodeFile(pack, 1, 9)
+	wantNotInTorrent(t, got, err, "a numbered pack that lacks the episode holds nothing to play")
+
+	// The guards that keep this from firing on anything with digits in it.
+	for _, f := range []TorrentFile{
+		file(0, "Movie.2019.1080p.BluRay.x264.mkv", 8000),
+		file(0, "[Group8] Feature [720p].mkv", 8000),
+	} {
+		got, err := pickEpisodeFile([]TorrentFile{f}, 1, 8)
+		wantPick(t, got, err, 0, "a lone release is not a numbered pack: "+f.Name)
+	}
+	// One numbered file is not a pack either — a film can be "Part 2".
+	single := []TorrentFile{file(0, "Some.Film.Part.2.mkv", 8000)}
+	got, err = pickEpisodeFile(single, 1, 7)
+	wantPick(t, got, err, 0, "a single numbered file still falls back")
+}
