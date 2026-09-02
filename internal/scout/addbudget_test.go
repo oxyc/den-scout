@@ -431,8 +431,15 @@ func TestAddInFlight_isScoutSideNotTheStores(t *testing.T) {
 	if err == nil {
 		t.Fatal("an add in flight must be reported")
 	}
-	if !errors.Is(err, errScoutSide) {
-		t.Errorf("the in-flight marker is scout's own bookkeeping: %v", err)
+	// Its own sentinel, not the budget's: an add in flight means the release IS being fetched, so the
+	// route answers 202 "coming", where a spent allowance answers 503 "not now". Sharing errScoutSide
+	// made both come out as a refusal, and the client stopped trying other sources for a release scout
+	// had queued itself.
+	if !errors.Is(err, errAddInFlight) {
+		t.Errorf("an add in flight needs its own sentinel, not the budget's: %v", err)
+	}
+	if errors.Is(err, errScoutSide) {
+		t.Error("an add in flight is not a refusal; conflating them loses the 202")
 	}
 	recordRefusal(cache, ServiceTorBox, "tok", H, err)
 	if _, remembered := backedOff(cache, ServiceTorBox, "tok", H); remembered {
@@ -585,5 +592,114 @@ func TestNoteAddAttempt_clearsTheTorrentMissMarker(t *testing.T) {
 	noteAddAttempt(cache, ServiceTorBox, "tok", H)
 	if _, stillMissing := cache.Get(torrentMissKey("tok", H)); stillMissing {
 		t.Error("the miss marker outlived the add that disproves it; Status cannot see the new torrent")
+	}
+}
+
+// Only a definitive "no such torrent" forgets a remembered id. Everything else says nothing about what
+// the account holds, and re-buying on it costs an add per poll.
+//
+// Measured before this: ten polls of ONE already-downloaded release cost ten adds, because a cancelled
+// poll erased the id, the re-add re-created the torrent, the next Status found it and cleared the
+// in-flight marker meant to stop the loop, and round it went.
+func TestKnownTorrentID_onlyAConfirmedAbsenceForgetsTheID(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		respond func() (*http.Response, error)
+	}{
+		{"cancelled poll", func() (*http.Response, error) { return nil, context.Canceled }},
+		{"throttled", func() (*http.Response, error) { return resp(429, `{"error":"RATE"}`), nil }},
+		{"server fault", func() (*http.Response, error) { return resp(500, `{}`), nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			adds := 0
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if isAddEndpoint(r) {
+					adds++
+					return resp(200, `{"data":{"torrent_id":77}}`), nil
+				}
+				if strings.Contains(r.URL.Path, "mylist") {
+					return resp(200, `{"data":[]}`), nil
+				}
+				return tc.respond() // requestdl on the held torrent
+			}}
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+			s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+			for i := 0; i < 10; i++ {
+				_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0)})
+			}
+			if adds != 0 {
+				t.Errorf("%d adds for a held torrent after a %s — this says nothing about what the account has", adds, tc.name)
+			}
+			if raw, _ := cache.Get(torrentIDKey("tok", H)); raw != "42" {
+				t.Errorf("the id was forgotten on a %s: %q", tc.name, raw)
+			}
+		})
+	}
+}
+
+// A pack that does not contain the requested episode is a PERMANENT fact about a torrent the account
+// has. Re-buying the pack to re-learn it spends an add and returns the identical refusal.
+func TestKnownTorrentID_aPackMismatchDoesNotReBuyThePack(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	adds := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if isAddEndpoint(r) {
+			adds++
+			return resp(200, `{"data":{"torrent_id":77}}`), nil
+		}
+		// The pack holds S01E01–E02 and nothing else.
+		return resp(200, `{"data":{"files":[{"id":0,"name":"Show.S01E01.mkv","size":10},{"id":1,"name":"Show.S01E02.mkv","size":20}]}}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(9)})
+	if !errors.Is(err, errEpisodeNotInTorrent) {
+		t.Fatalf("want errEpisodeNotInTorrent, got %v", err)
+	}
+	if adds != 0 {
+		t.Errorf("spent %d adds re-buying a pack to re-learn what it does not contain", adds)
+	}
+}
+
+// Every cache key that carries account state is scoped by the token.
+//
+// The comments say what happens otherwise — "would let one user's cached torrent_id be used with another
+// user's token → wrong/other-account content" — and the cache is process-global, so it is reachable.
+// Stripping keyHash(token) from any of these left the whole suite green.
+func TestCacheKeys_areScopedToTheAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  func(token string) string
+	}{
+		{"resolve", func(tok string) string { return resolveKey(tok, H) }},
+		{"torrentID", func(tok string) string { return torrentIDKey(tok, H) }},
+		{"torrentMiss", func(tok string) string { return torrentMissKey(tok, H) }},
+		{"refused", func(tok string) string { return refusedKey(ServiceTorBox, tok, H) }},
+		{"addAttempt", func(tok string) string { return addAttemptKey(ServiceTorBox, tok, H) }},
+		{"budget", func(tok string) string { return budgetAccount(ServiceTorBox, tok) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mine, theirs := tc.key("my-token"), tc.key("their-token")
+			if mine == theirs {
+				t.Fatalf("two accounts share the key %q — one user's state would be served to another", mine)
+			}
+			if strings.Contains(mine, "my-token") {
+				t.Errorf("the raw token is in the key: %q", mine)
+			}
+			if !strings.Contains(mine, keyHash("my-token")) {
+				t.Errorf("the key is not derived from the account: %q", mine)
+			}
+		})
 	}
 }

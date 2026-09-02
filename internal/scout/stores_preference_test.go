@@ -267,8 +267,16 @@ func TestCacheTruth_whatCountsAsKnown(t *testing.T) {
 		t.Error("a store confirming it HOLDS a release settles the question by itself")
 	}
 
-	// One store entirely out: excluded rather than making every hash unknown, so the survivor's answers
-	// keep their value and cachedOnly keeps filtering.
+	// Both answered, so nothing is missing.
+	if !truth.Complete() {
+		t.Error("both cache-truth stores answered; the picture is complete")
+	}
+
+	// One store entirely out. Its silence is exactly why the survivor's "no" cannot rule anything out,
+	// so the hash is NOT known — and the outage is reported separately, through Complete, so the handler
+	// can stop filtering rather than quietly serving an empty list. Dropping the down store from the
+	// count instead made the survivor authoritative: a cachedOnly request returned {"streams":[]}, with
+	// no degraded header, cached for five minutes and held for a day on stale-if-error.
 	down := &StorePool{stores: []Store{
 		namedStore{svc: ServiceTorBox, resolves: &calls}, // its check errored: no answers at all
 		namedStore{svc: ServicePremiumize, cached: map[string]bool{H: false}, resolves: &calls},
@@ -277,7 +285,10 @@ func TestCacheTruth_whatCountsAsKnown(t *testing.T) {
 	if !ok {
 		t.Fatal("one store still answered")
 	}
-	if !survivor.Known(H) {
-		t.Error("a downed store erased the answer the healthy one gave; cachedOnly would filter nothing")
+	if survivor.Known(H) {
+		t.Error("the down store may be the one holding it; the survivor's no cannot settle that")
+	}
+	if survivor.Complete() {
+		t.Error("a store that answered nothing must make the answer incomplete, or the outage is invisible")
 	}
 }

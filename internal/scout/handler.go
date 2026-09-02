@@ -271,7 +271,11 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// on any partial failure — which handed a viewer who asked for "only what plays now" releases the
 	// store had definitively said it does not hold. The coarse gate silently won over the per-hash filter
 	// that was added in the same commit to make exactly this case work.
-	truthOut := hasCacheTruth(config) && !truthOK
+	//
+	// A cache-truth store being entirely OUT is an outage too, even when the others answer normally:
+	// their replies cannot rule anything out on its behalf. Treating that as an ordinary answer let a
+	// cachedOnly request return an empty list, with no degraded header, cached for the full TTL.
+	truthOut := hasCacheTruth(config) && (!truthOK || !truth.Complete())
 	// audit #4: with no cache-truth store (RD-only), the cached-only filter would drop everything. Also
 	// skip it when the cache-truth stores are unreachable ENTIRELY (don't drop everything on a blip). A
 	// partial failure keeps the filter on — the per-hash CacheKnown check inside it drops only what is
@@ -506,11 +510,19 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 			writeQueued(w, target.InfoHash, status)
 			return
 		}
-		// A refusal SCOUT made — its hourly allowance, or an add it already has in flight — is not the
-		// debrid refusing, and must not be reported as one. errScoutSide was added to keep these apart in
-		// the refusal memory, and then the route went on saying "torbox" anyway: the app told the viewer
-		// the debrid was refusing while TorBox was answering perfectly well. Still a 503, because it is
-		// still "not now, try again", but named as ours.
+		// An add scout already sent is not a refusal at all — the release is being fetched, by us, right
+		// now. Answering 503 made the client tell the viewer their debrid was refusing AND stop trying
+		// other sources, for a release scout had queued moments earlier. 202 is simply what is true.
+		if errors.Is(err, errAddInFlight) {
+			log.Printf("scout: play %s → 202, an add is already in flight", shortHash(target.InfoHash))
+			writeQueued(w, target.InfoHash, StoreStatus{})
+			return
+		}
+		// A refusal SCOUT made — its hourly allowance — is not the debrid refusing, and must not be
+		// reported as one. errScoutSide was added to keep these apart in the refusal memory, and then the
+		// route went on saying "torbox" anyway: the app told the viewer the debrid was refusing while
+		// TorBox was answering perfectly well. Still a 503, because it is still "not now, try again", but
+		// named as ours.
 		if errors.Is(err, errScoutSide) {
 			log.Printf("scout: play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
 			writeJSON(w, http.StatusServiceUnavailable,

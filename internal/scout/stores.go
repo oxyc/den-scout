@@ -42,6 +42,23 @@ type ResolveTarget struct {
 // errWouldAdd — a NoAdd target could only be resolved by queueing the torrent, so it was not resolved.
 var errWouldAdd = &DeadLinkError{"not held by this account (add not permitted)"}
 
+// errTorrentGone — the service answered, and said it has no such torrent. The ONLY evidence that a
+// remembered torrent id is stale.
+//
+// It has to be positive evidence, because the alternative was measured: treating any failure of the
+// held path as "the torrent is gone" meant a cancelled poll erased a perfectly good id and re-bought the
+// torrent — ten polls of one already-downloaded release cost ten adds against a sixty-an-hour ceiling.
+// A cancellation, a throttle, a timeout, and a pack that lacks the requested episode say nothing at all
+// about whether the account still holds the file.
+var errTorrentGone = &DeadLinkError{"torbox no longer has this torrent"}
+
+// errAddInFlight — an add for this release is already out and unanswered, so the release IS being
+// fetched. Distinct from the hourly budget: this is per hash and per service, says nothing about the
+// account, and its honest answer is "coming", not "refused". Reported as a 503 naming the store, the
+// tvOS client told the viewer their debrid was refusing and stopped trying other sources — for a release
+// scout had itself queued moments earlier.
+var errAddInFlight = errors.New("an add for this release is already in flight")
+
 // Store is a debrid backend.
 //
 // CacheCheck returns ONLY what it learned: a hash it could not check is ABSENT from the map, which the
@@ -275,7 +292,7 @@ func addInFlight(cache Cache, svc DebridService, token, infoHash string) error {
 	if _, inFlight := cache.Get(addAttemptKey(svc, token, infoHash)); !inFlight {
 		return nil
 	}
-	return fmt.Errorf("%w: %w", errScoutSide,
+	return fmt.Errorf("%w: %w", errAddInFlight,
 		&StoreUnavailableError{svc, "scout already sent an add for this release and is awaiting the result"})
 }
 
@@ -429,7 +446,7 @@ func scoutSideReason(err error) string {
 // A cancellation is not a refusal: the caller went away, and nothing about the store or the release can
 // be concluded from it.
 func recordRefusal(cache Cache, svc DebridService, token, infoHash string, err error) {
-	if cache == nil || isCancellation(err) || errors.Is(err, errScoutSide) {
+	if cache == nil || isCancellation(err) || errors.Is(err, errScoutSide) || errors.Is(err, errAddInFlight) {
 		return
 	}
 	cache.Put(refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff)
@@ -496,12 +513,16 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		// poll, so a deleted torrent answered dead_link for at least six hours and the client blacklisted
 		// a release that had been playing an hour earlier. Before this shortcut existed, that case healed
 		// itself by falling through to the add.
-		s.forgetTorrentID(t.InfoHash)
-		log.Printf("scout: torbox no longer has %s (%v) — re-adding", shortHash(t.InfoHash), err)
-		var unavailable *StoreUnavailableError
-		if errors.As(err, &unavailable) {
-			return "", err // the service is refusing us; buying it again will not help
+		// ONLY a definitive "no such torrent" means the remembered id is stale. Anything else — a
+		// cancelled poll, a throttle, a timeout, a pack that does not contain the requested episode — is
+		// a fact about this attempt, not about what the account holds. Forgetting on all of them cost an
+		// add per poll: the re-add re-created the torrent, the next Status found it and cleared the
+		// in-flight marker meant to stop the loop, and round it went.
+		if !errors.Is(err, errTorrentGone) {
+			return "", err
 		}
+		s.forgetTorrentID(t.InfoHash)
+		log.Printf("scout: torbox no longer has %s — re-adding", shortHash(t.InfoHash))
 	}
 
 	// From here on, resolving MEANS queueing — so a caller that forbade that is answered now, before the
@@ -842,6 +863,11 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 	defer func() { _ = resp.Body.Close() }()
 	if storeRefusedUs(resp.StatusCode) {
 		return "", &StoreUnavailableError{ServiceTorBox, fmt.Sprintf("requestdl http %d", resp.StatusCode)}
+	}
+	// 404 is TorBox saying it has no such torrent — the ONE answer that means a remembered id is stale.
+	// Everything else says nothing about whether the account still holds it.
+	if resp.StatusCode == http.StatusNotFound {
+		return "", errTorrentGone
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", &DeadLinkError{fmt.Sprintf("torbox requestdl http %d", resp.StatusCode)}
@@ -1286,6 +1312,9 @@ func buildStores(config *Config, client doer, cache Cache) []Store {
 type CacheTruth struct {
 	holders map[string][]DebridService
 	known   map[string]bool
+	// complete — every configured cache-truth store answered for something. When false one of them is
+	// out, and what the others said cannot rule anything out on its behalf.
+	complete bool
 }
 
 // Cached — at least one store confirmed it holds this.
@@ -1294,6 +1323,10 @@ func (t CacheTruth) Cached(hash string) bool { return len(t.holders[hash]) > 0 }
 // Known — at least one cache-truth store gave an answer for this hash, either way. False means unknown,
 // which is NOT the same as not cached.
 func (t CacheTruth) Known(hash string) bool { return t.known[hash] }
+
+// Complete — every cache-truth store answered. False means one is out, which makes the whole answer
+// degraded even where the surviving store's replies look perfectly ordinary.
+func (t CacheTruth) Complete() bool { return t.complete }
 
 // HeldBy — the services that confirmed they hold it, in configured priority order. Resolving against
 // anything outside this list may add the torrent rather than fetch it.
@@ -1329,7 +1362,7 @@ func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (CacheTruth
 	// Store order, so a hash several services hold lists them in configured priority.
 	truthOK := false
 	answers := make(map[string]int, len(hashes))
-	cacheTruthStores := 0
+	cacheTruthStores, answeredStores := 0, 0
 	for i, m := range maps {
 		if !isCacheTruthService(p.stores[i].Service()) {
 			for hash, cached := range m {
@@ -1339,16 +1372,17 @@ func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (CacheTruth
 			}
 			continue
 		}
-		// A cache-truth store that answered for NOTHING is OUT, not silent about each hash in turn. It is
-		// left out of the count below rather than making every hash unknown — counting it erased what the
-		// healthy store positively confirmed, left `cachedOnly` filtering nothing at all, and made every
-		// response permanently degraded and uncacheable while one account's check was down. `truthOut`
-		// and the degraded flag are how an outage gets reported; this is how the survivor's answers keep
-		// their value.
+		cacheTruthStores++
+		// A store that answered for NOTHING is out. It STAYS in the denominator below — its silence is
+		// exactly why a "no" from the others cannot rule anything out — and the outage is reported
+		// separately through Complete, so the handler stops filtering rather than quietly serving an
+		// empty list. Dropping it from the denominator instead made the survivor's "no" authoritative: a
+		// cachedOnly request came back `{"streams":[]}` with no degraded header, cached for five minutes
+		// and held for a day on stale-if-error. A visible no-op is a far better failure than that.
 		if len(m) == 0 {
 			continue
 		}
-		cacheTruthStores++
+		answeredStores++
 		truthOK = true
 		for hash, cached := range m {
 			// Presence in the map is the store's claim to have answered for that hash.
@@ -1371,6 +1405,7 @@ func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (CacheTruth
 			truth.known[hash] = true
 		}
 	}
+	truth.complete = answeredStores == cacheTruthStores
 	return truth, truthOK
 }
 

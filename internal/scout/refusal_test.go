@@ -454,3 +454,32 @@ func TestResolve_noAddIsAnsweredAheadOfTheAddGuards(t *testing.T) {
 		t.Errorf("a read-only resolve was blocked by an add-path guard: %v", err)
 	}
 }
+
+// An add scout already sent is answered 202 "coming", not 503 "refused".
+//
+// The release IS being fetched — by us, moments ago. Answering 503 named the debrid and, on the tvOS
+// client, stopped it trying other sources: the viewer was told their debrid was refusing, for a release
+// scout had itself just queued.
+func TestHandlePlay_anInFlightAddIsQueuedNotRefused(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	noteAddAttempt(cache, ServiceTorBox, "tok", H) // an add went out and was abandoned
+
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+				client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+					return resp(200, `{"data":[]}`), nil // nothing queued that Status can see yet
+				}}}}
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/"+validBlob+"/play/"+encodePlayToken(PlayTarget{InfoHash: H}), nil))
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("an add already in flight is 202 coming, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "store_unavailable") {
+		t.Errorf("a release scout itself queued was reported as the debrid refusing: %s", rec.Body.String())
+	}
+}

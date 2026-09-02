@@ -448,3 +448,76 @@ func TestStream_uncheckedReleasesThatAreFilteredOutDoNotDegrade(t *testing.T) {
 		t.Errorf("served %d streams, want 1", n)
 	}
 }
+
+// One cache-truth store being entirely OUT is a degraded answer, even when the other replies normally.
+//
+// Its silence is why the survivor's "no" cannot rule anything out. Treated as an ordinary answer, a
+// cachedOnly request came back {"streams":[]} — no degraded header, cached for the full TTL and held for
+// a day on stale-if-error. An empty list is what "broken" looks like to the app.
+func TestStream_oneStoreEntirelyDownIsDegradedAndStopsFiltering(t *testing.T) {
+	held := repeat("a", 40)
+	h := NewHandler(Deps{
+		Cache:         NewMemoryCache(1 << 20),
+		ScrapeTimeout: time.Second,
+		MakeScrapers: func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				return []RawStream{{InfoHash: held, Title: "A 1080p WEB-DL", Seeders: intp(10)}}, nil
+			}}}
+		},
+		MakeStores: func(*Config) []Store {
+			return []Store{
+				// TorBox answers "I do not hold it"; Premiumize's check is down and says nothing. The
+				// release may be sitting on Premiumize, so it must not be dropped.
+				fakeStore{svc: ServiceTorBox, check: map[string]bool{held: false}},
+				fakeStore{svc: ServicePremiumize, checkErr: errCheckFailed},
+			}
+		},
+	})
+	rec := do(h, "/"+validBlob+"/stream/movie/tt5555555.json", nil)
+
+	if got := rec.Header().Get("X-Scout-Degraded"); got != "cache-check" {
+		t.Errorf("X-Scout-Degraded = %q: a store being out is not an ordinary answer", got)
+	}
+	if n := streamsLen(rec); n != 1 {
+		t.Errorf("served %d streams: cachedOnly must stop filtering when a store cannot be asked", n)
+	}
+	if cc := rec.Header().Get("cache-control"); !strings.Contains(cc, "no-store") {
+		t.Errorf("cache-control = %q: a degraded list must not be cached", cc)
+	}
+}
+
+// A store being out is degraded even when every SERVED release is confirmed held by the survivor.
+//
+// The per-hash unknown count does not catch this case: a holder's "yes" is knowledge, so `unchecked` is
+// zero and the response looks perfectly healthy — while one account's cache check is down and the list
+// may be missing everything that account alone holds. Cached for the full TTL, an outage would leave no
+// trace at all.
+func TestStream_aDownStoreIsDegradedEvenWhenEverythingServedIsKnownHeld(t *testing.T) {
+	held := repeat("a", 40)
+	h := NewHandler(Deps{
+		Cache:         NewMemoryCache(1 << 20),
+		ScrapeTimeout: time.Second,
+		MakeScrapers: func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				return []RawStream{{InfoHash: held, Title: "A 1080p WEB-DL", Seeders: intp(10)}}, nil
+			}}}
+		},
+		MakeStores: func(*Config) []Store {
+			return []Store{
+				fakeStore{svc: ServiceTorBox, check: map[string]bool{held: true}}, // a confirmed yes
+				fakeStore{svc: ServicePremiumize, checkErr: errCheckFailed},       // entirely down
+			}
+		},
+	})
+	rec := do(h, "/"+validBlob+"/stream/movie/tt6666666.json", nil)
+
+	if n := streamsLen(rec); n != 1 {
+		t.Fatalf("served %d streams, want the held one", n)
+	}
+	if got := rec.Header().Get("X-Scout-Degraded"); got != "cache-check" {
+		t.Errorf("X-Scout-Degraded = %q: a store is down and nothing in the response says so", got)
+	}
+	if cc := rec.Header().Get("cache-control"); !strings.Contains(cc, "no-store") {
+		t.Errorf("cache-control = %q: a list built during an outage must not be cached", cc)
+	}
+}
