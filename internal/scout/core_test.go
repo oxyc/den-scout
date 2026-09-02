@@ -130,9 +130,17 @@ func TestPickEpisodeFile(t *testing.T) {
 	if got, err := pickEpisodeFile([]TorrentFile{{Index: 8, Name: "Show.104.mp4"}}, 1, 4); err != nil || got == nil || *got != 8 {
 		t.Errorf("104: got %v, %v", got, err)
 	}
-	// Neither name is episode-labelled, so the largest-video fallback still applies.
-	if got, err := pickEpisodeFile([]TorrentFile{{Index: 4, Name: "a.mkv", SizeBytes: intp(10)}, {Index: 5, Name: "b.mkv", SizeBytes: intp(20)}}, 9, 9); err != nil || got == nil || *got != 5 {
-		t.Errorf("no-match → largest: got %v, %v want 5", got, err)
+	// Neither name is episode-labelled and there is more than one candidate, so this function has NO
+	// opinion — the largest-video fallback moved out to the callers, where it comes after the indexer's
+	// fileIdx instead of pre-empting it. Answering here made a guess beat a fact: a non-nil result makes
+	// every caller return before FileIdx is read, so a bare-numbered pack ("[Grp] Show - 03") served the
+	// same file for every episode of it.
+	if got, err := pickEpisodeFile([]TorrentFile{{Index: 4, Name: "a.mkv", SizeBytes: intp(10)}, {Index: 5, Name: "b.mkv", SizeBytes: intp(20)}}, 9, 9); err != nil || got != nil {
+		t.Errorf("no-match on a multi-file pool → no opinion: got %v, %v", got, err)
+	}
+	// One candidate is different: there the largest really is the only thing it could be.
+	if got, err := pickEpisodeFile([]TorrentFile{{Index: 4, Name: "a.mkv", SizeBytes: intp(10)}}, 9, 9); err != nil || got == nil || *got != 4 {
+		t.Errorf("a lone unlabelled video is still the answer: got %v, %v want 4", got, err)
 	}
 	if got, err := pickEpisodeFile(nil, 1, 1); got != nil || err != nil {
 		t.Errorf("no files → nil: got %v, %v", got, err)

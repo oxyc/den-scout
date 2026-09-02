@@ -419,7 +419,68 @@ func alreadyQueued(cache Cache, token, infoHash string) bool {
 func settleAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
 	if cache != nil {
 		cache.Put(addAttemptKey(svc, token, infoHash), "", time.Nanosecond)
+		// An outcome, of any kind, ends the run of not knowing.
+		cache.Put(unknownOutcomeKey(svc, token, infoHash), "", time.Nanosecond)
 	}
+}
+
+// unknownOutcomeKey — when scout FIRST failed to learn what an add did, for this release on this
+// account. The add-attempt marker cannot answer that: it lives 90 seconds and is written afresh by every
+// new attempt, so a release whose add answer is never readable cycles marker → expiry → new charged add
+// → marker, forever. The client is shown 202 "downloading" throughout and no path ever says dead link,
+// so it cannot fall through; on RD and Premiumize, which have no Status to rediscover the torrent with,
+// that is forty duplicate torrents an hour and a viewer with nothing to do but back out.
+//
+// This is the deadline `pendingGiveUp` already gives Premiumize's queue marker — "'coming' is a claim
+// with a deadline… refreshing the marker made it an absorbing state" — applied to the sibling marker
+// that never got one.
+func unknownOutcomeKey(svc DebridService, token, infoHash string) string {
+	return string(svc) + ":unknown:" + keyHash(token) + ":" + infoHash
+}
+
+// How long "we do not know yet" stays a wait rather than a verdict. Past it the release reads as dead so
+// the client moves on; the memory itself lives longer, so the give-up is not re-litigated every 90s.
+const addGiveUp = 10 * time.Minute
+const unknownOutcomeTTL = 30 * time.Minute
+
+// noteUnknownOutcome stamps the FIRST such failure and never restamps — a clock that resets is not a
+// deadline, which is the mistake noteQueued was fixed for.
+func noteUnknownOutcome(cache Cache, svc DebridService, token, infoHash string) {
+	if cache == nil {
+		return
+	}
+	key := unknownOutcomeKey(svc, token, infoHash)
+	if raw, ok := cache.Get(key); ok && raw != "" {
+		return
+	}
+	cache.Put(key, strconv.FormatInt(time.Now().Unix(), 10), unknownOutcomeTTL)
+}
+
+// unknownTooLong reports that the outcome has been unknown for longer than anyone should be asked to wait.
+func unknownTooLong(cache Cache, svc DebridService, token, infoHash string) bool {
+	if cache == nil {
+		return false
+	}
+	raw, ok := cache.Get(unknownOutcomeKey(svc, token, infoHash))
+	if !ok || raw == "" {
+		return false
+	}
+	at, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return false
+	}
+	return time.Since(time.Unix(at, 0)) > addGiveUp
+}
+
+// unknownOutcome is what an add whose answer never arrived returns: "still coming" until the deadline,
+// then a dead link so the client can fall through to another release.
+func unknownOutcome(cache Cache, svc DebridService, token, infoHash string) error {
+	if unknownTooLong(cache, svc, token, infoHash) {
+		return &DeadLinkError{string(svc) + " never reported what its add did"}
+	}
+	noteUnknownOutcome(cache, svc, token, infoHash)
+	return fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: svc,
+		Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
 }
 
 // transportKind describes a transport failure WITHOUT its URL. `*url.Error.Error()` embeds the request
@@ -843,8 +904,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 	if readErr != nil {
 		// Marker left set on purpose: the next poll answers 202 from it rather than buying the torrent
 		// again. The charge stays too — the add was written to the wire.
-		return 0, fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServiceTorBox,
-			Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
+		return 0, unknownOutcome(s.cache, ServiceTorBox, s.token, infoHash)
 	}
 	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1229,6 +1289,17 @@ func selectFileID(files []TorrentFile, t ResolveTarget) (*int, error) {
 		}
 		return t.FileIdx, nil
 	}
+	// An episode was asked for, no filename named one, and the indexer gave no position either: the
+	// largest video is the last thing left to go on, and for the common shape — one feature plus a
+	// sample — it is right. This used to live inside pickEpisodeFile, where being non-nil made this
+	// function return before FileIdx was ever read, so a guess beat a fact. Here it is what it should be:
+	// the fallback after the fact rather than instead of it.
+	if t.Season != nil && t.Episode != nil {
+		if pool := episodeFilePool(files); len(pool) > 0 {
+			idx := largest(pool).Index
+			return &idx, nil
+		}
+	}
 	return nil, nil
 }
 
@@ -1336,8 +1407,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// store_unavailable for the next minute. RD has no Status for handlePlay to rescue it with. That is
 	// the exact confusion the guard, errScoutSide and errAddInFlight all exist to end.
 	if readErr != nil {
-		return "", fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServiceRealDebrid,
-			Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
+		return "", unknownOutcome(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	}
 	settleAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	var added struct {
@@ -1756,8 +1826,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if readErr != nil {
 		// Marker left set and the charge kept: the next poll answers 202 from the marker instead of
 		// buying the transfer again.
-		return "", fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServicePremiumize,
-			Reason: "the transfer was answered but its body could not be read, so the outcome is unknown"})
+		return "", unknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	}
 	settleAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	// Premiumize ANSWERED, and every answer below this line is one that queued nothing — so the charge
@@ -1814,15 +1883,28 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		if !queued {
 			refundUnusedAdd(ServicePremiumize, s.token)
 		}
+		// Remembered, like every other answered failure on all three stores. This branch is the one that
+		// carries Premiumize's REAL refusals — it reports an unsupported magnet, an account at its limit
+		// and "no space" as HTTP 200 with `{"status":"error"}` — and it was the only one recording
+		// nothing at all: charge handed back, no marker, no backoff, no queue note. Thirty polls made
+		// thirty real directdl calls with the allowance still at fifty, because the refund kept giving it
+		// back. Worse for an account out of space, where EVERY release answers this way: twenty healthy
+		// releases condemned as dead in sixty calls, and neither /play nor ?probe=1 ever naming
+		// Premiumize, because nothing was written for them to read.
+		//
+		// Still a dead link to the client, though. Its own words — "Invalid src" and "not enough space"
+		// need different fixes and only the text says which — and this is not a refusal of the ACCOUNT: a
+		// 401/403/429/5xx is what that looks like, and it was handled above.
+		var dead *DeadLinkError
 		if !readable {
-			return "", &DeadLinkError{"premiumize directdl answered something unreadable"}
+			dead = &DeadLinkError{"premiumize directdl answered something unreadable"}
+		} else {
+			msg := strings.TrimSpace(body.Message)
+			dead = &DeadLinkError{"premiumize directdl: " +
+				strings.TrimSpace(body.Status+" "+msg[:min(len(msg), 200)])}
 		}
-		// Its own words: "Invalid src" and "not enough space" need different fixes and only the text says
-		// which. Not a refusal of the ACCOUNT — a 401/403/429/5xx is what that looks like, and it was
-		// handled above — so this stays a dead link the client can move past.
-		msg := strings.TrimSpace(body.Message)
-		return "", &DeadLinkError{"premiumize directdl: " +
-			strings.TrimSpace(body.Status+" "+msg[:min(len(msg), 200)])}
+		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
+		return "", dead
 	}
 	if len(body.Content) == 0 {
 		// A successful answer with nothing in it: this call really did queue a transfer, so the charge

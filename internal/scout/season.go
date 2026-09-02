@@ -93,6 +93,17 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 	if labelled {
 		return nil, errEpisodeNotInTorrent
 	}
+	// No opinion, rather than a guess. The fallback below is sound only for a pool of ONE, where "the
+	// largest file is the only thing it could be" is literally true. For a multi-file pack it hands back
+	// the biggest episode as though it were the one asked for — and because a non-nil answer makes every
+	// caller return early, it also DISCARDS the indexer's fileIdx, which is a position in this very
+	// torrent and was right. That is the whole of `[Grp] Show - 03 [1080p].mkv`: a bare episode number is
+	// not one of the unambiguous forms labelledEpisodeRe accepts — it cannot be, "Movie.2019.1080p" is
+	// full of digit runs — so a standard anime/TV pack was judged unlabelled and every episode of it
+	// resolved to the same file, with a 302 and no error.
+	if len(pool) > 1 {
+		return nil, nil
+	}
 	idx := largest(pool).Index
 	return &idx, nil
 }

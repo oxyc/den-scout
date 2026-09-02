@@ -1675,20 +1675,30 @@ func TestPremiumize_aRefusedMagnetIsNotAQueuedTransfer(t *testing.T) {
 	defer func() { globalAddBudget = prev }()
 
 	cache := NewMemoryCache(1 << 20)
+	calls := 0
 	s := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
 		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			calls++
 			return resp(200, `{"status":"error","message":"Invalid src"}`), nil
 		}}}
-	var err error
-	for i := 0; i < 5; i++ {
-		_, err = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
-	}
+	// The FIRST answer is the one the viewer acts on; the polls behind it meet the backoff.
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
 	if errors.Is(err, errAddInFlight) {
 		t.Errorf("a refused magnet was reported as a transfer on its way: %v", err)
 	}
 	var dead *DeadLinkError
 	if !errors.As(err, &dead) {
 		t.Fatalf("got %v, want a dead link the client can move past", err)
+	}
+	for i := 0; i < 29; i++ {
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	// This is where the loop shows, and where an allowance assertion cannot: HTTP 200 `{"status":"error"}`
+	// is how Premiumize reports an unsupported magnet, an account at its limit and "no space", and this
+	// branch alone recorded nothing — so thirty polls made thirty real calls while the refund kept the
+	// allowance at fifty the whole way.
+	if calls > 1 {
+		t.Errorf("made %d directdl calls over 30 polls — nothing bounds the loop", calls)
 	}
 	// Its own words, so "Invalid src" and "not enough space" stay tellable apart.
 	if !strings.Contains(dead.Error(), "Invalid src") {
@@ -2654,6 +2664,83 @@ func TestStores_aCompletedAddClearsTheInFlightMarker(t *testing.T) {
 			// And the release still resolves on the next poll rather than reporting a phantom add.
 			if link, err := store.Resolve(context.Background(), ResolveTarget{InfoHash: H}); link == "" {
 				t.Errorf("%s: the second poll answered %v", st.svc, err)
+			}
+		})
+	}
+}
+
+// A pack named with bare episode numbers — `[Grp] Show - 03 [1080p].mkv`, the standard anime/TV shape —
+// is not episode-LABELLED by the only evidence test that can be trusted (a bare number cannot be, since
+// "Movie.2019.1080p" is full of digit runs). It used to fall back to the largest video, and because that
+// answer is non-nil every caller returned before reading the indexer's fileIdx — a position in this very
+// torrent, and correct. So every episode of the pack resolved to the same file, with a 302 and no error.
+func TestStores_aBareNumberedPackUsesTheIndexersFileIndex(t *testing.T) {
+	files := []TorrentFile{
+		{Index: 0, Name: "[Grp] Show - 01 [1080p].mkv", SizeBytes: intp(900)},
+		{Index: 1, Name: "[Grp] Show - 02 [1080p].mkv", SizeBytes: intp(4000)}, // the largest: the old answer
+		{Index: 2, Name: "[Grp] Show - 03 [1080p].mkv", SizeBytes: intp(950)},
+	}
+	// S01E03 is at position 2, which is exactly what the indexer said.
+	target := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(3), FileIdx: intp(2)}
+
+	got, err := selectFileID(files, target)
+	wantPick(t, got, err, 2, "torbox follows the indexer rather than the biggest file")
+	got, err = (&realDebridStore{}).pickFileID(files, target)
+	wantPick(t, got, err, 2, "realdebrid follows the indexer")
+	got, err = (&premiumizeStore{}).pickIndex(files, target)
+	wantPick(t, got, err, 2, "premiumize follows the indexer")
+
+	// With no fileIdx there is nothing better than the largest, and that fallback must survive — a
+	// feature plus a sample is the common shape and the big one is right.
+	sampled := []TorrentFile{
+		{Index: 0, Name: "Show.1080p.mkv", SizeBytes: intp(4000)},
+		{Index: 1, Name: "Sample/sample.mkv", SizeBytes: intp(2)},
+	}
+	blind := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(3)}
+	got, err = selectFileID(sampled, blind)
+	wantPick(t, got, err, 0, "torbox still prefers the feature to the sample")
+	got, err = (&realDebridStore{}).pickFileID(sampled, blind)
+	wantPick(t, got, err, 0, "realdebrid still prefers the feature")
+	got, err = (&premiumizeStore{}).pickIndex(sampled, blind)
+	wantPick(t, got, err, 0, "premiumize still prefers the feature")
+}
+
+// "The outcome is unknown" is a wait, and a wait needs a deadline. The add-attempt marker lives 90s and
+// is rewritten by every new attempt, so a release whose add answer is never readable cycled marker →
+// expiry → fresh charged add → marker, forever: the client shown 202 "downloading" throughout with no
+// path ever answering dead link, and on RD and Premiumize — which have no Status to rediscover the
+// torrent with — forty duplicate torrents an hour and a viewer with nothing to do but back out.
+func TestStores_anAddWhoseOutcomeIsNeverKnownGivesUp(t *testing.T) {
+	for _, svc := range []DebridService{ServiceRealDebrid, ServiceTorBox, ServicePremiumize} {
+		t.Run(string(svc), func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			// The first failure starts the clock and reads as "still coming".
+			first := unknownOutcome(cache, svc, "tok", H)
+			if !errors.Is(first, errAddInFlight) {
+				t.Fatalf("got %v, want the add reported as still in flight", first)
+			}
+			// Re-asking must not restamp it: a clock every poll resets is not a deadline, it is the
+			// absorbing state this exists to end. Wind it back to just inside the window, ask twenty more
+			// times, and the stamp must still be the old one.
+			aged := time.Now().Add(-addGiveUp + time.Minute)
+			cache.Put(unknownOutcomeKey(svc, "tok", H),
+				strconv.FormatInt(aged.Unix(), 10), unknownOutcomeTTL)
+			for i := 0; i < 20; i++ {
+				_ = unknownOutcome(cache, svc, "tok", H)
+			}
+			if raw, _ := cache.Get(unknownOutcomeKey(svc, "tok", H)); raw != strconv.FormatInt(aged.Unix(), 10) {
+				t.Errorf("the clock was restamped to %s — twenty polls just bought another ten minutes", raw)
+			}
+			cache.Put(unknownOutcomeKey(svc, "tok", H),
+				strconv.FormatInt(time.Now().Add(-addGiveUp-time.Minute).Unix(), 10), unknownOutcomeTTL)
+			var dead *DeadLinkError
+			if err := unknownOutcome(cache, svc, "tok", H); !errors.As(err, &dead) {
+				t.Errorf("got %v, want a dead link so the client can fall through", err)
+			}
+			// An outcome of any kind ends the run of not knowing, so the next add starts fresh.
+			settleAddAttempt(cache, svc, "tok", H)
+			if err := unknownOutcome(cache, svc, "tok", H); !errors.Is(err, errAddInFlight) {
+				t.Errorf("got %v — the give-up outlived the answer that resolved it", err)
 			}
 		})
 	}
