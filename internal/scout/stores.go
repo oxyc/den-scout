@@ -102,6 +102,13 @@ func (e *DeadLinkError) Error() string { return "dead_link: " + e.Reason }
 type StoreUnavailableError struct {
 	Service DebridService
 	Reason  string
+	// Status — the HTTP status the service answered with, when there was one. Carried rather than parsed
+	// back out of Reason: that string embeds the service's own words, including up to 200 bytes of a
+	// non-JSON body, so matching "401"/"403" in it classified a rate-limit detail ("retry in 403 ms") and
+	// a Cloudflare Ray ID as a rejected key and silenced a healthy account. Deriving a fact from prose
+	// when the fact itself is available at the call site is the same mistake isPermanentFailure was
+	// deleted for.
+	Status int
 }
 
 func (e *StoreUnavailableError) Error() string {
@@ -298,7 +305,7 @@ func addInFlight(cache Cache, svc DebridService, token, infoHash string) error {
 		return nil
 	}
 	return fmt.Errorf("%w: %w", errAddInFlight,
-		&StoreUnavailableError{svc, "scout already sent an add for this release and is awaiting the result"})
+		&StoreUnavailableError{Service: svc, Reason: "scout already sent an add for this release and is awaiting the result"})
 }
 
 // noteAddAttempt records that an add request went out, whatever comes back.
@@ -350,6 +357,17 @@ func noteQueued(cache Cache, token, infoHash string) {
 	}
 }
 
+// pendingDead is written over the queue marker once a transfer has been given up on. It keeps
+// suppressing the charge and the re-queue for the marker's full life, without ever becoming a claim
+// about the SERVICE — the give-up has to stay a dead link, or the client cannot move on.
+const pendingDead = "dead"
+
+func markPendingDead(cache Cache, token, infoHash string) {
+	if cache != nil {
+		cache.Put(pmQueuedKey(token, infoHash), pendingDead, queuedTTL)
+	}
+}
+
 // pendingTooLong — this transfer was queued long enough ago that "still coming" has stopped being a
 // credible answer, so the client should be free to try something else.
 func pendingTooLong(cache Cache, token, infoHash string) bool {
@@ -359,6 +377,9 @@ func pendingTooLong(cache Cache, token, infoHash string) bool {
 	raw, ok := cache.Get(pmQueuedKey(token, infoHash))
 	if !ok {
 		return false
+	}
+	if raw == pendingDead {
+		return true
 	}
 	at, err := strconv.ParseInt(raw, 10, 64)
 	return err == nil && time.Since(time.Unix(at, 0)) >= pendingGiveUp
@@ -503,7 +524,7 @@ func refusalIsAboutTheAccount(err error) bool {
 	if !errors.As(err, &unavailable) {
 		return false
 	}
-	return strings.Contains(unavailable.Reason, "401") || strings.Contains(unavailable.Reason, "403")
+	return unavailable.Status == http.StatusUnauthorized || unavailable.Status == http.StatusForbidden
 }
 
 // errScoutSide marks a refusal SCOUT made — its hourly allowance, or an add it already has in flight —
@@ -629,7 +650,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// wait costs one call rather than one per poll.
 	if s.cache != nil {
 		if reason, ok := backedOff(s.cache, ServiceTorBox, s.token, t.InfoHash); ok {
-			return "", &StoreUnavailableError{ServiceTorBox, reason + " (backing off)"}
+			return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 		}
 	}
 	torrentID, err := s.addMagnet(ctx, t.InfoHash)
@@ -714,8 +735,8 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		// the entire diagnosis, which is how a hard refusal came to look like a slow download.
 		detail := readStoreError(resp)
 		if storeRefusedUs(resp.StatusCode) {
-			return 0, &StoreUnavailableError{ServiceTorBox,
-				fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
+			return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+				Reason: fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
 		}
 		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d%s", resp.StatusCode, detail)}
 	}
@@ -960,7 +981,8 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if storeRefusedUs(resp.StatusCode) {
-		return "", &StoreUnavailableError{ServiceTorBox, fmt.Sprintf("requestdl http %d", resp.StatusCode)}
+		return "", &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("requestdl http %d", resp.StatusCode)}
 	}
 	// 404 is TorBox saying it has no such torrent — the ONE answer that means a remembered id is stale.
 	// Everything else says nothing about whether the account still holds it.
@@ -1060,25 +1082,28 @@ func (s *realDebridStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 }
 
 func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
+	// Already bought? Then resolve from it instead of buying it again — BEFORE any add-path guard, the
+	// way TorBox orders it. Those guards describe the cost of adding, and this path adds nothing: with
+	// the backoff first, one 401 on an unrelated release blocked every release the account already held,
+	// read-only probes included, for the whole backoff window.
+	if id, held := s.knownTorrent(t); held {
+		return s.resolveExisting(ctx, id, t)
+	}
+	if t.NoAdd {
+		return "", errWouldAdd // RD has no cache API, so resolving anything else here is an add
+	}
 	// The same backoff TorBox has. Without it, a client polling /play for the length of a download added
 	// this magnet once per poll — hundreds of adds for one wait, each leaving a duplicate torrent on the
 	// account. TorBox backing off correctly made this worse, not better: ResolvePreferring fell straight
 	// through to whichever store had no memory of being refused.
 	if reason, ok := backedOff(s.cache, ServiceRealDebrid, s.token, t.InfoHash); ok {
-		return "", &StoreUnavailableError{ServiceRealDebrid, reason + " (backing off)"}
-	}
-	if t.NoAdd {
-		return "", errWouldAdd // RD has no cache API, so every resolve here is an add
+		return "", &StoreUnavailableError{Service: ServiceRealDebrid, Reason: reason + " (backing off)"}
 	}
 	// The same in-flight guard TorBox has. Giving it to TorBox alone did not stop the cancel loop, it
 	// moved it: ResolvePreferring walks on to the store without a marker, and fifty cancelled polls shut
 	// this account's allowance instead.
 	if err := addInFlight(s.cache, ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
-	}
-	// Already bought? Then resolve from it instead of buying it again.
-	if id, held := s.knownTorrent(t); held {
-		return s.resolveExisting(ctx, id, t)
 	}
 	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
@@ -1101,8 +1126,8 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// the app as "this release does not exist", and the player walked the whole candidate list collecting
 	// the identical non-answer and condemning healthy releases on the way.
 	if storeRefusedUs(addResp.StatusCode) {
-		refused := &StoreUnavailableError{ServiceRealDebrid,
-			fmt.Sprintf("addmagnet http %d", addResp.StatusCode)}
+		refused := &StoreUnavailableError{Service: ServiceRealDebrid, Status: addResp.StatusCode,
+			Reason: fmt.Sprintf("addmagnet http %d", addResp.StatusCode)}
 		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, refused)
 		return "", refused
 	}
@@ -1391,16 +1416,20 @@ func (s *premiumizeStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 }
 
 func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
-	// The same backoff TorBox has — a poll loop must not be able to sustain a refusal here either.
-	if reason, ok := backedOff(s.cache, ServicePremiumize, s.token, t.InfoHash); ok {
-		return "", &StoreUnavailableError{ServicePremiumize, reason + " (backing off)"}
-	}
+	// NoAdd first: it costs nothing and the guards below all describe the cost of adding. TorBox orders
+	// it this way for the same reason — a read-only caller cannot have caused a backoff and must not be
+	// blocked by one.
+	//
 	// directdl queues a transfer for anything the account does not already hold, so it is an add.
 	if t.NoAdd {
 		return "", errWouldAdd
 	}
 	if err := addInFlight(s.cache, ServicePremiumize, s.token, t.InfoHash); err != nil {
 		return "", err
+	}
+	// The same backoff TorBox has — a poll loop must not be able to sustain a refusal here either.
+	if reason, ok := backedOff(s.cache, ServicePremiumize, s.token, t.InfoHash); ok {
+		return "", &StoreUnavailableError{Service: ServicePremiumize, Reason: reason + " (backing off)"}
 	}
 	// A transfer we already queued. Do NOT skip the call — directdl is the only thing that can discover
 	// the transfer finished, so blocking it made a release that completed in two minutes unresolvable for
@@ -1434,8 +1463,8 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	defer func() { _ = resp.Body.Close() }()
 	// Same rule as the other two stores: being turned away says nothing about the release.
 	if storeRefusedUs(resp.StatusCode) {
-		refused := &StoreUnavailableError{ServicePremiumize,
-			fmt.Sprintf("directdl http %d", resp.StatusCode)}
+		refused := &StoreUnavailableError{Service: ServicePremiumize, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("directdl http %d", resp.StatusCode)}
 		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
 		return "", refused
 	}
@@ -1462,15 +1491,16 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		// cannot fall through to another release while it is being told one is on its way. Past the
 		// window the answer becomes a dead link, which is what it has turned out to be.
 		if pendingTooLong(s.cache, s.token, t.InfoHash) {
-			// Remember the verdict, not just reach it. Without this the marker expired at queuedTTL and
-			// the next poll queued the same doomed transfer again for another ten-minute window — and the
-			// client keeps polling a release it was told was dead, so it would.
-			dead := &DeadLinkError{"premiumize queued this transfer and never produced anything"}
-			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
-			return "", dead
+			// Remembered in the QUEUE marker, not the refusal cache. Filing it as a store refusal made
+			// every following poll a 503 naming Premiumize — which tells the viewer their debrid is
+			// refusing and stops the client trying other sources, for a release scout itself just
+			// condemned, on a store that is answering perfectly well. The whole point of the dead link is
+			// that the client moves on; a refusal is the one answer that prevents exactly that.
+			markPendingDead(s.cache, s.token, t.InfoHash)
+			return "", &DeadLinkError{"premiumize queued this transfer and never produced anything"}
 		}
 		return "", fmt.Errorf("%w: %w", errAddInFlight,
-			&StoreUnavailableError{ServicePremiumize, "the transfer is queued and has nothing to serve yet"})
+			&StoreUnavailableError{Service: ServicePremiumize, Reason: "the transfer is queued and has nothing to serve yet"})
 	}
 	// Content came back, so the account HOLDS this release: nothing was queued and this call was a read.
 	// The refund belongs HERE, before anything can return. Behind the file-selection checks below it was

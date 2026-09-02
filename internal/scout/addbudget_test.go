@@ -1284,7 +1284,7 @@ func TestStoreRefusal_aRejectedKeyBacksOffTheWholeAccount(t *testing.T) {
 	}
 	// A per-release refusal must still be per-release, or one dead torrent silences the account.
 	perRelease := NewMemoryCache(1 << 20)
-	recordRefusal(perRelease, ServiceTorBox, "tok", H, &StoreUnavailableError{ServiceTorBox, "createtorrent http 429"})
+	recordRefusal(perRelease, ServiceTorBox, "tok", H, &StoreUnavailableError{Service: ServiceTorBox, Reason: "createtorrent http 429"})
 	if _, off := backedOff(perRelease, ServiceTorBox, "tok", repeat("c", 40)); off {
 		t.Error("a 429 about one release backed off the whole account")
 	}
@@ -1332,7 +1332,120 @@ func TestPremiumize_theGiveUpVerdictIsRemembered(t *testing.T) {
 	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err == nil {
 		t.Fatal("a transfer past its deadline is not a success")
 	}
-	if _, off := backedOff(cache, ServicePremiumize, "tok", H); !off {
-		t.Error("the verdict was reached and thrown away; the next marker lifetime queues it all over again")
+
+	// Remembered — but in the QUEUE marker, never as a store refusal. Filing it as a refusal made every
+	// following poll a 503 naming Premiumize, which tells the viewer their debrid is refusing and stops
+	// the client trying other sources — for a release scout itself condemned, on a healthy store. The
+	// whole point of the dead link is that the client moves on.
+	if _, refused := backedOff(cache, ServicePremiumize, "tok", H); refused {
+		t.Error("the give-up was filed as a store refusal; the client can no longer fall through")
+	}
+	for i := 0; i < 5; i++ {
+		_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+		var unavailable *StoreUnavailableError
+		if errors.As(err, &unavailable) {
+			t.Fatalf("poll %d blamed the store for a verdict scout reached: %v", i, err)
+		}
+		if err == nil {
+			t.Fatalf("poll %d resolved a transfer that produced nothing", i)
+		}
+	}
+	// And it is not re-queued: the marker keeps suppressing the charge for its full life.
+	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "tok")); left != 50 {
+		t.Errorf("allowance %d — a condemned transfer was queued again", left)
+	}
+}
+
+// Whether a refusal is about the ACCOUNT is decided by the status code, not by matching digits in prose.
+//
+// The reason string embeds the service's own words — including up to 200 bytes of a non-JSON body — so
+// substring-matching "401"/"403" classified a rate-limit detail ("retry in 403 ms") and a Cloudflare Ray
+// ID as a rejected key, and silenced a healthy account for a minute while logging that the key was bad.
+// Deriving a fact from prose when the fact is available at the call site is what isPermanentFailure was
+// deleted for.
+func TestRefusalIsAboutTheAccount_readsTheStatusNotTheProse(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		wantAc bool
+	}{
+		{"a rejected key", &StoreUnavailableError{Service: ServiceTorBox, Status: 403,
+			Reason: "createtorrent http 403 (FORBIDDEN)"}, true},
+		{"an expired key", &StoreUnavailableError{Service: ServiceTorBox, Status: 401,
+			Reason: "createtorrent http 401"}, true},
+		{"a rate limit whose DETAIL contains 403", &StoreUnavailableError{Service: ServiceTorBox, Status: 429,
+			Reason: "createtorrent http 429 (RATE_LIMIT: slow down, retry in 403 ms)"}, false},
+		{"a 502 body carrying a Ray ID with 401 in it", &StoreUnavailableError{Service: ServiceTorBox, Status: 502,
+			Reason: "createtorrent http 502 (Cloudflare Ray ID: 8a1b401c9d2e4f01)"}, false},
+		{"a queue depth that looks like a status", &StoreUnavailableError{Service: ServiceTorBox, Status: 429,
+			Reason: "createtorrent http 429 (queued behind 4031 jobs)"}, false},
+	} {
+		if got := refusalIsAboutTheAccount(tc.err); got != tc.wantAc {
+			t.Errorf("%s: account-level = %v, want %v", tc.name, got, tc.wantAc)
+		}
+	}
+
+	// End to end: a 429 whose text contains 403 must back off ONE release, not the account.
+	cache := NewMemoryCache(1 << 20)
+	recordRefusal(cache, ServiceTorBox, "tok", H, &StoreUnavailableError{Service: ServiceTorBox, Status: 429,
+		Reason: "createtorrent http 429 (retry in 403 ms)"})
+	if _, off := backedOff(cache, ServiceTorBox, "tok", repeat("c", 40)); off {
+		t.Error("a rate limit about one release silenced the whole account")
+	}
+}
+
+// The add-path guards must not block a read.
+//
+// A release the account already holds needs no add, so a backoff — which describes the cost of adding,
+// and which is now account-wide for a rejected key — must not stand in its way. TorBox has ordered it
+// this way all along; Real-Debrid and Premiumize checked the backoff first, so one 401 on an unrelated
+// release blocked every release the account held, read-only probes included.
+func TestResolve_addGuardsDoNotBlockAReadPath(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	cache := NewMemoryCache(1 << 20)
+	// The account was refused outright a moment ago, on some other release.
+	recordRefusal(cache, ServiceRealDebrid, "tok", repeat("f", 40),
+		&StoreUnavailableError{Service: ServiceRealDebrid, Status: 403, Reason: "addmagnet http 403"})
+
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "/torrents/info/"):
+			return resp(200, `{"files":[{"id":1,"path":"/movie.mkv","bytes":9,"selected":1}],"links":["https://rd/r"]}`), nil
+		case strings.Contains(r.URL.Path, "selectFiles"):
+			return resp(204, ""), nil
+		case strings.Contains(r.URL.Path, "unrestrict/link"):
+			return resp(200, `{"download":"https://rd/dl.mkv"}`), nil
+		}
+		return resp(404, "{}"), nil
+	}}
+	s := &realDebridStore{token: "tok", client: d, cache: cache, api: realDebridAPI}
+	target := ResolveTarget{InfoHash: H}
+	s.rememberTorrent(target, "t1") // this one is already bought
+
+	link, err := s.Resolve(context.Background(), target)
+	if err != nil || link != "https://rd/dl.mkv" {
+		t.Errorf("a release the account already holds was blocked by an add-path backoff: %q %v", link, err)
+	}
+
+	// A NoAdd caller is likewise answered before the backoff, on a release that is NOT held.
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: repeat("b", 40), NoAdd: true}); !errors.Is(err, errWouldAdd) {
+		t.Errorf("a read-only resolve was blocked by an add-path guard: %v", err)
+	}
+
+	// Premiumize orders it the same way. It has no held-torrent path, so NoAdd is the read here — and it
+	// must be answered before an account backoff it cannot have caused.
+	pmCache := NewMemoryCache(1 << 20)
+	recordRefusal(pmCache, ServicePremiumize, "tok", repeat("f", 40),
+		&StoreUnavailableError{Service: ServicePremiumize, Status: 403, Reason: "directdl http 403"})
+	pm := &premiumizeStore{token: "tok", cache: pmCache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			t.Error("a NoAdd resolve must not reach the service at all")
+			return resp(200, `{}`), nil
+		}}}
+	if _, err := pm.Resolve(context.Background(), ResolveTarget{InfoHash: H, NoAdd: true}); !errors.Is(err, errWouldAdd) {
+		t.Errorf("premiumize blocked a read-only resolve with an add-path backoff: %v", err)
 	}
 }

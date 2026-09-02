@@ -312,7 +312,7 @@ func TestRefusalBackoff_appliesToEveryStore(t *testing.T) {
 // a key would let TorBox's backoff silence a Premiumize that is answering perfectly well.
 func TestRefusalBackoff_isPerService(t *testing.T) {
 	cache := NewMemoryCache(1 << 20)
-	recordRefusal(cache, ServiceTorBox, "tok", H, &StoreUnavailableError{ServiceTorBox, "429"})
+	recordRefusal(cache, ServiceTorBox, "tok", H, &StoreUnavailableError{Service: ServiceTorBox, Reason: "429"})
 
 	if _, refused := backedOff(cache, ServiceTorBox, "tok", H); !refused {
 		t.Error("torbox's own refusal was not remembered")
@@ -443,7 +443,7 @@ func TestHandlePlay_namesScoutNotTheDebridForItsOwnRefusals(t *testing.T) {
 // flight — both describe a state a NoAdd caller cannot have caused.
 func TestResolve_noAddIsAnsweredAheadOfTheAddGuards(t *testing.T) {
 	cache := NewMemoryCache(1 << 20)
-	recordRefusal(cache, ServiceTorBox, "tok", H, &StoreUnavailableError{ServiceTorBox, "429"})
+	recordRefusal(cache, ServiceTorBox, "tok", H, &StoreUnavailableError{Service: ServiceTorBox, Reason: "429"})
 	noteAddAttempt(cache, ServiceTorBox, "tok", H)
 
 	s := &torBoxStore{token: "tok", client: mockDoer{fn: func(*http.Request) (*http.Response, error) {

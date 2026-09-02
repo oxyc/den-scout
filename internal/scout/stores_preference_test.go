@@ -28,7 +28,7 @@ func (n namedStore) CacheCheck(context.Context, []string) (map[string]bool, erro
 func (n namedStore) Resolve(context.Context, ResolveTarget) (string, error) {
 	*n.resolves = append(*n.resolves, n.svc)
 	if n.refuse {
-		return "", &StoreUnavailableError{n.svc, "throttled"}
+		return "", &StoreUnavailableError{Service: n.svc, Reason: "throttled"}
 	}
 	if n.link == "" {
 		return "", &DeadLinkError{string(n.svc) + " has nothing"}
