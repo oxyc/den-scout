@@ -506,6 +506,17 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 			writeQueued(w, target.InfoHash, status)
 			return
 		}
+		// A refusal SCOUT made — its hourly allowance, or an add it already has in flight — is not the
+		// debrid refusing, and must not be reported as one. errScoutSide was added to keep these apart in
+		// the refusal memory, and then the route went on saying "torbox" anyway: the app told the viewer
+		// the debrid was refusing while TorBox was answering perfectly well. Still a 503, because it is
+		// still "not now, try again", but named as ours.
+		if errors.Is(err, errScoutSide) {
+			log.Printf("scout: play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]any{"error": "scout_busy", "detail": scoutSideReason(err)}, noStore)
+			return
+		}
 		// A debrid that throttled or faulted is not a dead release, and answering 404 made the two
 		// identical: the client fell through every remaining source collecting the same non-answer, then
 		// waited indefinitely on a download nothing had started. 503 says whose problem it is.

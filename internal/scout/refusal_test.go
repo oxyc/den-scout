@@ -403,3 +403,54 @@ func (n noAddAwareStore) Resolve(_ context.Context, t ResolveTarget) (string, er
 func (n noAddAwareStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
 	return StoreStatus{}, false
 }
+
+// Scout's own refusals reach the CLIENT as scout's, not as the debrid's.
+//
+// errScoutSide was wired into the refusal memory and then the route went on reading the wrapped
+// StoreUnavailableError and printing its service — so the app told the viewer TorBox was refusing while
+// TorBox was answering perfectly well. Both scout-side refusals (the hourly allowance, and an add
+// already in flight) go through this path.
+func TestHandlePlay_namesScoutNotTheDebridForItsOwnRefusals(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 0) // nothing left this hour
+	defer func() { globalAddBudget = prev }()
+
+	cache := NewMemoryCache(1 << 20)
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&torBoxStore{token: "tok", client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				return resp(200, `{"data":[]}`), nil
+			}}, cache: cache, api: torboxAPI}}
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/"+validBlob+"/play/"+encodePlayToken(PlayTarget{InfoHash: H}), nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a spent allowance is still 'not now': got %d %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "torbox") || strings.Contains(body, "store_unavailable") {
+		t.Errorf("scout's own ceiling was blamed on the debrid: %s", body)
+	}
+	if !strings.Contains(body, "scout_busy") {
+		t.Errorf("the client cannot tell whose refusal this is: %s", body)
+	}
+}
+
+// A read-only resolve is answered before the ADD backoff, and is never blocked by an add already in
+// flight — both describe a state a NoAdd caller cannot have caused.
+func TestResolve_noAddIsAnsweredAheadOfTheAddGuards(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	recordRefusal(cache, ServiceTorBox, "tok", H, &StoreUnavailableError{ServiceTorBox, "429"})
+	noteAddAttempt(cache, ServiceTorBox, "tok", H)
+
+	s := &torBoxStore{token: "tok", client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		return resp(200, `{"data":[]}`), nil
+	}}, cache: cache, api: torboxAPI}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, NoAdd: true})
+	if !errors.Is(err, errWouldAdd) {
+		t.Errorf("a read-only resolve was blocked by an add-path guard: %v", err)
+	}
+}

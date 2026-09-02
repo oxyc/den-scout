@@ -226,33 +226,58 @@ func TestResolvePreferring_unknownHoldersStillFallsThrough(t *testing.T) {
 	}
 }
 
-// A hash is KNOWN only when EVERY cache-truth store answered for it.
+// What "known" means, in the three cases that actually occur.
 //
-// The union was the same over-claim, one level up, as the batch bug it was written to fix: with two
-// accounts and one store's check down, a release that store holds came back known-and-not-cached — a
-// confident "nobody has this" from the only party that never voted — and a cachedOnly list then dropped
-// a release that would have played instantly.
-func TestCacheTruth_knownRequiresEveryCacheTruthStore(t *testing.T) {
+// A "yes" is knowledge on its own: one store confirming it HOLDS a release settles the question, and no
+// other store's silence unsettles it. A "no" needs everyone who could answer to have answered, because a
+// store that never voted may be the one holding it. And a store that answered NOTHING is out — excluded,
+// so its outage does not erase what the healthy store confirmed.
+//
+// Both halves have been wrong in turn. The union treated a partial "no" as knowledge: a confident
+// "nobody has this" from the only party that never voted. Requiring unanimity for both was worse — it
+// discarded the only certain facts in the set, so a cachedOnly list stopped filtering entirely and every
+// response was permanently degraded and uncacheable, with the filter on and inert.
+func TestCacheTruth_whatCountsAsKnown(t *testing.T) {
 	var calls []DebridService
-	pool := &StorePool{stores: []Store{
-		namedStore{svc: ServiceTorBox, resolves: &calls},                                        // its check is down
-		namedStore{svc: ServicePremiumize, cached: map[string]bool{H: false}, resolves: &calls}, // answered
+	other := repeat("b", 40)
+
+	// Both stores answered for H; only Premiumize answered for `other`.
+	partial := &StorePool{stores: []Store{
+		namedStore{svc: ServiceTorBox, cached: map[string]bool{H: false}, resolves: &calls},
+		namedStore{svc: ServicePremiumize, cached: map[string]bool{H: false, other: false}, resolves: &calls},
 	}}
-	truth, truthOK := pool.CacheCheck(t.Context(), []string{H})
+	truth, truthOK := partial.CacheCheck(t.Context(), []string{H, other})
 	if !truthOK {
-		t.Fatal("one store answered, so this is not a total outage")
+		t.Fatal("stores answered; this is not an outage")
 	}
-	if truth.Known(H) {
-		t.Error("TorBox never voted, so 'not cached' is not something we know")
+	if !truth.Known(H) {
+		t.Error("both stores said no about H — that is knowledge")
+	}
+	if truth.Known(other) {
+		t.Error("TorBox never voted on `other`, so 'not cached' is not something we know")
 	}
 
-	// With both answering it IS known, or the filter would never drop anything again.
-	both := &StorePool{stores: []Store{
+	// A holder's yes stands alone, even where TorBox said nothing.
+	held := &StorePool{stores: []Store{
 		namedStore{svc: ServiceTorBox, cached: map[string]bool{H: false}, resolves: &calls},
+		namedStore{svc: ServicePremiumize, cached: map[string]bool{H: false, other: true}, resolves: &calls},
+	}}
+	yes, _ := held.CacheCheck(t.Context(), []string{H, other})
+	if !yes.Known(other) || !yes.Cached(other) {
+		t.Error("a store confirming it HOLDS a release settles the question by itself")
+	}
+
+	// One store entirely out: excluded rather than making every hash unknown, so the survivor's answers
+	// keep their value and cachedOnly keeps filtering.
+	down := &StorePool{stores: []Store{
+		namedStore{svc: ServiceTorBox, resolves: &calls}, // its check errored: no answers at all
 		namedStore{svc: ServicePremiumize, cached: map[string]bool{H: false}, resolves: &calls},
 	}}
-	agreed, _ := both.CacheCheck(t.Context(), []string{H})
-	if !agreed.Known(H) {
-		t.Error("both cache-truth stores answered; that is knowledge")
+	survivor, ok := down.CacheCheck(t.Context(), []string{H})
+	if !ok {
+		t.Fatal("one store still answered")
+	}
+	if !survivor.Known(H) {
+		t.Error("a downed store erased the answer the healthy one gave; cachedOnly would filter nothing")
 	}
 }

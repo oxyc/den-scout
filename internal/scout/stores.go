@@ -219,6 +219,13 @@ func batchesFailed(batchOK []bool) error {
 
 // The torrent id alone, kept apart from the resolve entry so a queued torrent (no file list) is still
 // addressable by `Status`.
+// resolveKey — the cached (torrent id + file list) for a hash on this account. Scoped by the debrid
+// token: the value is an account-scoped torrent id, so an infohash-only key would let one user's id be
+// used with another user's token.
+func resolveKey(token, infoHash string) string {
+	return "torbox:resolve:" + keyHash(token) + ":" + infoHash
+}
+
 func torrentIDKey(token, infoHash string) string {
 	return "torbox:torrent:" + keyHash(token) + ":" + infoHash
 }
@@ -279,8 +286,17 @@ func addInFlight(cache Cache, svc DebridService, token, infoHash string) error {
 // allowance instead, fifty adds in under two minutes, because ResolvePreferring walks on to the store
 // with no marker.
 func noteAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
-	if cache != nil {
-		cache.Put(addAttemptKey(svc, token, infoHash), "1", addAttemptTTL)
+	if cache == nil {
+		return
+	}
+	cache.Put(addAttemptKey(svc, token, infoHash), "1", addAttemptTTL)
+	// Clear the torrent-miss marker too. It suppresses the account listing for 15s, and that listing is
+	// the only thing that can discover the torrent this add just created — so leaving it kept the next
+	// poll on the "nothing is queued" path instead of "it is downloading". The negative cache and the add
+	// loop feed each other. This line was dropped when these helpers were made shared, along with the
+	// paragraph saying why, and nothing failed: hence the test that now covers it.
+	if svc == ServiceTorBox {
+		cache.Put(torrentMissKey(token, infoHash), "", time.Nanosecond)
 	}
 }
 
@@ -393,6 +409,16 @@ func backedOff(cache Cache, svc DebridService, token, infoHash string) (string, 
 // these guards exist to end, and it condemns an account that is answering perfectly well.
 var errScoutSide = errors.New("refused by scout, not by the service")
 
+// scoutSideReason — what scout is busy with, for a client that can only show a sentence. The wrapped
+// StoreUnavailableError still carries the wording; only the blame changes.
+func scoutSideReason(err error) string {
+	var unavailable *StoreUnavailableError
+	if errors.As(err, &unavailable) {
+		return unavailable.Reason
+	}
+	return "scout is not accepting this request right now"
+}
+
 // recordRefusal remembers a refusal briefly, so a poll loop cannot sustain one.
 //
 // Only TorBox had this. The other two had no cache at all, so `ResolvePreferring` fell straight through
@@ -425,7 +451,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// Scope by the debrid token: the cached value is a TorBox torrent_id, which is account-scoped.
 	// Every per-install store shares one process-global cache, so an infohash-only key would let one
 	// user's cached torrent_id be used with another user's token (→ wrong/other-account content).
-	key := "torbox:resolve:" + keyHash(s.token) + ":" + t.InfoHash
+	key := resolveKey(s.token, t.InfoHash)
 
 	// Fast path: a warm entry from an earlier episode of the same pack. Skip it when episode-select is
 	// needed but the cached file list is empty (audit #3 — a transient blip would otherwise mis-serve).
@@ -460,7 +486,22 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// The lookup that answers this properly already exists and is already used by Status; it simply was
 	// never consulted here.
 	if id, held := s.knownTorrentID(t.InfoHash); held {
-		return s.resolveHeldTorrent(ctx, id, key, needFiles, t)
+		link, err := s.resolveHeldTorrent(ctx, id, key, needFiles, t)
+		if err == nil {
+			return link, nil
+		}
+		// The remembered id is a claim with a six-hour life, not a fact — the torrent can be removed from
+		// the account at any point, by the user or by TorBox. When it will not resolve, forget it and let
+		// the add path below buy it again. Without this the id is not only kept but REFRESHED on every
+		// poll, so a deleted torrent answered dead_link for at least six hours and the client blacklisted
+		// a release that had been playing an hour earlier. Before this shortcut existed, that case healed
+		// itself by falling through to the add.
+		s.forgetTorrentID(t.InfoHash)
+		log.Printf("scout: torbox no longer has %s (%v) — re-adding", shortHash(t.InfoHash), err)
+		var unavailable *StoreUnavailableError
+		if errors.As(err, &unavailable) {
+			return "", err // the service is refusing us; buying it again will not help
+		}
 	}
 
 	// From here on, resolving MEANS queueing — so a caller that forbade that is answered now, before the
@@ -657,6 +698,16 @@ func (s *torBoxStore) knownTorrentID(infoHash string) (int, bool) {
 	}
 	id, err := strconv.Atoi(raw)
 	return id, err == nil
+}
+
+// forgetTorrentID drops both remembered facts about a torrent the account turns out not to have, so the
+// next resolve starts from nothing rather than from a stale id.
+func (s *torBoxStore) forgetTorrentID(infoHash string) {
+	if s.cache == nil {
+		return
+	}
+	s.cache.Put(torrentIDKey(s.token, infoHash), "", time.Nanosecond)
+	s.cache.Put(resolveKey(s.token, infoHash), "", time.Nanosecond)
 }
 
 // torrentID finds the account's torrent id for an infohash: from the cache Resolve wrote, and failing
@@ -1288,24 +1339,35 @@ func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (CacheTruth
 			}
 			continue
 		}
+		// A cache-truth store that answered for NOTHING is OUT, not silent about each hash in turn. It is
+		// left out of the count below rather than making every hash unknown — counting it erased what the
+		// healthy store positively confirmed, left `cachedOnly` filtering nothing at all, and made every
+		// response permanently degraded and uncacheable while one account's check was down. `truthOut`
+		// and the degraded flag are how an outage gets reported; this is how the survivor's answers keep
+		// their value.
+		if len(m) == 0 {
+			continue
+		}
 		cacheTruthStores++
+		truthOK = true
 		for hash, cached := range m {
 			// Presence in the map is the store's claim to have answered for that hash.
 			answers[hash]++
-			truthOK = true
 			if cached {
 				truth.holders[hash] = append(truth.holders[hash], p.stores[i].Service())
 			}
 		}
 	}
-	// A hash is KNOWN only when EVERY cache-truth store answered for it, not when any did.
+	// A "yes" is knowledge on its own: one store confirming it HOLDS a release settles the question, and
+	// no other store's silence can unsettle it. A "no" needs everyone who could answer to have answered,
+	// because a store that never voted may be the one holding it.
 	//
-	// The union was the same over-claim one level up from the batch bug it was written to fix: with two
-	// accounts and one store's check down, a release that store holds came back known-and-not-cached —
-	// a confident "nobody has this" from the only party that never voted — and a cached-only list then
-	// dropped a release that would have played instantly.
+	// The union got the second half wrong — a confident "nobody has this" from the only party that never
+	// voted. Requiring unanimity for both got the FIRST half wrong, which was worse: it discarded the
+	// only certain facts in the set, so a cached-only list stopped filtering exactly when the surviving
+	// store's answers mattered most.
 	for hash, n := range answers {
-		if n == cacheTruthStores {
+		if len(truth.holders[hash]) > 0 || n == cacheTruthStores {
 			truth.known[hash] = true
 		}
 	}

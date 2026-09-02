@@ -511,3 +511,79 @@ func TestAddInFlight_discoveringTheTorrentSettlesTheMarker(t *testing.T) {
 		t.Errorf("the marker outlived the discovery it stood in for: %v", err)
 	}
 }
+
+// A remembered torrent id is a claim with a six-hour life, not a fact. When the account no longer has
+// the torrent, forget it and buy it again — do not answer dead_link for six hours.
+//
+// The shortcut that stops re-buying a held torrent also stopped the SELF-HEALING that used to happen
+// when a torrent was removed account-side: Resolve took the held path, failed, and re-Put the id with a
+// fresh six-hour TTL on every poll, so a client polling kept the stale entry alive indefinitely and
+// blacklisted a release that had been playing an hour earlier.
+func TestKnownTorrentID_aDeletedTorrentIsForgottenAndReBought(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	gone := true
+	adds := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case isAddEndpoint(r):
+			adds++
+			gone = false // re-bought: the account has it again
+			return resp(200, `{"data":{"torrent_id":77}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			return resp(200, `{"data":[]}`), nil
+		}
+		if gone {
+			return resp(404, `{"success":false}`), nil // requestdl on a torrent that is not there
+		}
+		return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL) // a stale id from before the deletion
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+	link, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0)})
+	if err != nil || link == "" {
+		t.Fatalf("a deleted torrent must be re-bought, not answered dead: %q %v", link, err)
+	}
+	if adds != 1 {
+		t.Errorf("made %d adds; the stale id should have been forgotten and the torrent re-added", adds)
+	}
+	if raw, _ := cache.Get(torrentIDKey("tok", H)); raw == "42" {
+		t.Error("the stale id survived, and every later poll would keep it alive for another six hours")
+	}
+
+	// And when the re-add ALSO fails, the stale id must be gone rather than re-stamped with a fresh
+	// six-hour TTL. That refresh is what made a deleted torrent unplayable indefinitely: the held path
+	// re-Put the id on every poll, so a polling client kept its own poison alive.
+	stuck := NewMemoryCache(1 << 20)
+	stuck.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+	dead := &torBoxStore{token: "tok", cache: stuck, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "mylist") {
+				return resp(200, `{"data":[]}`), nil
+			}
+			return resp(404, `{"success":false}`), nil // nothing works: the add fails too
+		}}}
+	_, _ = dead.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0)})
+	if raw, present := stuck.Get(torrentIDKey("tok", H)); present && raw == "42" {
+		t.Error("a failing resolve refreshed the stale id instead of forgetting it")
+	}
+}
+
+// An add going out clears the torrent-miss marker.
+//
+// That marker suppresses the account listing for 15s, and the listing is the only thing that can find
+// the torrent the add just created — so leaving it kept the next poll on the "nothing is queued" path
+// instead of "it is downloading". This line was deleted once during a refactor, with its explanation,
+// and nothing failed.
+func TestNoteAddAttempt_clearsTheTorrentMissMarker(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentMissKey("tok", H), "1", torrentMissTTL) // Status looked and found nothing
+	noteAddAttempt(cache, ServiceTorBox, "tok", H)
+	if _, stillMissing := cache.Get(torrentMissKey("tok", H)); stillMissing {
+		t.Error("the miss marker outlived the add that disproves it; Status cannot see the new torrent")
+	}
+}
