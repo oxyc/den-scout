@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -46,11 +47,20 @@ func TestBuildDeps(t *testing.T) {
 	settings := SettingsFromEnv(func(string) string { return "" })
 	deps := BuildDeps(settings, &http.Client{}, NewMemoryCache(1<<20))
 	cfg := &Config{Indexers: []Indexer{"torrentio", "comet"}, Filters: Filters{ExcludeCam: true}, Debrid: []DebridAccount{{ServiceTorBox, "t"}}}
-	// comet needs a per-install config URL and this environment supplies none, so it is not asked at all:
-	// asked bare it can only 403, and a non-answer that still counts as a response is what let an empty
-	// list look authoritative.
-	if sc := deps.MakeScrapers(cfg); len(sc) != 1 || sc[0].id() != "torrentio" {
-		t.Errorf("makeScrapers: %v", sc)
+	// comet needs a per-install config URL and this environment supplies none, so it is never requested —
+	// asked bare it can only 403. But it stays in the list as a source that CANNOT answer, rather than
+	// disappearing from it: dropping it would take it out of the quorum too, and "an empty result is
+	// authoritative only when every indexer answered" would quietly become "…every indexer we still
+	// bother asking", which is how one 200-empty becomes a confident "this release does not exist".
+	sc := deps.MakeScrapers(cfg)
+	if len(sc) != 2 || sc[0].id() != "torrentio" || sc[1].id() != "comet" {
+		t.Fatalf("makeScrapers: %v", sc)
+	}
+	if _, err := sc[1].scrape(context.Background(), scrapeQuery{}); err == nil {
+		t.Error("an unaskable indexer must fail, so it counts as a source that did not answer")
+	}
+	if _, ok := sc[1].(unaskableScraper); !ok {
+		t.Errorf("comet should be unaskable without a config URL, got %T", sc[1])
 	}
 	// Given the URL, it is asked.
 	withComet := BuildDeps(SettingsFromEnv(func(k string) string {

@@ -295,12 +295,29 @@ func makeScrapers(config *Config, client doer, urls map[Indexer]string) []scrape
 			}
 			if base == "" || !mintIndexerConfigs {
 				logIndexerSkipOnce(id, envVar)
+				// Kept in the list as a scraper that cannot answer, rather than dropped from it. Dropping
+				// removed it from the quorum too, so "an empty result is authoritative only when EVERY
+				// indexer answered" silently became "…every indexer we still bother asking" — and with
+				// the other two unconfigured, one torrentio 200-empty was again a confident "this release
+				// does not exist". That is the same bug the skip was introduced to fix, one level up.
+				out = append(out, unaskableScraper{indexer: id})
 				continue
 			}
 		}
 		out = append(out, &stremioScraper{indexer: id, baseURL: base, client: client})
 	}
 	return out
+}
+
+// unaskableScraper stands in for a configured indexer that cannot be addressed — it needs a per-install
+// config segment and none was supplied or could be minted. It fails without making a request, so it
+// costs nothing and still counts as a source that did not answer.
+type unaskableScraper struct{ indexer Indexer }
+
+func (s unaskableScraper) id() Indexer { return s.indexer }
+
+func (s unaskableScraper) scrape(context.Context, scrapeQuery) ([]RawStream, error) {
+	return nil, fmt.Errorf("%s: no config URL, not asked", s.indexer)
 }
 
 // Once per indexer per process: this runs on every request, and the operator needs the line once.
