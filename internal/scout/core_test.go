@@ -35,7 +35,10 @@ func TestDecodeConfig(t *testing.T) {
 
 	// valid optional filters + dedupe indexers (#10) + drop bogus
 	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","bogus","comet","torrentio"],"filters":{"resolutions":["2160p","nope","1080p"],"hdrOnly":true,"maxSizeGB":40}}`))
-	if len(c.Indexers) != 2 || c.Indexers[0] != "torrentio" || c.Indexers[1] != "comet" {
+	// comet is named here but centrally disabled (it 403s every request), so it is dropped despite being
+	// asked for: a sealed config cannot be edited from the server, and carrying a dead host makes the
+	// survivors look like a quorum when one of them sheds a request.
+	if len(c.Indexers) != 1 || c.Indexers[0] != "torrentio" {
 		t.Errorf("indexers: %v", c.Indexers)
 	}
 	if len(c.Filters.Resolutions) != 2 || !c.Filters.HDROnly || c.Filters.MaxSizeGB == nil || *c.Filters.MaxSizeGB != 40 {
@@ -47,7 +50,9 @@ func TestDecodeConfig(t *testing.T) {
 	// cachedOnly is deliberately off: inheriting "hide anything not already fetched" can leave a title
 	// showing one scrap of a release, or nothing, while good ones sit a download away.
 	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}]}`))
-	if !c.Filters.ExcludeCam || c.CachedOnly || len(c.Indexers) != 4 || c.ResultCap != 20 {
+	// The default indexer set is the working one, not every one this server knows how to talk to.
+	if !c.Filters.ExcludeCam || c.CachedOnly || c.ResultCap != 20 ||
+		len(c.Indexers) != 2 || c.Indexers[0] != "torrentio" || c.Indexers[1] != "mediafusion" {
 		t.Errorf("defaults: %+v", c)
 	}
 	// explicit off

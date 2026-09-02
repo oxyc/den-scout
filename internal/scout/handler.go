@@ -297,7 +297,19 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 
 	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
 	// the viewer will see; before serialisation, so the answer rides along in the same response and the
-	// list is cached WITH it.
+	// Where a list is lost. An empty answer has half a dozen possible authors — no indexer had it, a
+	// filter removed everything, the cache-only gate dropped an uncached set — and they are
+	// indistinguishable in the reply. Reported when the pipeline empties a list that started non-empty,
+	// which is the case worth a line and the one that had us guessing at an episode torrentio was
+	// serving 50 results for.
+	// Also when nothing was scraped at all: "no indexer had it" and "a filter removed it" are the two
+	// answers an empty reply can carry, and only this line separates them.
+	if len(ranked) == 0 || len(ranked) < len(seeds) {
+		log.Printf("scout: %s %s: scraped %d → ranked %d (cachedOnly=%t year=%v filters: res=%v minSeed=%d maxGB=%v cam=%t hdr=%t)",
+			sid.Type, sid.IMDb, len(seeds), len(ranked), effCachedOnly, expectedYear,
+			config.Filters.Resolutions, config.Filters.MinSeeders, config.Filters.MaxSizeGB,
+			config.Filters.ExcludeCam, config.Filters.HDROnly)
+	}
 	h.probeTop(ctx, config, ranked, sid)
 
 	out := make([]streamOut, 0, len(ranked))

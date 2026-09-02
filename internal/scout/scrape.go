@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -194,7 +195,47 @@ type stremioScraper struct {
 
 func (s *stremioScraper) id() Indexer { return s.indexer }
 
+// A shed request is not an answer.
+//
+// Opening a season asks for every episode at once, so an indexer sees a burst and sheds part of it —
+// torrentio answers 502 to some of them. Treated as a result, that turns into "no source found for this
+// episode" for a release the same indexer serves 50 of a second later. These statuses are the indexer
+// declining to answer right now, so the request is made again rather than reported as an outcome.
+func retryableScrapeStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500
+}
+
+// Short and jittered: the whole scrape is under an 8 s budget shared with three other indexers, so this
+// buys a second chance without spending someone else's timeout. Jitter because a burst that is shed
+// together would otherwise retry together and be shed together again.
+var scrapeRetryBackoff = []time.Duration{250 * time.Millisecond, 700 * time.Millisecond}
+
 func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		streams, err, retryable := s.scrapeOnce(ctx, q)
+		if err == nil {
+			if attempt > 0 {
+				log.Printf("scout: %s indexer answered on retry %d", s.indexer, attempt)
+			}
+			return streams, nil
+		}
+		lastErr = err
+		if !retryable || attempt >= len(scrapeRetryBackoff) {
+			return nil, lastErr
+		}
+		delay := scrapeRetryBackoff[attempt]
+		delay += time.Duration(rand.Int63n(int64(delay / 2)))
+		select {
+		case <-ctx.Done():
+			return nil, lastErr
+		case <-time.After(delay):
+		}
+	}
+}
+
+// scrapeOnce performs one request. The third return says whether the failure is worth another attempt.
+func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawStream, error, bool) {
 	stremID := q.IMDb
 	if q.HasEp {
 		stremID = fmt.Sprintf("%s:%d:%d", q.IMDb, q.Season, q.Episode)
@@ -202,7 +243,7 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 	u := strings.TrimRight(s.baseURL, "/") + "/stream/" + q.Type + "/" + url.QueryEscape(stremID) + ".json"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, err, false // a malformed request will be malformed again
 	}
 	req.Header.Set("accept", "application/json")
 	// Torrentio (and peers) 403 the default Go-http-client User-Agent as a bot signature — send a
@@ -213,18 +254,19 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 		// Log the indexer name + reason (never the URL — MediaFusion's carries its encrypted config) so a
 		// scrape outage is visible in the server log instead of silently becoming an empty stream list.
 		log.Printf("scout: %s indexer unreachable", s.indexer)
-		return nil, err
+		return nil, err, true // a transport failure mid-burst is worth one more try
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("scout: %s indexer returned http %d", s.indexer, resp.StatusCode)
-		return nil, fmt.Errorf("%s http %d", s.indexer, resp.StatusCode)
+		return nil, fmt.Errorf("%s http %d", s.indexer, resp.StatusCode),
+			retryableScrapeStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeBytes))
 	if err != nil {
-		return nil, err
+		return nil, err, true
 	}
-	return parseStremioStreams(body, string(s.indexer)), nil
+	return parseStremioStreams(body, string(s.indexer)), nil, false
 }
 
 // --- fan-out + dedupe ---

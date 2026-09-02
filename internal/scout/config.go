@@ -19,7 +19,21 @@ var debridServices = []DebridService{ServiceTorBox, ServiceRealDebrid, ServicePr
 
 type Indexer string
 
+// Every indexer a config may name.
 var allIndexers = []Indexer{"torrentio", "comet", "mediafusion", "torz"}
+
+// What an install gets when it names none — decided HERE rather than per install, so a dead host is
+// dropped for every client by one deploy instead of a reconfiguration each.
+var defaultIndexers = []Indexer{"torrentio", "mediafusion"}
+
+// Named but known-broken indexers, removed from any config. An install's sealed config cannot be edited
+// from the server, so without this an old blob keeps paying for a host that has been gone for months —
+// and worse, the survivors look like a quorum: when torrentio shed a burst, mediafusion's empty answer
+// became the whole result, and an episode torrentio serves 50 releases for read as "no source found".
+var disabledIndexers = map[Indexer]string{
+	"comet": "403s every request",
+	"torz":  "host no longer resolves",
+}
 var validResolutions = map[string]bool{"2160p": true, "1080p": true, "720p": true, "480p": true}
 
 type DebridAccount struct {
@@ -109,8 +123,15 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		}
 	}
 	idx = dedupeIndexers(idx) // audit #10
+	var kept []Indexer
+	for _, i := range idx {
+		if _, dead := disabledIndexers[i]; !dead {
+			kept = append(kept, i)
+		}
+	}
+	idx = kept
 	if len(idx) == 0 {
-		idx = append([]Indexer(nil), allIndexers...)
+		idx = append([]Indexer(nil), defaultIndexers...)
 	}
 
 	f := Filters{ExcludeCam: true} // default on
