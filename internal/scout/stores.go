@@ -246,6 +246,12 @@ func transportKind(err error) string {
 	return err.Error()
 }
 
+// isCancellation — the caller went away, rather than the store saying no. Nothing about the store or the
+// release can be concluded from it, so it must not be remembered as a refusal.
+func isCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // refusalReason renders an add failure for the backoff cache, keeping the service's own words where it
 // gave any — that string is what the probe route later reports and the log later prints.
 func refusalReason(err error) string {
@@ -355,7 +361,12 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		// Every refused add backs off, not only a 429. The refusal that caused the incident was a 400 —
 		// TorBox's answer for an account at its download limit — which is a `DeadLinkError`, so keying the
 		// backoff on the error TYPE left the one case that mattered re-adding on every poll.
-		if s.cache != nil {
+		//
+		// A cancelled request is NOT a refusal. /play runs on the client's context and the client cancels
+		// aggressively — a focus change is enough — so one cancelled add wrote "context canceled" into the
+		// backoff and served that release 503 store_unavailable for the next minute, on both /play and the
+		// probe route. An accusation TorBox never made, about a release that is very likely fine.
+		if s.cache != nil && !isCancellation(err) {
 			s.cache.Put(refusedKey(s.token, t.InfoHash), refusalReason(err), refusalBackoff)
 		}
 		return "", err
@@ -384,6 +395,12 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 }
 
 func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, error) {
+	// The account's hourly add allowance, counted here because this is the ONE place an add is made. Every
+	// other guard in this file protects a path someone thought of; this one bounds the paths nobody did.
+	if !globalAddBudget.take(keyHash(s.token)) {
+		log.Printf("scout: torbox add budget spent for the hour, refusing %s", shortHash(infoHash))
+		return 0, &StoreUnavailableError{ServiceTorBox, "hourly add budget spent"}
+	}
 	form := url.Values{"magnet": {magnetFor(infoHash)}, "seed": {"3"}, "allow_zip": {"false"}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/torrents/createtorrent", strings.NewReader(form.Encode()))
 	if err != nil {

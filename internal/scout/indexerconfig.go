@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Minting the per-install config segment that comet and mediafusion require.
@@ -63,6 +65,10 @@ type mintedConfig struct {
 // mediafusion get one POST per stream request.
 const mintFailureTTL = 2 * time.Minute
 
+// How long a mint may take. It runs BEFORE the scrape and inside the singleflight leader, so its ceiling
+// has to leave the scrape budget intact rather than consume it.
+const mintTimeout = 3 * time.Second
+
 func (m mintedConfig) ttl() time.Duration {
 	if m.url == "" {
 		return mintFailureTTL
@@ -73,6 +79,9 @@ func (m mintedConfig) ttl() time.Duration {
 var (
 	mintedMu sync.Mutex
 	minted   = map[string]mintedConfig{}
+	// One round trip per (indexer, account) in flight at a time — the cache alone only collapses
+	// SEQUENTIAL repeats, and a burst of episode requests is anything but sequential.
+	mintFlight singleflight.Group
 )
 
 // indexerBaseWithConfig returns a ready-to-use base URL for an indexer that needs a config segment, or
@@ -93,17 +102,29 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 	}
 	mintedMu.Unlock()
 
-	var url string
-	// A mint that has to reach the indexer can fail for reasons a retry fixes; one computed locally
-	// cannot, so only the former is transient.
-	transient := false
-	switch id {
-	case "comet":
-		url = mintCometURL(acct)
-	case "mediafusion":
-		url = mintMediaFusionURL(ctx, acct, client)
-		transient = url == ""
+	// Coalesced: the lock above is released before the round trip, so a burst of concurrent list builds
+	// each found the cache cold and each POSTed. Twelve at once meant twelve mints of the identical
+	// config, all of them ahead of the scrape on the user-visible path.
+	type mintResult struct {
+		url       string
+		transient bool
 	}
+	out, _, _ := mintFlight.Do(key, func() (any, error) {
+		var url string
+		// A mint that has to reach the indexer can fail for reasons a retry fixes; one computed locally
+		// cannot, so only the former is transient.
+		transient := false
+		switch id {
+		case "comet":
+			url = mintCometURL(acct)
+		case "mediafusion":
+			url = mintMediaFusionURL(ctx, acct, client)
+			transient = url == ""
+		}
+		return mintResult{url, transient}, nil
+	})
+	res, _ := out.(mintResult)
+	url, transient := res.url, res.transient
 	if url == "" {
 		// Remember the FAILURE too, briefly. Only successes were cached, so while the host was unhealthy
 		// every single stream request re-POSTed to it — with its own 10 s timeout, ahead of the scrape —
@@ -174,7 +195,9 @@ func mintMediaFusionURL(ctx context.Context, acct DebridAccount, client doer) st
 	if err != nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// Under the 8s per-indexer scrape budget this sits in front of, not over it. At 10s a slow mediafusion
+	// could burn the whole budget before a single indexer had been asked anything.
+	ctx, cancel := context.WithTimeout(ctx, mintTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		defaultIndexerURLs["mediafusion"]+"/encrypt-user-data", bytes.NewReader(raw))
