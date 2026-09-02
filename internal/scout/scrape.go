@@ -211,6 +211,12 @@ func retryableScrapeStatus(status int) bool {
 // together would otherwise retry together and be shed together again.
 var scrapeRetryBackoff = []time.Duration{250 * time.Millisecond, 700 * time.Millisecond}
 
+// Sized for one household, not for a service. Six queued requests pass instantly — glancing down a few
+// episodes, or a season page settling — and past that the tap runs at roughly four a second per host,
+// which no public indexer minds and which still returns a whole season in a couple of seconds. Per host,
+// so a slow indexer cannot delay a healthy one.
+var indexerLimiter = newHostLimiter(250*time.Millisecond, 6)
+
 func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream, error) {
 	var lastErr error
 	for attempt := 0; ; attempt++ {
@@ -242,6 +248,11 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 		stremID = fmt.Sprintf("%s:%d:%d", q.IMDb, q.Season, q.Episode)
 	}
 	u := strings.TrimRight(s.baseURL, "/") + "/stream/" + q.Type + "/" + url.QueryEscape(stremID) + ".json"
+	// Pace ourselves before asking. A burst passes straight through; sustained traffic queues rather than
+	// being shed, because a shed request is what became "this release does not exist" for a whole evening.
+	if parsed, perr := url.Parse(u); perr == nil {
+		indexerLimiter.wait(ctx, parsed.Host)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err, false // a malformed request will be malformed again
