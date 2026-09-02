@@ -584,6 +584,15 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// user's cached torrent_id be used with another user's token (→ wrong/other-account content).
 	key := resolveKey(s.token, t.InfoHash)
 
+	// A rejected key makes every request pointless, reads included — the same gate RD and Premiumize have.
+	// It sits ABOVE the warm fast path, not below it: any pack played in the last six hours resolves
+	// straight out of that entry and returns without ever reaching a gate placed after it, which is the
+	// normal state during a binge. Ten polls meant ten requestdl calls on a key TorBox had already
+	// rejected, and that branch records no refusal either, so it could not even set the key it skipped.
+	if reason, ok := accountBackedOff(s.cache, ServiceTorBox, s.token); ok {
+		return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
+	}
+
 	// Fast path: a warm entry from an earlier episode of the same pack. Skip it when episode-select is
 	// needed but the cached file list is empty (audit #3 — a transient blip would otherwise mis-serve).
 	if s.cache != nil {
@@ -611,10 +620,6 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		}
 	}
 
-	// A rejected key makes every request pointless, reads included — the same gate RD and Premiumize have.
-	if reason, ok := accountBackedOff(s.cache, ServiceTorBox, s.token); ok {
-		return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
-	}
 	// Does the account ALREADY hold this? The entry above is a six-hour convenience cache, not a record
 	// of what the account has — so "not played in the last six hours", which is the normal state of most
 	// of a library, fell through to createtorrent and paid an add for a torrent already sitting there.
@@ -999,17 +1004,23 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 		return "", &DeadLinkError{"torbox requestdl transport: " + transportKind(err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if storeRefusedUs(resp.StatusCode) {
-		return "", &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
-			Reason: fmt.Sprintf("requestdl http %d", resp.StatusCode)}
-	}
 	// 404 is TorBox saying it has no such torrent — the ONE answer that means a remembered id is stale.
-	// Everything else says nothing about whether the account still holds it.
+	// Everything else says nothing about whether the account still holds it. Checked before the body is
+	// read, because it is the one status whose meaning does not depend on the text.
 	if resp.StatusCode == http.StatusNotFound {
 		return "", errTorrentGone
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", &DeadLinkError{fmt.Sprintf("torbox requestdl http %d", resp.StatusCode)}
+		// The same rule the add path follows: TorBox explains itself in the body, and an account at its
+		// active-download limit and a torrent id it cannot serve are both a bare 400. Reading it here is
+		// what lets the read path TELL those apart at all — discarding it meant a genuine account refusal
+		// arriving as a 400 was invisible, recorded nothing, and was re-asked on every poll.
+		detail := readStoreError(resp)
+		if storeRefusedUs(resp.StatusCode) {
+			return "", &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+				Reason: fmt.Sprintf("requestdl http %d%s", resp.StatusCode, detail)}
+		}
+		return "", &DeadLinkError{fmt.Sprintf("torbox requestdl http %d%s", resp.StatusCode, detail)}
 	}
 	var body struct {
 		Success bool   `json:"success"`
@@ -1213,8 +1224,17 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 	info, err := s.info(ctx, id)
 	if err != nil {
 		// A refusal from the read path is remembered like any other, or nothing ever backs off and the
-		// next poll asks again.
-		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+		// next poll asks again — but ONLY a refusal. `info` also hands back a raw transport error, a bare
+		// `realdebrid info http 400`, and `realdebrid bad info` for a non-JSON 200 (a Cloudflare
+		// interstitial). None of those is RD declining to serve this account, and filing them as one made
+		// a TCP reset answer 503 store_unavailable naming realdebrid — which tells the viewer their
+		// debrid is refusing and stops the client trying other sources — for a release RD demonstrably
+		// holds. Because this path runs on every poll and each one re-stamps the record, it never lapsed
+		// while the blip lasted. The same narrowing TorBox's read path already makes.
+		var refusedUs *StoreUnavailableError
+		if errors.As(err, &refusedUs) {
+			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+		}
 		// Only a definitive "no such torrent" forgets the id. An empty file list, a throttle or a timeout
 		// all describe this attempt, not what the account holds — forgetting on those re-bought the
 		// torrent on the very next poll, which is the loop this memory exists to end.
@@ -1450,10 +1470,12 @@ func (s *premiumizeStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 }
 
 func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
-	// No dedicated account gate here, unlike TorBox and Real-Debrid: Premiumize has no read path that
-	// bypasses the backoff below, and `backedOff` already consults the account key first — so a separate
-	// check would be a no-op wearing the look of a guard. TorBox and RD need theirs because their
-	// held-torrent paths return before the backoff is ever reached.
+	// No dedicated account gate here, unlike TorBox and Real-Debrid: Premiumize has no read path at all —
+	// directdl is both the question and the purchase — so nothing here reaches the service without first
+	// passing the backoff below, and `backedOff` already consults the account key. A separate check would
+	// be a no-op wearing the look of a guard. (Two paths DO return above it, `NoAdd` and `addInFlight`,
+	// but neither speaks to Premiumize.) TorBox and RD need theirs because their held-torrent paths do
+	// talk to the service before any backoff is reached.
 	//
 	// NoAdd first: it costs nothing and the guards below all describe the cost of adding. TorBox orders
 	// it this way for the same reason — a read-only caller cannot have caused a backoff and must not be
@@ -1514,14 +1536,38 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// queues the same transfer again.
 	var body struct {
 		Status  string `json:"status"`
+		Message string `json:"message"`
 		Content []struct {
 			Path string `json:"path"`
 			Link string `json:"link"`
 			Size *int   `json:"size"`
 		} `json:"content"`
 	}
-	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Status != "success" || len(body.Content) == 0 {
-		// Nothing to serve: this call really did queue a transfer, so the charge stands.
+	readable := json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) == nil
+	// Premiumize answers an application-level refusal as HTTP 200 with `{"status":"error","message":…}` —
+	// an unsupported magnet, an account limit, no space. Only ONE of the three ways this call can fail to
+	// hand back content means a transfer was queued: a SUCCESSFUL answer that carries none. Collapsing
+	// all three charged an add for a transfer that does not exist, stamped the queue marker for its full
+	// twenty minutes (suppressing any later legitimate attempt), and answered 202 "downloading, 0%" for
+	// ten minutes on a magnet Premiumize had refused outright — a spinner the client cannot fall through.
+	if !readable || body.Status != "success" {
+		// Nothing was queued, so the charge must go back the same way the read path's does.
+		if !queued {
+			refundUnusedAdd(ServicePremiumize, s.token)
+		}
+		if !readable {
+			return "", &DeadLinkError{"premiumize directdl answered something unreadable"}
+		}
+		// Its own words: "Invalid src" and "not enough space" need different fixes and only the text says
+		// which. Not a refusal of the ACCOUNT — a 401/403/429/5xx is what that looks like, and it was
+		// handled above — so this stays a dead link the client can move past.
+		msg := strings.TrimSpace(body.Message)
+		return "", &DeadLinkError{"premiumize directdl: " +
+			strings.TrimSpace(body.Status+" "+msg[:min(len(msg), 200)])}
+	}
+	if len(body.Content) == 0 {
+		// A successful answer with nothing in it: this call really did queue a transfer, so the charge
+		// stands.
 		if !queued {
 			noteQueued(s.cache, s.token, t.InfoHash)
 		}

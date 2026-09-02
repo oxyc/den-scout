@@ -1582,18 +1582,6 @@ func TestPremiumize_aSlowTransferIsStillDiscoveredWhenItCompletes(t *testing.T) 
 	}
 }
 
-// countingCache counts writes, for behaviour that is only visible as a write — re-stamping a marker
-// with the same value renews its TTL and is otherwise invisible.
-type countingCache struct {
-	Cache
-	puts int
-}
-
-func (c *countingCache) Put(key, value string, ttl time.Duration) {
-	c.puts++
-	c.Cache.Put(key, value, ttl)
-}
-
 // The READ path records only a SERVICE refusal — not a torrent that is merely not ready, and not a
 // cancelled poll.
 //
@@ -1672,5 +1660,142 @@ func TestPremiumize_aRejectedKeyGatesEvenAReadPath(t *testing.T) {
 		}}}
 	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err == nil {
 		t.Error("a rejected key cannot serve anything")
+	}
+}
+
+// Premiumize answers an application-level refusal as HTTP 200 `{"status":"error",…}` — an unsupported
+// magnet, an account limit, no space. Only a SUCCESSFUL answer carrying no content means a transfer was
+// queued. Collapsing the two charged an add for a transfer that does not exist, stamped the queue marker
+// for its full twenty minutes so a later legitimate attempt was suppressed as "already queued", and made
+// /play answer 202 "downloading, 0%" for ten minutes — a spinner the client cannot fall through — for a
+// magnet Premiumize had refused outright.
+func TestPremiumize_aRefusedMagnetIsNotAQueuedTransfer(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `{"status":"error","message":"Invalid src"}`), nil
+		}}}
+	var err error
+	for i := 0; i < 5; i++ {
+		_, err = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if errors.Is(err, errAddInFlight) {
+		t.Errorf("a refused magnet was reported as a transfer on its way: %v", err)
+	}
+	var dead *DeadLinkError
+	if !errors.As(err, &dead) {
+		t.Fatalf("got %v, want a dead link the client can move past", err)
+	}
+	// Its own words, so "Invalid src" and "not enough space" stay tellable apart.
+	if !strings.Contains(dead.Error(), "Invalid src") {
+		t.Errorf("the service's own explanation was discarded: %q", dead.Error())
+	}
+	if alreadyQueued(cache, "tok", H) {
+		t.Error("a magnet Premiumize refused was marked as queued, blocking any retry for twenty minutes")
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "tok")); left != 50 {
+		t.Errorf("allowance %d — refusals were charged as adds", left)
+	}
+}
+
+// Real-Debrid's read path records ONLY a service refusal, the same narrowing TorBox's has. `info` also
+// hands back raw transport errors, a bare `info http 400`, and `bad info` for a non-JSON 200 (a
+// Cloudflare interstitial). Filing those as refusals made a TCP reset answer 503 store_unavailable
+// naming realdebrid — which stops the client trying other sources — for a release RD demonstrably holds,
+// and because this path runs on every poll and re-stamps the record, it never lapsed.
+func TestRealDebrid_onlyAServiceRefusalIsRecordedOnTheReadPath(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		doer       mockDoer
+		wantRecord bool
+	}{
+		{"a transport blip", mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("read tcp 10.0.0.2:443: connection reset by peer")
+		}}, false},
+		{"a 400", mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(400, `{}`), nil
+		}}, false},
+		{"an interstitial", mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `<html>just a moment</html>`), nil
+		}}, false},
+		{"the service refusing", mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(403, `{"error":"bad_token"}`), nil
+		}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			s := &realDebridStore{token: "tok", cache: cache, api: realDebridAPI, client: tc.doer}
+			target := ResolveTarget{InfoHash: H}
+			s.rememberTorrent(target, "t1")
+			if _, err := s.Resolve(context.Background(), target); err == nil {
+				t.Fatal("nothing here resolves")
+			}
+			if _, recorded := backedOff(cache, ServiceRealDebrid, "tok", H); recorded != tc.wantRecord {
+				t.Errorf("recorded=%v, want %v — this decides whether the app blames the debrid",
+					recorded, tc.wantRecord)
+			}
+		})
+	}
+}
+
+// The account gate has to sit ABOVE the warm resolve entry, not below it. Any pack played in the last
+// six hours takes that fast path and returns without reaching a gate placed after it — the normal state
+// during a binge — so ten polls made ten requestdl calls against a key TorBox had already rejected.
+func TestTorBox_theAccountGateCoversTheWarmFastPath(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	recordRefusal(cache, ServiceTorBox, "tok", repeat("f", 40),
+		&StoreUnavailableError{Service: ServiceTorBox, Status: 403, Reason: "createtorrent http 403"})
+	cache.Put(resolveKey("tok", H),
+		`{"torrentId":42,"files":[{"Index":0,"Name":"Show.S01E01.mkv","SizeBytes":900}]}`, resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			t.Error("a rejected key must stop the request before it is made, warm entry or not")
+			return resp(200, `{}`), nil
+		}}}
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0)}); err == nil {
+		t.Error("a rejected key cannot serve even a pack played minutes ago")
+	}
+}
+
+// The read path keeps the service's own words, the same rule the add path follows: an account at its
+// active-download limit and a torrent id TorBox cannot serve are both a bare 400, and only the text says
+// which. Discarding it left the read path unable to tell a genuine refusal from a dead link, so it
+// recorded nothing and re-asked on every poll.
+func TestTorBox_theReadPathKeepsTheServicesOwnWords(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "requestdl") {
+				return resp(400, `{"error":"DOWNLOAD_SERVER_ERROR","detail":"active download limit reached"}`), nil
+			}
+			return resp(200, `{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}`), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0), NoAdd: true})
+	if err == nil || !strings.Contains(err.Error(), "active download limit reached") {
+		t.Errorf("got %v — the answer that says WHY was thrown away one layer down", err)
+	}
+}
+
+// A cached file list that names its episodes is proof about the pack, not a hint: if the requested one
+// is not among them, adding the torrent again only re-learns the same thing, on an account with an
+// hourly ceiling on adds.
+func TestTorBox_aProvenWrongPackIsNotReAdded(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(resolveKey("tok", H),
+		`{"torrentId":42,"files":[{"Index":0,"Name":"Show.S01E01.mkv","SizeBytes":900},`+
+			`{"Index":1,"Name":"Show.S01E02.mkv","SizeBytes":950}]}`, resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			t.Errorf("the cached list already proves this pack is wrong; %s was asked anyway", r.URL.Path)
+			return resp(200, `{}`), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(9)})
+	if !errors.Is(err, errEpisodeNotInTorrent) {
+		t.Errorf("got %v, want errEpisodeNotInTorrent", err)
 	}
 }
