@@ -2259,7 +2259,10 @@ func TestTorBoxListFiles_classifiesTheRemainingShapes(t *testing.T) {
 // minutes at the client's cadence, and then 503 scout_busy on every RD resolve for the rest of the
 // rolling hour, healthy releases included.
 func TestRealDebrid_anAnsweredFailureIsNotACharge(t *testing.T) {
-	for _, tc := range []struct{ name, body string; status int }{
+	for _, tc := range []struct {
+		name, body string
+		status     int
+	}{
 		{"a rejected magnet", `{"error":"bad magnet","error_code":11}`, 400},
 		{"a 2xx with no id", `{"ok":true}`, 200},
 	} {
