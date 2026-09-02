@@ -2032,3 +2032,92 @@ func TestPremiumize_theServicesWordsCannotCarryTheToken(t *testing.T) {
 		t.Errorf("the token was persisted into the refusal cache: %s", reason)
 	}
 }
+
+// mylist replies with arrays as well as objects — that is why listFiles carries an []entry fallback at
+// all — and `data:[]` is the array form's only way to say "I hold nothing for this id", exactly as
+// `data:null` is the object form's. Read as "no answer" it kept the stale id, re-stamped its six hours
+// on every poll and never re-added, wedging the series path at a permanent 503 while movies healed.
+func TestTorBox_anEmptyListingIsTheAccountAnswering(t *testing.T) {
+	// A BARE top-level `[]` is deliberately absent: it is not the documented envelope at all, so it stays
+	// "no answer" rather than being read as a claim about what the account holds.
+	for _, payload := range []string{`{"data":[]}`, `{"success":false,"data":null}`} {
+		t.Run(payload, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			gone := true
+			adds := 0
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				switch {
+				case isAddEndpoint(r):
+					adds++
+					gone = false
+					return resp(200, `{"data":{"torrent_id":77}}`), nil
+				case strings.Contains(r.URL.Path, "mylist"):
+					if gone {
+						return resp(200, payload), nil
+					}
+					return resp(200, `{"data":[{"files":[{"id":0,"name":"Show.S01E01.mkv","size":900},`+
+						`{"id":1,"name":"Show.S01E02.mkv","size":950}]}]}`), nil
+				}
+				return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
+			}}
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+			s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+			link, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
+			if err != nil || link == "" {
+				t.Fatalf("a pack the account no longer holds must be re-bought: %q %v", link, err)
+			}
+			if adds != 1 {
+				t.Errorf("made %d adds; the stale id should have been forgotten once and the pack re-added", adds)
+			}
+			if raw, _ := cache.Get(torrentIDKey("tok", H)); raw == "42" {
+				t.Error("the stale id survived, and every later poll would keep it alive for another six hours")
+			}
+		})
+	}
+}
+
+// A torrent createtorrent returned seconds ago, which mylist then denies, is TorBox disagreeing with
+// itself — not the account saying it lacks the torrent. Passed through as `gone` the fresh id was never
+// remembered, so the next poll found nothing known and added the same torrent again: one add per poll,
+// bounded by nothing but the hourly allowance.
+func TestTorBox_aTorrentDeniedRightAfterBuyingItIsNotReBought(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	adds := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case isAddEndpoint(r):
+			adds++
+			return resp(200, `{"data":{"torrent_id":77}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			return resp(200, `{"success":false,"data":null}`), nil
+		}
+		return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+	target := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)}
+	// The first poll's answer is the one the viewer acts on: a dead link, so the client moves to another
+	// release rather than sitting on a service error for one that may be fine elsewhere.
+	_, first := s.Resolve(context.Background(), target)
+	var dead *DeadLinkError
+	if !errors.As(first, &dead) {
+		t.Errorf("got %v, want a dead link the client can move past", first)
+	}
+	// The polls behind it are what the backoff is for: they cost nothing, where before each bought the
+	// same torrent again.
+	for i := 0; i < 9; i++ {
+		_, _ = s.Resolve(context.Background(), target)
+	}
+	if adds > 1 {
+		t.Errorf("made %d adds; a store contradicting itself must not be paid once per poll", adds)
+	}
+}

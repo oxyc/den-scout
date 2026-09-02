@@ -687,7 +687,25 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 		return "", err
 	}
-	return s.resolveHeldTorrent(ctx, torrentID, key, needFiles, t)
+	link, err := s.resolveHeldTorrent(ctx, torrentID, key, needFiles, t)
+	// `gone` about an id createtorrent returned SECONDS ago is TorBox disagreeing with itself, not the
+	// account saying it lacks the torrent — and the two must not lead to the same place. Passed through,
+	// it left the fresh id unremembered, so the next poll found no known id and added the same torrent
+	// again: one add per poll, bounded by nothing but the hourly allowance, which a two-second cadence
+	// spends in under two minutes. (The held path above still re-buys on `gone`, which is where that
+	// verdict does mean what it says.)
+	//
+	// Backing off is what actually bounds it — converting the error alone does not, because the next poll
+	// finds no known id and buys the torrent again regardless of what this one answered. A store that
+	// creates a torrent and then denies holding it is faulting, so naming TorBox is accurate; the answer
+	// to THIS poll stays a dead link so the client can move on to another release rather than sit on a
+	// service error for a release that may be fine elsewhere.
+	if errors.Is(err, errTorrentGone) {
+		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, &StoreUnavailableError{
+			Service: ServiceTorBox, Reason: "created this torrent and then denied holding it"})
+		return "", &DeadLinkError{"torbox created this torrent and then denied holding it"}
+	}
+	return link, err
 }
 
 // resolveHeldTorrent turns a torrent the account HAS into a playable link: list its files if an episode
@@ -1026,8 +1044,17 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 	var e entry
 	if json.Unmarshal(body.Data, &e) != nil {
 		var arr []entry
-		if json.Unmarshal(body.Data, &arr) != nil || len(arr) == 0 {
+		// Two different facts, and folding them together reproduced the wedge the errTorrentGone split
+		// was written to remove. A payload that will not parse is no answer. An EMPTY ARRAY is TorBox
+		// answering: `data:[]` is the array form's only way to say "I hold nothing for this id", exactly
+		// as `data:null` is the object form's — and this fallback exists at all because mylist does reply
+		// with arrays. Read as "no answer" it kept the stale id, re-stamped its six hours on every poll,
+		// and never re-added, so the series path wedged at a permanent 503 while movies still healed.
+		if json.Unmarshal(body.Data, &arr) != nil {
 			return nil, errNoFileList
+		}
+		if len(arr) == 0 {
+			return nil, errTorrentGone
 		}
 		e = arr[0]
 	}
