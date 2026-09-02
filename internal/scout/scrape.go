@@ -309,17 +309,22 @@ func makeScrapers(config *Config, client doer, urls map[Indexer]string) []scrape
 		if envVar, needsPath := configPathIndexers[id]; needsPath && urls[id] == "" {
 			// Mint one from the debrid account we already hold, when the operator has allowed it. An
 			// explicit URL always wins, so a token-free config that was pasted in stays in use.
+			transient := false
 			if mintIndexerConfigs {
-				base = indexerBaseWithConfig(context.Background(), id, config, client)
+				base, transient = indexerBaseWithConfig(context.Background(), id, config, client)
 			}
 			if base == "" || !mintIndexerConfigs {
-				logIndexerSkipOnce(id, envVar)
+				// A transient mint failure is an outage, not a misconfiguration — don't tell the operator
+				// to configure something that already is. The mint logs its own reason.
+				if !transient {
+					logIndexerSkipOnce(id, envVar)
+				}
 				// Kept in the list as a scraper that cannot answer, rather than dropped from it. Dropping
 				// removed it from the quorum too, so "an empty result is authoritative only when EVERY
 				// indexer answered" silently became "…every indexer we still bother asking" — and with
 				// the other two unconfigured, one torrentio 200-empty was again a confident "this release
 				// does not exist". That is the same bug the skip was introduced to fix, one level up.
-				out = append(out, unaskableScraper{indexer: id})
+				out = append(out, unaskableScraper{indexer: id, transient: transient})
 				continue
 			}
 		}
@@ -331,7 +336,14 @@ func makeScrapers(config *Config, client doer, urls map[Indexer]string) []scrape
 // unaskableScraper stands in for a configured indexer that cannot be addressed — it needs a per-install
 // config segment and none was supplied or could be minted. It fails without making a request, so it
 // costs nothing and still counts as a source that did not answer.
-type unaskableScraper struct{ indexer Indexer }
+//
+// `transient` separates "not configured" from "the mint failed just now". Only the first is excluded
+// from the empty-result quorum; a transient failure means we genuinely do not know what this indexer
+// would have said, which is exactly the state the quorum exists to detect.
+type unaskableScraper struct {
+	indexer   Indexer
+	transient bool
+}
 
 func (s unaskableScraper) id() Indexer { return s.indexer }
 
@@ -409,7 +421,9 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 	// the difference. It is reported once per process by `logIndexerSkipOnce` instead.
 	if len(all) == 0 {
 		for i, ok := range respok {
-			if _, unaskable := scrapers[i].(unaskableScraper); unaskable {
+			// Only a PERMANENTLY unaskable indexer is excused. One whose config could not be minted this
+			// minute is an outage: it would have voted, and we do not know how.
+			if u, unaskable := scrapers[i].(unaskableScraper); unaskable && !u.transient {
 				continue
 			}
 			if !ok {

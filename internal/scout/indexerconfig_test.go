@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stubDoer answers one canned response and records what it was asked.
@@ -90,8 +91,8 @@ func TestIndexerBaseWithConfig_cachesPerAccount(t *testing.T) {
 	d := &stubDoer{status: 200, body: `{"encrypted_str":"E1","status":"success"}`}
 	cfg := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: "acct-a"}}}
 
-	first := indexerBaseWithConfig(context.Background(), "mediafusion", cfg, d)
-	second := indexerBaseWithConfig(context.Background(), "mediafusion", cfg, d)
+	first, _ := indexerBaseWithConfig(context.Background(), "mediafusion", cfg, d)
+	second, _ := indexerBaseWithConfig(context.Background(), "mediafusion", cfg, d)
 	if first == "" || first != second {
 		t.Fatalf("expected a stable minted URL, got %q then %q", first, second)
 	}
@@ -103,7 +104,7 @@ func TestIndexerBaseWithConfig_cachesPerAccount(t *testing.T) {
 	// debrid with another's token.
 	other := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: "acct-b"}}}
 	d.body = `{"encrypted_str":"E2","status":"success"}`
-	if got := indexerBaseWithConfig(context.Background(), "mediafusion", other, d); got == first {
+	if got, _ := indexerBaseWithConfig(context.Background(), "mediafusion", other, d); got == first {
 		t.Errorf("a second account reused the first's config: %s", got)
 	}
 }
@@ -112,18 +113,63 @@ func TestIndexerBaseWithConfig_cachesPerAccount(t *testing.T) {
 func TestIndexerBaseWithConfig_edges(t *testing.T) {
 	resetMinted()
 	d := &stubDoer{status: 200, body: `{"encrypted_str":"E","status":"success"}`}
-	if got := indexerBaseWithConfig(context.Background(), "mediafusion", &Config{}, d); got != "" {
-		t.Errorf("no account should mint nothing, got %s", got)
+	if got, transient := indexerBaseWithConfig(context.Background(), "mediafusion", &Config{}, d); got != "" || transient {
+		t.Errorf("no account should mint nothing, and permanently so: %q transient=%v", got, transient)
 	}
 	if _, ok := primaryDebrid(nil); ok {
 		t.Error("a nil config has no account")
 	}
 	cfg := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: "t"}}}
-	if got := indexerBaseWithConfig(context.Background(), "comet", cfg, d); got == "" {
+	if got, _ := indexerBaseWithConfig(context.Background(), "comet", cfg, d); got == "" {
 		t.Error("comet mints locally and should need no round trip")
 	}
-	if got := indexerBaseWithConfig(context.Background(), "torrentio", cfg, d); got != "" {
+	if got, _ := indexerBaseWithConfig(context.Background(), "torrentio", cfg, d); got != "" {
 		t.Errorf("torrentio needs no config segment, got %s", got)
+	}
+}
+
+// A mint that FAILED because the indexer was unreachable is an outage, not a misconfiguration, and the
+// two must stay distinguishable.
+//
+// They were not. A failed mint is cached for two minutes and makes the indexer "unaskable", which the
+// empty-result quorum EXCUSES — so one 10s timeout on a loaded homelab promoted torrentio's empty answer
+// to an authoritative "this release does not exist", cached and served with stale-if-error for a day.
+// A transient failure means we do not know what that indexer would have said, which is precisely the
+// state the quorum exists to detect.
+func TestIndexerBaseWithConfig_separatesOutageFromMisconfiguration(t *testing.T) {
+	cfg := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: "t"}}}
+
+	resetMinted()
+	unreachable := &stubDoer{err: fmt.Errorf("dial tcp: i/o timeout")}
+	got, transient := indexerBaseWithConfig(context.Background(), "mediafusion", cfg, unreachable)
+	if got != "" || !transient {
+		t.Errorf("an unreachable indexer is a transient failure: %q transient=%v", got, transient)
+	}
+
+	// The classification must survive the failure cache, or the two minutes it is replayed for
+	// reintroduce the same confusion.
+	if _, cached := indexerBaseWithConfig(context.Background(), "mediafusion", cfg, unreachable); !cached {
+		t.Error("the cached failure forgot that it was transient")
+	}
+	if unreachable.reqs != 1 {
+		t.Errorf("the failure was re-POSTed %d times instead of being cached", unreachable.reqs)
+	}
+}
+
+// A transient mint failure COUNTS as an indexer that did not answer, so an empty list stays
+// non-authoritative. Only a permanently unconfigured one is excused from the quorum.
+func TestUnaskableScraper_transientStillCountsInTheQuorum(t *testing.T) {
+	answered := fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) { return nil, nil }}
+	budget := 50 * time.Millisecond
+
+	unconfigured := []scraper{answered, unaskableScraper{indexer: "mediafusion"}}
+	if _, ok := scrapeAll(context.Background(), unconfigured, scrapeQuery{}, budget); !ok {
+		t.Error("an unconfigured indexer must not make an empty result look like an outage")
+	}
+
+	outage := []scraper{answered, unaskableScraper{indexer: "mediafusion", transient: true}}
+	if _, ok := scrapeAll(context.Background(), outage, scrapeQuery{}, budget); ok {
+		t.Error("an indexer that could not be reached must leave the empty result non-authoritative")
 	}
 }
 

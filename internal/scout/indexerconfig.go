@@ -50,6 +50,12 @@ func EnableIndexerConfigMinting(on bool) { mintIndexerConfigs = on }
 type mintedConfig struct {
 	url string
 	at  time.Time
+	// transient marks a failure a retry could fix — the indexer was unreachable, timed out, or refused
+	// the payload — as opposed to one no retry will: there is no debrid account to mint from. Only the
+	// latter is a misconfiguration, and the difference decides whether the indexer is excluded from the
+	// empty-result quorum or counts as one that did not answer. Collapsing them let a single 10s timeout
+	// on a loaded homelab promote an empty torrentio result to authoritative for two minutes.
+	transient bool
 }
 
 // How long a failure to mint is remembered. Short, because a host that is down now may be up in a
@@ -71,41 +77,47 @@ var (
 
 // indexerBaseWithConfig returns a ready-to-use base URL for an indexer that needs a config segment, or
 // "" when one cannot be built. Cached per (indexer, account) so a burst of episode requests mints once.
-func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, client doer) string {
+// The second result reports that a FAILURE was transient — see mintedConfig.transient. It is meaningless
+// when a URL was returned.
+func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, client doer) (string, bool) {
 	acct, ok := primaryDebrid(config)
 	if !ok {
-		return ""
+		return "", false // nothing to mint from, and no retry changes that
 	}
 	key := string(id) + ":" + keyHash(string(acct.Service)+":"+acct.Token)
 
 	mintedMu.Lock()
 	if m, hit := minted[key]; hit && time.Since(m.at) < m.ttl() {
 		mintedMu.Unlock()
-		return m.url
+		return m.url, m.transient
 	}
 	mintedMu.Unlock()
 
 	var url string
+	// A mint that has to reach the indexer can fail for reasons a retry fixes; one computed locally
+	// cannot, so only the former is transient.
+	transient := false
 	switch id {
 	case "comet":
 		url = mintCometURL(acct)
 	case "mediafusion":
 		url = mintMediaFusionURL(ctx, acct, client)
+		transient = url == ""
 	}
 	if url == "" {
 		// Remember the FAILURE too, briefly. Only successes were cached, so while the host was unhealthy
 		// every single stream request re-POSTed to it — with its own 10 s timeout, ahead of the scrape —
 		// meaning the worse it was, the harder scout hit it. The opposite of what a limiter is for.
 		mintedMu.Lock()
-		minted[key] = mintedConfig{url: "", at: time.Now()}
+		minted[key] = mintedConfig{url: "", at: time.Now(), transient: transient}
 		mintedMu.Unlock()
-		return ""
+		return "", transient
 	}
 	mintedMu.Lock()
 	minted[key] = mintedConfig{url: url, at: time.Now()}
 	mintedMu.Unlock()
 	log.Printf("scout: minted a config for the %s indexer from the %s account", id, acct.Service)
-	return url
+	return url, false
 }
 
 // primaryDebrid picks the account a minted config should speak for. First configured wins — the same
