@@ -80,7 +80,12 @@ func matchesEpisode(name string, patterns []*regexp2.Regexp) bool {
 // 10. In both cases a correct fileIdx was discarded on the way past. A directory describes the pack; only
 // the filename describes the file.
 func baseName(name string) string {
-	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+	// `/` only. The BitTorrent path is a list of components and every client joins it with a forward
+	// slash, which is what all three debrid APIs hand back. A backslash, meanwhile, is a legal character
+	// in a POSIX filename, and nothing in the string says which one it is: splitting on it turned
+	// `Show S01E01 - Part 1 \ Part 2.mkv` into ` Part 2.mkv`, losing the label and reclassifying a
+	// perfectly well-named file as unlabelled.
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
 		return name[i+1:]
 	}
 	return name
@@ -140,22 +145,30 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 				bare = append(bare, f)
 			}
 		}
-		// Evidence that picks out everything picks out nothing. When a bare number matches EVERY
-		// candidate it is part of what they share — the show's own title — rather than what tells them
-		// apart: `Stargate SG-1 - 02 - The Enemy Within.mkv` matches episode 1 in every file of the pack,
-		// and the largest was served for a request for episode 1. Discarding it leaves the indexer's
-		// fileIdx to decide, which is the thing that actually knows.
-		if len(bare) > 0 && !(len(bare) == len(unlabelled) && len(unlabelled) > 1) {
-			idx := largest(bare).Index
+		// Exactly one, or it is not evidence. In a numbered pack the episode's own number appears in one
+		// file; a number that turns up in several is something they share — the show's title — and
+		// picking the biggest of those served `Stargate SG-1 - 03` for a request for episode 1.
+		//
+		// The test used to be "did it match EVERY candidate", which asked about set sizes rather than
+		// about whether the evidence tells the files apart, and one odd file was enough to disarm it: add
+		// a sample to the same SG-1 pack and 3 of 4 matched, so the equality failed and the largest was
+		// served again. Counting to one has no such seam.
+		if len(bare) == 1 {
+			idx := bare[0].Index
 			return &idx, nil
 		}
 	}
-	// Only an UNAMBIGUOUS label can condemn a pack, and only when EVERY candidate carries one: a pack
-	// whose files all name their episodes, none of them yours, holds nothing to play. A bare number can
-	// never prove absence — bare numbering is frequently ABSOLUTE, so season 2 episode 1 is packed as
-	// `[Grp] Show - 13` and nothing in the name says so, and refusing there kills every episode of an
-	// ordinary anime season.
-	if len(unlabelled) == 0 {
+	// A pack that NAMES its episodes, none of them yours, holds nothing to play. Two labelled files are
+	// what make it a pack: one is a single episode, and a bare number can never prove absence — bare
+	// numbering is frequently ABSOLUTE, so season 2 episode 1 is packed as `[Grp] Show - 13` and nothing
+	// in the name says so, so refusing on that would kill every episode of an ordinary anime season.
+	//
+	// It counts the LABELLED files rather than requiring every file to be labelled. The stricter test
+	// asked about the pool instead of about the pack, so a single unlabelled extra — a sample, a
+	// featurette, a bonus rip, all of which are videos and all of which are ordinary in a season pack —
+	// disarmed the refusal for every episode of that pack, and the stores then served their largest
+	// video: a 302, no error, the wrong episode. One stray file cannot unmake a pack.
+	if len(pool)-len(unlabelled) > 1 {
 		return nil, errEpisodeNotInTorrent
 	}
 	// No opinion, rather than a guess. The fallback below is sound only for a pool of ONE, where "the

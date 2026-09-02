@@ -2,6 +2,7 @@ package scout
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -462,13 +463,13 @@ func TestPickEpisodeFile_theDirectoryIsNotEvidenceAboutTheFile(t *testing.T) {
 	if got, err := pickEpisodeFile(tagged, 1, 10); got != nil || err != nil {
 		t.Errorf("[10-bit] in the directory is not episode 10: got %v, %v", got, err)
 	}
-	// Windows-style separators too, since the name comes from whatever the torrent carries.
-	back := []TorrentFile{
-		file(301, `Show.S01E01-E10\Show.S01E01.mkv`, 900),
-		file(308, `Show.S01E01-E10\Show.S01E08.mkv`, 9000),
+	// Nested directories, which is what a season pack of a multi-season release looks like.
+	deep := []TorrentFile{
+		file(301, "Show Complete/Season 01/Show.S01E01.mkv", 900),
+		file(308, "Show Complete/Season 01/Show.S01E08.mkv", 9000),
 	}
-	got, err = pickEpisodeFile(back, 1, 1)
-	wantPick(t, got, err, 301, "a backslash separates a directory too")
+	got, err = pickEpisodeFile(deep, 1, 1)
+	wantPick(t, got, err, 301, "only the last component names the file")
 }
 
 // A number that matches EVERY candidate is part of what they share — the show's own title — not what
@@ -526,4 +527,77 @@ func TestPickEpisodeFile_oneLabelledFileDoesNotCondemnTheRest(t *testing.T) {
 	}
 	got, err = pickEpisodeFile(allLabelled, 1, 9)
 	wantNotInTorrent(t, got, err, "a fully labelled pack that lacks the episode holds nothing to play")
+}
+
+// One stray file cannot unmake a pack, and cannot rescue a number that decides nothing. Both guards used
+// to be phrased as set-size comparisons over the pool, so a single extra video — a sample, a featurette,
+// a bonus rip, all of them ordinary in a season pack and all of them videos — was enough to disarm each.
+func TestPickEpisodeFile_oneStrayFileDisarmsNothing(t *testing.T) {
+	labelled := []TorrentFile{
+		file(0, "Show.S01E01.1080p.mkv", 900),
+		file(1, "Show.S01E02.1080p.mkv", 950),
+		file(2, "Show.S01E03.1080p.mkv", 980),
+	}
+	// The pack names its episodes and none of them is S02E01, so there is nothing here to play — and
+	// that stays true with a sample, a featurette or both alongside.
+	for _, extra := range [][]TorrentFile{
+		nil,
+		{file(3, "Sample/show-sample.mkv", 20)},
+		{file(3, "Extras/Behind the Scenes.mkv", 9000)},
+		{file(3, "Sample/show-sample.mkv", 20), file(4, "Extras/Behind the Scenes.mkv", 9000)},
+	} {
+		got, err := pickEpisodeFile(append(append([]TorrentFile{}, labelled...), extra...), 2, 1)
+		wantNotInTorrent(t, got, err, fmt.Sprintf("a pack of other episodes plus %d extras", len(extra)))
+	}
+
+	// The mirror: a title number matches several files, so it tells them apart not at all — and adding a
+	// sample must not turn that back into an answer.
+	sg1 := []TorrentFile{
+		file(301, "Stargate SG-1 - 01 - Children of the Gods.mkv", 900),
+		file(302, "Stargate SG-1 - 02 - The Enemy Within.mkv", 950),
+		file(303, "Stargate SG-1 - 03 - Emancipation.mkv", 9000),
+	}
+	withSample := append(append([]TorrentFile{}, sg1...), file(304, "sample.mkv", 20))
+	for _, pool := range [][]TorrentFile{sg1, withSample} {
+		if got, err := pickEpisodeFile(pool, 1, 1); got != nil || err != nil {
+			t.Errorf("a number matching several files decides nothing (%d files): got %v, %v",
+				len(pool), got, err)
+		}
+	}
+	// And the episode whose number really is unique to one file is still found, sample or not.
+	for _, pool := range [][]TorrentFile{sg1, withSample} {
+		got, err := pickEpisodeFile(pool, 1, 2)
+		wantPick(t, got, err, 302, "episode 2 is named by exactly one file")
+	}
+
+	// A single labelled episode is not a pack: it cannot condemn anything.
+	one := []TorrentFile{file(0, "Show.S01E01.1080p.mkv", 900)}
+	if got, err := pickEpisodeFile(one, 2, 1); got == nil || err != nil {
+		t.Errorf("a lone episode file is not a pack that lacks your episode: got %v, %v", got, err)
+	}
+}
+
+// A backslash is legal in a POSIX filename, and these names come from the torrent. Splitting on it
+// unconditionally threw away the part of the name that carries the label.
+func TestBaseName_onlySplitsWhereADirectoryReallyEnds(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"Show.S01E01.mkv", "Show.S01E01.mkv"},
+		{"Pack/Show.S01E01.mkv", "Show.S01E01.mkv"},
+		{"Pack/Sub/Show.S01E01.mkv", "Show.S01E01.mkv"},
+		// A backslash is a legal filename character and every client joins the torrent's path components
+		// with a forward slash, so a backslash is never a separator here.
+		{`Show S01E01 - Part 1 \ Part 2.mkv`, `Show S01E01 - Part 1 \ Part 2.mkv`},
+		{`Pack/Show S01E01 - Part 1 \ Part 2.mkv`, `Show S01E01 - Part 1 \ Part 2.mkv`},
+	} {
+		if got := baseName(tc.in); got != tc.want {
+			t.Errorf("baseName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// The label survives, which is the point.
+	backslashed := []TorrentFile{
+		file(0, `Show S01E01 - Part 1 \ Part 2.mkv`, 900),
+		file(1, `Show S01E02 - Part 1 \ Part 2.mkv`, 9000),
+	}
+	got, err := pickEpisodeFile(backslashed, 1, 1)
+	wantPick(t, got, err, 0, "a backslash in the filename does not erase its episode label")
 }
