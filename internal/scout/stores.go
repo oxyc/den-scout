@@ -743,6 +743,12 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 		// failing, and letting it back the release off would stop the next poll retrying a list that is
 		// very likely to succeed.
 		if refusalIsAboutTheAccount(err) {
+			// The id first, for the same reason the unconditional write below exists: Status needs it to
+			// report a download in progress. Returning above that write dropped an id createtorrent had
+			// just handed us, so the next poll knew of no torrent and bought another one.
+			if s.cache != nil {
+				s.cache.Put(torrentIDKey(s.token, t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
+			}
 			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 			return "", err
 		}
@@ -1297,12 +1303,25 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	settleAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	// Read once, keep the bytes: the id and the explanation of a failure live in the same body, and
 	// decoding straight off the reader left nothing for readStoreError further down.
-	raw, _ := io.ReadAll(io.LimitReader(addResp.Body, maxStoreBytes))
+	raw, readErr := io.ReadAll(io.LimitReader(addResp.Body, maxStoreBytes))
 	_ = addResp.Body.Close()
 	var added struct {
 		ID string `json:"id"`
 	}
 	_ = json.Unmarshal(raw, &added)
+	// A body that could not be READ is not an answer that nothing was created. RD had already sent its
+	// status line — a 201 means the torrent exists on the account — and a mid-body reset, a TLS
+	// truncation or the client's context expiring after the headers arrived all land here. Folding it in
+	// with "RD created nothing" refunded the charge for a torrent that does exist, and since this branch
+	// records no backoff either, the budget was the only thing bounding the loop: sixty polls created
+	// sixty torrents on the account with the allowance untouched. So the charge STAYS, and the release is
+	// backed off — the outcome is unknown, which is exactly when re-asking is the expensive mistake.
+	if readErr != nil {
+		unknown := &StoreUnavailableError{Service: ServiceRealDebrid,
+			Reason: "the add was answered but its body could not be read, so the outcome is unknown"}
+		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, unknown)
+		return "", unknown
+	}
 	// A refusal is a fact about the account, not the release — the same distinction TorBox already draws.
 	// Every non-2xx here used to become a dead link, so on a Real-Debrid install a 429 or a 503 reached
 	// the app as "this release does not exist", and the player walked the whole candidate list collecting
@@ -1326,8 +1345,14 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		}
 		// RD was the only store discarding the service's own words here, so the log said the same thing
 		// for a bad magnet, a locked account and a Cloudflare page.
-		return "", &DeadLinkError{fmt.Sprintf("realdebrid no torrent id (http %d)%s",
+		dead := &DeadLinkError{fmt.Sprintf("realdebrid no torrent id (http %d)%s",
 			addResp.StatusCode, detail)}
+		// Backed off as well, the way TorBox's add path does. The refund fixes the quota, but on its own
+		// it left a poll loop free to re-ask forever — sixty polls, sixty real addMagnet calls — and
+		// "free" is why that went unnoticed. The client's answer to THIS poll is still a dead link, so it
+		// moves on to another release; only a client that keeps asking about this one meets the backoff.
+		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, dead)
+		return "", dead
 	}
 	// Remember the torrent RD just created, the way TorBox remembers its id. This is the fix the marker
 	// kept failing to be: a "we already bought this" fact, separate from "an add is in flight", and not
@@ -1721,7 +1746,12 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
 			return "", refused
 		}
-		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d%s", resp.StatusCode, detail)}
+		// Backed off for the same reason RD's twin is: without it a poll loop re-asks a magnet Premiumize
+		// has already rejected once every couple of seconds for as long as the viewer sits there. The
+		// answer to this poll stays a dead link so the client can fall through to another release.
+		dead := &DeadLinkError{fmt.Sprintf("premiumize directdl http %d%s", resp.StatusCode, detail)}
+		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
+		return "", dead
 	}
 	// Premiumize accepted it. Same reason as RD: no Status endpoint, so without this the next poll
 	// queues the same transfer again.

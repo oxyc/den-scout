@@ -2271,8 +2271,10 @@ func TestRealDebrid_anAnsweredFailureIsNotACharge(t *testing.T) {
 			globalAddBudget = newAddBudget(time.Hour, 50)
 			defer func() { globalAddBudget = prev }()
 
+			adds := 0
 			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 				if strings.Contains(r.URL.Path, "addMagnet") {
+					adds++
 					return resp(tc.status, tc.body), nil
 				}
 				return resp(200, `{}`), nil
@@ -2284,6 +2286,12 @@ func TestRealDebrid_anAnsweredFailureIsNotACharge(t *testing.T) {
 			}
 			if left := globalAddBudget.remaining(budgetAccount(ServiceRealDebrid, "tok")); left != 50 {
 				t.Fatalf("allowance %d — one viewer on one release spent the hour", left)
+			}
+			// The allowance alone cannot see the loop: refunding every attempt keeps it at 50 while sixty
+			// polls make sixty real calls upstream. Counting them is what notices that the refund removed
+			// the only bound this branch had, which is exactly how that regression shipped.
+			if adds > 1 {
+				t.Errorf("made %d addMagnet calls over 60 polls — nothing bounds the loop", adds)
 			}
 			// What the allowance buys: a DIFFERENT, healthy release still resolves, instead of being
 			// refused by scout's own bookkeeping for the rest of the hour.
@@ -2346,5 +2354,107 @@ func TestTorBox_aRejectedKeyOnMylistReachesTheAccountBackoff(t *testing.T) {
 	}
 	if _, ok := accountBackedOff(cache, ServiceTorBox, "tok"); !ok {
 		t.Error("the dead key was never recorded, so every later request asks with it again")
+	}
+}
+
+// A body that could not be READ is not an answer that nothing was created. RD had already sent its
+// status line — a 201 means the torrent exists on the account — and a mid-body reset, a TLS truncation
+// or the client's context expiring after the headers arrived all land here. Folding it in with "RD
+// created nothing" refunded the charge for a torrent that does exist, and with no backoff on that branch
+// the budget was the only bound: sixty polls created sixty torrents with the allowance untouched.
+func TestRealDebrid_anUnreadableAnswerIsNotProofNothingWasCreated(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	created := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "addMagnet") {
+			created++
+			// Answered 201 — the torrent exists — then the body dies mid-flight.
+			return &http.Response{StatusCode: 201, Body: io.NopCloser(brokenReader{})}, nil
+		}
+		return resp(200, `{}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	s := &realDebridStore{token: "tok", client: d, cache: cache, api: realDebridAPI}
+	for i := 0; i < 60; i++ {
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if created > 1 {
+		t.Errorf("created %d torrents on the account across 60 polls", created)
+	}
+	// The charge stays: the outcome is unknown, and that is precisely when assuming nothing happened is
+	// the expensive assumption.
+	if left := globalAddBudget.remaining(budgetAccount(ServiceRealDebrid, "tok")); left != 49 {
+		t.Errorf("allowance %d — an add whose outcome is unknown was treated as one that never happened", left)
+	}
+}
+
+// brokenReader answers with a read error after the status line has already been sent.
+type brokenReader struct{}
+
+func (brokenReader) Read([]byte) (int, error) { return 0, fmt.Errorf("unexpected EOF mid-body") }
+
+// The rejected-key return must not drop the torrent id it was just handed: Status needs it to report a
+// download in progress, and without it the next poll knows of no torrent and buys another.
+func TestTorBox_theRejectedKeyReturnKeepsTheTorrentId(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	adds := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case isAddEndpoint(r):
+			adds++
+			return resp(200, `{"data":{"torrent_id":77}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			return resp(403, `{"error":"BAD_TOKEN"}`), nil
+		}
+		return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
+	if raw, _ := cache.Get(torrentIDKey("tok", H)); raw != "77" {
+		t.Errorf("torrent id %q — the id createtorrent just handed us was dropped", raw)
+	}
+	if adds != 1 {
+		t.Errorf("made %d adds", adds)
+	}
+}
+
+// The same bound on Premiumize's answered-failure branch: refunding the charge fixed the quota but left
+// a poll loop free to re-ask a magnet Premiumize has already rejected, once every couple of seconds for
+// as long as the viewer sits there. Free of quota is not free.
+func TestPremiumize_anAnsweredFailureIsAskedOnlyOnce(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	calls := 0
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			calls++
+			return resp(400, `{"status":"error","message":"Invalid src"}`), nil
+		}}}
+	target := ResolveTarget{InfoHash: H}
+	// The first answer is a dead link, so the client falls through to another release rather than being
+	// told the store is unavailable for one the store has a definite opinion about.
+	_, first := s.Resolve(context.Background(), target)
+	var dead *DeadLinkError
+	if !errors.As(first, &dead) {
+		t.Errorf("got %v, want a dead link the client can move past", first)
+	}
+	for i := 0; i < 59; i++ {
+		_, _ = s.Resolve(context.Background(), target)
+	}
+	if calls > 1 {
+		t.Errorf("made %d directdl calls over 60 polls — nothing bounds the loop", calls)
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "tok")); left != 50 {
+		t.Errorf("allowance %d — a refused magnet was charged", left)
 	}
 }
