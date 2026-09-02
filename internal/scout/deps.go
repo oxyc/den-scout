@@ -27,6 +27,11 @@ type Settings struct {
 	// ConfigKeysPrev = comma-separated prior keys (rotation). Empty ConfigKey → sealed URLs disabled.
 	ConfigKey      string
 	ConfigKeysPrev string
+	// Let scout build comet's and mediafusion's per-install config segments from the debrid account it
+	// already holds, instead of skipping those indexers for want of a pasted URL. **This sends the debrid
+	// token to those hosts**, so it is off unless the operator turns it on. An explicit SCOUT_<name>_URL
+	// still wins, for a token-free config.
+	MintIndexerConfigs bool
 }
 
 func SettingsFromEnv(get func(string) string) Settings {
@@ -47,11 +52,15 @@ func SettingsFromEnv(get func(string) string) Settings {
 		CinemetaURL:    orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
 		ConfigKey:      get("SCOUT_CONFIG_KEY"),
 		ConfigKeysPrev: get("SCOUT_CONFIG_KEYS_PREV"),
+		MintIndexerConfigs: strings.EqualFold(get("SCOUT_MINT_INDEXER_CONFIGS"), "true") ||
+			get("SCOUT_MINT_INDEXER_CONFIGS") == "1",
 	}
 }
 
 // BuildDeps wires the core to a concrete HTTP client + cache.
 func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
+	// Decided once, at startup, from the operator's environment — never from a request.
+	EnableIndexerConfigMinting(settings.MintIndexerConfigs)
 	return Deps{
 		Cache:         cache,
 		ProbeClient:   client,

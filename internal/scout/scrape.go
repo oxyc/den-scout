@@ -286,11 +286,19 @@ func makeScrapers(config *Config, client doer, urls map[Indexer]string) []scrape
 		// cannot answer usefully, and its failure is silent in the worst way: mediafusion returns 200
 		// with an empty list, which counts as a response and votes on whether a release exists. Leaving
 		// it out means a genuine "nobody has this" still requires everyone who WAS asked to say so.
+		base := baseURLFor(id, config, urls)
 		if envVar, needsPath := configPathIndexers[id]; needsPath && urls[id] == "" {
-			logIndexerSkipOnce(id, envVar)
-			continue
+			// Mint one from the debrid account we already hold, when the operator has allowed it. An
+			// explicit URL always wins, so a token-free config that was pasted in stays in use.
+			if mintIndexerConfigs {
+				base = indexerBaseWithConfig(context.Background(), id, config, client)
+			}
+			if base == "" || !mintIndexerConfigs {
+				logIndexerSkipOnce(id, envVar)
+				continue
+			}
 		}
-		out = append(out, &stremioScraper{indexer: id, baseURL: baseURLFor(id, config, urls), client: client})
+		out = append(out, &stremioScraper{indexer: id, baseURL: base, client: client})
 	}
 	return out
 }
