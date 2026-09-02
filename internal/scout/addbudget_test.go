@@ -830,3 +830,158 @@ func TestQueued_aPermanentRefusalClearsTheMarker(t *testing.T) {
 		t.Error("a permanent refusal was left looking like a download in progress")
 	}
 }
+
+// Real-Debrid remembers the torrent it bought, so a release is paid for once however often it is asked
+// for — including when it can never be served.
+//
+// RD's addMagnet creates a NEW torrent every call, and RD has no Status endpoint for the wait in
+// between, so the guard has to be a memory of the purchase. It must survive both a success (the next
+// episode of the same pack) and a permanent refusal (a pack that lacks the episode), which is what
+// every earlier version of this got wrong in one direction or the other.
+func TestRealDebrid_buysAReleaseOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info string
+		want string // "" when no link is expected
+	}{
+		{"a pack that lacks the episode", `{"files":[{"id":1,"path":"/Show.S01E01.mkv","bytes":9}],"links":[]}`, ""},
+		{"a release that plays", `{"files":[{"id":1,"path":"/movie.mkv","bytes":9}],"links":["https://rd/r"]}`, "https://rd/dl.mkv"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			adds := 0
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				switch {
+				case strings.Contains(r.URL.Path, "addMagnet"):
+					adds++
+					return resp(201, `{"id":"t1"}`), nil
+				case strings.Contains(r.URL.Path, "/torrents/info/"):
+					return resp(200, tc.info), nil
+				case strings.Contains(r.URL.Path, "selectFiles"):
+					return resp(204, ""), nil
+				case strings.Contains(r.URL.Path, "unrestrict/link"):
+					return resp(200, `{"download":"https://rd/dl.mkv"}`), nil
+				}
+				return resp(404, "{}"), nil
+			}}
+			s := &realDebridStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: realDebridAPI}
+			target := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(9)}
+			if tc.want != "" {
+				target = ResolveTarget{InfoHash: H}
+			}
+			var last string
+			for i := 0; i < 10; i++ {
+				link, _ := s.Resolve(context.Background(), target)
+				last = link
+			}
+			if adds != 1 {
+				t.Errorf("%d adds across ten polls — RD makes a new torrent every time", adds)
+			}
+			if last != tc.want {
+				t.Errorf("last resolve = %q, want %q", last, tc.want)
+			}
+		})
+	}
+}
+
+// Only RD's own 404 forgets the remembered torrent. An empty file list is a torrent whose metadata has
+// not resolved yet — forgetting on it re-bought the release on the very next poll.
+func TestRealDebrid_forgetsOnlyOnAConfirmedAbsence(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	adds, gone := 0, false
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "addMagnet"):
+			adds++
+			return resp(201, `{"id":"t1"}`), nil
+		case strings.Contains(r.URL.Path, "/torrents/info/"):
+			if gone {
+				return resp(404, `{}`), nil
+			}
+			return resp(200, `{"files":[],"links":[]}`), nil // queued, metadata not in yet
+		}
+		return resp(404, "{}"), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	s := &realDebridStore{token: "tok", client: d, cache: cache, api: realDebridAPI}
+	for i := 0; i < 5; i++ {
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if adds != 1 {
+		t.Errorf("%d adds while the torrent was merely not ready", adds)
+	}
+	if _, held := s.knownTorrent(H); !held {
+		t.Error("a not-ready torrent was forgotten")
+	}
+	// A THROTTLE on the info call is not an absence either — it describes this attempt, not the account.
+	throttled := NewMemoryCache(1 << 20)
+	tAdds := 0
+	ts := &realDebridStore{token: "tok", cache: throttled, api: realDebridAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "addMagnet") {
+				tAdds++
+				return resp(201, `{"id":"t1"}`), nil
+			}
+			return resp(503, `{}`), nil // RD is faulting, and says nothing about what it holds
+		}}}
+	for i := 0; i < 5; i++ {
+		_, _ = ts.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if tAdds != 1 {
+		t.Errorf("%d adds while RD was merely throttling its own info endpoint", tAdds)
+	}
+	if _, held := ts.knownTorrent(H); !held {
+		t.Error("a throttle forgot the torrent, so the next poll buys it again")
+	}
+
+	// Now RD really does not have it: forget, and let the next attempt buy it again.
+	gone = true
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if _, held := s.knownTorrent(H); held {
+		t.Error("a 404 must forget the id, or the release is stuck behind a ghost for six hours")
+	}
+}
+
+// Premiumize marks a release as queued ONLY when directdl had nothing to serve. directdl IS the fetch,
+// so marking every call blocked releases that would have played instantly — the second episode of a pack
+// could not be resolved for twenty minutes.
+func TestPremiumize_marksOnlyAnEmptyAnswer(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	cache := NewMemoryCache(1 << 20)
+	served := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `{"status":"success","content":[{"path":"m.mkv","link":"https://pm/l","size":9}]}`), nil
+		}}}
+	if _, err := served.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err != nil {
+		t.Fatalf("a release premiumize can serve must resolve: %v", err)
+	}
+	if alreadyQueued(cache, "tok", H) {
+		t.Error("a release that was SERVED was marked as queued; the next request would be refused")
+	}
+	if _, err := served.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err != nil {
+		t.Errorf("the same release could not be resolved twice: %v", err)
+	}
+
+	// An empty answer means a transfer was queued: mark it, and stop paying for it again.
+	calls := 0
+	queued := &premiumizeStore{token: "tok", cache: NewMemoryCache(1 << 20), api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			calls++
+			return resp(200, `{"status":"success","content":[]}`), nil
+		}}}
+	for i := 0; i < 10; i++ {
+		_, _ = queued.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if calls != 1 {
+		t.Errorf("queued a transfer %d times for one release", calls)
+	}
+}

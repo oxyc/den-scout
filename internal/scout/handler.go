@@ -202,8 +202,8 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		value, degraded := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey)
-		return buildResult{value: value, degraded: degraded}, nil
+		value, degraded, complete := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey)
+		return buildResult{value: value, degraded: degraded, complete: complete}, nil
 	})
 	res := v.(buildResult)
 	// Signal a degraded build so the app can say "sources temporarily unavailable" rather than treating
@@ -218,8 +218,15 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	// down, on the only client that matters: an outage's empty list stuck on the device for five minutes,
 	// and up to a day on any later error.
 	cacheHeader := listCache
-	if res.degraded != "" {
+	switch {
+	case res.degraded != "":
 		cacheHeader = noStore
+	case !res.complete:
+		// The SAME lesson one line up, for the partial case: the server held this list for a minute and
+		// then told the client to keep it for five, with stale-if-error for a day. A list knowingly
+		// missing an indexer's releases must not outlive its short server-side life on the device.
+		cacheHeader = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d",
+			int(partialListTTL.Seconds()), int(partialListTTL.Seconds()))
 	}
 	h.conditional(w, r, body, etag, jsonType, cacheHeader)
 }
@@ -228,10 +235,13 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 type buildResult struct {
 	value    string
 	degraded string
+	// complete — every askable indexer answered. A partial list is real and worth caching, just not for
+	// as long, and not with a client freshness window longer than the server's own.
+	complete bool
 }
 
 // buildStreamList scrapes → cache-checks → ranks → serializes, caches "<etag>\x00<body>", returns it.
-func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) (string, string) {
+func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) (string, string, bool) {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
 
@@ -388,7 +398,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		}
 		h.deps.Cache.Put(cacheKey, value, ttl)
 	}
-	return value, degradedReason
+	return value, degradedReason, scrapeComplete
 }
 
 // writeQueued — the "it's coming" answer: 202 plus whatever the store actually reported. `etaSeconds` is

@@ -153,8 +153,11 @@ func TestLabelBranches(t *testing.T) {
 			t.Errorf("cleanLabel(%q)=%q want %q", title, got, want)
 		}
 	}
+	// 1440p has no bucket of its own; it must land on one of the two coarse answers rather than invent a
+	// third. The previous version of this had an empty branch body, so it could not fail whatever came
+	// back — it asserted nothing at all.
 	if got := detectResolution("x 1440p"); got != "1080p" && got != "" {
-		_ = got // 1440p falls outside the coarse buckets; just ensure no panic
+		t.Errorf("detectResolution(1440p) = %q, want 1080p or none", got)
 	}
 }
 

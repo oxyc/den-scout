@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -583,6 +584,17 @@ func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
 	if got := first.Header().Get("X-Scout-Degraded"); got != "" {
 		t.Errorf("X-Scout-Degraded = %q over a list that is short, not broken", got)
 	}
+	// The client must not be told to hold it longer than the server does. The server keeps a partial list
+	// for a minute; advertising the full five-minute max-age pinned a knowingly-short list on the device
+	// for five, and up to a day on stale-if-error — the guard defeated one layer down, again.
+	cc := first.Header().Get("cache-control")
+	if !strings.Contains(cc, fmt.Sprintf("max-age=%d", int(partialListTTL.Seconds()))) {
+		t.Errorf("cache-control = %q: the client would hold this longer than the server does", cc)
+	}
+	if strings.Contains(cc, "stale-if-error") {
+		t.Errorf("cache-control = %q: a short list must not survive a day of errors on the device", cc)
+	}
+
 	do(h, "/"+validBlob+"/stream/movie/tt8888888.json", nil)
 	if scrapes != 1 {
 		t.Errorf("scraped %d times: a partial list must be cached, or every request pays the full scrape", scrapes)

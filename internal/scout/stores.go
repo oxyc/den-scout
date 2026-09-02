@@ -317,57 +317,33 @@ func noteAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
 	}
 }
 
-// How long a store with no Status endpoint remembers that it QUEUED a release.
+// pmQueuedKey — Premiumize's directdl queued a transfer and had nothing to serve yet.
 //
-// TorBox does not need this: it remembers a torrent id and answers Status, so a poll during a download
-// short-circuits long before Resolve. Real-Debrid and Premiumize have neither — a just-added torrent is
-// not downloadable yet, which comes back as a dead link rather than a refusal, so nothing stopped the
-// next poll re-adding it. Thirty polls of one release put thirty duplicate torrents on the account and
-// spent thirty of the hourly allowance in a minute: the loop TorBox's guards closed, relocated.
-//
-// Long enough to cover a download, short enough that a release which never arrives can be asked for
+// Set ONLY on that outcome, never on a successful one. directdl IS the fetch: for a release the account
+// holds it returns links straight away, and only an uncached one queues. A marker set on every call
+// blocked releases that would have played instantly — one infohash is a whole season pack, so the second
+// episode of a show could not be resolved for twenty minutes. Marking only the empty answer suppresses
+// exactly the repeat that costs something, and nothing else.
+func pmQueuedKey(token, infoHash string) string {
+	return "premiumize:queued:" + keyHash(token) + ":" + infoHash
+}
+
+// Long enough to cover a download, short enough that a transfer which never arrives can be asked for
 // again within one sitting.
 const queuedTTL = 20 * time.Minute
 
-// noteQueued records that this store was asked to fetch the release and accepted.
-//
-// It MUST be undone the moment the release becomes playable, or the moment it is known to be
-// unplayable — see settleQueued. A marker that outlives the wait it describes is not a wait but a
-// twenty-minute lie: one infohash serves a whole season pack, so a single successful play blocked every
-// other episode of that show, and a permanent refusal — a pack that lacks the episode, a filename the
-// service blocks — came back as "downloading" instead of letting the client fall through to the next
-// release.
-func noteQueued(cache Cache, svc DebridService, token, infoHash string) {
+func noteQueued(cache Cache, token, infoHash string) {
 	if cache != nil {
-		cache.Put(addAttemptKey(svc, token, infoHash), "1", queuedTTL)
+		cache.Put(pmQueuedKey(token, infoHash), "1", queuedTTL)
 	}
 }
 
-// settleQueued clears the marker once the outcome is known either way — a link, or a verdict the client
-// can act on. Only "asked for, nothing playable yet" keeps it.
-func settleQueued(cache Cache, svc DebridService, token, infoHash, link string, err error) {
-	if link != "" || isPermanentFailure(err) {
-		settleAddAttempt(cache, svc, token, infoHash)
-	}
-}
-
-// isPermanentFailure — an answer that waiting will not change, so the client must be free to give up on
-// this release and try the next rather than polling a promise.
-func isPermanentFailure(err error) bool {
-	if err == nil {
+func alreadyQueued(cache Cache, token, infoHash string) bool {
+	if cache == nil {
 		return false
 	}
-	if errors.Is(err, errEpisodeNotInTorrent) {
-		return true
-	}
-	// NOT "no content" / "no link": those are what a transfer that has only just been queued answers, and
-	// treating them as a verdict re-added the release on the very next poll — the loop this is here to
-	// stop. A filename the service refuses to serve is the one post-add answer that waiting cannot change.
-	var dead *DeadLinkError
-	if !errors.As(err, &dead) || dead == errTorrentGone {
-		return false
-	}
-	return strings.Contains(dead.Reason, "blocked filename")
+	_, queued := cache.Get(pmQueuedKey(token, infoHash))
+	return queued
 }
 
 // settleAddAttempt clears the marker once the outcome IS known, whatever it was.
@@ -1020,11 +996,7 @@ func (s *realDebridStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 	return StoreStatus{}, false
 }
 
-func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (link string, err error) {
-	// Whatever this returns, the queued marker is settled against it: a link or a verdict clears it, only
-	// "nothing playable yet" keeps it. Deferred rather than written at each return, because there are
-	// nine of them and the one that got missed is what turned a successful play into a 20-minute block.
-	defer func() { settleQueued(s.cache, ServiceRealDebrid, s.token, t.InfoHash, link, err) }()
+func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
 	// The same backoff TorBox has. Without it, a client polling /play for the length of a download added
 	// this magnet once per poll — hundreds of adds for one wait, each leaving a duplicate torrent on the
 	// account. TorBox backing off correctly made this worse, not better: ResolvePreferring fell straight
@@ -1040,6 +1012,10 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (link st
 	// this account's allowance instead.
 	if err := addInFlight(s.cache, ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
+	}
+	// Already bought? Then resolve from it instead of buying it again.
+	if id, held := s.knownTorrent(t.InfoHash); held {
+		return s.resolveExisting(ctx, id, t)
 	}
 	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
@@ -1070,12 +1046,53 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (link st
 	if addResp.StatusCode < 200 || addResp.StatusCode >= 300 || added.ID == "" {
 		return "", &DeadLinkError{"realdebrid no torrent id"}
 	}
-	// RD accepted it. Remember that, or the next poll adds it again — RD has no Status for the download
-	// in between, and "added but not ready" arrives here as a dead link rather than a refusal.
-	noteQueued(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
+	// Remember the torrent RD just created, the way TorBox remembers its id. This is the fix the marker
+	// kept failing to be: a "we already bought this" fact, separate from "an add is in flight", and not
+	// cleared when the release resolves or is refused. Without it every poll called addMagnet again and
+	// RD made a NEW torrent each time — ten polls of one unplayable pack, ten adds, ten duplicates.
+	s.rememberTorrent(t.InfoHash, added.ID)
+	id := added.ID
 
-	info, err := s.info(ctx, added.ID)
+	return s.resolveExisting(ctx, id, t)
+}
+
+// rdTorrentKey — the RD torrent id this account created for an infohash. Account-scoped like every other
+// key that carries account state.
+func rdTorrentKey(token, infoHash string) string {
+	return "realdebrid:torrent:" + keyHash(token) + ":" + infoHash
+}
+
+func (s *realDebridStore) rememberTorrent(infoHash, id string) {
+	if s.cache != nil {
+		s.cache.Put(rdTorrentKey(s.token, infoHash), id, resolveCacheTTL)
+	}
+}
+
+func (s *realDebridStore) knownTorrent(infoHash string) (string, bool) {
+	if s.cache == nil {
+		return "", false
+	}
+	id, ok := s.cache.Get(rdTorrentKey(s.token, infoHash))
+	return id, ok && id != ""
+}
+
+func (s *realDebridStore) forgetTorrent(infoHash string) {
+	if s.cache != nil {
+		s.cache.Put(rdTorrentKey(s.token, infoHash), "", time.Nanosecond)
+	}
+}
+
+// resolveExisting turns an RD torrent this account already has into a playable link. Shared by the
+// just-added path and by the one that found it was already bought — they differ only in how the id came.
+func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t ResolveTarget) (string, error) {
+	info, err := s.info(ctx, id)
 	if err != nil {
+		// Only a definitive "no such torrent" forgets the id. An empty file list, a throttle or a timeout
+		// all describe this attempt, not what the account holds — forgetting on those re-bought the
+		// torrent on the very next poll, which is the loop this memory exists to end.
+		if errors.Is(err, errTorrentGone) {
+			s.forgetTorrent(t.InfoHash)
+		}
 		return "", err
 	}
 	files := make([]TorrentFile, len(info.Files))
@@ -1097,7 +1114,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (link st
 		}
 	}
 
-	sel, err := s.post(ctx, "/torrents/selectFiles/"+added.ID, url.Values{"files": {fmt.Sprintf("%d", *fileID)}})
+	sel, err := s.post(ctx, "/torrents/selectFiles/"+id, url.Values{"files": {fmt.Sprintf("%d", *fileID)}})
 	if err != nil {
 		return "", err
 	}
@@ -1105,7 +1122,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (link st
 	if sel.StatusCode < 200 || sel.StatusCode >= 300 {
 		return "", &DeadLinkError{fmt.Sprintf("realdebrid selectFiles http %d", sel.StatusCode)}
 	}
-	ready, err := s.info(ctx, added.ID)
+	ready, err := s.info(ctx, id)
 	if err != nil {
 		return "", err
 	}
@@ -1128,6 +1145,12 @@ func (s *realDebridStore) info(ctx context.Context, id string) (*rdInfo, error) 
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// 404 is RD saying it has no torrent under that id — the one answer that means a remembered id is
+	// stale. Anything else, including an empty file list on a torrent whose metadata has not resolved
+	// yet, says nothing about whether the account has it.
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errTorrentGone
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &DeadLinkError{fmt.Sprintf("realdebrid info http %d", resp.StatusCode)}
 	}
@@ -1258,9 +1281,7 @@ func (s *premiumizeStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 	return StoreStatus{}, false
 }
 
-func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (link string, err error) {
-	// Settled against whatever this returns — see the same deferral on the Real-Debrid path.
-	defer func() { settleQueued(s.cache, ServicePremiumize, s.token, t.InfoHash, link, err) }()
+func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
 	// The same backoff TorBox has — a poll loop must not be able to sustain a refusal here either.
 	if reason, ok := backedOff(s.cache, ServicePremiumize, s.token, t.InfoHash); ok {
 		return "", &StoreUnavailableError{ServicePremiumize, reason + " (backing off)"}
@@ -1271,6 +1292,10 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (link st
 	}
 	if err := addInFlight(s.cache, ServicePremiumize, s.token, t.InfoHash); err != nil {
 		return "", err
+	}
+	// A transfer we already queued and that had nothing to serve. Asking again queues it again.
+	if alreadyQueued(s.cache, s.token, t.InfoHash) {
+		return "", &DeadLinkError{"premiumize is still fetching this release"}
 	}
 	if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
 		return "", err
@@ -1301,7 +1326,6 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (link st
 	}
 	// Premiumize accepted it. Same reason as RD: no Status endpoint, so without this the next poll
 	// queues the same transfer again.
-	noteQueued(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	var body struct {
 		Status  string `json:"status"`
 		Content []struct {
@@ -1311,6 +1335,8 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (link st
 		} `json:"content"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Status != "success" || len(body.Content) == 0 {
+		// Queued, nothing to serve yet: remember it, so the next poll waits instead of queueing again.
+		noteQueued(s.cache, s.token, t.InfoHash)
 		return "", &DeadLinkError{"premiumize no content"}
 	}
 	files := make([]TorrentFile, len(body.Content))
