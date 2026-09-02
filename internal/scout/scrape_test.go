@@ -129,8 +129,18 @@ func TestScrapeAll(t *testing.T) {
 	if len(out) != 1 || out[0].InfoHash != repeat("a", 40) {
 		t.Errorf("scrapeAll gather-what-responded: %+v", out)
 	}
-	if !anyOK {
-		t.Error("anyOK should be true when a scraper responded")
+	// A PARTIAL answer is served but is NOT authoritative. Serving what came back is right; storing it as
+	// the answer for the next five minutes is a completeness claim, and a list missing an entire
+	// indexer's releases is not complete — it went out with max-age=300, stale-if-error=86400 and no
+	// degraded header: a partial answer presented as the whole one.
+	if anyOK {
+		t.Error("two of three indexers failed; the list is incomplete and must not be cached as the answer")
+	}
+
+	// Every indexer answering IS the answer, empty or not — otherwise nothing would ever be cached.
+	quiet := fakeScraper{"mediafusion", func(context.Context) ([]RawStream, error) { return nil, nil }}
+	if _, complete := scrapeAll(context.Background(), []scraper{ok, quiet}, scrapeQuery{}, 30*time.Millisecond); !complete {
+		t.Error("every indexer answered; that is a complete list")
 	}
 
 	// every scraper failing → anyOK false (a degraded blip, not a genuine empty)

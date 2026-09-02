@@ -62,6 +62,10 @@ func (l *hostLimiter) wait(ctx context.Context, host string) {
 	if delay <= 0 {
 		return
 	}
+	// Not "skip the wait when it would exceed the caller's deadline". That was tried and is a bypass: every
+	// caller carries a deadline, so a client with short ones sails past the limiter entirely — the test
+	// for cancellation-minting caught it immediately, with 400 of 400 callers passing free. Queueing past
+	// a deadline is a real cost, but the burst is where it gets solved, not here.
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {

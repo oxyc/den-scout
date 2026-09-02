@@ -317,6 +317,25 @@ func noteAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
 	}
 }
 
+// How long a store with no Status endpoint remembers that it QUEUED a release.
+//
+// TorBox does not need this: it remembers a torrent id and answers Status, so a poll during a download
+// short-circuits long before Resolve. Real-Debrid and Premiumize have neither — a just-added torrent is
+// not downloadable yet, which comes back as a dead link rather than a refusal, so nothing stopped the
+// next poll re-adding it. Thirty polls of one release put thirty duplicate torrents on the account and
+// spent thirty of the hourly allowance in a minute: the loop TorBox's guards closed, relocated.
+//
+// Long enough to cover a download, short enough that a release which never arrives can be asked for
+// again within one sitting.
+const queuedTTL = 20 * time.Minute
+
+// noteQueued records that this store was asked to fetch the release and accepted.
+func noteQueued(cache Cache, svc DebridService, token, infoHash string) {
+	if cache != nil {
+		cache.Put(addAttemptKey(svc, token, infoHash), "1", queuedTTL)
+	}
+}
+
 // settleAddAttempt clears the marker once the outcome IS known, whatever it was.
 //
 // The marker means "we do not know", not "an add happened" — so it must not outlive learning. A refused
@@ -582,7 +601,14 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	if err != nil {
 		return "", err
 	}
-	return s.requestDownload(ctx, torrentID, fileID)
+	link, err := s.requestDownload(ctx, torrentID, fileID)
+	if errors.Is(err, errTorrentGone) {
+		// The id we were just handed is not one TorBox has. Undo the two writes above: leaving them
+		// re-stamped a stale id with a fresh six-hour TTL on every poll, so a polling client kept its own
+		// poison alive and the release stayed unplayable for as long as it kept asking.
+		s.forgetTorrentID(t.InfoHash)
+	}
+	return link, err
 }
 
 func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, error) {
@@ -876,6 +902,10 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 		Success bool   `json:"success"`
 		Data    string `json:"data"`
 	}
+	// NOT errTorrentGone. `success:false` is also what a torrent that is still downloading answers, which
+	// is the normal state of one that was queued moments ago — treating it as "the account does not have
+	// this" forgot the id of a perfectly good fetch in progress. A 404 is the only answer that means the
+	// id is stale; this one means "not yet".
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || !body.Success || body.Data == "" {
 		return "", &DeadLinkError{"torbox no link"}
 	}
@@ -1002,6 +1032,9 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if addResp.StatusCode < 200 || addResp.StatusCode >= 300 || added.ID == "" {
 		return "", &DeadLinkError{"realdebrid no torrent id"}
 	}
+	// RD accepted it. Remember that, or the next poll adds it again — RD has no Status for the download
+	// in between, and "added but not ready" arrives here as a dead link rather than a refusal.
+	noteQueued(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 
 	info, err := s.info(ctx, added.ID)
 	if err != nil {
@@ -1226,6 +1259,9 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d", resp.StatusCode)}
 	}
+	// Premiumize accepted it. Same reason as RD: no Status endpoint, so without this the next poll
+	// queues the same transfer again.
+	noteQueued(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	var body struct {
 		Status  string `json:"status"`
 		Content []struct {
@@ -1340,7 +1376,11 @@ func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (CacheTruth
 		holders: make(map[string][]DebridService, len(hashes)),
 		known:   make(map[string]bool, len(hashes)),
 	}
+	// Nothing to ask about is a COMPLETE answer, not an outage. Leaving `complete` false here meant a
+	// title with no releases at all was reported degraded and re-scraped in full on every request,
+	// forever — an outage flag raised over a question nobody asked.
 	if len(hashes) == 0 {
+		truth.complete = true
 		return truth, true
 	}
 	// Independent per store; run concurrently. A store error can't 500 the request (audit #5) — it only

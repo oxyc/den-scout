@@ -238,3 +238,21 @@ func TestHostLimiter_degradesToNoOp(t *testing.T) {
 	nilLimiter.wait(context.Background(), "h")
 	newHostLimiter(time.Hour, 0).wait(context.Background(), "")
 }
+
+// The burst has to cover a household's largest legitimate burst, which is opening a season: one request
+// per episode, all at once.
+//
+// At a burst of 10 a 24-episode show queued the tail fourteen seconds out, against an eight-second
+// scrape budget — so those episodes were never asked, counted as indexers that did not answer, and came
+// back as a degraded empty list from a perfectly healthy indexer. The sustained rate is what protects
+// the indexer; the burst only decides whether normal use waits at all.
+func TestIndexerLimiter_burstCoversASeasonOpen(t *testing.T) {
+	const season = 24
+	b := &bucket{tokens: float64(indexerLimiter.burst), last: time.Now()}
+	for i := 0; i < season; i++ {
+		if delay := b.take(indexerLimiter.every, indexerLimiter.burst); delay > 0 {
+			t.Fatalf("episode %d of a season open waited %v; the tail is never asked within the budget",
+				i+1, delay)
+		}
+	}
+}

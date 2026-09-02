@@ -221,7 +221,10 @@ var scrapeRetryBackoff = []time.Duration{250 * time.Millisecond, 700 * time.Mill
 // requests an hour; 1/s per host is still an order of magnitude above that, while a loop that re-asks
 // forever — the documented failure here — meets a wall it can be seen hitting. Per host, so a slow
 // indexer cannot delay a healthy one.
-var indexerLimiter = newHostLimiter(time.Second, 10)
+// Burst sized to a household's largest legitimate burst — opening a season is one request per episode,
+// and 10 turned a 24-episode show into fourteen seconds of queueing against an eight-second budget. The
+// sustained rate is what actually protects the indexer; the burst only decides whether normal use waits.
+var indexerLimiter = newHostLimiter(time.Second, 30)
 
 func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream, error) {
 	// One token per logical scrape, not per attempt. Pacing inside the retry loop spent up to three, and
@@ -419,17 +422,22 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 	// never ran, and three unavailable titles in a row flipped /health to degraded on a healthy service.
 	// A permanent misconfiguration is not a transient failure, and feeding both into one counter loses
 	// the difference. It is reported once per process by `logIndexerSkipOnce` instead.
-	if len(all) == 0 {
-		for i, ok := range respok {
-			// Only a PERMANENTLY unaskable indexer is excused. One whose config could not be minted this
-			// minute is an outage: it would have voted, and we do not know how.
-			if u, unaskable := scrapers[i].(unaskableScraper); unaskable && !u.transient {
-				continue
-			}
-			if !ok {
-				anyOK = false
-				break
-			}
+	//
+	// The same reasoning applies to a NON-empty list, which is why the check below is no longer gated on
+	// emptiness. Serving what came back is right; CACHING it as the answer for the next five minutes is a
+	// completeness claim, and a list missing an entire indexer's releases is not complete. torrentio 502s
+	// while mediafusion answers, and the shorter list was stored and shipped with `max-age=300,
+	// stale-if-error=86400` and no degraded header — a partial answer presented as the whole one, which
+	// is the mistake this file is otherwise built around not making.
+	for i, ok := range respok {
+		// Only a PERMANENTLY unaskable indexer is excused. One whose config could not be minted this
+		// minute is an outage: it would have voted, and we do not know how.
+		if u, unaskable := scrapers[i].(unaskableScraper); unaskable && !u.transient {
+			continue
+		}
+		if !ok {
+			anyOK = false
+			break
 		}
 	}
 	return dedupe(all), anyOK

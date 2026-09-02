@@ -521,3 +521,33 @@ func TestStream_aDownStoreIsDegradedEvenWhenEverythingServedIsKnownHeld(t *testi
 		t.Errorf("cache-control = %q: a list built during an outage must not be cached", cc)
 	}
 }
+
+// A title with no releases is a COMPLETE answer, not an outage.
+//
+// The cache check is never asked anything when there are no hashes, and leaving that as "incomplete"
+// raised the outage flag over a question nobody put: every such title came back degraded and no-store,
+// and was re-scraped in full on every single request, forever.
+func TestStream_noReleasesIsAnAnswerNotAnOutage(t *testing.T) {
+	scrapes := 0
+	h := NewHandler(Deps{
+		Cache:         NewMemoryCache(1 << 20),
+		ScrapeTimeout: time.Second,
+		MakeScrapers: func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				scrapes++
+				return nil, nil // asked, answered, and it has nothing
+			}}}
+		},
+		MakeStores: func(*Config) []Store {
+			return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{}}}
+		},
+	})
+	first := do(h, "/"+validBlob+"/stream/movie/tt7777777.json", nil)
+	if got := first.Header().Get("X-Scout-Degraded"); got != "" {
+		t.Errorf("X-Scout-Degraded = %q for a title that simply has no releases", got)
+	}
+	do(h, "/"+validBlob+"/stream/movie/tt7777777.json", nil)
+	if scrapes != 1 {
+		t.Errorf("scraped %d times: an authoritative empty answer must be cached like any other", scrapes)
+	}
+}

@@ -703,3 +703,50 @@ func TestCacheKeys_areScopedToTheAccount(t *testing.T) {
 		})
 	}
 }
+
+// A store with no Status endpoint must remember that it QUEUED a release, or every poll re-adds it.
+//
+// TorBox does not need this — it keeps a torrent id and answers Status, so a poll during the download
+// short-circuits long before Resolve. Real-Debrid and Premiumize have neither, and a just-added torrent
+// that is not downloadable yet comes back as a dead link rather than a refusal, so nothing stopped the
+// loop. Thirty polls of one release put thirty duplicate torrents on the account and spent thirty of the
+// hourly allowance in a minute: the loop TorBox's guards closed, relocated.
+func TestQueued_aStoreWithoutStatusDoesNotReAddOnEveryPoll(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(doer, Cache) Store
+	}{
+		{"realdebrid", func(d doer, c Cache) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+		{"premiumize", func(d doer, c Cache) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			adds := 0
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if isAddEndpoint(r) {
+					adds++
+					// Accepted, but nothing playable yet — the normal state of a fresh download.
+					return resp(200, `{"id":"t1","status":"success","content":[]}`), nil
+				}
+				return resp(200, `{"files":[],"links":[]}`), nil
+			}}
+			store := tc.build(d, NewMemoryCache(1<<20))
+			for i := 0; i < 30; i++ {
+				_, _ = store.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			}
+			if adds != 1 {
+				t.Errorf("%d adds across thirty polls of one release — each one a duplicate torrent", adds)
+			}
+			if left := globalAddBudget.remaining(budgetAccount(store.Service(), "tok")); left != 49 {
+				t.Errorf("allowance dropped to %d; one queued release must cost one add", left)
+			}
+		})
+	}
+}
