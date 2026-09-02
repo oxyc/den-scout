@@ -206,6 +206,27 @@ func torrentIDKey(token, infoHash string) string {
 	return "torbox:torrent:" + keyHash(token) + ":" + infoHash
 }
 
+// transportKind describes a transport failure WITHOUT its URL. `*url.Error.Error()` embeds the request
+// URL, which for TorBox carries the account token in its query string — so the cause is reported and the
+// address is dropped. Enough to tell a timeout from a refused connection; never enough to leak a secret.
+func transportKind(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		switch {
+		case urlErr.Timeout():
+			return "timeout"
+		case errors.Is(urlErr.Err, context.Canceled):
+			return "cancelled"
+		default:
+			return urlErr.Err.Error()
+		}
+	}
+	if err == nil {
+		return "unknown"
+	}
+	return err.Error()
+}
+
 // refusalReason renders an add failure for the backoff cache, keeping the service's own words where it
 // gave any — that string is what the probe route later reports and the log later prints.
 func refusalReason(err error) string {
@@ -545,7 +566,13 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 	}
 	resp, err := s.get(ctx, s.api+"/torrents/requestdl?"+q.Encode())
 	if err != nil {
-		return "", err
+		// Never the raw error. TorBox wants the token as a QUERY PARAMETER, and a transport failure yields
+		// a *url.Error whose message is `Get "<the whole URL>": …` — Go redacts userinfo passwords, not
+		// query strings. Both the resolve log and the /play error line print %v of whatever comes back
+		// here, so one timeout would have written the live debrid token into a rotated, shipped container
+		// log. `docs/SEALED-CONFIG.md` lists "the token is never logged" as an acceptance criterion, and
+		// the whole sealing design exists because the URL *is* the credential.
+		return "", &DeadLinkError{"torbox requestdl transport: " + transportKind(err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if storeRefusedUs(resp.StatusCode) {
