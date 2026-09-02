@@ -52,6 +52,18 @@ type mintedConfig struct {
 	at  time.Time
 }
 
+// How long a failure to mint is remembered. Short, because a host that is down now may be up in a
+// minute and an indexer skipped is real coverage lost — but not zero, which is what made an unhealthy
+// mediafusion get one POST per stream request.
+const mintFailureTTL = 2 * time.Minute
+
+func (m mintedConfig) ttl() time.Duration {
+	if m.url == "" {
+		return mintFailureTTL
+	}
+	return mintedTTL
+}
+
 var (
 	mintedMu sync.Mutex
 	minted   = map[string]mintedConfig{}
@@ -67,7 +79,7 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 	key := string(id) + ":" + keyHash(string(acct.Service)+":"+acct.Token)
 
 	mintedMu.Lock()
-	if m, hit := minted[key]; hit && time.Since(m.at) < mintedTTL {
+	if m, hit := minted[key]; hit && time.Since(m.at) < m.ttl() {
 		mintedMu.Unlock()
 		return m.url
 	}
@@ -81,6 +93,12 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 		url = mintMediaFusionURL(ctx, acct, client)
 	}
 	if url == "" {
+		// Remember the FAILURE too, briefly. Only successes were cached, so while the host was unhealthy
+		// every single stream request re-POSTed to it — with its own 10 s timeout, ahead of the scrape —
+		// meaning the worse it was, the harder scout hit it. The opposite of what a limiter is for.
+		mintedMu.Lock()
+		minted[key] = mintedConfig{url: "", at: time.Now()}
+		mintedMu.Unlock()
 		return ""
 	}
 	mintedMu.Lock()

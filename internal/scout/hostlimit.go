@@ -33,6 +33,14 @@ type bucket struct {
 }
 
 func newHostLimiter(every time.Duration, burst int) *hostLimiter {
+	// A non-positive interval makes the refill +Inf and every delay zero — a limiter that looks configured
+	// and silently isn't. Fail loud in the only direction that is safe here: pace something.
+	if every <= 0 {
+		every = time.Second
+	}
+	if burst < 1 {
+		burst = 1
+	}
 	return &hostLimiter{buckets: map[string]*bucket{}, every: every, burst: burst}
 }
 
@@ -58,6 +66,10 @@ func (l *hostLimiter) wait(ctx context.Context, host string) {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		// Give the token back. The caller abandons the request, so nothing was asked of the host — and a
+		// token spent on a request never sent is debt the NEXT caller pays, at a rate comparable to the
+		// scrape budget itself.
+		b.refund()
 	case <-timer.C:
 	}
 }
@@ -75,8 +87,20 @@ func (b *bucket) take(every time.Duration, burst int) time.Duration {
 	}
 	b.last = now
 	b.tokens--
+	// Debt is floored at one burst. Unbounded, a stampede queues the tail arbitrarily far out — and the
+	// caller's own deadline is the wrong place to discover that, since a request that waits past its
+	// budget is exactly the "timed out because it queued" failure this must not cause.
+	if b.tokens < -float64(burst) {
+		b.tokens = -float64(burst)
+	}
 	if b.tokens >= 0 {
 		return 0
 	}
 	return time.Duration(-b.tokens * float64(every))
+}
+
+func (b *bucket) refund() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokens++
 }
