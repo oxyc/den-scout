@@ -22,7 +22,7 @@ type RawStream struct {
 	Title     string
 	SizeBytes *int
 	Seeders   *int
-	Cached bool
+	Cached    bool
 	// Whether anyone could answer the cachedness question this request. False means the check failed, so
 	// `Cached` is a default rather than an observation — and must not be reported to a client as one.
 	CacheKnown bool
