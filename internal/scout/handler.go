@@ -227,9 +227,11 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 
 	// Cap the seed set before the cache-check fan-out: a misbehaving/hostile indexer returning thousands
 	// of tiny stream objects would otherwise mean hundreds of concurrent outbound debrid requests. The
-	// cap is well above any real title's stream count, so it can't drop meaningful results.
+	// cap is well above any real title's stream count, so it rarely bites — but when it does it now keeps
+	// the most promising releases rather than the first ones the scrape happened to return.
 	if len(seeds) > maxSeeds {
-		seeds = seeds[:maxSeeds]
+		log.Printf("scout: %s %s: %d seeds capped to %d (best-scored kept)", sid.Type, sid.IMDb, len(seeds), maxSeeds)
+		seeds = capSeeds(seeds, maxSeeds)
 	}
 
 	pool := &StorePool{stores: h.deps.MakeStores(config)}

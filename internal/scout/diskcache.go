@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"log"
@@ -97,6 +98,107 @@ func (c *TieredCache) Put(key, value string, ttl time.Duration) {
 	}
 	if err := os.Rename(tmp.Name(), c.path(key)); err != nil {
 		c.disable("rename", err)
+	}
+}
+
+// How often expired entries are swept, and how long a leftover temp file may linger before it counts as
+// abandoned. Hourly is far more often than space needs and rare enough to be invisible: the sweep is a
+// small read per file, and the store holds thousands, not millions.
+const (
+	SweepInterval = time.Hour
+	tempFileGrace = time.Hour
+)
+
+// Sweep removes expired entries and abandoned temp files, and reports how many it deleted.
+//
+// Expiry was enforced only on READ — which means only for a key someone asks for again. Every key nobody
+// re-reads was written once and kept forever: a stream list for a title watched once, a one-minute
+// refusal, a fifteen-second torrent-miss, a probe for a release that never comes back up the ranking. On
+// a homelab box that is unbounded growth with no ceiling and nothing reporting it.
+//
+// Best-effort like the rest of the disk tier: an unreadable directory, or a file that vanishes underneath
+// us, is skipped rather than fatal.
+func (c *TieredCache) Sweep() int {
+	if c.disabled() {
+		return 0
+	}
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return 0
+	}
+	now := time.Now()
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		switch {
+		case strings.HasSuffix(name, ".ent"):
+			if !c.entryExpired(filepath.Join(c.dir, name), now) {
+				continue
+			}
+		case strings.HasPrefix(name, ".tmp-"):
+			// A temp file outlives its Put only if the process died between CreateTemp and rename. The
+			// grace period keeps the sweep from racing a write that is legitimately in flight.
+			info, err := e.Info()
+			if err != nil || now.Sub(info.ModTime()) < tempFileGrace {
+				continue
+			}
+		default:
+			continue // not ours
+		}
+		if os.Remove(filepath.Join(c.dir, name)) == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
+// entryExpired reads just the expiry line. A file that cannot be read or parsed counts as expired — Get
+// cannot serve it either way, so keeping it only keeps a file nothing can ever use.
+func (c *TieredCache) entryExpired(path string, now time.Time) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false // it may already be gone; don't claim a deletion we didn't make
+	}
+	defer func() { _ = f.Close() }()
+	// The expiry is a unix timestamp on the first line; 32 bytes is more than enough to reach the newline.
+	head := make([]byte, 32)
+	n, _ := f.Read(head)
+	nl := strings.IndexByte(string(head[:n]), '\n')
+	if nl <= 0 {
+		return true
+	}
+	expires, err := strconv.ParseInt(string(head[:nl]), 10, 64)
+	if err != nil {
+		return true
+	}
+	return now.Unix() >= expires
+}
+
+// SweepEvery runs Sweep on a ticker until ctx ends. Started once from main, so the goroutine lives as
+// long as the process and there is nothing to stop but the context.
+func (c *TieredCache) SweepEvery(ctx context.Context, every time.Duration) {
+	if c.disabled() {
+		return
+	}
+	// Once at startup: a redeploy is the most likely moment for the store to be holding a backlog of
+	// entries that expired while the process was not running.
+	if n := c.Sweep(); n > 0 {
+		log.Printf("den-scout: swept %d expired cache entries at startup", n)
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n := c.Sweep(); n > 0 {
+				log.Printf("den-scout: swept %d expired cache entries", n)
+			}
+		}
 	}
 }
 

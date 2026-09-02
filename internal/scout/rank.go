@@ -175,6 +175,43 @@ var (
 	reHDROnly = mustRE2(`dolby vision|dolbyvision|dovi|\bhdr\b|hdr10|\bhlg\b`)
 )
 
+// capSeeds trims a scrape result to the most promising `limit` releases.
+//
+// The cap itself is right: it bounds the debrid cache-check fan-out, so a misbehaving or hostile indexer
+// returning thousands of tiny stream objects cannot become hundreds of concurrent outbound requests.
+// What was wrong is WHICH ones it kept. Trimming in scrape order is arbitrary — past the cap a 2160p
+// REMUX sitting at the tail was dropped while cam junk at the head survived, and neither the viewer nor
+// the log saw it happen.
+//
+// Scored on title-derived signals only, because this runs BEFORE the cache check: `Cached` is false on
+// everything here, so its bonus is uniformly absent and cannot bias the choice. Seeders break ties.
+// Selection only — the real ranking still runs afterwards over whatever survives.
+func capSeeds(streams []RawStream, limit int) []RawStream {
+	if limit <= 0 || len(streams) <= limit {
+		return streams
+	}
+	type ranked struct {
+		s       RawStream
+		score   int
+		seeders int
+	}
+	all := make([]ranked, len(streams))
+	for i, s := range streams {
+		all[i] = ranked{s, qualityScore(s), intOr(s.Seeders, 0)}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].score != all[j].score {
+			return all[i].score > all[j].score
+		}
+		return all[i].seeders > all[j].seeders
+	})
+	out := make([]RawStream, limit)
+	for i := range out {
+		out[i] = all[i].s
+	}
+	return out
+}
+
 // qualityScore — additive, higher wins.
 func qualityScore(s RawStream) int {
 	t := strings.ToLower(s.Title)

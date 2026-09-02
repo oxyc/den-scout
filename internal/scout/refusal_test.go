@@ -38,7 +38,7 @@ func TestRecentRefusal_readsWhatTheQueueingPathWrote(t *testing.T) {
 		t.Error("nothing was refused, so nothing should be reported")
 	}
 
-	cache.Put(refusedKey("tok", "hash-refused"), "createtorrent http 429", time.Minute)
+	cache.Put(refusedKey(ServiceTorBox, "tok", "hash-refused"), "createtorrent http 429", time.Minute)
 	svc, reason, ok := pool.RecentRefusal("hash-refused")
 	if !ok || svc != ServiceTorBox || !strings.Contains(reason, "429") {
 		t.Errorf("refusal not reported: %v %q %v", svc, reason, ok)
@@ -153,7 +153,7 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 	// Recently refused → 503, naming the service. Never 404: the account was turned away, which says
 	// nothing at all about whether the release exists.
 	cache := NewMemoryCache(1 << 20)
-	cache.Put(refusedKey("tok", "abc"), "createtorrent http 429", time.Minute)
+	cache.Put(refusedKey(ServiceTorBox, "tok", "abc"), "createtorrent http 429", time.Minute)
 	refusedStore := &torBoxStore{token: "tok", cache: cache, api: "https://api.example",
 		client: &stubDoer{status: 200, body: `{"data":[]}`}}
 	h := &handler{deps: Deps{Cache: NewMemoryCache(1 << 20),
@@ -255,5 +255,77 @@ func TestSeasonEpisodeOf(t *testing.T) {
 	movie := &StreamID{Type: "movie", IMDb: "tt2"}
 	if seasonOf(movie) != nil || episodeOf(movie) != nil {
 		t.Error("a movie has neither")
+	}
+}
+
+// The backoff belongs to every store that can be refused, not just the one whose refusal was noticed
+// first.
+//
+// Only TorBox remembered a refusal. The other two had no cache at all, so a client polling /play for the
+// length of a download re-added the magnet once per poll — hundreds of adds for one wait, each leaving a
+// duplicate torrent on the account. TorBox backing off correctly made this WORSE: ResolvePreferring fell
+// straight through to whichever store had no memory of being turned away.
+func TestRefusalBackoff_appliesToEveryStore(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(Cache, doer) Store
+	}{
+		{"realdebrid", func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+		{"premiumize", func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adds := 0
+			d := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				adds++
+				return resp(503, `{"error":"busy"}`), nil
+			}}
+			store := tc.build(NewMemoryCache(1<<20), d)
+			target := ResolveTarget{InfoHash: H}
+			for i := 0; i < 6; i++ { // a client polling /play through a download
+				_, err := store.Resolve(context.Background(), target)
+				var unavailable *StoreUnavailableError
+				if !errors.As(err, &unavailable) {
+					t.Fatalf("poll %d: want a refusal, got %v", i, err)
+				}
+			}
+			if adds != 1 {
+				t.Errorf("added %d times across six polls — the backoff is not holding", adds)
+			}
+			if _, refused := store.(refusalReporter).RecentRefusal(H); !refused {
+				t.Error("the store cannot report the refusal it just recorded")
+			}
+		})
+	}
+}
+
+// A refusal is remembered per SERVICE. One store being throttled says nothing about another, and sharing
+// a key would let TorBox's backoff silence a Premiumize that is answering perfectly well.
+func TestRefusalBackoff_isPerService(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	recordRefusal(cache, ServiceTorBox, "tok", H, &StoreUnavailableError{ServiceTorBox, "429"})
+
+	if _, refused := backedOff(cache, ServiceTorBox, "tok", H); !refused {
+		t.Error("torbox's own refusal was not remembered")
+	}
+	if _, refused := backedOff(cache, ServicePremiumize, "tok", H); refused {
+		t.Error("torbox's refusal silenced premiumize")
+	}
+}
+
+// A cancelled request is not a refusal. /play runs on the client's context and the client cancels
+// aggressively, so recording one served a healthy release 503 for the next minute.
+func TestRefusalBackoff_ignoresCancellation(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	recordRefusal(cache, ServiceTorBox, "tok", H, context.Canceled)
+	if _, refused := backedOff(cache, ServiceTorBox, "tok", H); refused {
+		t.Error("a cancelled request was remembered as a refusal by the store")
+	}
+	recordRefusal(cache, ServiceTorBox, "tok", H, context.DeadlineExceeded)
+	if _, refused := backedOff(cache, ServiceTorBox, "tok", H); refused {
+		t.Error("an expired deadline was remembered as a refusal by the store")
 	}
 }

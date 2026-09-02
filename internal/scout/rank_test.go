@@ -1,6 +1,9 @@
 package scout
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func rs(title string, mut func(*RawStream)) RawStream {
 	s := RawStream{InfoHash: "h", Title: title, Source: "torrentio"}
@@ -174,4 +177,64 @@ func titles(streams []RawStream) []string {
 		out[i] = s.Title
 	}
 	return out
+}
+
+// The seed cap keeps the BEST releases, not the first ones the scrape happened to return.
+//
+// The cap bounds the debrid cache-check fan-out, which is right — but it used to trim in scrape order.
+// Past the cap a 2160p REMUX sitting at the tail was dropped while cam junk at the head survived, and
+// neither the viewer nor the log saw it happen.
+func TestCapSeeds_keepsTheBestNotTheFirst(t *testing.T) {
+	var streams []RawStream
+	for i := 0; i < 40; i++ { // junk arrives first, as an indexer's own order well might
+		streams = append(streams, RawStream{
+			InfoHash: fmt.Sprintf("%040x", i),
+			Title:    fmt.Sprintf("Some.Film.2024.CAM.XviD-JUNK.%d.mkv", i),
+			Seeders:  intp(1),
+		})
+	}
+	gem := RawStream{InfoHash: repeat("f", 40), Title: "Some.Film.2024.2160p.UHD.BluRay.REMUX.HDR.mkv", Seeders: intp(50)}
+	streams = append(streams, gem)
+
+	kept := capSeeds(streams, 10)
+	if len(kept) != 10 {
+		t.Fatalf("capped to %d, want 10", len(kept))
+	}
+	found := false
+	for _, s := range kept {
+		if s.InfoHash == gem.InfoHash {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the best release was dropped and forty cam rips were kept")
+	}
+}
+
+// Under the cap nothing is touched — not reordered, not dropped. The real ranking runs afterwards and
+// owns the order the viewer sees.
+func TestCapSeeds_leavesASmallListAlone(t *testing.T) {
+	streams := []RawStream{
+		{InfoHash: "a", Title: "Some.Film.2024.CAM.mkv"},
+		{InfoHash: "b", Title: "Some.Film.2024.2160p.REMUX.mkv"},
+	}
+	kept := capSeeds(streams, 10)
+	if len(kept) != 2 || kept[0].InfoHash != "a" || kept[1].InfoHash != "b" {
+		t.Errorf("a list under the cap was altered: %+v", kept)
+	}
+	if got := capSeeds(streams, 0); len(got) != 2 {
+		t.Errorf("a non-positive cap must not drop anything: %+v", got)
+	}
+}
+
+// Equal quality falls back to seeders — between two identical-looking releases, the one more people are
+// sharing is the one that will actually download.
+func TestCapSeeds_breaksTiesOnSeeders(t *testing.T) {
+	streams := []RawStream{
+		{InfoHash: "low", Title: "Some.Film.2024.1080p.WEB-DL.mkv", Seeders: intp(2)},
+		{InfoHash: "high", Title: "Some.Film.2024.1080p.WEB-DL.mkv", Seeders: intp(900)},
+	}
+	if kept := capSeeds(streams, 1); len(kept) != 1 || kept[0].InfoHash != "high" {
+		t.Errorf("tie not broken on seeders: %+v", kept)
+	}
 }

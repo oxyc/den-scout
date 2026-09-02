@@ -291,15 +291,45 @@ func (p *StorePool) RecentRefusal(infoHash string) (DebridService, string, bool)
 }
 
 func (s *torBoxStore) RecentRefusal(infoHash string) (string, bool) {
-	if s.cache == nil {
-		return "", false
-	}
-	return s.cache.Get(refusedKey(s.token, infoHash))
+	return backedOff(s.cache, ServiceTorBox, s.token, infoHash)
+}
+
+func (s *realDebridStore) RecentRefusal(infoHash string) (string, bool) {
+	return backedOff(s.cache, ServiceRealDebrid, s.token, infoHash)
+}
+
+func (s *premiumizeStore) RecentRefusal(infoHash string) (string, bool) {
+	return backedOff(s.cache, ServicePremiumize, s.token, infoHash)
 }
 
 // refusedKey marks a hash the service just declined to add for this account, so polls stop re-asking.
-func refusedKey(token, infoHash string) string {
-	return "torbox:refused:" + keyHash(token) + ":" + infoHash
+// Per service, because a refusal by one says nothing about another.
+func refusedKey(svc DebridService, token, infoHash string) string {
+	return string(svc) + ":refused:" + keyHash(token) + ":" + infoHash
+}
+
+// backedOff — this account was turned away for this hash a moment ago, with the reason.
+func backedOff(cache Cache, svc DebridService, token, infoHash string) (string, bool) {
+	if cache == nil {
+		return "", false
+	}
+	return cache.Get(refusedKey(svc, token, infoHash))
+}
+
+// recordRefusal remembers a refusal briefly, so a poll loop cannot sustain one.
+//
+// Only TorBox had this. The other two had no cache at all, so `ResolvePreferring` fell straight through
+// to them and added once per poll for the whole length of a download — several hundred adds on Real-
+// Debrid for one wait, each leaving a duplicate torrent on the account. The backoff belongs to every
+// store that can be refused, not to the one whose refusal was noticed first.
+//
+// A cancellation is not a refusal: the caller went away, and nothing about the store or the release can
+// be concluded from it.
+func recordRefusal(cache Cache, svc DebridService, token, infoHash string, err error) {
+	if cache == nil || isCancellation(err) {
+		return
+	}
+	cache.Put(refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff)
 }
 
 // How long to stop asking after the service refuses. Long enough that a poll loop can't sustain a
@@ -352,7 +382,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// fails, nothing is cached, and the next poll adds again. Back off for a minute after a refusal so a
 	// wait costs one call rather than one per poll.
 	if s.cache != nil {
-		if reason, ok := s.cache.Get(refusedKey(s.token, t.InfoHash)); ok {
+		if reason, ok := backedOff(s.cache, ServiceTorBox, s.token, t.InfoHash); ok {
 			return "", &StoreUnavailableError{ServiceTorBox, reason + " (backing off)"}
 		}
 	}
@@ -366,9 +396,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		// aggressively — a focus change is enough — so one cancelled add wrote "context canceled" into the
 		// backoff and served that release 503 store_unavailable for the next minute, on both /play and the
 		// probe route. An accusation TorBox never made, about a release that is very likely fine.
-		if s.cache != nil && !isCancellation(err) {
-			s.cache.Put(refusedKey(s.token, t.InfoHash), refusalReason(err), refusalBackoff)
-		}
+		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 		return "", err
 	}
 	var files []TorrentFile
@@ -679,6 +707,7 @@ const realDebridAPI = "https://api.real-debrid.com/rest/1.0"
 type realDebridStore struct {
 	token  string
 	client doer
+	cache  Cache
 	api    string
 }
 
@@ -720,8 +749,16 @@ func (s *realDebridStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 }
 
 func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
+	// The same backoff TorBox has. Without it, a client polling /play for the length of a download added
+	// this magnet once per poll — hundreds of adds for one wait, each leaving a duplicate torrent on the
+	// account. TorBox backing off correctly made this worse, not better: ResolvePreferring fell straight
+	// through to whichever store had no memory of being refused.
+	if reason, ok := backedOff(s.cache, ServiceRealDebrid, s.token, t.InfoHash); ok {
+		return "", &StoreUnavailableError{ServiceRealDebrid, reason + " (backing off)"}
+	}
 	addResp, err := s.post(ctx, "/torrents/addMagnet", url.Values{"magnet": {magnetFor(t.InfoHash)}})
 	if err != nil {
+		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
 		return "", err
 	}
 	var added struct {
@@ -735,8 +772,10 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// the app as "this release does not exist", and the player walked the whole candidate list collecting
 	// the identical non-answer and condemning healthy releases on the way.
 	if storeRefusedUs(addResp.StatusCode) {
-		return "", &StoreUnavailableError{ServiceRealDebrid,
+		refused := &StoreUnavailableError{ServiceRealDebrid,
 			fmt.Sprintf("addmagnet http %d", addResp.StatusCode)}
+		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, refused)
+		return "", refused
 	}
 	if addResp.StatusCode < 200 || addResp.StatusCode >= 300 || added.ID == "" {
 		return "", &DeadLinkError{"realdebrid no torrent id"}
@@ -857,6 +896,7 @@ const premiumizeAPI = "https://www.premiumize.me/api"
 type premiumizeStore struct {
 	token  string
 	client doer
+	cache  Cache
 	api    string
 }
 
@@ -926,6 +966,10 @@ func (s *premiumizeStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 }
 
 func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
+	// The same backoff TorBox has — a poll loop must not be able to sustain a refusal here either.
+	if reason, ok := backedOff(s.cache, ServicePremiumize, s.token, t.InfoHash); ok {
+		return "", &StoreUnavailableError{ServicePremiumize, reason + " (backing off)"}
+	}
 	form := url.Values{"apikey": {s.token}, "src": {magnetFor(t.InfoHash)}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/transfer/directdl", strings.NewReader(form.Encode()))
 	if err != nil {
@@ -934,13 +978,16 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	resp, err := s.client.Do(req)
 	if err != nil {
+		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Same rule as the other two stores: being turned away says nothing about the release.
 	if storeRefusedUs(resp.StatusCode) {
-		return "", &StoreUnavailableError{ServicePremiumize,
+		refused := &StoreUnavailableError{ServicePremiumize,
 			fmt.Sprintf("directdl http %d", resp.StatusCode)}
+		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
+		return "", refused
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d", resp.StatusCode)}
@@ -1013,9 +1060,9 @@ func buildStores(config *Config, client doer, cache Cache) []Store {
 		case ServiceTorBox:
 			stores = append(stores, &torBoxStore{token: token, client: client, cache: cache, api: torboxAPI})
 		case ServiceRealDebrid:
-			stores = append(stores, &realDebridStore{token: token, client: client, api: realDebridAPI})
+			stores = append(stores, &realDebridStore{token: token, client: client, cache: cache, api: realDebridAPI})
 		case ServicePremiumize:
-			stores = append(stores, &premiumizeStore{token: token, client: client, api: premiumizeAPI})
+			stores = append(stores, &premiumizeStore{token: token, client: client, cache: cache, api: premiumizeAPI})
 		}
 	}
 	return stores

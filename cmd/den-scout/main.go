@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -35,6 +36,9 @@ func main() {
 		},
 	}
 	cache := scout.NewTieredCache(settings.CacheBytes, settings.CacheDir)
+	// Expiry on the disk tier is enforced on READ, so a key nobody asks for again never dies on its own.
+	// This sweep is what gives the store a ceiling instead of unbounded growth.
+	go cache.SweepEvery(context.Background(), scout.SweepInterval)
 	handler := scout.NewHandler(scout.BuildDeps(settings, client, cache))
 
 	srv := &http.Server{
