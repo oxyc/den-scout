@@ -3,9 +3,21 @@ package scout
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
+
+// heldOnTorBox is the cache truth a probe needs: these hashes are confirmed present on the TorBox
+// account, so resolving them is a read rather than an add.
+func heldOnTorBox(hashes ...string) CacheTruth {
+	truth := CacheTruth{holders: map[string][]DebridService{}, known: map[string]bool{}}
+	for _, h := range hashes {
+		truth.holders[h] = []DebridService{ServiceTorBox}
+		truth.known[h] = true
+	}
+	return truth
+}
 
 // Probing costs a debrid RESOLVE per release, so it must never happen by accident. A caller that hasn't
 // wired a probe client gets the old behaviour exactly — the list is built without touching the account.
@@ -19,7 +31,7 @@ func TestProbeTop_optIn(t *testing.T) {
 		},
 	}}
 	streams := []RawStream{{InfoHash: "abc"}}
-	h.probeTop(context.Background(), &Config{}, streams, nil)
+	h.probeTop(context.Background(), &Config{}, streams, nil, heldOnTorBox("abc"))
 	if resolves != 0 || streams[0].Probe != nil {
 		t.Fatalf("probed without a client: resolves=%d probe=%v", resolves, streams[0].Probe)
 	}
@@ -40,7 +52,7 @@ func TestProbeTop_capsAtTopN(t *testing.T) {
 	}
 	h := &handler{deps: Deps{Cache: cache, ProbeClient: http.DefaultClient,
 		MakeStores: func(*Config) []Store { return nil }}}
-	h.probeTop(context.Background(), &Config{}, streams, nil)
+	h.probeTop(context.Background(), &Config{}, streams, nil, heldOnTorBox("hash"))
 
 	probed := 0
 	for i := range streams {
@@ -62,7 +74,7 @@ func TestProbeTop_cacheHitSkipsResolve(t *testing.T) {
 	h := &handler{deps: Deps{Cache: cache, ProbeClient: http.DefaultClient,
 		MakeStores: func(*Config) []Store { made++; return nil }}}
 	streams := []RawStream{s}
-	h.probeTop(context.Background(), &Config{}, streams, nil)
+	h.probeTop(context.Background(), &Config{}, streams, nil, heldOnTorBox("cached-hash"))
 
 	if made != 0 {
 		t.Fatalf("built a store pool despite a cache hit (%d)", made)
@@ -83,7 +95,7 @@ func TestProbeTop_uncachedIsNeverProbed(t *testing.T) {
 		Cache:       NewMemoryCache(1 << 20),
 		ProbeClient: http.DefaultClient,
 		MakeStores: func(*Config) []Store {
-			return []Store{fakeStore{resolve: func() (string, error) {
+			return []Store{fakeStore{svc: ServiceTorBox, resolve: func() (string, error) {
 				select {
 				case resolved <- struct{}{}:
 				default:
@@ -93,7 +105,7 @@ func TestProbeTop_uncachedIsNeverProbed(t *testing.T) {
 		},
 	}}
 	streams := []RawStream{{InfoHash: "uncached-hash", Cached: false}}
-	h.probeTop(context.Background(), &Config{}, streams, nil)
+	h.probeTop(context.Background(), &Config{}, streams, nil, CacheTruth{})
 
 	if streams[0].Probe != nil {
 		t.Fatalf("an uncached release was probed: %+v", streams[0].Probe)
@@ -114,7 +126,7 @@ func TestProbeTop_cachedProbesBehindTheResponse(t *testing.T) {
 		Cache:       NewMemoryCache(1 << 20),
 		ProbeClient: http.DefaultClient,
 		MakeStores: func(*Config) []Store {
-			return []Store{fakeStore{resolve: func() (string, error) {
+			return []Store{fakeStore{svc: ServiceTorBox, resolve: func() (string, error) {
 				select {
 				case resolved <- struct{}{}:
 				default:
@@ -124,7 +136,7 @@ func TestProbeTop_cachedProbesBehindTheResponse(t *testing.T) {
 		},
 	}}
 	streams := []RawStream{{InfoHash: "held-hash", Cached: true}}
-	h.probeTop(context.Background(), &Config{}, streams, nil)
+	h.probeTop(context.Background(), &Config{}, streams, nil, heldOnTorBox("held-hash"))
 
 	// Returned WITHOUT the probe: that is the whole point — the viewer gets the list now.
 	if streams[0].Probe != nil {
@@ -166,6 +178,67 @@ func TestWithProbe_overridesTitleGuesses(t *testing.T) {
 	untouched := withProbe(base, nil)
 	if untouched.Probed || untouched.AudioLanguages != nil || *untouched.Codec != "h264" {
 		t.Fatalf("unprobed release was altered: %+v", untouched)
+	}
+}
+
+// The probe resolves ONLY against a store that holds the release — never through the pool.
+//
+// `Cached` is the union across accounts, so with two configured, a release only the SECOND holds still
+// reads as cached. Resolving that through the pool reaches the first account in priority order, and an
+// account that does not hold a torrent does not fetch it — it ADDS it. Six probes per newly-viewed title
+// against a sixty-an-hour ceiling is a browse that spends the evening's quota with nobody pressing play.
+// Invisible on a single-account install, which is why the existing guard looked sufficient.
+func TestProbeTop_resolvesOnlyAgainstAHoldingStore(t *testing.T) {
+	var asked []DebridService
+	var mu sync.Mutex
+	record := func(svc DebridService) func() (string, error) {
+		return func() (string, error) {
+			mu.Lock()
+			asked = append(asked, svc)
+			mu.Unlock()
+			return "", nil
+		}
+	}
+	h := &handler{deps: Deps{
+		Cache:       NewMemoryCache(1 << 20),
+		ProbeClient: http.DefaultClient,
+		MakeStores: func(*Config) []Store {
+			return []Store{
+				fakeStore{svc: ServiceTorBox, resolve: record(ServiceTorBox)},
+				fakeStore{svc: ServicePremiumize, resolve: record(ServicePremiumize)},
+			}
+		},
+	}}
+	// Held on Premiumize only — TorBox is configured first and must never be asked.
+	truth := CacheTruth{
+		holders: map[string][]DebridService{"pm-only": {ServicePremiumize}},
+		known:   map[string]bool{"pm-only": true},
+	}
+	streams := []RawStream{{InfoHash: "pm-only", Cached: true}}
+	h.probeTop(context.Background(), &Config{}, streams, nil, truth)
+
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		ran := len(asked) > 0
+		mu.Unlock()
+		if ran {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the background probe never ran")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // leave room for a wrong second call to happen
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, svc := range asked {
+		if svc == ServiceTorBox {
+			t.Fatalf("probed through TorBox, which does not hold this — that ADDS the torrent. asked=%v", asked)
+		}
 	}
 }
 

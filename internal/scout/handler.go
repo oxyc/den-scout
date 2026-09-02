@@ -239,10 +239,14 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	}
 	truth, truthOK := pool.CacheCheck(ctx, hashes)
 	for i := range seeds {
-		seeds[i].Cached = truth[seeds[i].InfoHash]
+		hash := seeds[i].InfoHash
+		seeds[i].Cached = truth.Cached(hash)
 		// Whether that false means "not held" or "nobody could ask" is decided here, once, and carried —
-		// rather than being re-guessed by every consumer from a header they may not have.
-		seeds[i].CacheKnown = truthOK
+		// rather than being re-guessed by every consumer from a header they may not have. Per HASH, not
+		// per request: the checks are batched, so one failed batch leaves 100 releases unknown while the
+		// rest of the list is perfectly well known. Stamping the request-wide `truthOK` on all of them
+		// asserted the answer for exactly the hashes nobody had an answer for.
+		seeds[i].CacheKnown = truth.Known(hash)
 	}
 
 	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
@@ -322,7 +326,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 			config.Filters.Resolutions, config.Filters.MinSeeders, config.Filters.MaxSizeGB,
 			config.Filters.ExcludeCam, config.Filters.HDROnly)
 	}
-	h.probeTop(ctx, config, ranked, sid)
+	h.probeTop(ctx, config, ranked, sid, truth)
 
 	out := make([]streamOut, 0, len(ranked))
 	for _, s := range ranked {
@@ -376,7 +380,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, pool *
 		return
 	}
 	// Cached is a read, not an add: the file is already there and /play would only mint a link for it.
-	if len(pool.CachedBy(ctx, []string{infoHash})[infoHash]) > 0 {
+	if probeTruth, _ := pool.CacheCheck(ctx, []string{infoHash}); probeTruth.Cached(infoHash) {
 		log.Printf("scout: probe %s → 200 ready", shortHash(infoHash))
 		writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
 		return
@@ -434,7 +438,8 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// there is nothing to choose between, and it would be a wasted upstream call on every play.
 	var preferred []DebridService
 	if len(config.Debrid) > 1 {
-		preferred = pool.CachedBy(ctx, []string{target.InfoHash})[target.InfoHash]
+		playTruth, _ := pool.CacheCheck(ctx, []string{target.InfoHash})
+		preferred = playTruth.HeldBy(target.InfoHash)
 	}
 	link, err := pool.ResolvePreferring(ctx, rt, preferred)
 	if err != nil {

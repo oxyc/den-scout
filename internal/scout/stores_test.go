@@ -2,6 +2,7 @@ package scout
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -25,6 +26,61 @@ func TestTorBoxCacheCheck(t *testing.T) {
 	boom := &torBoxStore{token: "t", client: mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(503, "down"), nil }}, api: torboxAPI}
 	if _, err := boom.CacheCheck(context.Background(), []string{H}); err == nil {
 		t.Error("all-batch failure should return an error")
+	}
+}
+
+// A batch that failed leaves its hashes OUT of the map rather than marking them uncached.
+//
+// Checks go out in batches of 100 and up to 500 hashes are checked, so one timed-out batch used to
+// assert "TorBox does not hold this" about 100 releases — and report no error, because another batch
+// succeeded. With cachedOnly on, that silently drops up to 100 genuinely playable releases with no
+// degraded signal; without it, playing one pays an add for a torrent the account already had.
+func TestTorBoxCacheCheck_aFailedBatchIsAbsentNotUncached(t *testing.T) {
+	hashes := make([]string, cacheBatch+2)
+	for i := range hashes {
+		hashes[i] = fmt.Sprintf("%040x", i)
+	}
+	// The first batch answers (and holds nothing); the second — the last two hashes — fails.
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Count(r.URL.Query().Get("hash"), ",")+1 == cacheBatch {
+			return resp(200, `{"data":{}}`), nil
+		}
+		return resp(503, "down"), nil
+	}}
+	s := &torBoxStore{token: "t", client: d, api: torboxAPI}
+	m, err := s.CacheCheck(context.Background(), hashes)
+	if err != nil {
+		t.Fatalf("one good batch is not a total failure: %v", err)
+	}
+	answered, ok := m[hashes[0]]
+	if !ok || answered {
+		t.Errorf("a hash in the batch that came back must be present and false: present=%v value=%v", ok, answered)
+	}
+	if _, present := m[hashes[cacheBatch]]; present {
+		t.Error("a hash in the FAILED batch must be absent — present-and-false claims TorBox does not hold it")
+	}
+}
+
+// The account's whole torrent list is fetched to find a hash, and only hits were remembered. So a miss —
+// which is every poll of a release that was never queued — refetched the entire list, once per poll, for
+// the length of a download.
+func TestTorBoxTorrentID_remembersAMiss(t *testing.T) {
+	lists := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "mylist") {
+			lists++
+			return resp(200, `{"data":[]}`), nil
+		}
+		return resp(404, "{}"), nil
+	}}
+	s := &torBoxStore{token: "t", client: d, api: torboxAPI, cache: NewMemoryCache(1 << 20)}
+	for i := 0; i < 5; i++ {
+		if _, ok := s.torrentID(context.Background(), H); ok {
+			t.Fatal("an empty account holds nothing")
+		}
+	}
+	if lists != 1 {
+		t.Errorf("fetched the whole account list %d times for five polls of the same miss", lists)
 	}
 }
 
@@ -207,8 +263,8 @@ func TestStorePool(t *testing.T) {
 		fakeStore{svc: ServicePremiumize, check: map[string]bool{H: false, other: true}},
 	}}
 	m, truthOK := pool.CacheCheck(context.Background(), []string{H, other})
-	if !m[H] || !m[other] {
-		t.Errorf("pool union: %v", m)
+	if !m.Cached(H) || !m.Cached(other) {
+		t.Errorf("pool union: %v / %v", m.HeldBy(H), m.HeldBy(other))
 	}
 	if !truthOK {
 		t.Error("pool truthOK should be true when a cache-truth store succeeded")

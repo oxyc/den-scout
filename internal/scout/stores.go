@@ -138,9 +138,6 @@ func (s *torBoxStore) get(ctx context.Context, u string) (*http.Response, error)
 
 func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
-	for _, h := range hashes {
-		result[h] = false
-	}
 	if len(hashes) == 0 {
 		return result, nil
 	}
@@ -182,15 +179,21 @@ func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[stri
 		})
 	}
 	_ = g.Wait()
+	// Only a batch that came back describes its hashes. One that failed leaves them ABSENT from the map,
+	// which the pool reads as "we do not know" — writing false there states that TorBox does not hold
+	// them, which is a different and costly claim: it drops a genuinely cached release from a cached-only
+	// list, or pays an add at play time for a torrent the account already had. With 500 seeds in batches
+	// of 100, one timed-out batch made that claim about 100 releases and reported no error at all.
 	for i, h := range hashes {
-		if cached[i] {
-			result[h] = true
+		if batchOK[i/cacheBatch] {
+			result[h] = cached[i]
 		}
 	}
 	return result, batchesFailed(batchOK)
 }
 
-// batchesFailed reports errCheckFailed only when every batch failed (none returned usable data).
+// batchesFailed reports errCheckFailed only when every batch failed (none returned usable data). A
+// partial failure is not an error — the hashes it could not answer for are simply absent from the map.
 func batchesFailed(batchOK []bool) error {
 	for _, ok := range batchOK {
 		if ok {
@@ -204,6 +207,22 @@ func batchesFailed(batchOK []bool) error {
 // addressable by `Status`.
 func torrentIDKey(token, infoHash string) string {
 	return "torbox:torrent:" + keyHash(token) + ":" + infoHash
+}
+
+// Remembering that the account has NO torrent for a hash, briefly.
+//
+// The lookup that answers this fetches the account's ENTIRE torrent list, and only a hit was remembered.
+// So the miss — which is every poll of a release that was never queued — refetched the whole list each
+// time. A client polls /play every couple of seconds for the length of a download, so a ten-minute wait
+// was some three hundred full-account-list fetches, each one growing with the account's history.
+//
+// Deliberately short: an add can land at any moment, and Status is what tells the viewer their download
+// is progressing. This only has to collapse a burst of polls, not remember anything for long. A fresh add
+// is unaffected either way, since it writes the id and the id is checked first.
+const torrentMissTTL = 15 * time.Second
+
+func torrentMissKey(token, infoHash string) string {
+	return "torbox:notorrent:" + keyHash(token) + ":" + infoHash
 }
 
 // transportKind describes a transport failure WITHOUT its URL. `*url.Error.Error()` embeds the request
@@ -483,8 +502,17 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 			}
 		}
 	}
+	if s.cache != nil {
+		if _, missed := s.cache.Get(torrentMissKey(s.token, infoHash)); missed {
+			return 0, false
+		}
+	}
 	id, ok := s.findTorrentByHash(ctx, infoHash)
 	if !ok {
+		// Remember the miss too, or every poll re-fetches the whole account list to learn the same thing.
+		if s.cache != nil {
+			s.cache.Put(torrentMissKey(s.token, infoHash), "1", torrentMissTTL)
+		}
 		return 0, false
 	}
 	// Remember it, so the next poll of this wait is a single-id lookup again rather than another list.
@@ -819,9 +847,6 @@ func (s *premiumizeStore) Service() DebridService { return ServicePremiumize }
 
 func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error) {
 	result := make(map[string]bool, len(hashes))
-	for _, h := range hashes {
-		result[h] = false
-	}
 	if len(hashes) == 0 {
 		return result, nil
 	}
@@ -869,9 +894,10 @@ func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) (map[
 		})
 	}
 	_ = g.Wait()
+	// As with TorBox: a failed batch leaves its hashes absent rather than claiming they are not cached.
 	for i, h := range hashes {
-		if cached[i] {
-			result[h] = true
+		if batchOK[i/cacheBatch] {
+			result[h] = cached[i]
 		}
 	}
 	return result, batchesFailed(batchOK)
@@ -978,45 +1004,72 @@ func buildStores(config *Config, client doer, cache Cache) []Store {
 	return stores
 }
 
-// CacheCheck unions every store's cache truth. truthOK reports whether at least one cache-truth store
-// (TorBox/Premiumize) answered successfully; when false during an outage the handler skips the
-// cached-only filter (rather than dropping everything) and declines to cache the degraded list.
-func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (result map[string]bool, truthOK bool) {
-	result = make(map[string]bool, len(hashes))
-	for _, h := range hashes {
-		result[h] = false
+// CacheTruth is what the pool actually learned about a batch of hashes.
+//
+// Not a bare map of yes/no, because "no" and "we could not find out" have opposite costs and were being
+// reported identically. A false "not cached" drops a playable release from a cached-only list, or pays a
+// debrid ADD at play time for a torrent the account already held — against a sixty-an-hour ceiling. And
+// WHICH service holds a release matters as much as whether one does: the union said "cached" for a
+// release only the second account had, and the probe path then resolved it against the first, adding it.
+type CacheTruth struct {
+	holders map[string][]DebridService
+	known   map[string]bool
+}
+
+// Cached — at least one store confirmed it holds this.
+func (t CacheTruth) Cached(hash string) bool { return len(t.holders[hash]) > 0 }
+
+// Known — at least one cache-truth store gave an answer for this hash, either way. False means unknown,
+// which is NOT the same as not cached.
+func (t CacheTruth) Known(hash string) bool { return t.known[hash] }
+
+// HeldBy — the services that confirmed they hold it, in configured priority order. Resolving against
+// anything outside this list may add the torrent rather than fetch it.
+func (t CacheTruth) HeldBy(hash string) []DebridService { return t.holders[hash] }
+
+// CacheCheck asks every store at once. truthOK reports whether at least one cache-truth store
+// (TorBox/Premiumize) answered at all; when false the handler skips the cached-only filter (rather than
+// dropping everything) and declines to cache the degraded list.
+func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (CacheTruth, bool) {
+	truth := CacheTruth{
+		holders: make(map[string][]DebridService, len(hashes)),
+		known:   make(map[string]bool, len(hashes)),
 	}
 	if len(hashes) == 0 {
-		return result, true
+		return truth, true
 	}
-	// Independent per store; run concurrently and union. A store error can't 500 the request (audit #5)
-	// — it only withholds that store's truth.
+	// Independent per store; run concurrently. A store error can't 500 the request (audit #5) — it only
+	// withholds that store's truth.
 	maps := make([]map[string]bool, len(p.stores))
-	ok := make([]bool, len(p.stores))
 	var g errgroup.Group
 	for i, st := range p.stores {
 		i, st := i, st
 		g.Go(func() error {
-			m, err := st.CacheCheck(ctx, hashes)
-			maps[i] = m
-			if err == nil && isCacheTruthService(st.Service()) {
-				ok[i] = true
+			// An error means the store learned NOTHING — a partial failure returns no error and simply
+			// omits the hashes it could not check, so absence carries that case on its own.
+			if m, err := st.CacheCheck(ctx, hashes); err == nil {
+				maps[i] = m
 			}
 			return nil
 		})
 	}
 	_ = g.Wait()
+	// Store order, so a hash several services hold lists them in configured priority.
+	truthOK := false
 	for i, m := range maps {
-		if ok[i] {
-			truthOK = true
-		}
-		for h, c := range m {
-			if c {
-				result[h] = true
+		cacheTruth := isCacheTruthService(p.stores[i].Service())
+		for hash, cached := range m {
+			// Presence in the map is the store's claim to have answered for that hash.
+			if cacheTruth {
+				truth.known[hash] = true
+				truthOK = true
+			}
+			if cached {
+				truth.holders[hash] = append(truth.holders[hash], p.stores[i].Service())
 			}
 		}
 	}
-	return result, truthOK
+	return truth, truthOK
 }
 
 func isCacheTruthService(svc DebridService) bool {
@@ -1091,35 +1144,40 @@ func (p *StorePool) ordered(preferred []DebridService) []Store {
 	return out
 }
 
-// CachedBy reports which services hold each hash. Same calls as CacheCheck — this keeps the per-service
-// detail that the union in CacheCheck discards, so /play can resolve from a service that already has it.
-func (p *StorePool) CachedBy(ctx context.Context, hashes []string) map[string][]DebridService {
-	byHash := make(map[string][]DebridService, len(hashes))
-	if len(hashes) == 0 {
-		return byHash
+// ResolveCachedOnly resolves against ONLY the services that are known to hold the release, and fails
+// rather than falling through to one that would have to fetch it.
+//
+// This is the read-only sibling of Resolve, for callers that must never cause an add. Resolve tries every
+// configured store in priority order, so with two accounts a release cached on the SECOND one still
+// reaches the first — which adds it. That is invisible on a single-account install and burns the whole
+// hourly quota on a two-account one, from a background path nobody asked for.
+func (p *StorePool) ResolveCachedOnly(ctx context.Context, t ResolveTarget,
+	holders []DebridService) (string, error) {
+	if len(holders) == 0 {
+		return "", &DeadLinkError{"no store holds this release"}
 	}
-	maps := make([]map[string]bool, len(p.stores))
-	var g errgroup.Group
-	for i, st := range p.stores {
-		i, st := i, st
-		g.Go(func() error {
-			m, err := st.CacheCheck(ctx, hashes)
-			if err == nil {
-				maps[i] = m
-			}
-			return nil
-		})
+	held := make(map[DebridService]bool, len(holders))
+	for _, svc := range holders {
+		held[svc] = true
 	}
-	_ = g.Wait()
-	// Store order, so a hash held by several services lists them in the configured priority.
-	for i, m := range maps {
-		for hash, cached := range m {
-			if cached {
-				byHash[hash] = append(byHash[hash], p.stores[i].Service())
-			}
+	var refused error
+	for _, st := range p.stores {
+		if !held[st.Service()] {
+			continue
+		}
+		link, err := st.Resolve(ctx, t)
+		if err == nil {
+			return link, nil
+		}
+		var unavailable *StoreUnavailableError
+		if errors.As(err, &unavailable) && refused == nil {
+			refused = err
 		}
 	}
-	return byHash
+	if refused != nil {
+		return "", refused
+	}
+	return "", &DeadLinkError{"no holding store could resolve"}
 }
 
 // Status — the first store that can say a queued release is still downloading. Only meaningful right

@@ -35,7 +35,8 @@ const probeTTL = 720 * time.Hour
 //
 // Best-effort by construction: a release that can't be resolved, a server that ignores Range, a container
 // nobody parses — all leave the entry exactly as the indexer described it.
-func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStream, sid *StreamID) {
+func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStream, sid *StreamID,
+	truth CacheTruth) {
 	// Opt-in: no client, no probing. Probing costs a debrid RESOLVE per release, so it must never happen
 	// by accident — a caller that hasn't asked for it (a test, an embedder) gets the old behaviour
 	// exactly, and the stream list is built without touching the debrid account at all.
@@ -72,8 +73,17 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 			}
 			continue
 		}
+		// WHICH services hold it, not just that one does. `s.Cached` is the union across accounts, so on a
+		// two-account install a release only the second holds still reads as cached here — and resolving
+		// it through the pool would reach the first account, which adds it. Carrying the holders lets the
+		// probe resolve read-only.
+		holders := truth.HeldBy(s.InfoHash)
+		if len(holders) == 0 {
+			continue
+		}
 		pending = append(pending, probeJob{
-			key: key,
+			key:     key,
+			holders: holders,
 			target: ResolveTarget{
 				InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonOf(sid), Episode: episodeOf(sid),
 			},
@@ -87,8 +97,11 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 // probeJob is a copy, deliberately: the background work must not reach into the response's slice, which
 // the caller is free to marshal and hand to the client the moment probeTop returns.
 type probeJob struct {
-	key    string
-	target ResolveTarget
+	key string
+	// The services confirmed to hold this release. The probe resolves against these ONLY — anything else
+	// would fetch rather than read, which is an add against the quota.
+	holders []DebridService
+	target  ResolveTarget
 }
 
 // probeBehind warms the probe cache after the reply has gone out.
@@ -106,7 +119,7 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 		for _, job := range jobs {
 			g.Go(func() error {
 				_, _, _ = h.sf.Do("probe:"+job.key, func() (any, error) {
-					link, err := pool.Resolve(gctx, job.target)
+					link, err := pool.ResolveCachedOnly(gctx, job.target, job.holders)
 					if err != nil || link == "" {
 						return nil, nil
 					}
