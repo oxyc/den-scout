@@ -46,8 +46,21 @@ func TestBuildDeps(t *testing.T) {
 	settings := SettingsFromEnv(func(string) string { return "" })
 	deps := BuildDeps(settings, &http.Client{}, NewMemoryCache(1<<20))
 	cfg := &Config{Indexers: []Indexer{"torrentio", "comet"}, Filters: Filters{ExcludeCam: true}, Debrid: []DebridAccount{{ServiceTorBox, "t"}}}
-	if sc := deps.MakeScrapers(cfg); len(sc) != 2 || sc[0].id() != "torrentio" {
+	// comet needs a per-install config URL and this environment supplies none, so it is not asked at all:
+	// asked bare it can only 403, and a non-answer that still counts as a response is what let an empty
+	// list look authoritative.
+	if sc := deps.MakeScrapers(cfg); len(sc) != 1 || sc[0].id() != "torrentio" {
 		t.Errorf("makeScrapers: %v", sc)
+	}
+	// Given the URL, it is asked.
+	withComet := BuildDeps(SettingsFromEnv(func(k string) string {
+		if k == "SCOUT_COMET_URL" {
+			return "https://comet.example/CONFIG"
+		}
+		return ""
+	}), &http.Client{}, NewMemoryCache(1<<20))
+	if sc := withComet.MakeScrapers(cfg); len(sc) != 2 || sc[1].id() != "comet" {
+		t.Errorf("makeScrapers with comet URL: %v", sc)
 	}
 	if st := deps.MakeStores(cfg); len(st) != 1 || st[0].Service() != ServiceTorBox {
 		t.Errorf("makeStores: %v", st)

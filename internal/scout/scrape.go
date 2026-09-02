@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -281,9 +282,28 @@ var defaultIndexerURLs = map[Indexer]string{
 func makeScrapers(config *Config, client doer, urls map[Indexer]string) []scraper {
 	out := make([]scraper, 0, len(config.Indexers))
 	for _, id := range config.Indexers {
+		// An indexer that needs a per-install config segment and hasn't been given one is not asked. It
+		// cannot answer usefully, and its failure is silent in the worst way: mediafusion returns 200
+		// with an empty list, which counts as a response and votes on whether a release exists. Leaving
+		// it out means a genuine "nobody has this" still requires everyone who WAS asked to say so.
+		if envVar, needsPath := configPathIndexers[id]; needsPath && urls[id] == "" {
+			logIndexerSkipOnce(id, envVar)
+			continue
+		}
 		out = append(out, &stremioScraper{indexer: id, baseURL: baseURLFor(id, config, urls), client: client})
 	}
 	return out
+}
+
+// Once per indexer per process: this runs on every request, and the operator needs the line once.
+var indexerSkipLogged sync.Map
+
+func logIndexerSkipOnce(id Indexer, envVar string) {
+	if _, seen := indexerSkipLogged.LoadOrStore(id, true); seen {
+		return
+	}
+	log.Printf("scout: %s needs a per-install config URL and has none — not querying it. Set %s to the "+
+		"address from that addon's /configure page.", id, envVar)
 }
 
 func baseURLFor(id Indexer, config *Config, urls map[Indexer]string) string {
@@ -321,7 +341,12 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 	}
 	_ = g.Wait()
 	var all []RawStream
-	anyOK := len(scrapers) == 0 // no indexers configured is a config issue, not a scrape failure
+	// Nothing to ask is not an answer. This used to read as success on the grounds that "no indexers
+	// configured" is an operator choice rather than a scrape failure — but defaults mean a config can no
+	// longer end up with none, so an empty scraper list now means every one of them was skipped for
+	// want of a config URL. Reporting that as a confirmed-empty result is how a misconfiguration
+	// becomes "this release does not exist".
+	anyOK := false
 	for i, r := range results {
 		all = append(all, r...)
 		if respok[i] {

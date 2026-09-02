@@ -26,6 +26,19 @@ var allIndexers = []Indexer{"torrentio", "comet", "mediafusion", "torz"}
 // dropped for every client by one deploy instead of a reconfiguration each.
 var defaultIndexers = []Indexer{"torrentio", "mediafusion"}
 
+// Indexers whose stream endpoint lives behind a per-install config segment (`/{config}/stream/...`),
+// obtainable only from that addon's own /configure page.
+//
+// Asked without one they do not fail usefully: comet answers 403, and mediafusion answers **200 with an
+// empty stream list** — a dead indexer wearing a healthy status. That empty success counted as a real
+// response, so it voted on whether a release exists, and an episode with fifty releases was reported as
+// having none. An indexer that cannot be asked properly must not be asked at all.
+var configPathIndexers = map[Indexer]string{
+	"comet":       "SCOUT_COMET_URL",
+	"mediafusion": "SCOUT_MEDIAFUSION_URL",
+	"torz":        "SCOUT_TORZ_URL",
+}
+
 // Named but known-broken indexers, removed from any config. An install's sealed config cannot be edited
 // from the server, so without this an old blob keeps paying for a host that has been gone for months —
 // and worse, the survivors look like a quorum: when torrentio shed a burst, mediafusion's empty answer
