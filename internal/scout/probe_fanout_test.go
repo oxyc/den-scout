@@ -31,6 +31,7 @@ func TestProbeTop_capsAtTopN(t *testing.T) {
 	streams := make([]RawStream, 20)
 	for i := range streams {
 		streams[i].InfoHash = "hash"
+		streams[i].Cached = true
 	}
 	cache := NewMemoryCache(1 << 20)
 	// Pre-seed every entry so no resolve is attempted, then count how many were consulted.
@@ -55,7 +56,7 @@ func TestProbeTop_capsAtTopN(t *testing.T) {
 // A cached probe must not cost a resolve — that is what makes the disk tier worth having across restarts.
 func TestProbeTop_cacheHitSkipsResolve(t *testing.T) {
 	cache := NewMemoryCache(1 << 20)
-	s := RawStream{InfoHash: "cached-hash"}
+	s := RawStream{InfoHash: "cached-hash", Cached: true}
 	cache.Put(probeCacheKey(&s, nil), `{"audioLanguages":["it"],"videoCodec":"h264"}`, probeTTL)
 	made := 0
 	h := &handler{deps: Deps{Cache: cache, ProbeClient: http.DefaultClient,
@@ -71,10 +72,43 @@ func TestProbeTop_cacheHitSkipsResolve(t *testing.T) {
 	}
 }
 
-// An uncached release must not delay the reply. Probing costs a debrid resolve plus a ranged read
-// apiece, which put ~12s on top of the scrape and timed clients out; the list now goes out first and the
-// probe warms the cache behind it, for the next request.
-func TestProbeTop_uncachedProbesBehindTheResponse(t *testing.T) {
+// A release the store does not hold is never probed at all.
+//
+// Probing resolves, and resolving a release the account does not hold ADDS it — so this read path was
+// queueing up to six torrents per newly-viewed title against a sixty-an-hour ceiling. Browsing spent the
+// quota, and the refusals that followed were read as dead releases and blamed on the releases.
+func TestProbeTop_uncachedIsNeverProbed(t *testing.T) {
+	resolved := make(chan struct{}, 1)
+	h := &handler{deps: Deps{
+		Cache:       NewMemoryCache(1 << 20),
+		ProbeClient: http.DefaultClient,
+		MakeStores: func(*Config) []Store {
+			return []Store{fakeStore{resolve: func() (string, error) {
+				select {
+				case resolved <- struct{}{}:
+				default:
+				}
+				return "", nil
+			}}}
+		},
+	}}
+	streams := []RawStream{{InfoHash: "uncached-hash", Cached: false}}
+	h.probeTop(context.Background(), &Config{}, streams, nil)
+
+	if streams[0].Probe != nil {
+		t.Fatalf("an uncached release was probed: %+v", streams[0].Probe)
+	}
+	select {
+	case <-resolved:
+		t.Fatal("an uncached release was resolved — that adds the torrent and spends the add quota")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// A HELD release still probes behind the response. Probing costs a ranged read apiece, which put ~12s on
+// top of the scrape and timed clients out; the list goes out first and the probe warms the cache for the
+// next request.
+func TestProbeTop_cachedProbesBehindTheResponse(t *testing.T) {
 	resolved := make(chan struct{}, 1)
 	h := &handler{deps: Deps{
 		Cache:       NewMemoryCache(1 << 20),
@@ -89,12 +123,12 @@ func TestProbeTop_uncachedProbesBehindTheResponse(t *testing.T) {
 			}}}
 		},
 	}}
-	streams := []RawStream{{InfoHash: "uncached-hash"}}
+	streams := []RawStream{{InfoHash: "held-hash", Cached: true}}
 	h.probeTop(context.Background(), &Config{}, streams, nil)
 
 	// Returned WITHOUT the probe: that is the whole point — the viewer gets the list now.
 	if streams[0].Probe != nil {
-		t.Fatalf("an uncached release was probed inline: %+v", streams[0].Probe)
+		t.Fatalf("a held release was probed inline: %+v", streams[0].Probe)
 	}
 	// …and the work still happens, just not in the client's way.
 	select {

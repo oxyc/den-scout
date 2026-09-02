@@ -48,6 +48,19 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 			break
 		}
 		s := &streams[i]
+		// Only probe what the store ALREADY holds. Probing resolves, and resolving a release the account
+		// does not hold ADDS it — so this read path was queueing up to six torrents per newly-viewed
+		// title, against a sixty-an-hour ceiling. Browsing did it; opening a ten-episode season did it
+		// sixty times. That is where the quota went, and the refusals it produced were then read as dead
+		// releases and blamed on the releases.
+		//
+		// Nothing is lost: probe facts are keyed by infohash and kept for a month, so a release is probed
+		// for free the first time it is listed after it becomes cached. It also self-heals during a
+		// cache-check outage — everything reads as not-held, so nothing is probed, which is precisely
+		// when touching the debrid is least wise.
+		if !s.Cached {
+			continue
+		}
 		if s.InfoHash == "" {
 			continue
 		}

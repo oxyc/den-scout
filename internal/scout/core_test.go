@@ -191,11 +191,25 @@ func TestCleanLabelAndSize(t *testing.T) {
 }
 
 func TestStreamAttributes(t *testing.T) {
-	a := streamAttributes(RawStream{Title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos", SizeBytes: intp(40 * gib), Seeders: intp(12), Cached: true})
+	a := streamAttributes(RawStream{Title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos", SizeBytes: intp(40 * gib),
+		Seeders: intp(12), Cached: true, CacheKnown: true})
 	if a.Resolution == nil || *a.Resolution != "2160p" || a.Source == nil || *a.Source != "remux" ||
 		a.Codec == nil || *a.Codec != "hevc" || !a.HDR || !a.DolbyVision || a.Audio == nil || *a.Audio != "Atmos" ||
-		a.HDRFormat == nil || *a.HDRFormat != "HDR" || a.ThreeD || !a.Cached || a.Seeders == nil || *a.Seeders != 12 {
+		a.HDRFormat == nil || *a.HDRFormat != "HDR" || a.ThreeD || a.Cached == nil || !*a.Cached ||
+		a.Seeders == nil || *a.Seeders != 12 {
 		t.Errorf("rich attrs: %+v", a)
+	}
+
+	// Cachedness is reported only when it was observed. A failed cache check leaves `Cached` at its zero
+	// value, and sending that as `false` is a claim nobody made — the client reads a definite "must
+	// download" and queues a fetch for a release the debrid may already hold.
+	unknown := streamAttributes(RawStream{Title: "Movie.1080p.WEB-DL", Cached: false, CacheKnown: false})
+	if unknown.Cached != nil {
+		t.Errorf("unchecked cachedness must be omitted, got %v", *unknown.Cached)
+	}
+	held := streamAttributes(RawStream{Title: "Movie.1080p.WEB-DL", Cached: false, CacheKnown: true})
+	if held.Cached == nil || *held.Cached {
+		t.Errorf("an observed 'not held' must be reported as false, got %v", held.Cached)
 	}
 	// HDR10-family variants are distinguished (a stream can be DV *and* carry an HDR10 base).
 	hdrCases := map[string]string{

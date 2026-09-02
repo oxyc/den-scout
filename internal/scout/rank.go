@@ -22,8 +22,11 @@ type RawStream struct {
 	Title     string
 	SizeBytes *int
 	Seeders   *int
-	Cached    bool
-	Source    string
+	Cached bool
+	// Whether anyone could answer the cachedness question this request. False means the check failed, so
+	// `Cached` is a default rather than an observation — and must not be reported to a client as one.
+	CacheKnown bool
+	Source     string
 	// What the file itself said, when it was probed. nil means "not asked" — distinct from "asked and it
 	// told us nothing", so the client can tell an unprobed release from a genuinely featureless one.
 	Probe *Probe

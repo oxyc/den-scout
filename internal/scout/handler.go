@@ -231,6 +231,9 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	truth, truthOK := pool.CacheCheck(ctx, hashes)
 	for i := range seeds {
 		seeds[i].Cached = truth[seeds[i].InfoHash]
+		// Whether that false means "not held" or "nobody could ask" is decided here, once, and carried —
+		// rather than being re-guessed by every consumer from a header they may not have.
+		seeds[i].CacheKnown = truthOK
 	}
 
 	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
