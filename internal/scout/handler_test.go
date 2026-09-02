@@ -551,3 +551,40 @@ func TestStream_noReleasesIsAnAnswerNotAnOutage(t *testing.T) {
 		t.Errorf("scraped %d times: an authoritative empty answer must be cached like any other", scrapes)
 	}
 }
+
+// A partial but non-empty list is served AND cached. Whatever came back is real.
+//
+// Refusing to trust it put the full 8s scrape and a fresh debrid cache-check fan-out on every single
+// /stream for as long as one indexer stayed flaky, and told the app "sources temporarily unavailable"
+// over a perfectly good list. It is cached for less time instead, so the missing releases appear soon
+// after that indexer recovers.
+func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
+	scrapes := 0
+	h := NewHandler(Deps{
+		Cache:         NewMemoryCache(1 << 20),
+		ScrapeTimeout: 50 * time.Millisecond,
+		MakeScrapers: func(*Config) []scraper {
+			return []scraper{
+				fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+					scrapes++
+					return []RawStream{{InfoHash: repeat("a", 40), Title: "A 1080p WEB-DL", Seeders: intp(10)}}, nil
+				}},
+				fakeScraper{"comet", func(context.Context) ([]RawStream, error) { return nil, context.Canceled }},
+			}
+		},
+		MakeStores: func(*Config) []Store {
+			return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{repeat("a", 40): true}}}
+		},
+	})
+	first := do(h, "/"+validBlob+"/stream/movie/tt8888888.json", nil)
+	if n := streamsLen(first); n != 1 {
+		t.Fatalf("served %d streams; what the healthy indexer returned is real", n)
+	}
+	if got := first.Header().Get("X-Scout-Degraded"); got != "" {
+		t.Errorf("X-Scout-Degraded = %q over a list that is short, not broken", got)
+	}
+	do(h, "/"+validBlob+"/stream/movie/tt8888888.json", nil)
+	if scrapes != 1 {
+		t.Errorf("scraped %d times: a partial list must be cached, or every request pays the full scrape", scrapes)
+	}
+}

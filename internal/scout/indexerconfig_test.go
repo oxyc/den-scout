@@ -163,12 +163,12 @@ func TestUnaskableScraper_transientStillCountsInTheQuorum(t *testing.T) {
 	budget := 50 * time.Millisecond
 
 	unconfigured := []scraper{answered, unaskableScraper{indexer: "mediafusion"}}
-	if _, ok := scrapeAll(context.Background(), unconfigured, scrapeQuery{}, budget); !ok {
+	if _, ok, _ := scrapeAll(context.Background(), unconfigured, scrapeQuery{}, budget); !ok {
 		t.Error("an unconfigured indexer must not make an empty result look like an outage")
 	}
 
 	outage := []scraper{answered, unaskableScraper{indexer: "mediafusion", transient: true}}
-	if _, ok := scrapeAll(context.Background(), outage, scrapeQuery{}, budget); ok {
+	if _, ok, _ := scrapeAll(context.Background(), outage, scrapeQuery{}, budget); ok {
 		t.Error("an indexer that could not be reached must leave the empty result non-authoritative")
 	}
 }

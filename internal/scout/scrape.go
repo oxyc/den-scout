@@ -382,7 +382,10 @@ func baseURLFor(id Indexer, config *Config, urls map[Indexer]string) string {
 // out; then dedupes by infohash. The bool reports whether at least one scraper responded — a false
 // (every indexer failed/timed out) means an empty result is a degraded blip, not a genuine "no
 // torrents", so the caller must not cache it.
-func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration) ([]RawStream, bool) {
+// Returns the releases, whether an EMPTY result may be trusted, and whether every askable indexer
+// answered. The last is not the same question as the second: a partial non-empty list is worth serving
+// and worth caching, just for less time.
+func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration) ([]RawStream, bool, bool) {
 	results := make([][]RawStream, len(scrapers))
 	respok := make([]bool, len(scrapers))
 	g, gctx := errgroup.WithContext(ctx)
@@ -423,12 +426,13 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 	// A permanent misconfiguration is not a transient failure, and feeding both into one counter loses
 	// the difference. It is reported once per process by `logIndexerSkipOnce` instead.
 	//
-	// The same reasoning applies to a NON-empty list, which is why the check below is no longer gated on
-	// emptiness. Serving what came back is right; CACHING it as the answer for the next five minutes is a
-	// completeness claim, and a list missing an entire indexer's releases is not complete. torrentio 502s
-	// while mediafusion answers, and the shorter list was stored and shipped with `max-age=300,
-	// stale-if-error=86400` and no degraded header — a partial answer presented as the whole one, which
-	// is the mistake this file is otherwise built around not making.
+	// A NON-empty partial list is a different case, and conflating the two was a mistake worth recording.
+	// Marking it non-authoritative made every response uncacheable whenever ONE indexer was flaky: the
+	// full 8s scrape and a fresh debrid cache-check fan-out on every single /stream, plus a degraded
+	// header that has the app tell the viewer "sources temporarily unavailable" over a perfectly good
+	// list. That is a worse answer than the one it was fixing. The list is served AND cached; `complete`
+	// carries the incompleteness so the caller can hold it for a shorter time instead.
+	complete := true
 	for i, ok := range respok {
 		// Only a PERMANENTLY unaskable indexer is excused. One whose config could not be minted this
 		// minute is an outage: it would have voted, and we do not know how.
@@ -436,11 +440,14 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 			continue
 		}
 		if !ok {
-			anyOK = false
+			complete = false
+			if len(all) == 0 {
+				anyOK = false // an EMPTY list is only authoritative when everyone answered
+			}
 			break
 		}
 	}
-	return dedupe(all), anyOK
+	return dedupe(all), anyOK, complete
 }
 
 // dedupe by infohash, merging the richest facts (fill missing fileIdx/size, max seeders); first-seen

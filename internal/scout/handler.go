@@ -37,6 +37,10 @@ const (
 	resolveBudget = 45 * time.Second
 	// Upper bound on scraped seeds fed into the cache-check fan-out (guards outbound amplification).
 	maxSeeds = 500
+	// How long a list is kept when an indexer did not answer. Short enough that the missing releases
+	// appear soon after that indexer recovers; long enough that a flaky upstream does not put the full
+	// scrape and a debrid fan-out on every single request.
+	partialListTTL = time.Minute
 )
 
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
@@ -229,7 +233,7 @@ type buildResult struct {
 // buildStreamList scrapes → cache-checks → ranks → serializes, caches "<etag>\x00<body>", returns it.
 func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) (string, string) {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
-	seeds, scrapeOK := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
+	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
 
 	// Cap the seed set before the cache-check fan-out: a misbehaving/hostile indexer returning thousands
 	// of tiny stream objects would otherwise mean hundreds of concurrent outbound debrid requests. The
@@ -372,7 +376,17 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	etag := etagFor(string(body))
 	value := etag + "\x00" + string(body)
 	if !degraded {
-		h.deps.Cache.Put(cacheKey, value, h.deps.ListTTL)
+		// A list missing one indexer's releases is worth serving and worth caching — just not for as long
+		// as a complete one. Refusing to cache it at all put the full scrape and a fresh debrid fan-out on
+		// every single request whenever one upstream was flaky, which is a worse answer than the slightly
+		// short list it was protecting against.
+		ttl := h.deps.ListTTL
+		if !scrapeComplete {
+			ttl = partialListTTL
+			log.Printf("scout: %s %s: an indexer did not answer; caching this list for %s only",
+				sid.Type, sid.IMDb, ttl)
+		}
+		h.deps.Cache.Put(cacheKey, value, ttl)
 	}
 	return value, degradedReason
 }

@@ -750,3 +750,83 @@ func TestQueued_aStoreWithoutStatusDoesNotReAddOnEveryPoll(t *testing.T) {
 		})
 	}
 }
+
+// A release that RESOLVED must be playable again immediately.
+//
+// The queued marker reused the in-flight key with a 20-minute TTL and nothing cleared it on success, so
+// a store with no held-torrent fast path answered 202 "downloading" for a release it had just served.
+// One infohash is a whole season pack, so playing S01E01 blocked every other episode of the show; a
+// replay, a resume, or an expired redirect hit the same wall.
+func TestQueued_aResolvedReleaseIsNotBlockedByItsOwnMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		make func(doer, Cache) Store
+	}{
+		{"realdebrid", "",
+			func(d doer, c Cache) Store {
+				return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+			}},
+		{"premiumize", `{"status":"success","content":[{"path":"movie.mkv","link":"https://pm/final","size":999}]}`,
+			func(d doer, c Cache) Store {
+				return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if tc.body != "" {
+					return resp(200, tc.body), nil
+				}
+				switch { // Real-Debrid needs its full add → info → select → unrestrict sequence
+				case strings.Contains(r.URL.Path, "addMagnet"):
+					return resp(201, `{"id":"t1"}`), nil
+				case strings.Contains(r.URL.Path, "/torrents/info/"):
+					return resp(200, `{"files":[{"id":1,"path":"/movie.mkv","bytes":999}],"links":["https://rd/restricted"]}`), nil
+				case strings.Contains(r.URL.Path, "selectFiles"):
+					return resp(204, ""), nil
+				case strings.Contains(r.URL.Path, "unrestrict/link"):
+					return resp(200, `{"download":"https://rd/dl.mkv"}`), nil
+				}
+				return resp(404, "{}"), nil
+			}}
+			store := tc.make(d, NewMemoryCache(1<<20))
+
+			first, err := store.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			if err != nil || first == "" {
+				t.Fatalf("first resolve: %q %v", first, err)
+			}
+			second, err := store.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			if err != nil || second == "" {
+				t.Fatalf("a release that just played came back as %q %v — its own marker blocked it", second, err)
+			}
+		})
+	}
+}
+
+// A permanent refusal after the add must not be laundered into a 20-minute wait: the client has to be
+// able to give up on this release and try the next.
+func TestQueued_aPermanentRefusalClearsTheMarker(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	cache := NewMemoryCache(1 << 20)
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if isAddEndpoint(r) {
+			return resp(201, `{"id":"t1"}`), nil
+		}
+		// A filename RD will not serve — no amount of waiting changes it.
+		return resp(200, `{"files":[{"id":1,"path":"/Movie.2024.WEB-DL.x265.mkv","bytes":999}],"links":[]}`), nil
+	}}
+	s := &realDebridStore{token: "tok", client: d, cache: cache, api: realDebridAPI}
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err == nil {
+		t.Fatal("a blocked filename must fail")
+	}
+	if err := addInFlight(cache, ServiceRealDebrid, "tok", H); err != nil {
+		t.Error("a permanent refusal was left looking like a download in progress")
+	}
+}

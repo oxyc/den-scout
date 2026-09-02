@@ -221,7 +221,7 @@ func TestScrapeAll_unaskableIndexerDoesNotBlockAnEmptyVerdict(t *testing.T) {
 	answeredEmpty := fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) { return nil, nil }}
 	unaskable := unaskableScraper{indexer: "mediafusion"}
 
-	_, ok := scrapeAll(context.Background(), []scraper{answeredEmpty, unaskable}, scrapeQuery{}, time.Second)
+	_, ok, _ := scrapeAll(context.Background(), []scraper{answeredEmpty, unaskable}, scrapeQuery{}, time.Second)
 	if !ok {
 		t.Error("every askable indexer answered, so the empty result is authoritative")
 	}
@@ -230,7 +230,7 @@ func TestScrapeAll_unaskableIndexerDoesNotBlockAnEmptyVerdict(t *testing.T) {
 	found := fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
 		return []RawStream{{InfoHash: repeat("d", 40), Title: "a release"}}, nil
 	}}
-	if seeds, ok := scrapeAll(context.Background(), []scraper{found, unaskable}, scrapeQuery{},
+	if seeds, ok, _ := scrapeAll(context.Background(), []scraper{found, unaskable}, scrapeQuery{},
 		time.Second); !ok || len(seeds) != 1 {
 		t.Errorf("a non-empty result stands on its own: %d seeds, ok=%v", len(seeds), ok)
 	}
@@ -239,7 +239,7 @@ func TestScrapeAll_unaskableIndexerDoesNotBlockAnEmptyVerdict(t *testing.T) {
 	failed := fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
 		return nil, fmt.Errorf("502")
 	}}
-	if _, ok := scrapeAll(context.Background(), []scraper{failed, unaskable}, scrapeQuery{}, time.Second); ok {
+	if _, ok, _ := scrapeAll(context.Background(), []scraper{failed, unaskable}, scrapeQuery{}, time.Second); ok {
 		t.Error("an indexer that failed means the empty result is not authoritative")
 	}
 }

@@ -330,10 +330,44 @@ func noteAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
 const queuedTTL = 20 * time.Minute
 
 // noteQueued records that this store was asked to fetch the release and accepted.
+//
+// It MUST be undone the moment the release becomes playable, or the moment it is known to be
+// unplayable — see settleQueued. A marker that outlives the wait it describes is not a wait but a
+// twenty-minute lie: one infohash serves a whole season pack, so a single successful play blocked every
+// other episode of that show, and a permanent refusal — a pack that lacks the episode, a filename the
+// service blocks — came back as "downloading" instead of letting the client fall through to the next
+// release.
 func noteQueued(cache Cache, svc DebridService, token, infoHash string) {
 	if cache != nil {
 		cache.Put(addAttemptKey(svc, token, infoHash), "1", queuedTTL)
 	}
+}
+
+// settleQueued clears the marker once the outcome is known either way — a link, or a verdict the client
+// can act on. Only "asked for, nothing playable yet" keeps it.
+func settleQueued(cache Cache, svc DebridService, token, infoHash, link string, err error) {
+	if link != "" || isPermanentFailure(err) {
+		settleAddAttempt(cache, svc, token, infoHash)
+	}
+}
+
+// isPermanentFailure — an answer that waiting will not change, so the client must be free to give up on
+// this release and try the next rather than polling a promise.
+func isPermanentFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errEpisodeNotInTorrent) {
+		return true
+	}
+	// NOT "no content" / "no link": those are what a transfer that has only just been queued answers, and
+	// treating them as a verdict re-added the release on the very next poll — the loop this is here to
+	// stop. A filename the service refuses to serve is the one post-add answer that waiting cannot change.
+	var dead *DeadLinkError
+	if !errors.As(err, &dead) || dead == errTorrentGone {
+		return false
+	}
+	return strings.Contains(dead.Reason, "blocked filename")
 }
 
 // settleAddAttempt clears the marker once the outcome IS known, whatever it was.
@@ -986,7 +1020,11 @@ func (s *realDebridStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 	return StoreStatus{}, false
 }
 
-func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
+func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (link string, err error) {
+	// Whatever this returns, the queued marker is settled against it: a link or a verdict clears it, only
+	// "nothing playable yet" keeps it. Deferred rather than written at each return, because there are
+	// nine of them and the one that got missed is what turned a successful play into a 20-minute block.
+	defer func() { settleQueued(s.cache, ServiceRealDebrid, s.token, t.InfoHash, link, err) }()
 	// The same backoff TorBox has. Without it, a client polling /play for the length of a download added
 	// this magnet once per poll — hundreds of adds for one wait, each leaving a duplicate torrent on the
 	// account. TorBox backing off correctly made this worse, not better: ResolvePreferring fell straight
@@ -1220,7 +1258,9 @@ func (s *premiumizeStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 	return StoreStatus{}, false
 }
 
-func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
+func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (link string, err error) {
+	// Settled against whatever this returns — see the same deferral on the Real-Debrid path.
+	defer func() { settleQueued(s.cache, ServicePremiumize, s.token, t.InfoHash, link, err) }()
 	// The same backoff TorBox has — a poll loop must not be able to sustain a refusal here either.
 	if reason, ok := backedOff(s.cache, ServicePremiumize, s.token, t.InfoHash); ok {
 		return "", &StoreUnavailableError{ServicePremiumize, reason + " (backing off)"}

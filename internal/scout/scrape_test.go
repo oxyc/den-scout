@@ -125,26 +125,29 @@ func TestScrapeAll(t *testing.T) {
 	}}
 	boom := fakeScraper{"comet", func(context.Context) ([]RawStream, error) { return nil, context.Canceled }}
 	hang := fakeScraper{"torz", func(ctx context.Context) ([]RawStream, error) { <-ctx.Done(); return nil, ctx.Err() }}
-	out, anyOK := scrapeAll(context.Background(), []scraper{ok, boom, hang}, scrapeQuery{}, 30*time.Millisecond)
+	out, anyOK, complete := scrapeAll(context.Background(), []scraper{ok, boom, hang}, scrapeQuery{}, 30*time.Millisecond)
 	if len(out) != 1 || out[0].InfoHash != repeat("a", 40) {
 		t.Errorf("scrapeAll gather-what-responded: %+v", out)
 	}
-	// A PARTIAL answer is served but is NOT authoritative. Serving what came back is right; storing it as
-	// the answer for the next five minutes is a completeness claim, and a list missing an entire
-	// indexer's releases is not complete — it went out with max-age=300, stale-if-error=86400 and no
-	// degraded header: a partial answer presented as the whole one.
-	if anyOK {
-		t.Error("two of three indexers failed; the list is incomplete and must not be cached as the answer")
+	// A partial NON-EMPTY answer is still worth serving and worth caching — whatever came back is real.
+	// Marking it non-authoritative put the full scrape and a fresh debrid fan-out on every request while
+	// one indexer was flaky, which is a worse answer than the slightly short list it was protecting
+	// against. What it is NOT is complete, and that is carried separately so it can be held for less time.
+	if !anyOK {
+		t.Error("a non-empty list is real; refusing to trust it re-scrapes on every request")
+	}
+	if complete {
+		t.Error("two of three indexers failed; the list cannot be described as complete")
 	}
 
-	// Every indexer answering IS the answer, empty or not — otherwise nothing would ever be cached.
+	// Every indexer answering IS complete, empty or not — otherwise nothing would ever be cached in full.
 	quiet := fakeScraper{"mediafusion", func(context.Context) ([]RawStream, error) { return nil, nil }}
-	if _, complete := scrapeAll(context.Background(), []scraper{ok, quiet}, scrapeQuery{}, 30*time.Millisecond); !complete {
+	if _, _, whole := scrapeAll(context.Background(), []scraper{ok, quiet}, scrapeQuery{}, 30*time.Millisecond); !whole {
 		t.Error("every indexer answered; that is a complete list")
 	}
 
 	// every scraper failing → anyOK false (a degraded blip, not a genuine empty)
-	if _, ok := scrapeAll(context.Background(), []scraper{boom}, scrapeQuery{}, 30*time.Millisecond); ok {
+	if _, ok, _ := scrapeAll(context.Background(), []scraper{boom}, scrapeQuery{}, 30*time.Millisecond); ok {
 		t.Error("anyOK should be false when every scraper failed")
 	}
 
@@ -155,7 +158,7 @@ func TestScrapeAll(t *testing.T) {
 	b := fakeScraper{"comet", func(context.Context) ([]RawStream, error) {
 		return []RawStream{{InfoHash: repeat("h", 40), Title: "second", Seeders: intp(99), FileIdx: intp(3), SizeBytes: intp(500)}}, nil
 	}}
-	merged, _ := scrapeAll(context.Background(), []scraper{a, b}, scrapeQuery{}, time.Second)
+	merged, _, _ := scrapeAll(context.Background(), []scraper{a, b}, scrapeQuery{}, time.Second)
 	if len(merged) != 1 || merged[0].Title != "first" || intOr(merged[0].Seeders, 0) != 99 || merged[0].FileIdx == nil || merged[0].SizeBytes == nil {
 		t.Errorf("dedupe merge: %+v", merged[0])
 	}
