@@ -595,7 +595,17 @@ func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
 		t.Errorf("cache-control = %q: a short list must not survive a day of errors on the device", cc)
 	}
 
-	do(h, "/"+validBlob+"/stream/movie/tt8888888.json", nil)
+	// The SECOND requester is served from cache, and must be told the same short freshness. Stremio races
+	// and cancels addon requests, so a duplicate inside the one-minute window is routine — and it was
+	// getting max-age=300 plus a day of stale-if-error for a list the server keeps for sixty seconds.
+	second := do(h, "/"+validBlob+"/stream/movie/tt8888888.json", nil)
+	hitCC := second.Header().Get("cache-control")
+	if !strings.Contains(hitCC, fmt.Sprintf("max-age=%d", int(partialListTTL.Seconds()))) {
+		t.Errorf("cache hit sent %q — the shortening is defeated one branch over", hitCC)
+	}
+	if strings.Contains(hitCC, "stale-if-error") {
+		t.Errorf("cache hit sent %q: a short list must not survive a day of errors", hitCC)
+	}
 	if scrapes != 1 {
 		t.Errorf("scraped %d times: a partial list must be cached, or every request pays the full scrape", scrapes)
 	}

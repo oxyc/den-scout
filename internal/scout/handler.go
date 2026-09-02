@@ -179,13 +179,23 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	}
 	ttlSec := int(h.deps.ListTTL.Seconds())
 	listCache := fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
+	partialSec := int(partialListTTL.Seconds())
+	partialListCache := fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d", partialSec, partialSec)
 	origin := h.publicOrigin(r)
 	// audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
 	cacheKey := "list:" + keyHash(configBlob) + ":" + keyHash(origin) + ":" + streamCacheID(sid)
 
 	if hit, ok := h.deps.Cache.Get(cacheKey); ok {
-		etag, body := splitCached(hit)
-		h.conditional(w, r, body, etag, jsonType, listCache)
+		// The completeness rides WITH the entry. Shortening the header only on the build meant the very
+		// next requester — Stremio races and cancels addon requests, so that happens routinely — was told
+		// to hold a knowingly-short list for five minutes and a day on stale-if-error, which is the harm
+		// the shortening exists to prevent, defeated one branch over.
+		complete, etag, body := splitCached(hit)
+		header := listCache
+		if !complete {
+			header = partialListCache
+		}
+		h.conditional(w, r, body, etag, jsonType, header)
 		return
 	}
 
@@ -211,7 +221,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	if res.degraded != "" {
 		w.Header().Set("X-Scout-Degraded", res.degraded)
 	}
-	etag, body := splitCached(res.value)
+	_, etag, body := splitCached(res.value)
 	// A degraded build is deliberately not cached server-side, "so the next request retries instead of
 	// serving the blip for the whole TTL" — and then the same body went out with `max-age=300,
 	// stale-if-error=86400`, which URLSession's shared cache honours. The guard was defeated one layer
@@ -225,8 +235,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		// The SAME lesson one line up, for the partial case: the server held this list for a minute and
 		// then told the client to keep it for five, with stale-if-error for a day. A list knowingly
 		// missing an indexer's releases must not outlive its short server-side life on the device.
-		cacheHeader = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d",
-			int(partialListTTL.Seconds()), int(partialListTTL.Seconds()))
+		cacheHeader = partialListCache
 	}
 	h.conditional(w, r, body, etag, jsonType, cacheHeader)
 }
@@ -384,7 +393,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	}
 	body, _ := json.Marshal(streamsResponse{Streams: out})
 	etag := etagFor(string(body))
-	value := etag + "\x00" + string(body)
+	value := joinCached(scrapeComplete, etag, string(body))
 	if !degraded {
 		// A list missing one indexer's releases is worth serving and worth caching — just not for as long
 		// as a complete one. Refusing to cache it at all put the full scrape and a fresh debrid fan-out on
@@ -702,11 +711,27 @@ func etagMatches(ifNoneMatch, etag string) bool {
 	return false
 }
 
-func splitCached(v string) (etag, body string) {
-	if i := strings.IndexByte(v, '\x00'); i >= 0 {
-		return v[:i], v[i+1:]
+// A cached list is "<complete>\x00<etag>\x00<body>". The completeness is stored with the entry because
+// the cache-hit branch has to answer the same question the build did, and could not otherwise know.
+func splitCached(v string) (complete bool, etag, body string) {
+	first := strings.IndexByte(v, '\x00')
+	if first < 0 {
+		return true, "", v
 	}
-	return "", v
+	rest := v[first+1:]
+	second := strings.IndexByte(rest, '\x00')
+	if second < 0 {
+		return true, v[:first], rest // an entry written before completeness was recorded
+	}
+	return v[:first] == "1", rest[:second], rest[second+1:]
+}
+
+func joinCached(complete bool, etag, body string) string {
+	flag := "0"
+	if complete {
+		flag = "1"
+	}
+	return flag + "\x00" + etag + "\x00" + body
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any, cacheControl string) {

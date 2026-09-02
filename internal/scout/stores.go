@@ -338,6 +338,14 @@ func noteQueued(cache Cache, token, infoHash string) {
 	}
 }
 
+// settleQueuedTransfer clears the marker once Premiumize has something to serve — the transfer is done,
+// and a later request must be free to pay for it again if it is ever evicted.
+func settleQueuedTransfer(cache Cache, token, infoHash string) {
+	if cache != nil {
+		cache.Put(pmQueuedKey(token, infoHash), "", time.Nanosecond)
+	}
+}
+
 func alreadyQueued(cache Cache, token, infoHash string) bool {
 	if cache == nil {
 		return false
@@ -983,9 +991,10 @@ func (s *realDebridStore) post(ctx context.Context, path string, form url.Values
 
 type rdInfo struct {
 	Files []struct {
-		ID    int    `json:"id"`
-		Path  string `json:"path"`
-		Bytes int    `json:"bytes"`
+		ID       int    `json:"id"`
+		Path     string `json:"path"`
+		Bytes    int    `json:"bytes"`
+		Selected int    `json:"selected"`
 	} `json:"files"`
 	Links []string `json:"links"`
 }
@@ -1014,7 +1023,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		return "", err
 	}
 	// Already bought? Then resolve from it instead of buying it again.
-	if id, held := s.knownTorrent(t.InfoHash); held {
+	if id, held := s.knownTorrent(t); held {
 		return s.resolveExisting(ctx, id, t)
 	}
 	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
@@ -1050,7 +1059,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// kept failing to be: a "we already bought this" fact, separate from "an add is in flight", and not
 	// cleared when the release resolves or is refused. Without it every poll called addMagnet again and
 	// RD made a NEW torrent each time — ten polls of one unplayable pack, ten adds, ten duplicates.
-	s.rememberTorrent(t.InfoHash, added.ID)
+	s.rememberTorrent(t, added.ID)
 	id := added.ID
 
 	return s.resolveExisting(ctx, id, t)
@@ -1058,27 +1067,41 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 
 // rdTorrentKey — the RD torrent id this account created for an infohash. Account-scoped like every other
 // key that carries account state.
-func rdTorrentKey(token, infoHash string) string {
-	return "realdebrid:torrent:" + keyHash(token) + ":" + infoHash
+// Keyed by the FILE, not the torrent.
+//
+// One infohash is a whole season pack, and Real-Debrid decides which file a torrent serves through
+// selectFiles — the links it then returns describe that selection. So a remembered id is only reusable
+// for the same target: reusing it across episodes re-selected on a torrent RD had already started and
+// served S01E01's link for a request for S01E02. Wrong content, silently, which is worse than the extra
+// add it was saving. A separate torrent per episode is how RD is meant to be used, and repeated polls of
+// the SAME episode — the loop that actually costs quota — still reuse one.
+func rdTorrentKey(token, infoHash string, t ResolveTarget) string {
+	sel := ""
+	if t.Season != nil && t.Episode != nil {
+		sel = fmt.Sprintf(":s%de%d", *t.Season, *t.Episode)
+	} else if t.FileIdx != nil {
+		sel = fmt.Sprintf(":f%d", *t.FileIdx)
+	}
+	return "realdebrid:torrent:" + keyHash(token) + ":" + infoHash + sel
 }
 
-func (s *realDebridStore) rememberTorrent(infoHash, id string) {
+func (s *realDebridStore) rememberTorrent(t ResolveTarget, id string) {
 	if s.cache != nil {
-		s.cache.Put(rdTorrentKey(s.token, infoHash), id, resolveCacheTTL)
+		s.cache.Put(rdTorrentKey(s.token, t.InfoHash, t), id, resolveCacheTTL)
 	}
 }
 
-func (s *realDebridStore) knownTorrent(infoHash string) (string, bool) {
+func (s *realDebridStore) knownTorrent(t ResolveTarget) (string, bool) {
 	if s.cache == nil {
 		return "", false
 	}
-	id, ok := s.cache.Get(rdTorrentKey(s.token, infoHash))
+	id, ok := s.cache.Get(rdTorrentKey(s.token, t.InfoHash, t))
 	return id, ok && id != ""
 }
 
-func (s *realDebridStore) forgetTorrent(infoHash string) {
+func (s *realDebridStore) forgetTorrent(t ResolveTarget) {
 	if s.cache != nil {
-		s.cache.Put(rdTorrentKey(s.token, infoHash), "", time.Nanosecond)
+		s.cache.Put(rdTorrentKey(s.token, t.InfoHash, t), "", time.Nanosecond)
 	}
 }
 
@@ -1091,7 +1114,7 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 		// all describe this attempt, not what the account holds — forgetting on those re-bought the
 		// torrent on the very next poll, which is the loop this memory exists to end.
 		if errors.Is(err, errTorrentGone) {
-			s.forgetTorrent(t.InfoHash)
+			s.forgetTorrent(t)
 		}
 		return "", err
 	}
@@ -1129,7 +1152,39 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 	if len(ready.Links) == 0 {
 		return "", &DeadLinkError{"realdebrid not ready"}
 	}
-	return s.unrestrict(ctx, ready.Links[0])
+	link, ok := rdLinkFor(ready, *fileID)
+	if !ok {
+		return "", &DeadLinkError{"realdebrid has no link for the selected file"}
+	}
+	return s.unrestrict(ctx, link)
+}
+
+// rdLinkFor picks the link belonging to a file id.
+//
+// RD's `links` map one-to-one onto the SELECTED files, in file order — not onto every file, and not onto
+// the one thing we asked for. Returning links[0] regardless served S01E01's link for a request for
+// S01E02 on any torrent with more than one file selected, which is the normal state of a season pack RD
+// has already been asked about. Silently the wrong episode, which is worse than any cost it saved.
+func rdLinkFor(info *rdInfo, fileID int) (string, bool) {
+	pos := 0
+	for _, f := range info.Files {
+		if f.Selected == 0 {
+			continue
+		}
+		if f.ID == fileID {
+			if pos < len(info.Links) {
+				return info.Links[pos], true
+			}
+			return "", false
+		}
+		pos++
+	}
+	// No file reports a selection — an older/leaner response shape. With exactly one link there is only
+	// one thing it can be; with several, guessing is what caused the bug.
+	if pos == 0 && len(info.Links) == 1 {
+		return info.Links[0], true
+	}
+	return "", false
 }
 
 func (s *realDebridStore) info(ctx context.Context, id string) (*rdInfo, error) {
@@ -1293,12 +1348,15 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if err := addInFlight(s.cache, ServicePremiumize, s.token, t.InfoHash); err != nil {
 		return "", err
 	}
-	// A transfer we already queued and that had nothing to serve. Asking again queues it again.
-	if alreadyQueued(s.cache, s.token, t.InfoHash) {
-		return "", &DeadLinkError{"premiumize is still fetching this release"}
-	}
-	if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
-		return "", err
+	// A transfer we already queued. Do NOT skip the call — directdl is the only thing that can discover
+	// the transfer finished, so blocking it made a release that completed in two minutes unresolvable for
+	// the remaining eighteen. What the marker suppresses is the CHARGE: the transfer is already paid for,
+	// so asking about it again must not spend another add.
+	queued := alreadyQueued(s.cache, s.token, t.InfoHash)
+	if !queued {
+		if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
+			return "", err
+		}
 	}
 	form := url.Values{"apikey": {s.token}, "src": {magnetFor(t.InfoHash)}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/transfer/directdl", strings.NewReader(form.Encode()))
@@ -1335,9 +1393,13 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		} `json:"content"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Status != "success" || len(body.Content) == 0 {
-		// Queued, nothing to serve yet: remember it, so the next poll waits instead of queueing again.
+		// Queued, nothing to serve yet. Remembering it stops the next poll paying for the same transfer,
+		// and errAddInFlight is what makes the route answer 202 "coming" rather than 404 "dead" — a
+		// DeadLinkError here had the client remember a perfectly good release as unplayable, which is the
+		// exact defect the in-flight sentinel was introduced to end.
 		noteQueued(s.cache, s.token, t.InfoHash)
-		return "", &DeadLinkError{"premiumize no content"}
+		return "", fmt.Errorf("%w: %w", errAddInFlight,
+			&StoreUnavailableError{ServicePremiumize, "the transfer is queued and has nothing to serve yet"})
 	}
 	files := make([]TorrentFile, len(body.Content))
 	for i, c := range body.Content {
@@ -1350,6 +1412,9 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if idx == nil || *idx < 0 || *idx >= len(body.Content) || body.Content[*idx].Link == "" {
 		return "", &DeadLinkError{"premiumize no link"}
 	}
+	// It has something to serve, so the transfer is no longer pending — and a much later request must be
+	// free to pay for it again if Premiumize has since dropped it.
+	settleQueuedTransfer(s.cache, s.token, t.InfoHash)
 	return body.Content[*idx].Link, nil
 }
 

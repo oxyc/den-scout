@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -741,11 +742,15 @@ func TestQueued_aStoreWithoutStatusDoesNotReAddOnEveryPoll(t *testing.T) {
 			for i := 0; i < 30; i++ {
 				_, _ = store.Resolve(context.Background(), ResolveTarget{InfoHash: H})
 			}
-			if adds != 1 {
-				t.Errorf("%d adds across thirty polls of one release — each one a duplicate torrent", adds)
-			}
+			// The measure is the CHARGE, not the call. Premiumize's directdl is both the question and the
+			// purchase — it is the only thing that can notice the transfer finished, so it has to keep
+			// being called; what must not repeat is paying for it. Real-Debrid can separate the two, and
+			// does: one addMagnet, then info against the torrent it remembers.
 			if left := globalAddBudget.remaining(budgetAccount(store.Service(), "tok")); left != 49 {
 				t.Errorf("allowance dropped to %d; one queued release must cost one add", left)
+			}
+			if store.Service() == ServiceRealDebrid && adds != 1 {
+				t.Errorf("%d addMagnet calls across thirty polls — each one a duplicate torrent", adds)
 			}
 		})
 	}
@@ -916,7 +921,7 @@ func TestRealDebrid_forgetsOnlyOnAConfirmedAbsence(t *testing.T) {
 	if adds != 1 {
 		t.Errorf("%d adds while the torrent was merely not ready", adds)
 	}
-	if _, held := s.knownTorrent(H); !held {
+	if _, held := s.knownTorrent(ResolveTarget{InfoHash: H}); !held {
 		t.Error("a not-ready torrent was forgotten")
 	}
 	// A THROTTLE on the info call is not an absence either — it describes this attempt, not the account.
@@ -936,14 +941,14 @@ func TestRealDebrid_forgetsOnlyOnAConfirmedAbsence(t *testing.T) {
 	if tAdds != 1 {
 		t.Errorf("%d adds while RD was merely throttling its own info endpoint", tAdds)
 	}
-	if _, held := ts.knownTorrent(H); !held {
+	if _, held := ts.knownTorrent(ResolveTarget{InfoHash: H}); !held {
 		t.Error("a throttle forgot the torrent, so the next poll buys it again")
 	}
 
 	// Now RD really does not have it: forget, and let the next attempt buy it again.
 	gone = true
 	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
-	if _, held := s.knownTorrent(H); held {
+	if _, held := s.knownTorrent(ResolveTarget{InfoHash: H}); held {
 		t.Error("a 404 must forget the id, or the release is stuck behind a ghost for six hours")
 	}
 }
@@ -971,17 +976,164 @@ func TestPremiumize_marksOnlyAnEmptyAnswer(t *testing.T) {
 		t.Errorf("the same release could not be resolved twice: %v", err)
 	}
 
-	// An empty answer means a transfer was queued: mark it, and stop paying for it again.
+	// An empty answer means a transfer was queued: remember it, so the next poll does not pay again —
+	// but keep asking, because directdl is the only thing that can notice it finished.
+	before := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "pending"))
 	calls := 0
-	queued := &premiumizeStore{token: "tok", cache: NewMemoryCache(1 << 20), api: premiumizeAPI,
+	done := false
+	queued := &premiumizeStore{token: "pending", cache: NewMemoryCache(1 << 20), api: premiumizeAPI,
 		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
 			calls++
+			if done {
+				return resp(200, `{"status":"success","content":[{"path":"m.mkv","link":"https://pm/done","size":9}]}`), nil
+			}
 			return resp(200, `{"status":"success","content":[]}`), nil
 		}}}
 	for i := 0; i < 10; i++ {
-		_, _ = queued.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+		_, err := queued.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+		if !errors.Is(err, errAddInFlight) {
+			t.Fatalf("a queued transfer must read as coming, not dead: %v", err)
+		}
 	}
-	if calls != 1 {
-		t.Errorf("queued a transfer %d times for one release", calls)
+	if spent := before - globalAddBudget.remaining(budgetAccount(ServicePremiumize, "pending")); spent != 1 {
+		t.Errorf("paid for the same transfer %d times", spent)
+	}
+	if calls < 10 {
+		t.Errorf("only asked %d times: nothing else can notice the transfer finished", calls)
+	}
+
+	// And when it does finish, the very next poll serves it.
+	done = true
+	link, err := queued.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if err != nil || link != "https://pm/done" {
+		t.Errorf("a completed transfer must be served: %q %v", link, err)
+	}
+	if alreadyQueued(queued.cache, "pending", H) {
+		t.Error("the marker outlived the transfer it described")
+	}
+}
+
+// A remembered Real-Debrid torrent is per FILE, and its link is the one for the file selected.
+//
+// One infohash is a whole season pack. Reusing a torrent id across episodes re-selected files on a
+// torrent RD had already started and then served links[0] regardless — S01E01's link for a request for
+// S01E02. Silently the wrong episode, which is worse than the add it saved.
+func TestRealDebrid_servesTheEpisodeThatWasAskedFor(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	// A pack RD has already fully selected: two files, two links, in file order.
+	pack := `{"files":[{"id":1,"path":"/Show.S01E01.mkv","bytes":9,"selected":1},
+	                   {"id":2,"path":"/Show.S01E02.mkv","bytes":9,"selected":1}],
+	          "links":["https://rd/E01","https://rd/E02"]}`
+	var unrestricted string
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "addMagnet"):
+			return resp(201, `{"id":"t1"}`), nil
+		case strings.Contains(r.URL.Path, "/torrents/info/"):
+			return resp(200, pack), nil
+		case strings.Contains(r.URL.Path, "selectFiles"):
+			return resp(204, ""), nil
+		case strings.Contains(r.URL.Path, "unrestrict/link"):
+			b, _ := io.ReadAll(r.Body)
+			unrestricted = string(b)
+			return resp(200, `{"download":"https://rd/dl"}`), nil
+		}
+		return resp(404, "{}"), nil
+	}}
+	s := &realDebridStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: realDebridAPI}
+
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(1)}); err != nil {
+		t.Fatalf("E01: %v", err)
+	}
+	if !strings.Contains(unrestricted, "E01") {
+		t.Errorf("E01 unrestricted %q", unrestricted)
+	}
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)}); err != nil {
+		t.Fatalf("E02: %v", err)
+	}
+	if !strings.Contains(unrestricted, "E02") {
+		t.Errorf("E02 unrestricted %q — the pack's first link was served for the second episode", unrestricted)
+	}
+}
+
+// rdLinkFor maps a file id onto RD's links, which describe the SELECTED files in file order.
+func TestRDLinkFor(t *testing.T) {
+	info := &rdInfo{Links: []string{"L-b", "L-d"}}
+	info.Files = append(info.Files,
+		struct {
+			ID       int    `json:"id"`
+			Path     string `json:"path"`
+			Bytes    int    `json:"bytes"`
+			Selected int    `json:"selected"`
+		}{ID: 1, Path: "a", Selected: 0},
+		struct {
+			ID       int    `json:"id"`
+			Path     string `json:"path"`
+			Bytes    int    `json:"bytes"`
+			Selected int    `json:"selected"`
+		}{ID: 2, Path: "b", Selected: 1},
+		struct {
+			ID       int    `json:"id"`
+			Path     string `json:"path"`
+			Bytes    int    `json:"bytes"`
+			Selected int    `json:"selected"`
+		}{ID: 3, Path: "c", Selected: 0},
+		struct {
+			ID       int    `json:"id"`
+			Path     string `json:"path"`
+			Bytes    int    `json:"bytes"`
+			Selected int    `json:"selected"`
+		}{ID: 4, Path: "d", Selected: 1},
+	)
+	if link, ok := rdLinkFor(info, 2); !ok || link != "L-b" {
+		t.Errorf("first selected file → first link: %q %v", link, ok)
+	}
+	if link, ok := rdLinkFor(info, 4); !ok || link != "L-d" {
+		t.Errorf("second selected file → second link: %q %v", link, ok)
+	}
+	// An unselected file has no link of its own; guessing one is what served the wrong episode.
+	if _, ok := rdLinkFor(info, 3); ok {
+		t.Error("an unselected file must not be given someone else's link")
+	}
+	// A leaner response with no selection flags and exactly one link has only one possible answer.
+	lean := &rdInfo{Links: []string{"only"}}
+	lean.Files = append(lean.Files, struct {
+		ID       int    `json:"id"`
+		Path     string `json:"path"`
+		Bytes    int    `json:"bytes"`
+		Selected int    `json:"selected"`
+	}{ID: 7, Path: "x"})
+	if link, ok := rdLinkFor(lean, 7); !ok || link != "only" {
+		t.Errorf("single-link fallback: %q %v", link, ok)
+	}
+}
+
+// The two keys HEAD added carry account state and must be scoped to the token like every other one.
+func TestCacheKeys_theNewOnesAreScopedToo(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  func(token string) string
+	}{
+		{"rdTorrent", func(tok string) string { return rdTorrentKey(tok, H, ResolveTarget{InfoHash: H}) }},
+		{"pmQueued", func(tok string) string { return pmQueuedKey(tok, H) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mine, theirs := tc.key("my-token"), tc.key("their-token")
+			if mine == theirs {
+				t.Fatalf("two accounts share the key %q", mine)
+			}
+			if strings.Contains(mine, "my-token") || !strings.Contains(mine, keyHash("my-token")) {
+				t.Errorf("key not derived from the account without exposing it: %q", mine)
+			}
+		})
+	}
+	// And the RD key separates episodes of one pack, or a season pack serves one episode for all of them.
+	e1 := rdTorrentKey("tok", H, ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(1)})
+	e2 := rdTorrentKey("tok", H, ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
+	if e1 == e2 {
+		t.Error("two episodes of one pack share a remembered torrent")
 	}
 }
