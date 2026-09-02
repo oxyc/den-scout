@@ -1406,9 +1406,11 @@ func TestResolve_addGuardsDoNotBlockAReadPath(t *testing.T) {
 	defer func() { globalAddBudget = prev }()
 
 	cache := NewMemoryCache(1 << 20)
-	// The account was refused outright a moment ago, on some other release.
+	// A PER-RELEASE add backoff on some other release: a throttle, not a rejected key. This is the kind a
+	// read cannot have caused and must not be blocked by. (An account-level 401/403 is different, and
+	// does gate reads — asking again with a rejected key is pointless whatever is being asked for.)
 	recordRefusal(cache, ServiceRealDebrid, "tok", repeat("f", 40),
-		&StoreUnavailableError{Service: ServiceRealDebrid, Status: 403, Reason: "addmagnet http 403"})
+		&StoreUnavailableError{Service: ServiceRealDebrid, Status: 429, Reason: "addmagnet http 429"})
 
 	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 		switch {
@@ -1439,7 +1441,7 @@ func TestResolve_addGuardsDoNotBlockAReadPath(t *testing.T) {
 	// must be answered before an account backoff it cannot have caused.
 	pmCache := NewMemoryCache(1 << 20)
 	recordRefusal(pmCache, ServicePremiumize, "tok", repeat("f", 40),
-		&StoreUnavailableError{Service: ServicePremiumize, Status: 403, Reason: "directdl http 403"})
+		&StoreUnavailableError{Service: ServicePremiumize, Status: 429, Reason: "directdl http 429"})
 	pm := &premiumizeStore{token: "tok", cache: pmCache, api: premiumizeAPI,
 		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
 			t.Error("a NoAdd resolve must not reach the service at all")
@@ -1448,4 +1450,137 @@ func TestResolve_addGuardsDoNotBlockAReadPath(t *testing.T) {
 	if _, err := pm.Resolve(context.Background(), ResolveTarget{InfoHash: H, NoAdd: true}); !errors.Is(err, errWouldAdd) {
 		t.Errorf("premiumize blocked a read-only resolve with an add-path backoff: %v", err)
 	}
+}
+
+// A condemned transfer is answered without asking the service.
+//
+// Moving the verdict out of the refusal cache fixed the wrong answer and removed the only thing
+// suppressing the CALL: `alreadyQueued` tests presence, so a dead marker skipped the charge forever
+// while directdl — which queues — went out once per poll, unbilled and unbacked-off, for as long as a
+// client kept asking. Re-stamping the marker each time meant it could never age out either.
+func TestPremiumize_aCondemnedTransferStopsAskingTheService(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	calls := 0
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			calls++
+			return resp(200, `{"status":"success","content":[]}`), nil
+		}}}
+	// Queued a moment ago: this poll asks, gets nothing, and the transfer stays believable.
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H}); !errors.Is(err, errAddInFlight) {
+		t.Fatalf("a freshly queued transfer is coming: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("a pending transfer must still be asked about: %d calls", calls)
+	}
+	// Now past its deadline. Every following poll is answered without touching the service.
+	cache.Put(pmQueuedKey("tok", H), strconv.FormatInt(time.Now().Add(-(queuedTTL-time.Minute)).Unix(), 10), queuedTTL)
+	for i := 0; i < 30; i++ {
+		if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err == nil {
+			t.Fatalf("poll %d resolved a transfer that produced nothing", i)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("asked the service %d times about a transfer already condemned", calls)
+	}
+	// One charge for the one transfer that was genuinely queued, and none for the thirty condemned polls.
+	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "tok")); left != 49 {
+		t.Errorf("allowance %d — a condemned transfer was queued again", left)
+	}
+}
+
+// A rejected key DOES gate a read: asking again with a key the service refuses is pointless whatever is
+// being asked for, and without this the read path recorded the refusal and asked again on the next poll.
+func TestResolve_aRejectedKeyGatesEvenAReadPath(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	recordRefusal(cache, ServiceRealDebrid, "tok", repeat("f", 40),
+		&StoreUnavailableError{Service: ServiceRealDebrid, Status: 403, Reason: "addmagnet http 403"})
+	s := &realDebridStore{token: "tok", cache: cache, api: realDebridAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			t.Error("a rejected key must stop the request before it is made")
+			return resp(200, `{}`), nil
+		}}}
+	target := ResolveTarget{InfoHash: H}
+	s.rememberTorrent(target, "t1") // even a release the account holds
+	if _, err := s.Resolve(context.Background(), target); err == nil {
+		t.Error("a rejected key cannot serve anything")
+	}
+}
+
+// Real-Debrid's READ path classifies a refusal as a refusal.
+//
+// Promoting the held-torrent path ahead of the backoff copied TorBox's ordering without the
+// classification that makes it safe: RD mapped every non-2xx to a dead link, so an expired key or a
+// throttle — on a release RD demonstrably holds — reached the app as "this release does not exist", with
+// no backoff recorded and the account backoff shadowed by the very reordering.
+func TestRealDebrid_theReadPathReportsARefusalAsARefusal(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	calls := 0
+	cache := NewMemoryCache(1 << 20)
+	s := &realDebridStore{token: "tok", cache: cache, api: realDebridAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			calls++
+			return resp(403, `{"error":"bad_token"}`), nil
+		}}}
+	target := ResolveTarget{InfoHash: H}
+	s.rememberTorrent(target, "t1") // the account holds this one
+
+	_, err := s.Resolve(context.Background(), target)
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("a rejected key is the service refusing, not a dead release: %v", err)
+	}
+	// Remembered, so the poll loop stops — and account-wide, because a 403 is about the key.
+	for i := 0; i < 9; i++ {
+		_, _ = s.Resolve(context.Background(), target)
+	}
+	if calls != 1 {
+		t.Errorf("asked a service that had rejected the key %d times", calls)
+	}
+	if _, off := backedOff(cache, ServiceRealDebrid, "tok", repeat("c", 40)); !off {
+		t.Error("a rejected key must back off the account, not one release")
+	}
+}
+
+// The condemned marker is written ONCE. Re-stamping it on every poll gave it a fresh twenty minutes
+// each time, so the suppression it carries could never age out while a client kept asking.
+func TestPremiumize_theDeadMarkerIsNotRestamped(t *testing.T) {
+	// Counted, not compared: re-stamping writes the SAME value with a fresh TTL, so only the write itself
+	// is observable — and the fresh TTL is the whole defect.
+	cache := &countingCache{Cache: NewMemoryCache(1 << 20)}
+	markPendingDead(cache, "tok", H)
+	markPendingDead(cache, "tok", H)
+	markPendingDead(cache, "tok", H)
+	if cache.puts != 1 {
+		t.Errorf("wrote the marker %d times; each write renews its TTL and it can never age out", cache.puts)
+	}
+	if got, _ := cache.Get(pmQueuedKey("tok", H)); got != pendingDead {
+		t.Fatalf("marker value: %q", got)
+	}
+	// A timestamp marker, by contrast, is replaced by the verdict exactly once.
+	fresh := NewMemoryCache(1 << 20)
+	fresh.Put(pmQueuedKey("tok", H), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+	markPendingDead(fresh, "tok", H)
+	if got, _ := fresh.Get(pmQueuedKey("tok", H)); got != pendingDead {
+		t.Errorf("a pending marker was not condemned: %q", got)
+	}
+}
+
+// countingCache counts writes, for behaviour that is only visible as a write — re-stamping a marker
+// with the same value renews its TTL and is otherwise invisible.
+type countingCache struct {
+	Cache
+	puts int
+}
+
+func (c *countingCache) Put(key, value string, ttl time.Duration) {
+	c.puts++
+	c.Cache.Put(key, value, ttl)
 }

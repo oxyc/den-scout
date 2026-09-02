@@ -130,15 +130,29 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 		// every single stream request re-POSTed to it — with its own 10 s timeout, ahead of the scrape —
 		// meaning the worse it was, the harder scout hit it. The opposite of what a limiter is for.
 		mintedMu.Lock()
+		pruneMintedLocked()
 		minted[key] = mintedConfig{url: "", at: time.Now(), transient: transient}
 		mintedMu.Unlock()
 		return "", transient
 	}
 	mintedMu.Lock()
+	pruneMintedLocked()
 	minted[key] = mintedConfig{url: url, at: time.Now()}
 	mintedMu.Unlock()
 	log.Printf("scout: minted a config for the %s indexer from the %s account", id, acct.Service)
 	return url, false
+}
+
+// pruneMintedLocked drops entries past their own TTL. Expiry was only ever consulted on READ, so an
+// entry nobody asked for again stayed resident forever — and the key is derived from a token the config
+// supplies unverified, with comet's mint needing no network at all, so every distinct token minted
+// successfully and was kept. Caller holds mintedMu.
+func pruneMintedLocked() {
+	for k, m := range minted {
+		if time.Since(m.at) >= m.ttl() {
+			delete(minted, k)
+		}
+	}
 }
 
 // primaryDebrid picks the account a minted config should speak for. First configured wins — the same

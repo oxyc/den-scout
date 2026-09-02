@@ -188,3 +188,32 @@ func TestMintingIsOptIn(t *testing.T) {
 		t.Error("SCOUT_MINT_INDEXER_CONFIGS=true should enable it")
 	}
 }
+
+// Expired mint entries are reclaimed on write.
+//
+// Expiry was only consulted on READ, so an entry nobody asked for again stayed resident forever — and
+// the key is derived from a token the config supplies unverified, with comet's mint needing no network
+// at all, so every distinct token minted successfully and was kept.
+func TestMinted_expiredEntriesAreReclaimed(t *testing.T) {
+	resetMinted()
+	mintedMu.Lock()
+	for i := 0; i < 500; i++ {
+		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "u", at: time.Now().Add(-2 * mintedTTL)}
+	}
+	live := "comet:live"
+	minted[live] = mintedConfig{url: "u", at: time.Now()}
+	mintedMu.Unlock()
+
+	cfg := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: "fresh"}}}
+	if url, _ := indexerBaseWithConfig(context.Background(), "comet", cfg, nil); url == "" {
+		t.Fatal("comet mints locally and should succeed")
+	}
+	mintedMu.Lock()
+	defer mintedMu.Unlock()
+	if len(minted) > 2 {
+		t.Errorf("%d entries retained; expired mints are never reclaimed", len(minted))
+	}
+	if _, ok := minted[live]; !ok {
+		t.Error("a live entry was pruned")
+	}
+}

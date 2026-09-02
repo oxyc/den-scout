@@ -27,8 +27,11 @@ func parseMP4(head []byte) (Probe, bool) {
 		if codec := sampleCodec(mdia); codec != "" && kind == "vide" && p.VideoCodec == "" {
 			p.VideoCodec = codec
 		}
-		if kind == "soun" && p.AudioChannels == "" {
-			if n := mp4AudioChannels(mdia); n > 0 {
+		// The RICHEST audio track wins, not the first one listed — the rule probe.go states and readTrackFacts
+		// already follows. First-wins reported "5.1" for a remux that lists 5.1 before its 7.1 track, and the
+		// probe overrides the correctly-titled value, so the viewer is shown a worse fact than the title had.
+		if kind == "soun" {
+			if n := mp4AudioChannels(mdia); n > channelCount(p.AudioChannels) {
 				p.AudioChannels = channelLayout(n)
 			}
 		}

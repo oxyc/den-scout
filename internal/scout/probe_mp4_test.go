@@ -340,3 +340,27 @@ func readFixture(t *testing.T, name string) []byte {
 	}
 	return data
 }
+
+// The RICHEST audio track wins, not the first one listed.
+//
+// probe.go states the rule and readTrackFacts follows it; MP4 and AVI did the opposite, so a remux
+// listing 5.1 before 7.1 reported "5.1" — and the probe OVERRIDES the correctly-titled value, so the
+// viewer was shown a worse fact than the release name already carried. Driven through the real parser:
+// asserting the comparison rule alone passed against the first-wins code.
+func TestParseMP4_richestAudioTrackWins(t *testing.T) {
+	fiveThenSeven := mp4File(
+		trak("soun", "eng", 0, audioEntry("mp4a", 6)),
+		trak("soun", "eng", 0, audioEntry("mp4a", 8)),
+	)
+	if p, ok := parseMP4(fiveThenSeven); !ok || p.AudioChannels != "7.1" {
+		t.Errorf("5.1 listed first won over 7.1: %q (ok=%v)", p.AudioChannels, ok)
+	}
+	// And a poorer later track must not overwrite a richer earlier one.
+	sevenThenStereo := mp4File(
+		trak("soun", "eng", 0, audioEntry("mp4a", 8)),
+		trak("soun", "eng", 0, audioEntry("mp4a", 2)),
+	)
+	if p, ok := parseMP4(sevenThenStereo); !ok || p.AudioChannels != "7.1" {
+		t.Errorf("a stereo track overwrote 7.1: %q (ok=%v)", p.AudioChannels, ok)
+	}
+}

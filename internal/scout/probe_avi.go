@@ -34,8 +34,9 @@ func parseAVI(head []byte) (Probe, bool) {
 			case "strf":
 				// Follows the strh it belongs to; for audio it is a WAVEFORMATEX whose second field is
 				// the channel count.
-				if lastKind == "auds" && p.AudioChannels == "" && body+4 <= len(buf) {
-					if n := int(binary.LittleEndian.Uint16(buf[body+2 : body+4])); n > 0 {
+				// Richest wins, as everywhere else — not the first stream listed.
+				if lastKind == "auds" && body+4 <= len(buf) {
+					if n := int(binary.LittleEndian.Uint16(buf[body+2 : body+4])); n > channelCount(p.AudioChannels) {
 						p.AudioChannels = channelLayout(n)
 					}
 				}
