@@ -186,3 +186,61 @@ func TestResolvePreferring_ignoresUnknownServices(t *testing.T) {
 		t.Fatalf("link = %q, err = %v", link, err)
 	}
 }
+
+// One press of play must not queue the same torrent on every configured account.
+//
+// A store that HOLDS the release only reads it, so asking every holder is free. A store that does not
+// hold it ADDS it — and the fallthrough did that once per account, spending three of an hourly sixty to
+// obtain a single file. The second and third adds cannot help: the first is already fetching exactly
+// what they would.
+func TestResolvePreferring_addsToOneStoreAtMost(t *testing.T) {
+	var calls []DebridService
+	pool := &StorePool{stores: []Store{
+		namedStore{svc: ServiceTorBox, resolves: &calls},     // holder, but cannot serve
+		namedStore{svc: ServiceRealDebrid, resolves: &calls}, // non-holder: may add
+		namedStore{svc: ServicePremiumize, resolves: &calls}, // non-holder: must be skipped
+	}}
+	_, err := pool.ResolvePreferring(t.Context(), ResolveTarget{InfoHash: H}, []DebridService{ServiceTorBox})
+	if err == nil {
+		t.Fatal("nothing could serve it; this should fail")
+	}
+	if len(calls) != 2 || calls[0] != ServiceTorBox || calls[1] != ServiceRealDebrid {
+		t.Errorf("stores asked: %v — a second non-holder was allowed to add the same torrent", calls)
+	}
+}
+
+// A store that REFUSED us never got to add anything, so the allowance is still unspent. Otherwise a
+// throttled first account would block the fetch outright.
+func TestResolvePreferring_arefusalDoesNotSpendTheAdd(t *testing.T) {
+	var calls []DebridService
+	pool := &StorePool{stores: []Store{
+		namedStore{svc: ServiceTorBox, resolves: &calls, refuse: true}, // holder, throttled
+		namedStore{svc: ServiceRealDebrid, resolves: &calls, refuse: true},
+		namedStore{svc: ServicePremiumize, link: "https://pm/x", resolves: &calls},
+	}}
+	link, err := pool.ResolvePreferring(t.Context(), ResolveTarget{InfoHash: H}, []DebridService{ServiceTorBox})
+	if err != nil || link != "https://pm/x" {
+		t.Fatalf("a throttled account must not block the fetch: %q %v", link, err)
+	}
+	if len(calls) != 3 {
+		t.Errorf("stores asked: %v — a refusal wrongly consumed the add allowance", calls)
+	}
+}
+
+// With NO holders known — a cache-check outage, or an RD-only install that has no cache truth to give —
+// the bound must not apply. There the fallthrough is the only way to resolve at all, and refusing it
+// turns "we could not find out" into "you cannot play this". The add budget bounds that case instead.
+func TestResolvePreferring_unknownHoldersStillFallsThrough(t *testing.T) {
+	var calls []DebridService
+	pool := &StorePool{stores: []Store{
+		namedStore{svc: ServiceTorBox, resolves: &calls},
+		namedStore{svc: ServiceRealDebrid, link: "https://rd/x", resolves: &calls},
+	}}
+	link, err := pool.ResolvePreferring(t.Context(), ResolveTarget{InfoHash: H}, nil)
+	if err != nil || link != "https://rd/x" {
+		t.Fatalf("with nothing known, the fallthrough is the only route: %q %v", link, err)
+	}
+	if len(calls) != 2 {
+		t.Errorf("stores asked: %v — the bound applied where nothing was known", calls)
+	}
+}

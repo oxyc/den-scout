@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -88,7 +89,22 @@ func (b *addBudget) remaining(account string) int {
 	return 0
 }
 
-// One per process, keyed by account, so every store built for every request shares the count. A budget
-// held on the store would reset on each request, which is every request — the stores are rebuilt per
-// call from the install's config.
+// One per process, keyed by service+account, so every store built for every request shares the count. A
+// budget held on the store would reset on each request, which is every request — the stores are rebuilt
+// per call from the install's config.
 var globalAddBudget = newAddBudget(addBudgetWindow, addBudgetLimit)
+
+// spendAdd charges one add against a service's account, or refuses. Every store calls this immediately
+// before the request that queues a torrent, so there is one place the allowance is enforced rather than
+// one per store — and no way to add without passing through it.
+//
+// Per service AND account: TorBox's ceiling is TorBox's. Counting them together would let a busy
+// Real-Debrid close TorBox's budget, and a service with no published limit would still be worth bounding
+// — an unbounded add loop is a bug wherever it points.
+func spendAdd(svc DebridService, token, infoHash string) error {
+	if globalAddBudget.take(string(svc) + ":" + keyHash(token)) {
+		return nil
+	}
+	log.Printf("scout: %s add budget spent for the hour, refusing %s", svc, shortHash(infoHash))
+	return &StoreUnavailableError{svc, "hourly add budget spent"}
+}

@@ -423,11 +423,8 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 }
 
 func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, error) {
-	// The account's hourly add allowance, counted here because this is the ONE place an add is made. Every
-	// other guard in this file protects a path someone thought of; this one bounds the paths nobody did.
-	if !globalAddBudget.take(keyHash(s.token)) {
-		log.Printf("scout: torbox add budget spent for the hour, refusing %s", shortHash(infoHash))
-		return 0, &StoreUnavailableError{ServiceTorBox, "hourly add budget spent"}
+	if err := spendAdd(ServiceTorBox, s.token, infoHash); err != nil {
+		return 0, err
 	}
 	form := url.Values{"magnet": {magnetFor(infoHash)}, "seed": {"3"}, "allow_zip": {"false"}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/torrents/createtorrent", strings.NewReader(form.Encode()))
@@ -756,6 +753,9 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if reason, ok := backedOff(s.cache, ServiceRealDebrid, s.token, t.InfoHash); ok {
 		return "", &StoreUnavailableError{ServiceRealDebrid, reason + " (backing off)"}
 	}
+	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
+		return "", err
+	}
 	addResp, err := s.post(ctx, "/torrents/addMagnet", url.Values{"magnet": {magnetFor(t.InfoHash)}})
 	if err != nil {
 		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
@@ -970,6 +970,10 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if reason, ok := backedOff(s.cache, ServicePremiumize, s.token, t.InfoHash); ok {
 		return "", &StoreUnavailableError{ServicePremiumize, reason + " (backing off)"}
 	}
+	// directdl queues a transfer for anything the account does not already hold, so it is an add.
+	if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
+		return "", err
+	}
 	form := url.Values{"apikey": {s.token}, "src": {magnetFor(t.InfoHash)}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/transfer/directdl", strings.NewReader(form.Encode()))
 	if err != nil {
@@ -1156,8 +1160,32 @@ func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error
 // release nobody is seeding: the client waits on a download the service was never asked to start.
 func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	preferred []DebridService) (string, error) {
+	holds := make(map[DebridService]bool, len(preferred))
+	for _, svc := range preferred {
+		holds[svc] = true
+	}
 	var refused error
+	// When we KNOW who holds this, adds are bounded to one. A holder only reads, so asking every holder
+	// costs nothing; a non-holder ADDS, and the fallthrough did that once per configured account — one
+	// press of play could queue the same torrent on three services, spending three of an hourly sixty for
+	// a single file, and the second and third cannot help because the first is already fetching exactly
+	// what they would.
+	//
+	// With no holders known — a cache-check outage, or an RD-only install where there is no cache truth
+	// to have — the bound does NOT apply. There the fallthrough is the only way to resolve at all, and
+	// refusing it would turn "we could not find out" into "you cannot play this". The add budget is what
+	// bounds that case; this bounds the case where we have better information than a guess.
+	boundAdds := len(preferred) > 0
+	spentAdd := false
 	for _, st := range p.ordered(preferred) {
+		if boundAdds && !holds[st.Service()] {
+			if spentAdd {
+				log.Printf("scout: not also adding %s to %s — one fetch is already queued",
+					shortHash(t.InfoHash), st.Service())
+				continue
+			}
+			spentAdd = true
+		}
 		link, err := st.Resolve(ctx, t)
 		if err == nil {
 			return link, nil
@@ -1168,6 +1196,11 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 		var unavailable *StoreUnavailableError
 		if errors.As(err, &unavailable) && refused == nil {
 			refused = err
+		}
+		// A store that was REFUSED never got to add anything, so the allowance is still unspent and the
+		// next store may use it. Otherwise a throttled first account would block the fetch entirely.
+		if errors.As(err, &unavailable) {
+			spentAdd = false
 		}
 	}
 	if refused != nil {

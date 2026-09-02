@@ -1,6 +1,9 @@
 package scout
 
 import (
+	"context"
+	"errors"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -118,5 +121,84 @@ func TestAddBudget_nilAllowsEverything(t *testing.T) {
 	}
 	if b.remaining("acct") != -1 {
 		t.Error("a nil budget has no remaining count to report")
+	}
+}
+
+// The allowance covers EVERY store that can add, not just the one whose limit is documented.
+//
+// It was enforced inside torBoxStore.addMagnet, so Real-Debrid and Premiumize adds were uncounted — and
+// an unbounded add loop is a bug wherever it points, published limit or not. Per service AND account, so
+// a busy Real-Debrid cannot close TorBox's budget.
+func TestSpendAdd_isPerServiceAndAccount(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 1)
+	defer func() { globalAddBudget = prev }()
+
+	for _, svc := range []DebridService{ServiceTorBox, ServiceRealDebrid, ServicePremiumize} {
+		if err := spendAdd(svc, "tok", H); err != nil {
+			t.Errorf("%s: first add refused: %v", svc, err)
+		}
+		if err := spendAdd(svc, "tok", H); err == nil {
+			t.Errorf("%s: second add allowed against an allowance of 1", svc)
+		}
+		// A different account on the same service has its own allowance.
+		if err := spendAdd(svc, "other-tok", H); err != nil {
+			t.Errorf("%s: another account's allowance was consumed: %v", svc, err)
+		}
+	}
+}
+
+// A refusal names the service, so the app can say which debrid is the problem rather than "no source".
+func TestSpendAdd_refusalNamesTheService(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 0)
+	defer func() { globalAddBudget = prev }()
+
+	err := spendAdd(ServiceRealDebrid, "tok", H)
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Service != ServiceRealDebrid {
+		t.Fatalf("want a realdebrid StoreUnavailableError, got %v", err)
+	}
+}
+
+// Every store that can add is WIRED to the allowance, not merely able to consult it.
+//
+// The budget lived inside torBoxStore.addMagnet, so Real-Debrid and Premiumize added freely past it.
+// Testing spendAdd alone would not have noticed: this drives each store's Resolve with the allowance
+// already spent and asserts no request reaches the service at all.
+func TestStores_refuseToAddOnceTheBudgetIsSpent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(doer) Store
+	}{
+		{"torbox", func(d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
+		}},
+		{"realdebrid", func(d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: realDebridAPI}
+		}},
+		{"premiumize", func(d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: premiumizeAPI}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 0) // nothing left this hour
+			defer func() { globalAddBudget = prev }()
+
+			reqs := 0
+			d := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				reqs++
+				return resp(200, `{}`), nil
+			}}
+			_, err := tc.build(d).Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			var unavailable *StoreUnavailableError
+			if !errors.As(err, &unavailable) {
+				t.Fatalf("want a budget refusal, got %v", err)
+			}
+			if reqs != 0 {
+				t.Errorf("made %d requests despite a spent allowance — the store is not wired to it", reqs)
+			}
+		})
 	}
 }
