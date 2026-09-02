@@ -80,21 +80,32 @@ func TestScraperURL(t *testing.T) {
 	}
 }
 
-func TestMakeScrapersTorrentioOpts(t *testing.T) {
+// Torrentio is asked on its BARE path, whatever the filters say.
+//
+// The options segment was free to add and expensive to keep: with torrentio's origin down, Cloudflare
+// answers from `stale-if-error` only for a URL it already holds, and a private options path is warm
+// essentially never. Scout collected 502s for an episode whose bare path served 50 releases to a curl on
+// the same machine. Nothing is lost — rankStreams drops cam/scr itself and applies its own ordering.
+func TestMakeScrapersTorrentioUsesBarePath(t *testing.T) {
 	cfg := &Config{Indexers: []Indexer{"torrentio", "mediafusion"}, Filters: Filters{ExcludeCam: true}}
 	got := makeScrapers(cfg, mockDoer{}, map[Indexer]string{"mediafusion": "https://mf.self/CONFIG"})
 	tor := got[0].(*stremioScraper)
-	if tor.baseURL != "https://torrentio.strem.fun/sort=qualitysize|qualityfilter=cam,scr" {
+	if tor.baseURL != "https://torrentio.strem.fun" {
 		t.Errorf("torrentio base: %s", tor.baseURL)
 	}
 	mf := got[1].(*stremioScraper)
 	if mf.baseURL != "https://mf.self/CONFIG" {
 		t.Errorf("mediafusion override: %s", mf.baseURL)
 	}
-	// excludeCam off → no qualityfilter
+	// The filter setting must not change the URL at all — that coupling was the whole defect.
 	off := makeScrapers(&Config{Indexers: []Indexer{"torrentio"}, Filters: Filters{ExcludeCam: false}}, mockDoer{}, nil)
-	if off[0].(*stremioScraper).baseURL != "https://torrentio.strem.fun/sort=qualitysize" {
+	if off[0].(*stremioScraper).baseURL != "https://torrentio.strem.fun" {
 		t.Errorf("excludeCam off: %s", off[0].(*stremioScraper).baseURL)
+	}
+	// An operator override still wins, so a self-hosted torrentio can be pointed at.
+	custom := makeScrapers(cfg, mockDoer{}, map[Indexer]string{"torrentio": "https://tor.self/opts"})
+	if custom[0].(*stremioScraper).baseURL != "https://tor.self/opts" {
+		t.Errorf("override: %s", custom[0].(*stremioScraper).baseURL)
 	}
 }
 

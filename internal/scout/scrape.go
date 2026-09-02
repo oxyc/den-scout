@@ -290,13 +290,12 @@ func baseURLFor(id Indexer, config *Config, urls map[Indexer]string) string {
 	if u, ok := urls[id]; ok && u != "" {
 		return u
 	}
-	if id == "torrentio" {
-		opts := "sort=qualitysize"
-		if config.Filters.ExcludeCam {
-			opts += "|qualityfilter=cam,scr"
-		}
-		return defaultIndexerURLs["torrentio"] + "/" + opts
-	}
+	// Deliberately no torrentio options segment. Asking for `sort=qualitysize|qualityfilter=cam,scr`
+	// bought nothing — `rankStreams` drops cam/scr itself and re-sorts by its own quality score — and it
+	// cost everything: with torrentio's origin down, Cloudflare answers from `stale-if-error` only for a
+	// URL it already holds. The bare path is warm because the whole world requests it; a private options
+	// path is warm essentially never, so scout got a 502 for an episode that served 50 releases to a
+	// plain curl from the same machine, and reported it as "no source found".
 	return defaultIndexerURLs[id]
 }
 
