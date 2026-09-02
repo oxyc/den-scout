@@ -357,23 +357,6 @@ func noteQueued(cache Cache, token, infoHash string) {
 	}
 }
 
-// pendingDead is written over the queue marker once a transfer has been given up on. It keeps
-// suppressing the charge and the re-queue for the marker's full life, without ever becoming a claim
-// about the SERVICE — the give-up has to stay a dead link, or the client cannot move on.
-const pendingDead = "dead"
-
-func markPendingDead(cache Cache, token, infoHash string) {
-	if cache == nil {
-		return
-	}
-	// Written once. Re-stamping on every poll gave the marker a fresh twenty minutes each time, so the
-	// suppression it carries could never age out while a client kept polling.
-	if raw, ok := cache.Get(pmQueuedKey(token, infoHash)); ok && raw == pendingDead {
-		return
-	}
-	cache.Put(pmQueuedKey(token, infoHash), pendingDead, queuedTTL)
-}
-
 // pendingTooLong — this transfer was queued long enough ago that "still coming" has stopped being a
 // credible answer, so the client should be free to try something else.
 func pendingTooLong(cache Cache, token, infoHash string) bool {
@@ -383,9 +366,6 @@ func pendingTooLong(cache Cache, token, infoHash string) bool {
 	raw, ok := cache.Get(pmQueuedKey(token, infoHash))
 	if !ok {
 		return false
-	}
-	if raw == pendingDead {
-		return true
 	}
 	at, err := strconv.ParseInt(raw, 10, 64)
 	return err == nil && time.Since(time.Unix(at, 0)) >= pendingGiveUp
@@ -631,6 +611,10 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		}
 	}
 
+	// A rejected key makes every request pointless, reads included — the same gate RD and Premiumize have.
+	if reason, ok := accountBackedOff(s.cache, ServiceTorBox, s.token); ok {
+		return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
+	}
 	// Does the account ALREADY hold this? The entry above is a six-hour convenience cache, not a record
 	// of what the account has — so "not played in the last six hours", which is the normal state of most
 	// of a library, fell through to createtorrent and paid an add for a torrent already sitting there.
@@ -717,9 +701,17 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 		return "", err
 	}
 	link, err := s.requestDownload(ctx, torrentID, fileID)
-	if err != nil {
-		// The Status carried here had no reader: a revoked key on a torrent the account holds recorded no
-		// backoff, so every poll asked again.
+	// ONLY a service refusal is remembered here. The add path deliberately records dead links too — a
+	// TorBox account at its download limit answers 400, so keying on the error TYPE missed the one case
+	// that mattered — but that reasoning does not carry to the read path, where a dead link means "no
+	// link yet", the ordinary state of a torrent still downloading. And requestDownload flattens every
+	// transport failure into a DeadLinkError on purpose, to keep the token out of the logs, which
+	// destroys the classification isCancellation needs: a cancelled poll was being filed as TorBox
+	// refusing. Recorded broadly, this told the viewer their debrid was refusing — and stopped the client
+	// trying other sources — for a torrent that was merely not ready, and let a read-only probe create a
+	// backoff its own contract says it cannot cause.
+	var refusedUs *StoreUnavailableError
+	if errors.As(err, &refusedUs) {
 		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 	}
 	if errors.Is(err, errTorrentGone) {
@@ -1458,9 +1450,11 @@ func (s *premiumizeStore) Status(context.Context, ResolveTarget) (StoreStatus, b
 }
 
 func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
-	if reason, ok := accountBackedOff(s.cache, ServicePremiumize, s.token); ok {
-		return "", &StoreUnavailableError{Service: ServicePremiumize, Reason: reason + " (backing off)"}
-	}
+	// No dedicated account gate here, unlike TorBox and Real-Debrid: Premiumize has no read path that
+	// bypasses the backoff below, and `backedOff` already consults the account key first — so a separate
+	// check would be a no-op wearing the look of a guard. TorBox and RD need theirs because their
+	// held-torrent paths return before the backoff is ever reached.
+	//
 	// NoAdd first: it costs nothing and the guards below all describe the cost of adding. TorBox orders
 	// it this way for the same reason — a read-only caller cannot have caused a backoff and must not be
 	// blocked by one.
@@ -1475,13 +1469,6 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// The same backoff TorBox has — a poll loop must not be able to sustain a refusal here either.
 	if reason, ok := backedOff(s.cache, ServicePremiumize, s.token, t.InfoHash); ok {
 		return "", &StoreUnavailableError{Service: ServicePremiumize, Reason: reason + " (backing off)"}
-	}
-	// Already condemned: answer without asking. Moving the verdict out of the refusal cache fixed the
-	// wrong answer and removed the only thing suppressing the CALL — `alreadyQueued` tests presence, so a
-	// dead marker skipped the charge forever while directdl (which queues) went out once per poll,
-	// unbilled and unbacked-off, for as long as a client kept asking.
-	if pendingTooLong(s.cache, s.token, t.InfoHash) {
-		return "", &DeadLinkError{"premiumize queued this transfer and never produced anything"}
 	}
 	// A transfer we already queued. Do NOT skip the call — directdl is the only thing that can discover
 	// the transfer finished, so blocking it made a release that completed in two minutes unresolvable for
@@ -1548,7 +1535,6 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			// refusing and stops the client trying other sources, for a release scout itself just
 			// condemned, on a store that is answering perfectly well. The whole point of the dead link is
 			// that the client moves on; a refusal is the one answer that prevents exactly that.
-			markPendingDead(s.cache, s.token, t.InfoHash)
 			return "", &DeadLinkError{"premiumize queued this transfer and never produced anything"}
 		}
 		return "", fmt.Errorf("%w: %w", errAddInFlight,

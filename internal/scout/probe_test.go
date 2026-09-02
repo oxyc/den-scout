@@ -2,6 +2,7 @@ package scout
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -123,4 +124,45 @@ func TestProbeTracks_readsOnlyTheHeadWhenRangeIsIgnored(t *testing.T) {
 	if got := served.Load(); got > 8<<20 {
 		t.Fatalf("pulled %d bytes for a 1 MiB probe — the drain is unbounded", got)
 	}
+}
+
+// AVI's richest-audio rule, which had no test while its MP4 twin did.
+func TestParseAVI_richestAudioTrackWins(t *testing.T) {
+	// strf carries a WAVEFORMATEX whose second field is the channel count; two audio streams, poorer first.
+	strf := func(channels int) []byte {
+		b := make([]byte, 16)
+		binary.LittleEndian.PutUint16(b[2:4], uint16(channels))
+		return b
+	}
+	file := aviFile(
+		aviChunk("strh", append([]byte("auds"), make([]byte, 8)...)), aviChunk("strf", strf(6)),
+		aviChunk("strh", append([]byte("auds"), make([]byte, 8)...)), aviChunk("strf", strf(8)),
+	)
+	if p, ok := parseAVI(file); !ok || p.AudioChannels != "7.1" {
+		t.Errorf("5.1 listed first won over 7.1: %q (ok=%v)", p.AudioChannels, ok)
+	}
+}
+
+// Minimal RIFF/AVI builders: id + little-endian size + payload, padded to an even boundary.
+func aviChunk(id string, payload []byte) []byte {
+	out := make([]byte, 8, 8+len(payload)+1)
+	copy(out, id)
+	binary.LittleEndian.PutUint32(out[4:8], uint32(len(payload)))
+	out = append(out, payload...)
+	if len(payload)%2 == 1 {
+		out = append(out, 0)
+	}
+	return out
+}
+
+func aviFile(chunks ...[]byte) []byte {
+	var body []byte
+	for _, c := range chunks {
+		body = append(body, c...)
+	}
+	out := make([]byte, 12, 12+len(body))
+	copy(out, "RIFF")
+	binary.LittleEndian.PutUint32(out[4:8], uint32(4+len(body)))
+	copy(out[8:], "AVI ")
+	return append(out, body...)
 }
