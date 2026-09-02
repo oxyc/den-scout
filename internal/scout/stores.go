@@ -832,8 +832,21 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		// rather than sending the same add again.
 		return 0, err
 	}
-	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
 	defer func() { _ = resp.Body.Close() }()
+	// Read the body BEFORE settling, because the read is the last thing that can fail: a status line
+	// without a body we could read is still an add whose outcome we never saw. The previous commit added
+	// the errAddInFlight branch below but left this settle where it was, so TorBox returned "an add is in
+	// flight" having just deleted the marker that says so — and since recordRefusal ignores
+	// errAddInFlight there was no backoff either, so the next poll charged and sent createtorrent again.
+	// Fifty adds, the hour's allowance gone, the client shown 202 "downloading, 0%" throughout.
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxStoreBytes))
+	if readErr != nil {
+		// Marker left set on purpose: the next poll answers 202 from it rather than buying the torrent
+		// again. The charge stays too — the add was written to the wire.
+		return 0, fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServiceTorBox,
+			Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
+	}
+	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// TorBox explains itself in the body — an account at its active-download limit and a malformed
 		// magnet are both a bare 400, and only the text says which. Discarding it left the status code as
@@ -843,23 +856,12 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		// it into the refusal cache, which in production writes through to disk. TorBox's token rides in
 		// a header here rather than the URL, so a leak needs the service to echo the header back — but
 		// this was the one call site not following the rule, which is reason enough.
-		detail := redactToken(readStoreError(resp), s.token)
+		detail := redactToken(storeErrorText(raw), s.token)
 		if storeRefusedUs(resp.StatusCode) {
 			return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
 		}
 		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d%s", resp.StatusCode, detail)}
-	}
-	// The same distinction RD's add draws: a body that could not be READ is an add whose outcome we never
-	// saw, not one that created nothing. Collapsing them turned a cancelled poll — /play runs on the
-	// client's context, and a focus change is enough — into `torbox no torrent_id`, which Resolve records
-	// as a refusal, so the next minute of polls answered 503 naming TorBox for a torrent it had just
-	// accepted. That only escaped notice because handlePlay asks Status first and findTorrentByHash
-	// rediscovers the torrent; RD, which has no Status, had no such rescue.
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxStoreBytes))
-	if readErr != nil {
-		return 0, fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServiceTorBox,
-			Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
 	}
 	var body struct {
 		Data *struct {
@@ -1742,8 +1744,22 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		return "", err
 	}
-	settleAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	defer func() { _ = resp.Body.Close() }()
+	// Read before settling, the same order RD and TorBox use: the read is the last thing that can fail,
+	// and a status line whose body we could not read is an add whose outcome we never saw. Premiumize was
+	// the store this never reached. Its `!readable` branch REFUNDED the charge and returned a bare dead
+	// link, leaving no memory of the add on any of the four channels — charge given back, marker already
+	// cleared, noteQueued never reached, no refusal recorded — so thirty polls of one release made thirty
+	// real directdl calls with the allowance still at fifty. Nothing bounded it, the budget least of all,
+	// because the refund kept handing it back. directdl IS the fetch, so each of those queued a transfer.
+	rawBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxStoreBytes))
+	if readErr != nil {
+		// Marker left set and the charge kept: the next poll answers 202 from the marker instead of
+		// buying the transfer again.
+		return "", fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServicePremiumize,
+			Reason: "the transfer was answered but its body could not be read, so the outcome is unknown"})
+	}
+	settleAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	// Premiumize ANSWERED, and every answer below this line is one that queued nothing — so the charge
 	// goes back on all of them, the same rule the success path follows further down. Only the transport
 	// failure above keeps its charge, because there the outcome is genuinely unknown.
@@ -1760,7 +1776,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		// Redacted for the same reason TorBox's is: the apikey rides in directdl's form body, and this
 		// text is not merely logged but PERSISTED into the refusal cache, from where the probe route
 		// prints it verbatim. An upstream error page that quotes the request back would put it there.
-		detail := redactToken(readStoreError(resp), s.token)
+		detail := redactToken(storeErrorText(rawBody), s.token)
 		// Same rule as the other two stores: being turned away says nothing about the release.
 		if storeRefusedUs(resp.StatusCode) {
 			refused := &StoreUnavailableError{Service: ServicePremiumize, Status: resp.StatusCode,
@@ -1786,7 +1802,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			Size *int   `json:"size"`
 		} `json:"content"`
 	}
-	readable := json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) == nil
+	readable := json.Unmarshal(rawBody, &body) == nil
 	// Premiumize answers an application-level refusal as HTTP 200 with `{"status":"error","message":…}` —
 	// an unsupported magnet, an account limit, no space. Only ONE of the three ways this call can fail to
 	// hand back content means a transfer was queued: a SUCCESSFUL answer that carries none. Collapsing

@@ -2490,19 +2490,36 @@ func TestStores_aCancelledAddBodyIsNotARefusal(t *testing.T) {
 			globalAddBudget = newAddBudget(time.Hour, 50)
 			defer func() { globalAddBudget = prev }()
 
-			ctx, cancel := context.WithCancel(context.Background())
 			cache := NewMemoryCache(1 << 20)
+			adds := 0
 			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 				if strings.Contains(r.URL.Path, st.path) {
+					adds++
 					// The add was accepted; the body then dies because the viewer moved on.
+					ctx, cancel := context.WithCancel(context.Background())
 					cancel()
 					return &http.Response{StatusCode: 200, Body: io.NopCloser(cancelledReader{ctx})}, nil
 				}
 				return resp(200, st.head), nil
 			}}
-			_, _ = st.make(cache, d).Resolve(ctx, ResolveTarget{InfoHash: H})
+			store := st.make(cache, d)
+			for i := 0; i < 30; i++ {
+				_, _ = store.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			}
+			// Three properties, because "not filed as a refusal" alone is a PROXY: both the TorBox and
+			// the Premiumize bug this test was written for passed that assertion while re-sending the add
+			// on every poll. What matters is that a cancelled poll cannot cost an add and cannot loop.
 			if reason, ok := backedOff(cache, st.svc, "tok", H); ok {
 				t.Errorf("a cancelled poll was filed as %s refusing: %s", st.svc, reason)
+			}
+			if adds > 1 {
+				t.Errorf("%s sent the add %d times across 30 polls — the marker that says one is in "+
+					"flight was cleared before the body was read", st.svc, adds)
+			}
+			// The charge stays exactly once: the add was written to the wire, and refunding it is what
+			// removed the only bound the loop had.
+			if left := globalAddBudget.remaining(budgetAccount(st.svc, "tok")); left != 49 {
+				t.Errorf("%s allowance %d, want 49", st.svc, left)
 			}
 		})
 	}
@@ -2579,5 +2596,65 @@ func TestTorBox_theAddDetailCannotCarryTheToken(t *testing.T) {
 	}
 	if reason, ok := backedOff(cache, ServiceTorBox, token, H); ok && strings.Contains(reason, token) {
 		t.Errorf("the token was persisted into the refusal cache: %s", reason)
+	}
+}
+
+// The other side of moving the settle after the body read: an add that DID complete must still clear the
+// marker. Left set, every later poll answers "an add is already in flight" for a release that resolved
+// perfectly well — 202 downloading forever, with no add ever sent again to heal it.
+func TestStores_aCompletedAddClearsTheInFlightMarker(t *testing.T) {
+	for _, st := range []struct {
+		name string
+		svc  DebridService
+		make func(Cache, doer) Store
+		body func(*http.Request) *http.Response
+	}{
+		{"realdebrid", ServiceRealDebrid, func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}, func(r *http.Request) *http.Response {
+			switch {
+			case strings.Contains(r.URL.Path, "addMagnet"):
+				return resp(201, `{"id":"t1"}`)
+			case strings.Contains(r.URL.Path, "unrestrict"):
+				return resp(200, `{"download":"https://rd/ok"}`)
+			case strings.Contains(r.URL.Path, "/torrents/info/"):
+				return resp(200, `{"files":[{"id":1,"path":"m.mkv","bytes":9,"selected":1}],"links":["l1"]}`)
+			}
+			return resp(200, `{}`)
+		}},
+		{"torbox", ServiceTorBox, func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}, func(r *http.Request) *http.Response {
+			if isAddEndpoint(r) {
+				return resp(200, `{"data":{"torrent_id":7}}`)
+			}
+			return resp(200, `{"success":true,"data":"https://cdn/x"}`)
+		}},
+		{"premiumize", ServicePremiumize, func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}, func(*http.Request) *http.Response {
+			return resp(200, `{"status":"success","content":[{"path":"m.mkv","link":"https://pm/ok"}]}`)
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			cache := NewMemoryCache(1 << 20)
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) { return st.body(r), nil }}
+			store := st.make(cache, d)
+			if link, err := store.Resolve(context.Background(), ResolveTarget{InfoHash: H}); link == "" {
+				t.Fatalf("setup: the release did not resolve: %v", err)
+			}
+			if err := addInFlight(cache, st.svc, "tok", H); err != nil {
+				t.Errorf("%s: the marker survived a completed add, so every later poll answers %v",
+					st.svc, err)
+			}
+			// And the release still resolves on the next poll rather than reporting a phantom add.
+			if link, err := store.Resolve(context.Background(), ResolveTarget{InfoHash: H}); link == "" {
+				t.Errorf("%s: the second poll answered %v", st.svc, err)
+			}
+		})
 	}
 }
