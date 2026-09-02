@@ -2251,3 +2251,97 @@ func TestTorBoxListFiles_classifiesTheRemainingShapes(t *testing.T) {
 		}
 	}
 }
+
+// The same invariant on all three stores: when the service ANSWERS and creates nothing, the charge taken
+// before the request goes back. RD had neither of its siblings' bounds on this branch — TorBox records a
+// refusal here, Premiumize refunds — so a magnet RD rejects with a 400, or any 2xx scout cannot pull an
+// id out of (a proxy page served as 200), spent one add per poll. Fifty real addMagnet calls inside two
+// minutes at the client's cadence, and then 503 scout_busy on every RD resolve for the rest of the
+// rolling hour, healthy releases included.
+func TestRealDebrid_anAnsweredFailureIsNotACharge(t *testing.T) {
+	for _, tc := range []struct{ name, body string; status int }{
+		{"a rejected magnet", `{"error":"bad magnet","error_code":11}`, 400},
+		{"a 2xx with no id", `{"ok":true}`, 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, "addMagnet") {
+					return resp(tc.status, tc.body), nil
+				}
+				return resp(200, `{}`), nil
+			}}
+			cache := NewMemoryCache(1 << 20)
+			s := &realDebridStore{token: "tok", client: d, cache: cache, api: realDebridAPI}
+			for i := 0; i < 60; i++ {
+				_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			}
+			if left := globalAddBudget.remaining(budgetAccount(ServiceRealDebrid, "tok")); left != 50 {
+				t.Fatalf("allowance %d — one viewer on one release spent the hour", left)
+			}
+			// What the allowance buys: a DIFFERENT, healthy release still resolves, instead of being
+			// refused by scout's own bookkeeping for the rest of the hour.
+			healthy := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				switch {
+				case strings.Contains(r.URL.Path, "addMagnet"):
+					return resp(201, `{"id":"t9"}`), nil
+				case strings.Contains(r.URL.Path, "unrestrict"):
+					return resp(200, `{"download":"https://rd/ok"}`), nil
+				case strings.Contains(r.URL.Path, "/torrents/info/"):
+					return resp(200, `{"files":[{"id":1,"path":"m.mkv","bytes":9,"selected":1}],"links":["l1"]}`), nil
+				}
+				return resp(200, `{}`), nil
+			}}
+			other := &realDebridStore{token: "tok", client: healthy, cache: cache, api: realDebridAPI}
+			if link, err := other.Resolve(context.Background(), ResolveTarget{InfoHash: repeat("b", 40)}); link == "" {
+				t.Errorf("a healthy release answered %v — scout refused what RD would have served", err)
+			}
+		})
+	}
+}
+
+// RD was also the only store discarding the service's own words on this branch, so the log read the same
+// for a bad magnet, a locked account and a Cloudflare page.
+func TestRealDebrid_theAddKeepsTheServicesOwnWords(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "addMagnet") {
+			return resp(400, `{"error":"infringing_file"}`), nil
+		}
+		return resp(200, `{}`), nil
+	}}
+	s := &realDebridStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: realDebridAPI}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if err == nil || !strings.Contains(err.Error(), "infringing_file") {
+		t.Errorf("got %v — the answer that says WHY was discarded", err)
+	}
+}
+
+// A key TorBox rejects on mylist must reach the account-wide backoff. listFiles classifies it, but the
+// only caller assigned the error and never consulted it for any value but errTorrentGone, so the
+// classification died one line after it was made.
+func TestTorBox_aRejectedKeyOnMylistReachesTheAccountBackoff(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "mylist") {
+				return resp(401, `{"error":"BAD_TOKEN"}`), nil
+			}
+			return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Status != 401 {
+		t.Fatalf("got %v, want the refusal carrying its status", err)
+	}
+	if _, ok := accountBackedOff(cache, ServiceTorBox, "tok"); !ok {
+		t.Error("the dead key was never recorded, so every later request asks with it again")
+	}
+}

@@ -120,8 +120,21 @@ func (e *StoreUnavailableError) Error() string {
 // falls back to a clipped snippet of the raw body, because a truncated reason still beats none.
 func readStoreError(resp *http.Response) string {
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	if err != nil || len(raw) == 0 {
+	if err != nil {
 		return ""
+	}
+	return storeErrorText(raw)
+}
+
+// storeErrorText is readStoreError over bytes already in hand, for a caller that had to read the body
+// once for its own sake — RD's add answers with the torrent id and the reason for a failure in the same
+// place, and decoding straight off the reader left nothing behind to explain a failure with.
+func storeErrorText(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if len(raw) > 2048 {
+		raw = raw[:2048]
 	}
 	var body struct {
 		Error  any    `json:"error"`
@@ -716,10 +729,21 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	var files []TorrentFile
 	if needFiles {
 		var err error
-		if files, err = s.listFiles(ctx, torrentID); errors.Is(err, errTorrentGone) {
+		files, err = s.listFiles(ctx, torrentID)
+		if errors.Is(err, errTorrentGone) {
 			// Returned HERE, above the id re-stamp below, and left for the caller to act on: this is the
 			// account saying it no longer holds the torrent, so the id must be forgotten and the torrent
 			// bought again. Stamping it first would refresh a stale id's six hours on every poll.
+			return "", err
+		}
+		// A REJECTED KEY has to be remembered here, or the classification listFiles makes is thrown away
+		// by the only caller that sees it: the error was assigned and then never consulted for any value
+		// but errTorrentGone, so a 401 fell through to the status-less errNoFileList below and the
+		// account-wide backoff never learned the key was dead. Narrow on purpose — a 5xx is this attempt
+		// failing, and letting it back the release off would stop the next poll retrying a list that is
+		// very likely to succeed.
+		if refusalIsAboutTheAccount(err) {
+			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 			return "", err
 		}
 	}
@@ -1271,24 +1295,39 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		return "", err
 	}
 	settleAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
+	// Read once, keep the bytes: the id and the explanation of a failure live in the same body, and
+	// decoding straight off the reader left nothing for readStoreError further down.
+	raw, _ := io.ReadAll(io.LimitReader(addResp.Body, maxStoreBytes))
+	_ = addResp.Body.Close()
 	var added struct {
 		ID string `json:"id"`
 	}
-	dec := json.NewDecoder(io.LimitReader(addResp.Body, maxStoreBytes))
-	_ = dec.Decode(&added)
-	_ = addResp.Body.Close()
+	_ = json.Unmarshal(raw, &added)
 	// A refusal is a fact about the account, not the release — the same distinction TorBox already draws.
 	// Every non-2xx here used to become a dead link, so on a Real-Debrid install a 429 or a 503 reached
 	// the app as "this release does not exist", and the player walked the whole candidate list collecting
 	// the identical non-answer and condemning healthy releases on the way.
-	if storeRefusedUs(addResp.StatusCode) {
-		refused := &StoreUnavailableError{Service: ServiceRealDebrid, Status: addResp.StatusCode,
-			Reason: fmt.Sprintf("addmagnet http %d", addResp.StatusCode)}
-		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, refused)
-		return "", refused
-	}
+	//
+	// Either way RD answered and created nothing, so the charge taken before the request goes back — the
+	// rule Premiumize's answered-failure branch already followed and this one did not. Without it a
+	// magnet RD rejects with a 400, or any 2xx scout cannot pull an id out of (a proxy page served as
+	// 200), spent one add per poll: fifty real addMagnet calls inside two minutes at the client's
+	// cadence, and then 503 scout_busy on EVERY Real-Debrid resolve for the rest of the rolling hour,
+	// healthy releases included. On an RD-only install that is every /play, since RD has no Status for
+	// the handler to short-circuit on.
 	if addResp.StatusCode < 200 || addResp.StatusCode >= 300 || added.ID == "" {
-		return "", &DeadLinkError{"realdebrid no torrent id"}
+		refundUnusedAdd(ServiceRealDebrid, s.token)
+		detail := redactToken(storeErrorText(raw), s.token)
+		if storeRefusedUs(addResp.StatusCode) {
+			refused := &StoreUnavailableError{Service: ServiceRealDebrid, Status: addResp.StatusCode,
+				Reason: fmt.Sprintf("addmagnet http %d%s", addResp.StatusCode, detail)}
+			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, refused)
+			return "", refused
+		}
+		// RD was the only store discarding the service's own words here, so the log said the same thing
+		// for a bad magnet, a locked account and a Cloudflare page.
+		return "", &DeadLinkError{fmt.Sprintf("realdebrid no torrent id (http %d)%s",
+			addResp.StatusCode, detail)}
 	}
 	// Remember the torrent RD just created, the way TorBox remembers its id. This is the fix the marker
 	// kept failing to be: a "we already bought this" fact, separate from "an add is in flight", and not
