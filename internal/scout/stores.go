@@ -239,6 +239,49 @@ func torrentMissKey(token, infoHash string) string {
 	return "torbox:notorrent:" + keyHash(token) + ":" + infoHash
 }
 
+// An add we SENT but never got an answer to.
+//
+// This is the honest state between "queued" and "not queued", and it needs its own memory because the
+// two obvious ones both lie about it. Treating it as a refusal blames the service for the client hanging
+// up; treating it as never-happened re-adds on the next poll. A client polls /play every couple of
+// seconds and cancels on a focus change, so re-adding turned ONE release into sixty createtorrent calls
+// against a sixty-an-hour ceiling — measured — while the budget reported a full allowance because each
+// one had been refunded.
+//
+// Long enough to outlast the poll cadence that causes the loop, short enough that a genuinely lost add
+// can be retried within the wait rather than at the end of it.
+const addAttemptTTL = 90 * time.Second
+
+func addAttemptKey(token, infoHash string) string {
+	return "torbox:adding:" + keyHash(token) + ":" + infoHash
+}
+
+// noteAddAttempt records that a createtorrent went out, whatever comes back.
+//
+// It also clears the torrent-miss marker. That marker suppresses the account listing for 15s, and the
+// listing is the only thing that can discover the torrent this add just created — so leaving it in place
+// kept every following poll on the "nothing is queued, add it" path instead of the "it is downloading"
+// one. The negative cache and the add loop were feeding each other.
+func (s *torBoxStore) noteAddAttempt(infoHash string) {
+	if s.cache == nil {
+		return
+	}
+	s.cache.Put(addAttemptKey(s.token, infoHash), "1", addAttemptTTL)
+	s.cache.Put(torrentMissKey(s.token, infoHash), "", time.Nanosecond)
+}
+
+// settleAddAttempt clears the marker once the outcome IS known, whatever it was.
+//
+// The marker means "we do not know", not "an add happened" — so it must not outlive learning. A refused
+// add has the refusal backoff, and a successful one has its cached torrent id; both describe the state
+// better than this does. Keeping it would block the legitimate retry when createtorrent succeeded but
+// the follow-up file listing did not.
+func (s *torBoxStore) settleAddAttempt(infoHash string) {
+	if s.cache != nil {
+		s.cache.Put(addAttemptKey(s.token, infoHash), "", time.Nanosecond)
+	}
+}
+
 // transportKind describes a transport failure WITHOUT its URL. `*url.Error.Error()` embeds the request
 // URL, which for TorBox carries the account token in its query string — so the cause is reported and the
 // address is dropped. Enough to tell a timeout from a refused connection; never enough to leak a secret.
@@ -330,6 +373,11 @@ func backedOff(cache Cache, svc DebridService, token, infoHash string) (string, 
 	return cache.Get(refusedKey(svc, token, infoHash))
 }
 
+// errOurBudget marks a refusal scout made on its own behalf. It must not be remembered as the store's,
+// and it must not be reported to the client as the store's — the budget exists so an operator stops
+// blaming the debrid, and saying "torbox refused" when scout did is the same confusion wearing a badge.
+var errOurBudget = errors.New("local add budget")
+
 // recordRefusal remembers a refusal briefly, so a poll loop cannot sustain one.
 //
 // Only TorBox had this. The other two had no cache at all, so `ResolvePreferring` fell straight through
@@ -340,7 +388,7 @@ func backedOff(cache Cache, svc DebridService, token, infoHash string) (string, 
 // A cancellation is not a refusal: the caller went away, and nothing about the store or the release can
 // be concluded from it.
 func recordRefusal(cache Cache, svc DebridService, token, infoHash string, err error) {
-	if cache == nil || isCancellation(err) {
+	if cache == nil || isCancellation(err) || errors.Is(err, errOurBudget) {
 		return
 	}
 	cache.Put(refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff)
@@ -442,21 +490,31 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 }
 
 func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, error) {
+	// An add we already sent and never heard back about must not be sent again — see addAttemptKey.
+	if s.cache != nil {
+		if _, inFlight := s.cache.Get(addAttemptKey(s.token, infoHash)); inFlight {
+			return 0, &StoreUnavailableError{ServiceTorBox, "an add for this release is already in flight"}
+		}
+	}
 	if err := spendAdd(ServiceTorBox, s.token, infoHash); err != nil {
 		return 0, err
 	}
 	form := url.Values{"magnet": {magnetFor(infoHash)}, "seed": {"3"}, "allow_zip": {"false"}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/torrents/createtorrent", strings.NewReader(form.Encode()))
 	if err != nil {
+		refundAdd(ServiceTorBox, s.token, errRequestNotSent)
 		return 0, err
 	}
 	req.Header.Set("authorization", "Bearer "+s.token)
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	s.noteAddAttempt(infoHash)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		refundAdd(ServiceTorBox, s.token, err)
+		// No response, so the outcome is genuinely unknown: the marker STAYS, and the next poll finds it
+		// rather than sending the same add again.
 		return 0, err
 	}
+	s.settleAddAttempt(infoHash)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// TorBox explains itself in the body — an account at its active-download limit and a malformed
@@ -781,7 +839,6 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	}
 	addResp, err := s.post(ctx, "/torrents/addMagnet", url.Values{"magnet": {magnetFor(t.InfoHash)}})
 	if err != nil {
-		refundAdd(ServiceRealDebrid, s.token, err)
 		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
 		return "", err
 	}
@@ -1009,7 +1066,6 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		refundAdd(ServicePremiumize, s.token, err)
 		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		return "", err
 	}

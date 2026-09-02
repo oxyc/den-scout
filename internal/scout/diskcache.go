@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -56,7 +57,7 @@ func (c *TieredCache) Get(key string) (string, bool) {
 	}
 	// "<unix-expiry>\n<value>". Wall-clock on disk on purpose: a monotonic deadline means nothing to the
 	// process that reads the file after a restart.
-	nl := strings.IndexByte(string(raw), '\n')
+	nl := bytes.IndexByte(raw, '\n')
 	if nl <= 0 {
 		return "", false
 	}

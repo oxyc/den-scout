@@ -113,11 +113,11 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		if h.scrapeFails.Load() >= scrapeFailThreshold {
 			status = map[string]any{"status": "degraded", "reason": "indexers"}
 		}
-		// A spent add budget refuses every play with the same 503 a throttled debrid gives, and until now
-		// the only evidence was one log line per refusal. Report what is left, per account, so an
-		// exhausted allowance is visible before someone spends an evening blaming the debrid.
-		if spent := globalAddBudget.snapshot(); len(spent) > 0 {
-			status["addBudget"] = spent
+		// A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
+		// other evidence is one log line per refusal. The tightest remaining allowance is what an operator
+		// or a monitor needs; per-account detail is withheld because this route is unauthenticated.
+		if left, accounts := globalAddBudget.lowest(); accounts > 0 {
+			status["addBudgetRemaining"] = left
 		}
 		writeJSON(w, http.StatusOK, status, noStore)
 		return
@@ -256,18 +256,6 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		// asserted the answer for exactly the hashes nobody had an answer for.
 		seeds[i].CacheKnown = truth.Known(hash)
 	}
-	// A PARTIALLY failed check is degraded too. `truthOK` only asks whether some store answered about
-	// something, so one failed batch out of five left it true: the list went out and was CACHED as
-	// authoritative with a hundred releases unexamined, and no header said so.
-	unchecked := 0
-	if hasCacheTruth(config) {
-		for i := range seeds {
-			if !seeds[i].CacheKnown {
-				unchecked++
-			}
-		}
-	}
-
 	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
 	// misleading empty/partial list; return it for this request but don't cache it, so the next request
 	// retries instead of serving the blip for the whole TTL.
@@ -278,21 +266,17 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		h.scrapeFails.Add(1)
 	}
 
-	truthDegraded := hasCacheTruth(config) && (!truthOK || unchecked > 0)
-	degradedReason := ""
-	if !scrapeOK {
-		degradedReason = "indexers"
-	} else if truthDegraded {
-		degradedReason = "cache-check"
-	}
-	degraded := degradedReason != ""
-	if unchecked > 0 {
-		log.Printf("scout: %s %s: %d of %d releases could not be cache-checked", sid.Type, sid.IMDb, unchecked, len(seeds))
-	}
-
+	// TOTAL failure and PARTIAL failure are different states and drive different decisions, so they get
+	// different variables. Folding them into one turned off the cached-only filter for the whole request
+	// on any partial failure — which handed a viewer who asked for "only what plays now" releases the
+	// store had definitively said it does not hold. The coarse gate silently won over the per-hash filter
+	// that was added in the same commit to make exactly this case work.
+	truthOut := hasCacheTruth(config) && !truthOK
 	// audit #4: with no cache-truth store (RD-only), the cached-only filter would drop everything. Also
-	// skip it when the cache-truth stores are unreachable this request (don't drop everything on a blip).
-	effCachedOnly := config.CachedOnly && hasCacheTruth(config) && !truthDegraded
+	// skip it when the cache-truth stores are unreachable ENTIRELY (don't drop everything on a blip). A
+	// partial failure keeps the filter on — the per-hash CacheKnown check inside it drops only what is
+	// known not to be held, and keeps what nobody could ask about.
+	effCachedOnly := config.CachedOnly && hasCacheTruth(config) && !truthOut
 	// RD-only: drop releases RD blocks by filename (they'd 404 at resolve).
 	if rdOnly(config) {
 		var kept []RawStream
@@ -332,6 +316,32 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		ExpectedYear:        expectedYear,
 		ExpectedTitleTokens: expectedTitleTokens,
 	})
+
+	// Degraded is judged on what is actually SERVED, not on what was scraped.
+	//
+	// A partial cache-check failure is only a problem if it touched a release the viewer will see. Counted
+	// over all 500 seeds instead, a failed batch covering releases that every filter would have dropped
+	// still marked the response degraded — which means not cached, which means the next /stream re-runs
+	// the whole eight-second scrape. That is a user-visible cost paid for a fact about nothing.
+	unchecked := 0
+	if hasCacheTruth(config) {
+		for i := range ranked {
+			if !ranked[i].CacheKnown {
+				unchecked++
+			}
+		}
+	}
+	degradedReason := ""
+	if !scrapeOK {
+		degradedReason = "indexers"
+	} else if truthOut || unchecked > 0 {
+		degradedReason = "cache-check"
+	}
+	degraded := degradedReason != ""
+	if unchecked > 0 {
+		log.Printf("scout: %s %s: %d of %d served releases could not be cache-checked",
+			sid.Type, sid.IMDb, unchecked, len(ranked))
+	}
 
 	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
 	// the viewer will see; before serialisation, so the answer rides along in the same response and the
@@ -395,17 +405,26 @@ func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 // handleProbe answers "can this play yet?" without changing anything. Same vocabulary as /play so the
 // client reads one set of statuses: 202 while downloading, 200 once the store holds it, 404 when neither
 // is true — which here means "nothing has been queued", not "this release is dead".
-func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, pool *StorePool,
+func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config *Config, pool *StorePool,
 	infoHash string, rt ResolveTarget) {
 	if status, ok := pool.Status(ctx, rt); ok {
 		writeQueued(w, infoHash, status)
 		return
 	}
-	// Cached is a read, not an add: the file is already there and /play would only mint a link for it.
-	if probeTruth, _ := pool.CacheCheck(ctx, []string{infoHash}); probeTruth.Cached(infoHash) {
-		log.Printf("scout: probe %s → 200 ready", shortHash(infoHash))
-		writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
-		return
+	// "Ready" has to mean the ACCOUNT can serve it without queueing anything, which a cache check cannot
+	// establish on its own: TorBox's checkcached reports what TorBox has, not what this account has. So
+	// the claim is settled by a NoAdd resolve — the stores refuse rather than queue — and a cached-but-
+	// not-held release correctly falls through to the "nothing queued" answer instead of promising a
+	// playback that would start with a download.
+	probeTruth, truthOK := pool.CacheCheck(ctx, []string{infoHash})
+	if probeTruth.Cached(infoHash) {
+		readOnly := rt
+		readOnly.NoAdd = true
+		if _, err := pool.ResolveCachedOnly(ctx, readOnly, probeTruth.HeldBy(infoHash)); err == nil {
+			log.Printf("scout: probe %s → 200 ready", shortHash(infoHash))
+			writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
+			return
+		}
 	}
 	// A refusal the store recorded moments ago outranks "nothing queued". Without this the probe reports
 	// a throttled account as an absence, which reads as a release nobody can deliver — and the client
@@ -415,6 +434,13 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, pool *
 		log.Printf("scout: probe %s → 503, %s %s", shortHash(infoHash), svc, reason)
 		writeJSON(w, http.StatusServiceUnavailable,
 			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
+		return
+	}
+	// With the cache check down we do not know whether anything is queued, and 404 "not_queued" is a
+	// claim, not a shrug — the client reads it as a release nobody has. Say the store could not be asked.
+	if !truthOK && hasCacheTruth(config) {
+		log.Printf("scout: probe %s → 503, cache check unavailable", shortHash(infoHash))
+		writeJSON(w, http.StatusServiceUnavailable, errBody("cache_check_unavailable"), noStore)
 		return
 	}
 	log.Printf("scout: probe %s → 404 not queued", shortHash(infoHash))
@@ -442,7 +468,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// 60 adds an hour; a single three-minute wait spent thirty-six of them, and the account was throttled
 	// out of playing anything at all. A probe reports what is true right now and starts nothing.
 	if r.URL.Query().Get("probe") == "1" {
-		h.handleProbe(w, ctx, pool, target.InfoHash, rt)
+		h.handleProbe(w, ctx, config, pool, target.InfoHash, rt)
 		return
 	}
 

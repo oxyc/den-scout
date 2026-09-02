@@ -99,15 +99,18 @@ func TestHandleProbe_reportsWithoutQueueing(t *testing.T) {
 	h := &handler{deps: Deps{
 		Cache: NewMemoryCache(1 << 20),
 		MakeStores: func(*Config) []Store {
-			return []Store{fakeStore{svc: ServiceTorBox, resolve: func() (string, error) {
-				resolves++
-				return "", nil
-			}}}
+			// The store ANSWERED and said it does not hold this — "not queued" is a fact here, not a
+			// shrug. A store that could not be asked gets a different answer, tested below.
+			return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{"abc": false},
+				resolve: func() (string, error) {
+					resolves++
+					return "", nil
+				}}}
 		},
 	}}
 	rec := httptest.NewRecorder()
 	pool := &StorePool{stores: h.deps.MakeStores(&Config{})}
-	h.handleProbe(rec, context.Background(), pool, "abc", ResolveTarget{InfoHash: "abc"})
+	h.handleProbe(rec, context.Background(), probeConfig(), pool, "abc", ResolveTarget{InfoHash: "abc"})
 
 	if resolves != 0 {
 		t.Errorf("a probe resolved %d times — resolving adds the torrent", resolves)
@@ -128,7 +131,7 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 		h := &handler{deps: Deps{Cache: NewMemoryCache(1 << 20),
 			MakeStores: func(*Config) []Store { return stores }}}
 		rec := httptest.NewRecorder()
-		h.handleProbe(rec, context.Background(), &StorePool{stores: stores}, "abc",
+		h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: stores}, "abc",
 			ResolveTarget{InfoHash: "abc"})
 		return rec
 	}
@@ -145,7 +148,10 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 	}
 
 	// Held by the store → 200 ready, without minting a link (that is /play's job).
-	ready := probe([]Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{"abc": true}}})
+	// Held AND resolvable without an add: both are required, because a cache check alone cannot say the
+	// account can serve it — TorBox reports what TorBox has, not what this account has.
+	ready := probe([]Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{"abc": true},
+		resolve: func() (string, error) { return "https://cdn/x", nil }}})
 	if ready.Code != http.StatusOK || !strings.Contains(ready.Body.String(), "ready") {
 		t.Errorf("a held release should be 200 ready: %d %s", ready.Code, ready.Body.String())
 	}
@@ -159,7 +165,7 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 	h := &handler{deps: Deps{Cache: NewMemoryCache(1 << 20),
 		MakeStores: func(*Config) []Store { return []Store{refusedStore} }}}
 	rec := httptest.NewRecorder()
-	h.handleProbe(rec, context.Background(), &StorePool{stores: []Store{refusedStore}}, "abc",
+	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{refusedStore}}, "abc",
 		ResolveTarget{InfoHash: "abc"})
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("a refused account should be 503, got %d", rec.Code)
@@ -328,4 +334,9 @@ func TestRefusalBackoff_ignoresCancellation(t *testing.T) {
 	if _, refused := backedOff(cache, ServiceTorBox, "tok", H); refused {
 		t.Error("an expired deadline was remembered as a refusal by the store")
 	}
+}
+
+// probeConfig — a TorBox install, so handleProbe's cache-truth branches are exercised.
+func probeConfig() *Config {
+	return &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: "tok"}}}
 }

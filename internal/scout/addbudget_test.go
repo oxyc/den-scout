@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,28 +205,60 @@ func TestStores_refuseToAddOnceTheBudgetIsSpent(t *testing.T) {
 	}
 }
 
-// A cancelled add must give its charge back, or the client wedges its own hour shut.
+// A cancel storm must cost ONE add, not one per poll — and the one it costs must be counted.
 //
-// The charge happens before the request, which is right — an add that succeeds but whose response is
-// lost must still count. But the tvOS client polls /play every couple of seconds on the request context
-// and cancels on a focus change, so without a refund fifty cancelled polls of ONE release closed the
-// whole allowance in under two minutes (measured), after which every other title was refused too.
-func TestAddBudget_cancelledAddsDoNotWedgeTheHour(t *testing.T) {
+// Both halves matter and an earlier version got each of them wrong in turn. Refunding cancelled adds
+// looked right and was measurably false: the POST has already been written, the debrid counts it, and
+// sixty cancelled polls of one release put sixty createtorrent calls on the account while this budget
+// still reported a full allowance. The cure is not to stop counting but to stop re-sending: an add whose
+// outcome we never learned is remembered, and the next poll finds that memory instead of the add path.
+func TestAddBudget_aCancelStormCostsOneAdd(t *testing.T) {
 	prev := globalAddBudget
-	globalAddBudget = newAddBudget(time.Hour, 5)
+	globalAddBudget = newAddBudget(time.Hour, 50)
 	defer func() { globalAddBudget = prev }()
 
-	d := mockDoer{fn: func(*http.Request) (*http.Response, error) { return nil, context.Canceled }}
+	sent := 0
+	d := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		sent++ // the request went out; the caller just never gets the answer
+		return nil, context.Canceled
+	}}
 	s := &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 60; i++ {
 		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
 	}
-	if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != 5 {
-		t.Errorf("%d of 5 adds left after fifty CANCELLED polls — cancellation is spending the budget", left)
+	if sent != 1 {
+		t.Errorf("sent %d createtorrent requests across sixty cancelled polls of one release", sent)
 	}
-	// And an unrelated title is still playable.
+	if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != 49 {
+		t.Errorf("remaining = %d, want 49 — the add that WAS sent must be counted", left)
+	}
+	// Other titles are unaffected: one stuck release must not close the hour.
 	if err := spendAdd(ServiceTorBox, "tok", repeat("c", 40)); err != nil {
-		t.Errorf("another title was refused because of cancelled polls elsewhere: %v", err)
+		t.Errorf("another title was refused: %v", err)
+	}
+}
+
+// The in-flight marker means "we do not know", so it must not outlive learning. Once createtorrent
+// answers — even to refuse — the outcome is known and a legitimate retry has to be able to proceed.
+func TestAddBudget_aKnownOutcomeReleasesTheInFlightMarker(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	sent := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "createtorrent") {
+			sent++
+			return resp(200, `{"data":{"torrent_id":9}}`), nil
+		}
+		return resp(500, "boom"), nil // the follow-up listing fails, so the resolve is retried
+	}}
+	s := &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
+	ep := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(1)}
+	_, _ = s.Resolve(context.Background(), ep)
+	_, _ = s.Resolve(context.Background(), ep)
+	if sent != 2 {
+		t.Errorf("sent %d adds; a completed-but-unusable add must not block the retry", sent)
 	}
 }
 
@@ -277,5 +311,75 @@ func TestNoAdd_neverReachesAnAddEndpoint(t *testing.T) {
 				t.Errorf("made %d requests for a NoAdd target — the store queued the torrent anyway", reqs)
 			}
 		})
+	}
+}
+
+// refundAdd must discriminate. Its whole job is telling "the request was never sent" from "the response
+// never arrived", and an earlier version refunded both — putting sixty real adds on the account while
+// reporting a full allowance. The prior test for this drove a 400 RESPONSE, so err was nil and refundAdd
+// was never reached: it passed against an unconditional refund.
+func TestRefundAdd_onlyForARequestThatWasNeverSent(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 10)
+	defer func() { globalAddBudget = prev }()
+	acct := budgetAccount(ServiceTorBox, "tok")
+
+	globalAddBudget.take(acct)
+	refundAdd(ServiceTorBox, "tok", context.Canceled)
+	if left := globalAddBudget.remaining(acct); left != 9 {
+		t.Errorf("a cancelled add was refunded (remaining %d) — it had already reached the service", left)
+	}
+	refundAdd(ServiceTorBox, "tok", context.DeadlineExceeded)
+	if left := globalAddBudget.remaining(acct); left != 9 {
+		t.Errorf("an expired deadline was refunded (remaining %d) — same reason", left)
+	}
+	refundAdd(ServiceTorBox, "tok", errors.New("connection reset"))
+	if left := globalAddBudget.remaining(acct); left != 9 {
+		t.Errorf("a transport error was refunded (remaining %d); it may still have been delivered", left)
+	}
+	refundAdd(ServiceTorBox, "tok", errRequestNotSent)
+	if left := globalAddBudget.remaining(acct); left != 10 {
+		t.Errorf("a request that was never built must be refunded, remaining %d", left)
+	}
+}
+
+// Scout's own ceiling is not the debrid's refusal, and must not be remembered or reported as one.
+func TestSpendAdd_ourCeilingIsNotTheStoresRefusal(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 0)
+	defer func() { globalAddBudget = prev }()
+
+	cache := NewMemoryCache(1 << 20)
+	err := spendAdd(ServiceTorBox, "tok", H)
+	recordRefusal(cache, ServiceTorBox, "tok", H, err)
+	if _, remembered := backedOff(cache, ServiceTorBox, "tok", H); remembered {
+		t.Error("scout's own budget was written into the store's refusal memory")
+	}
+	// It still reads as unavailable to the caller — just not as TorBox's doing.
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("a budget refusal must still be a refusal: %v", err)
+	}
+	if !strings.Contains(unavailable.Reason, "scout") {
+		t.Errorf("the reason must name scout as the refuser: %q", unavailable.Reason)
+	}
+}
+
+// /health reports the allowance without naming accounts. The route is unauthenticated, and a stable
+// service:hash(token) key would make it a confirmation oracle for a guessed token.
+func TestHealth_reportsTheBudgetWithoutNamingAccounts(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 10)
+	defer func() { globalAddBudget = prev }()
+	globalAddBudget.take(budgetAccount(ServiceTorBox, "secret-token"))
+
+	rec := httptest.NewRecorder()
+	NewHandler(Deps{Cache: NewMemoryCache(1 << 20)}).ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "addBudgetRemaining") {
+		t.Errorf("a spent allowance must be visible: %s", body)
+	}
+	if strings.Contains(body, keyHash("secret-token")) || strings.Contains(body, "torbox") {
+		t.Errorf("/health discloses which account is spending: %s", body)
 	}
 }

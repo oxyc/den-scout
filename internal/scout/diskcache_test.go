@@ -152,3 +152,22 @@ func TestTieredCache_sweepEveryRunsAndStops(t *testing.T) {
 		t.Error("SweepEvery span a ticker for a cache with no disk tier")
 	}
 }
+
+// One failed WRITE must not stop reclamation. `disable` is set for the process lifetime, and it also
+// short-circuits Get before the on-read expiry removal — so gating Sweep on it too meant a single ENOSPC
+// or permissions blip turned off BOTH ways an entry is ever reclaimed, which is precisely the unbounded
+// growth the sweeper exists to prevent. The directory may still be readable when it is not writable, and
+// reaping is exactly what helps if the problem was space.
+func TestTieredCache_sweepSurvivesAWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	c := NewTieredCache(1, dir)
+	for i := 0; i < 5; i++ {
+		c.Put(fmt.Sprintf("dead-%d", i), "v", time.Millisecond)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	c.disable("write", fmt.Errorf("no space left on device"))
+	if got := c.Sweep(); got != 5 {
+		t.Errorf("swept %d after a write failure, want 5 — the store can no longer be reclaimed at all", got)
+	}
+}

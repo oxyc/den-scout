@@ -369,3 +369,39 @@ func TestRoutesRDOnlyReturnsStreams(t *testing.T) {
 		t.Error("RD-only should still return streams (cachedOnly skipped)")
 	}
 }
+
+// A PARTIAL cache-check failure is degraded, and the response must say so.
+//
+// `truthOK` only asks whether some store answered about something, so one failed batch out of five left
+// it true: the list went out and was CACHED as authoritative with releases nobody had examined, and no
+// header said so. The check must be per hash, over what is actually SERVED.
+func TestStream_partialCacheCheckIsDegraded(t *testing.T) {
+	// The store answers for one hash and omits the other — what a half-failed batch looks like.
+	answered := repeat("a", 40)
+	unknown := repeat("b", 40)
+	h := NewHandler(Deps{
+		Cache:         NewMemoryCache(1 << 20),
+		ScrapeTimeout: time.Second,
+		MakeScrapers: func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				return []RawStream{
+					{InfoHash: answered, Title: "A 1080p WEB-DL", Seeders: intp(10)},
+					{InfoHash: unknown, Title: "B 1080p WEB-DL", Seeders: intp(10)},
+				}, nil
+			}}}
+		},
+		MakeStores: func(*Config) []Store {
+			return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{answered: true}}}
+		},
+	})
+	rec := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil)
+
+	if got := rec.Header().Get("X-Scout-Degraded"); got != "cache-check" {
+		t.Errorf("X-Scout-Degraded = %q, want cache-check — a release nobody could check was served as fact", got)
+	}
+	// validBlob sets cachedOnly. The unchecked release must still be served — it is not KNOWN to be
+	// uncached, and a partial failure must not turn the whole filter off either (that was the bug).
+	if n := streamsLen(rec); n != 2 {
+		t.Errorf("served %d streams, want 2: the cached one and the one nobody could check", n)
+	}
+}

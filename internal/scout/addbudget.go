@@ -1,6 +1,8 @@
 package scout
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -69,11 +71,8 @@ func (b *addBudget) take(account string) bool {
 	return true
 }
 
-// refund returns the most recent charge when the add did not happen. Without it a cancelled request is
-// indistinguishable from a torrent that was queued, and the client cancels constantly — fifty cancelled
-// polls of ONE release closed the whole hour, measured, after which every other title was refused too.
-// The same lesson the host limiter learned: a charge for a request that was never made is debt the next
-// caller pays.
+// refund returns the most recent charge. Only for an add that was never sent — see refundAdd; refunding
+// one that merely lost its response hands back an allowance the debrid has already spent.
 func (b *addBudget) refund(account string) {
 	if b == nil {
 		return
@@ -107,27 +106,34 @@ func (b *addBudget) remaining(account string) int {
 	return 0
 }
 
-// snapshot reports the remaining allowance per account, for /health. Only accounts that have spent
-// something appear, so a fresh process reports nothing rather than a list of zeros.
-func (b *addBudget) snapshot() map[string]int {
+// lowest reports the smallest remaining allowance across all accounts, and how many accounts have spent
+// anything. For /health, which is the point: an operator needs to know the ceiling is being approached,
+// and a monitor needs one number to alert on.
+//
+// Deliberately NOT keyed by account. /health is unauthenticated — every other route is protected by an
+// unguessable config segment — and `service:hash(token)` is stable, so publishing it turns the endpoint
+// into a confirmation oracle for a guessed token and discloses which services this install uses. The
+// aggregate answers the operational question without answering that one.
+func (b *addBudget) lowest() (left, accounts int) {
 	if b == nil {
-		return nil
+		return -1, 0
 	}
 	b.mu.Lock()
-	accounts := make([]string, 0, len(b.spent))
+	keys := make([]string, 0, len(b.spent))
 	for acct := range b.spent {
-		accounts = append(accounts, acct)
+		keys = append(keys, acct)
 	}
 	b.mu.Unlock()
-	out := make(map[string]int, len(accounts))
-	for _, acct := range accounts {
-		if left := b.remaining(acct); left < b.limit {
-			// The account key is service:hash(token) — the hash keeps the token out of a response that is
-			// not otherwise authenticated, while still telling two accounts apart.
-			out[acct] = left
+	left = b.limit
+	for _, acct := range keys {
+		if r := b.remaining(acct); r < b.limit {
+			accounts++
+			if r < left {
+				left = r
+			}
 		}
 	}
-	return out
+	return left, accounts
 }
 
 // One per process, keyed by service+account, so every store built for every request shares the count.
@@ -150,18 +156,30 @@ func spendAdd(svc DebridService, token, infoHash string) error {
 		return nil
 	}
 	log.Printf("scout: %s add budget spent for the hour, refusing %s", svc, shortHash(infoHash))
-	return &StoreUnavailableError{svc, "hourly add budget spent"}
+	// Wrapped so the refusal memory can tell scout's own ceiling from the service's — see errOurBudget.
+	return fmt.Errorf("%w: %w", errOurBudget,
+		&StoreUnavailableError{svc, "scout's own hourly add budget for this account is spent"})
 }
 
-// refundAdd gives the charge back when the request that would have queued the torrent never completed —
-// a cancelled client, an expired deadline. Charging before the request is right (an add that succeeds
-// but whose response is lost must still count), but only if an add that demonstrably did not happen is
-// given back.
+// refundAdd gives the charge back when the request was never sent at all.
+//
+// It used to refund on cancellation, which was wrong and measurably so: a cancelled add has already been
+// written to the wire, and the debrid counts it. Sixty cancelled polls of one release put sixty
+// createtorrent calls on the account while this budget still reported a full allowance. "The response
+// never arrived" and "the request never happened" are not the same fact, and only the second is a
+// refund — the recurring mistake in this codebase is treating one as the other.
+//
+// The problem the refund was reaching for is real (a cancelling client must not be able to lock itself
+// out), but the answer is to stop re-adding, not to stop counting. See addAttemptKey.
 func refundAdd(svc DebridService, token string, err error) {
-	if isCancellation(err) {
+	if errors.Is(err, errRequestNotSent) {
 		globalAddBudget.refund(budgetAccount(svc, token))
 	}
 }
+
+// errRequestNotSent marks the one case where nothing reached the service: the request could not even be
+// constructed. Everything past that point may have been received.
+var errRequestNotSent = errors.New("request was not sent")
 
 func budgetAccount(svc DebridService, token string) string {
 	return string(svc) + ":" + keyHash(token)
