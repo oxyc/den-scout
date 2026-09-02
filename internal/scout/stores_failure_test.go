@@ -232,7 +232,9 @@ func TestTorBoxListFiles_saysWhyItHasNoFiles(t *testing.T) {
 		want error
 	}{
 		{"a transport blip", boom, errNoFileList},
-		{"a 500", status(500), errNoFileList},
+		// A 400 says nothing about the account; a 500 or a 401 does, and is classified separately in
+		// TestTorBoxListFiles_classifiesTheRemainingShapes so it can raise the account-wide backoff.
+		{"a 400", status(400), errNoFileList},
 		{"an unreadable body", ok(`garbage`), errNoFileList},
 		{"a 404", status(404), errTorrentGone},
 		{"the account no longer holds it", ok(`{"success":false,"data":null}`), errTorrentGone},

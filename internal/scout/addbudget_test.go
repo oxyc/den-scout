@@ -2121,3 +2121,133 @@ func TestTorBox_aTorrentDeniedRightAfterBuyingItIsNotReBought(t *testing.T) {
 		t.Errorf("made %d adds; a store contradicting itself must not be paid once per poll", adds)
 	}
 }
+
+// Real-Debrid needs the same bound TorBox's just-added path got, and for a worse loop: `gone` about a
+// torrent RD created moments ago erases the memory just written, the next poll finds nothing known and
+// adds again — and RD mints a NEW id every time, so the re-add can never converge on one torrent and
+// heal. Two minutes of one viewer on one release spent the whole hourly allowance, left fifty duplicate
+// torrents on the account, and then answered 503 scout_busy for every RD resolve for the rest of the
+// hour. On an RD-only install every /play poll reaches here, since RD has no Status to short-circuit on.
+func TestRealDebrid_aTorrentDeniedRightAfterBuyingItIsNotReBought(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	adds := 0
+	ids := map[string]bool{}
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "addMagnet"):
+			adds++
+			id := fmt.Sprintf("t%d", adds) // RD mints a fresh id every time
+			ids[id] = true
+			return resp(201, fmt.Sprintf(`{"id":%q}`, id)), nil
+		case strings.Contains(r.URL.Path, "/torrents/info/"):
+			return resp(404, `{}`), nil // RD denies the torrent it just created
+		}
+		return resp(200, `{}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	s := &realDebridStore{token: "tok", client: d, cache: cache, api: realDebridAPI}
+	target := ResolveTarget{InfoHash: H}
+
+	_, first := s.Resolve(context.Background(), target)
+	var dead *DeadLinkError
+	if !errors.As(first, &dead) || !strings.Contains(dead.Error(), "denied holding it") {
+		t.Errorf("got %v, want a dead link naming the contradiction", first)
+	}
+	for i := 0; i < 30; i++ {
+		_, _ = s.Resolve(context.Background(), target)
+	}
+	if adds > 1 {
+		t.Errorf("made %d adds and left %d duplicate torrents on the account", adds, len(ids))
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServiceRealDebrid, "tok")); left < 49 {
+		t.Errorf("allowance %d — one viewer on one release spent the hour", left)
+	}
+}
+
+// The narrow direction of the just-added backoff, which only a comment guarded: it must fire ONLY when
+// the store denies a torrent it just created. Widened to any error it would back off every legitimately
+// queueing torrent — the ordinary state of a fetch in progress — and answer 503 for a minute on a
+// release that is simply not ready yet.
+func TestTorBox_theContradictionBackoffDoesNotFireOnAnOrdinaryWait(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case isAddEndpoint(r):
+			return resp(200, `{"data":{"torrent_id":77}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			// Queued: the entry exists, its files have not resolved yet.
+			return resp(200, `{"data":{"files":[]}}`), nil
+		}
+		return resp(200, `{"success":false}`), nil // no link yet — still downloading
+	}}
+	cache := NewMemoryCache(1 << 20)
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
+	if reason, ok := backedOff(cache, ServiceTorBox, "tok", H); ok {
+		t.Errorf("a torrent that is merely still fetching was backed off: %s", reason)
+	}
+	// And the id is kept, so Status can report the download rather than the release reading as dead.
+	if raw, _ := cache.Get(torrentIDKey("tok", H)); raw != "77" {
+		t.Errorf("torrent id %q — a queued fetch lost the id Status needs", raw)
+	}
+}
+
+// mylist is queried by id, so an answer carrying several entries must be matched to the one asked for.
+// Taking the first blind picks a file id out of ANOTHER torrent's list — the wrong-episode failure by a
+// route the name-match cannot catch, since the names it matches would be the other torrent's.
+func TestTorBoxListFiles_matchesTheEntryToTheIdAskedFor(t *testing.T) {
+	body := `{"data":[{"id":9,"files":[{"id":0,"name":"OTHER.S09E09.mkv","size":10}]},` +
+		`{"id":42,"files":[{"id":7,"name":"Show.S01E02.mkv","size":900}]}]}`
+	s := &torBoxStore{token: "tok", api: torboxAPI, client: routed{fallbk: ok(body)}}
+	files, err := s.listFiles(t.Context(), 42)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if len(files) != 1 || files[0].Name != "Show.S01E02.mkv" {
+		t.Errorf("got %+v — another torrent's files were used to pick ours", files)
+	}
+	// And when no entry matches, that is not our torrent's file list either: refuse rather than guess.
+	s = &torBoxStore{token: "tok", api: torboxAPI, client: routed{fallbk: ok(body)}}
+	if _, err := s.listFiles(t.Context(), 5); !errors.Is(err, errNoFileList) {
+		t.Errorf("got %v, want errNoFileList when the answer describes other torrents", err)
+	}
+}
+
+// Two classifications on mylist that the three-way split got wrong in opposite directions.
+func TestTorBoxListFiles_classifiesTheRemainingShapes(t *testing.T) {
+	// A rejected key found HERE must be able to raise the account-wide backoff. errNoFileList carries
+	// Status 0, so routing a 401 to it left the dead key undiscoverable on this endpoint.
+	cache := NewMemoryCache(1 << 20)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI, client: routed{fallbk: status(401)}}
+	_, err := s.listFiles(t.Context(), 42)
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Status != 401 {
+		t.Fatalf("got %v, want a refusal carrying its status", err)
+	}
+	recordRefusal(cache, ServiceTorBox, "tok", H, err)
+	if _, ok := accountBackedOff(cache, ServiceTorBox, "tok"); !ok {
+		t.Error("a key TorBox rejected on mylist never reaches the account backoff")
+	}
+
+	// A body with no `data` key at all is not TorBox's envelope — a proxy page that happens to be valid
+	// JSON, say. Silence, not a claim about the account; read as `gone` it paid an add to re-buy a
+	// torrent nobody said was missing.
+	s = &torBoxStore{token: "tok", api: torboxAPI, client: routed{fallbk: ok(`{}`)}}
+	if _, err := s.listFiles(t.Context(), 42); !errors.Is(err, errNoFileList) {
+		t.Errorf("got %v, want errNoFileList for a body that is not the envelope", err)
+	}
+	// The two shapes that DO say it still must.
+	for _, payload := range []string{`{"success":false,"data":null}`, `{"data":null}`} {
+		s = &torBoxStore{token: "tok", api: torboxAPI, client: routed{fallbk: ok(payload)}}
+		if _, err := s.listFiles(t.Context(), 42); !errors.Is(err, errTorrentGone) {
+			t.Errorf("%s: got %v, want errTorrentGone", payload, err)
+		}
+	}
+}

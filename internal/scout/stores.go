@@ -1014,6 +1014,13 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, errTorrentGone
 	}
+	// Being turned away is a fact about the ACCOUNT, and errNoFileList carries Status 0 — so a key TorBox
+	// has rejected, discovered on this endpoint, could never raise the account-wide backoff that exists
+	// to stop every later request asking with the same dead key.
+	if storeRefusedUs(resp.StatusCode) {
+		return nil, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("mylist http %d", resp.StatusCode)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, errNoFileList
 	}
@@ -1029,8 +1036,15 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 	// mylist ANSWERING, so it is `gone`, not `no answer`: the caller must forget the id and re-add rather
 	// than report the store unavailable forever. (On requestdl the same success:false means the opposite
 	// — "no link yet" — which is why that endpoint keys the verdict on a 404 instead.)
-	if (body.Success != nil && !*body.Success) || len(body.Data) == 0 || string(body.Data) == "null" {
+	if (body.Success != nil && !*body.Success) || string(body.Data) == "null" {
 		return nil, errTorrentGone
+	}
+	// A body carrying no `data` key AT ALL is not the documented envelope — a proxy or CDN page that
+	// happens to be valid JSON, say. That is silence, not a claim about the account, and reading it as
+	// `gone` paid an add to re-buy a torrent nobody said was missing. The two shapes that really do say
+	// so are handled above, so nothing is lost by being careful here.
+	if len(body.Data) == 0 {
+		return nil, errNoFileList
 	}
 	type tbFile struct {
 		ID        int    `json:"id"`
@@ -1039,6 +1053,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		Size      *int   `json:"size"`
 	}
 	type entry struct {
+		ID    int      `json:"id"`
 		Files []tbFile `json:"files"`
 	}
 	var e entry
@@ -1056,7 +1071,24 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		if len(arr) == 0 {
 			return nil, errTorrentGone
 		}
+		// The entry for the id we ASKED about, not whichever came first. mylist is queried by id and so
+		// should answer with one, but taking arr[0] blind means a multi-entry answer picks a file id out
+		// of another torrent's file list — the wrong-episode failure, by a route the name-match cannot
+		// catch, since the names it matches would be the other torrent's.
 		e = arr[0]
+		if len(arr) > 1 {
+			match := -1
+			for i, cand := range arr {
+				if cand.ID == torrentID {
+					match = i
+					break
+				}
+			}
+			if match < 0 {
+				return nil, errNoFileList
+			}
+			e = arr[match]
+		}
 	}
 	out := make([]TorrentFile, 0, len(e.Files))
 	for _, f := range e.Files {
@@ -1265,7 +1297,21 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	s.rememberTorrent(t, added.ID)
 	id := added.ID
 
-	return s.resolveExisting(ctx, id, t)
+	link, err := s.resolveExisting(ctx, id, t)
+	// The same bound TorBox's just-added path has, and for a worse loop. `gone` about a torrent RD
+	// created moments ago erases the memory just written, so the next poll finds nothing known and adds
+	// again — and RD mints a NEW id every time, so unlike TorBox the re-add cannot converge on one
+	// torrent and heal. `recordRefusal` deliberately ignores errTorrentGone, so nothing bounded it: two
+	// minutes of one viewer sitting on one release spent the whole hourly allowance, left fifty duplicate
+	// torrents on the account, and then answered 503 scout_busy for every RD resolve — healthy releases
+	// included — for the rest of the hour. On an RD-only install every /play poll reaches here, because
+	// RD has no Status for the handler to short-circuit on.
+	if errors.Is(err, errTorrentGone) {
+		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, &StoreUnavailableError{
+			Service: ServiceRealDebrid, Reason: "created this torrent and then denied holding it"})
+		return "", &DeadLinkError{"realdebrid created this torrent and then denied holding it"}
+	}
+	return link, err
 }
 
 // rdTorrentKey — the RD torrent id this account created for an infohash. Account-scoped like every other
