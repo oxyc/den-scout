@@ -287,6 +287,18 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 			anyOK = true
 		}
 	}
+	// An EMPTY result is only authoritative when EVERY indexer answered. "Someone responded" is enough to
+	// trust a non-empty list — whatever came back is real — but not enough to state that a release does
+	// not exist. torrentio 502s while another indexer legitimately has nothing, and the union of those
+	// two was reported to the app as a confident "not available" for an episode that does exist.
+	if len(all) == 0 {
+		for _, ok := range respok {
+			if !ok {
+				anyOK = false
+				break
+			}
+		}
+	}
 	return dedupe(all), anyOK
 }
 
