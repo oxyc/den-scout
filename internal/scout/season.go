@@ -32,9 +32,18 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 		fmt.Sprintf(`\b%02d%02d(?![\dpi])`, season, episode),
 		// The episode number standing alone as its own token: `[Grp] Show - 03 [1080p].mkv`, which is how
 		// most anime and a good deal of TV is packed. The delimiters must be real separators rather than
-		// "any non-digit", or `[Group8]` matches episode 8 — and the token must be the WHOLE digit run,
-		// which is what keeps 1080p, 720p, x264 and a year out of it.
-		fmt.Sprintf(`(?:^|[ ._\-\[\]()])0*%d(?:[ ._\-\[\]()]|$)`, episode),
+		// "any non-digit", or `[Group8]` matches episode 8, and the token must be the WHOLE digit run,
+		// which keeps 1080p, 720p, x264 and a year out.
+		//
+		// A DOT CANNOT OPEN THE TOKEN, and can only close it when a digit does not follow. Both rules
+		// exist for the same family of names: `DDP5.1`, `TrueHD.7.1`, `AC3.5.1`, `H.264`, `AAC.2.0`,
+		// `2024.03.15`. With the dot as an ordinary separator every one of those is a standalone number,
+		// so on any pack with 5.1 audio — which is most of them — EVERY file matched episode 1 and the
+		// largest was served: ask for E01 of a ten-episode pack, get E10, with a 302 and no error. The
+		// cost of the rule is `Show.03.1080p.mkv`, a dot-separated bare number, which no longer matches;
+		// a missed match falls through to the indexer's own file index, while a false one plays the
+		// wrong episode.
+		fmt.Sprintf(`(?:^|[ _\-\[\]()])0*%d(?:[ _\-\[\]()]|\.(?!\d)|$)`, episode),
 	}
 	out := make([]*regexp2.Regexp, 0, len(specs))
 	for _, s := range specs {
@@ -67,12 +76,6 @@ var errEpisodeNotInTorrent = errors.New("torrent holds no file for that episode"
 // the mismatch below is claimed only when a filename really does name a different episode.
 var labelledEpisodeRe = mustRE2(`(s\d{1,2}[ ._-]*e\d{1,3}|\b\d{1,2}x\d{2}\b|season[ ._-]*\d{1,2}[ ._-]*episode[ ._-]*\d{1,3})`)
 
-// bareNumberRe — does a filename carry a standalone 1-3 digit token, the `[Grp] Show - 03 [1080p].mkv`
-// shape? On its own that says nothing: a film can be "Part 2". Across a POOL it says a great deal, which
-// is why the caller counts rather than tests. The token must be the whole digit run between real
-// separators, so a year, 1080p, 720p, x264 and `[Group8]` are all excluded.
-var bareNumberRe = mustRE2(`(^|[ ._\-\[\]()])\d{1,3}([ ._\-\[\]()]|$)`)
-
 // pickEpisodeFile picks the file index for an episode: an SxxExx match among video files (largest on
 // ties), else the largest video file.
 //
@@ -88,28 +91,26 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 
 	patterns := episodePatterns(season, episode)
 	var matched []TorrentFile
-	labelled, numbered := false, 0
+	labelled := false
 	for _, f := range pool {
-		name := strings.ToLower(f.Name)
 		if matchesEpisode(f.Name, patterns) {
 			matched = append(matched, f)
 		}
-		if labelledEpisodeRe.match(name) {
+		if labelledEpisodeRe.match(strings.ToLower(f.Name)) {
 			labelled = true
-		}
-		if bareNumberRe.match(name) {
-			numbered++
 		}
 	}
 	if len(matched) > 0 {
 		idx := largest(matched).Index
 		return &idx, nil
 	}
-	// TWO or more files each carrying a standalone number is a numbered pack, and a pack that does not
-	// hold the episode asked for holds nothing to play — the same verdict a SxxExx pack gets. One such
-	// file is not evidence of anything ("Movie.Part.2.mkv" is a film), which is why the count matters:
-	// it makes the pack the subject, not the filename.
-	if labelled || numbered > 1 {
+	// Only an UNAMBIGUOUS label can condemn a pack. A bare number is good enough to recognise the episode
+	// when it matches, and never good enough to prove absence: bare numbering is frequently ABSOLUTE, so
+	// season 2 episode 1 is packed as `[Grp] Show - 13` and nothing in the name says so. Counting numbered
+	// files as evidence of a pack therefore refused every episode of an ordinary anime season — a release
+	// that plays, answered 404 and discarded by the client. SxxExx carries its season and can be trusted
+	// to mean what it says; this is why only it decides.
+	if labelled {
 		return nil, errEpisodeNotInTorrent
 	}
 	// No opinion, rather than a guess. The fallback below is sound only for a pool of ONE, where "the

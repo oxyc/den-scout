@@ -287,9 +287,11 @@ func TestStores_theFallbackNeverPicksANonVideo(t *testing.T) {
 	wantPick(t, got, err, 1, "with no video anywhere, the largest is all there is")
 }
 
-// A pack numbered the way most anime and much TV is packed. The episode is found by its own number, and
-// a pack that does not hold the episode asked for is refused rather than answered with its biggest file
-// — the same verdict a SxxExx pack gets, reached by the evidence that a POOL of numbered files is a pack.
+// A pack numbered the way most anime and much TV is packed: the episode is found by its own number.
+//
+// A miss, though, is NOT evidence the pack lacks the episode — bare numbering is often absolute, so
+// season 2 episode 1 is packed as `- 13` and nothing in the name says so. Only an unambiguous SxxExx
+// label, which carries its season, can condemn a pack; a bare miss defers to the indexer's file index.
 func TestPickEpisodeFile_bareNumberedPacks(t *testing.T) {
 	pack := []TorrentFile{
 		file(0, "[Grp] Show - 01 [1080p].mkv", 900),
@@ -300,19 +302,80 @@ func TestPickEpisodeFile_bareNumberedPacks(t *testing.T) {
 	wantPick(t, got, err, 2, "the episode is named by its own number")
 	got, err = pickEpisodeFile(pack, 1, 1)
 	wantPick(t, got, err, 0, "and so is the first one")
-	got, err = pickEpisodeFile(pack, 1, 9)
-	wantNotInTorrent(t, got, err, "a numbered pack that lacks the episode holds nothing to play")
-
-	// The guards that keep this from firing on anything with digits in it.
-	for _, f := range []TorrentFile{
-		file(0, "Movie.2019.1080p.BluRay.x264.mkv", 8000),
-		file(0, "[Group8] Feature [720p].mkv", 8000),
-	} {
-		got, err := pickEpisodeFile([]TorrentFile{f}, 1, 8)
-		wantPick(t, got, err, 0, "a lone release is not a numbered pack: "+f.Name)
+	if got, err := pickEpisodeFile(pack, 1, 9); got != nil || err != nil {
+		t.Errorf("a bare-number miss must defer, not condemn: got %v, %v", got, err)
 	}
-	// One numbered file is not a pack either — a film can be "Part 2".
-	single := []TorrentFile{file(0, "Some.Film.Part.2.mkv", 8000)}
-	got, err = pickEpisodeFile(single, 1, 7)
-	wantPick(t, got, err, 0, "a single numbered file still falls back")
+}
+
+// The bare-number matcher's boundaries, asserted where they can actually fail.
+//
+// Every name below is a real release shape. A dot cannot open a standalone number and can only close one
+// when no digit follows, because `DDP5.1`, `TrueHD.7.1`, `AC3.5.1`, `H.264`, `AAC.2.0` and a date all
+// contain dot-delimited digit runs. Treating the dot as an ordinary separator made every file in a pack
+// with 5.1 audio — most packs — match episode 1, and the largest was served: ask for E01 of a
+// ten-episode pack, get E10, 302, no error.
+func TestEpisodePatterns_bareNumberBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		episode int
+		want    bool
+		why     string
+	}{
+		{"[Grp] Show - 03 [1080p].mkv", 3, true, "the shape the matcher exists for"},
+		{"[Grp] Show - 3 [1080p].mkv", 3, true, "unpadded"},
+		{"[Grp] Show - 03.mkv", 3, true, "a dot closes the token when no digit follows"},
+		{"Show_07_1080p.mkv", 7, true, "underscores are separators too"},
+		{"Show.S01E03.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv", 1, false, "DDP5.1 is not episode 1"},
+		{"Show.S01E03.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv", 264, false, "H.264 is not episode 264"},
+		{"Show.S03E07.TrueHD.7.1.Atmos-GRP.mkv", 1, false, "TrueHD.7.1 is not episode 1"},
+		{"Show.S03E07.DTS-HD.MA.5.1-GRP.mkv", 5, false, "a dot-led 5 is not episode 5"},
+		{"Show.S03E07.AAC.2.0-GRP.mkv", 2, false, "AAC.2.0 is not episode 2"},
+		{"Show.S03E07.AAC.2.0-GRP.mkv", 0, false, "nor episode 0"},
+		// Space-separated names are where the trailing rule earns its keep: the leading rule alone cannot
+		// see `5` in "DDP 5.1", because a space really does open the token there. Only "a dot may not
+		// close a number when a digit follows" rejects it.
+		{"Show S03E07 DDP 5.1 Atmos-GRP.mkv", 5, false, "DDP 5.1 is not episode 5"},
+		{"Show S03E07 DTS-HD MA 7.1-GRP.mkv", 7, false, "nor 7.1 episode 7"},
+		{"Show.2024.03.15.1080p.WEB.h264-GRP.mkv", 3, false, "a date is not an episode"},
+		{"[Group8] Feature [720p].mkv", 8, false, "a group tag is not an episode"},
+		{"Movie.2019.1080p.BluRay.x264.mkv", 19, false, "a year is not an episode"},
+		{"Show.S01E03.1080p.mkv", 1080, false, "a resolution is not an episode"},
+		{"[Grp] Show - 03 [1080p][HEVC][10bit].mkv", 10, false, "10bit is not episode 10"},
+	} {
+		got := matchesEpisode(tc.name, episodePatterns(1, tc.episode))
+		if got != tc.want {
+			t.Errorf("ep %d vs %q: got %v, want %v — %s", tc.episode, tc.name, got, tc.want, tc.why)
+		}
+	}
+}
+
+// The two failures the boundaries above prevent, driven through the real pickers.
+func TestPickEpisodeFile_modernPackNamesAreNotAllEpisodeOne(t *testing.T) {
+	// A plain WEB-DL season pack. Every file carries DDP5.1 and H.264.
+	pack := []TorrentFile{
+		file(0, "Show.S01E01.First.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv", 900),
+		file(1, "Show.S01E02.Second.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv", 950),
+		file(2, "Show.S01E10.Tenth.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.mkv", 9000),
+	}
+	got, err := pickEpisodeFile(pack, 1, 1)
+	wantPick(t, got, err, 0, "E01 is E01, not the biggest file in the pack")
+
+	// An absolute-numbered anime pack: season 2 packed as episodes 13-24, which is what the catalogue's
+	// S02E01 means. The names match nothing, and the pool must NOT be condemned — the indexer's file
+	// index is right and the caller needs the chance to use it.
+	absolute := []TorrentFile{
+		file(0, "[Grp] Show - 13 [1080p][HEVC][10bit].mkv", 900),
+		file(1, "[Grp] Show - 14 [1080p][HEVC][10bit].mkv", 950),
+	}
+	if got, err := pickEpisodeFile(absolute, 2, 1); got != nil || err != nil {
+		t.Errorf("an absolute-numbered pack must defer to the indexer: got %v, %v", got, err)
+	}
+
+	// A lone episode beside its sample, neither naming an episode: still playable.
+	sampled := []TorrentFile{
+		file(0, "Show.1080p.WEB-DL.DDP5.1.H.264-NTb.mkv", 4000),
+		file(1, "Show.1080p.WEB-DL.DDP5.1.H.264-NTb-sample.mkv", 2),
+	}
+	got, err = selectFileID(sampled, ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(3)})
+	wantPick(t, got, err, 0, "a feature plus a sample is not a pack that lacks your episode")
 }
