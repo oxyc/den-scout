@@ -1920,3 +1920,115 @@ func TestRedactToken_anEmptyTokenLeavesTextAlone(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// The series path must heal from a deleted torrent exactly as the movie path does. Refusing to guess an
+// episode fires BEFORE requestDownload, whose 404 was the only producer of errTorrentGone and so the
+// only thing that could forget the id and re-add — so a pack deleted account-side answered 503
+// store_unavailable on every poll, forever: no backoff to lapse, the six-hour id refreshed each time,
+// and the tiered cache writing it through to disk so a restart did not clear it either. The distinction
+// that fixes it is that mylist ANSWERING "no such torrent" is not the same as mylist not answering.
+func TestTorBox_aDeletedPackIsReBoughtForASeriesToo(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	gone := true
+	adds := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case isAddEndpoint(r):
+			adds++
+			gone = false // re-bought: the account has it again
+			return resp(200, `{"data":{"torrent_id":77}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			if gone {
+				// TorBox's own words for an id it no longer holds — a 200, not an error.
+				return resp(200, `{"success":false,"data":null}`), nil
+			}
+			return resp(200, `{"data":{"files":[{"id":0,"name":"Show.S01E01.mkv","size":900},`+
+				`{"id":1,"name":"Show.S01E02.mkv","size":950}]}}`), nil
+		}
+		return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL) // a stale id from before the deletion
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+	link, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
+	if err != nil || link == "" {
+		t.Fatalf("a deleted pack must be re-bought, not answered unavailable forever: %q %v", link, err)
+	}
+	if adds != 1 {
+		t.Errorf("made %d adds; the stale id should have been forgotten and the pack re-added", adds)
+	}
+	if raw, _ := cache.Get(torrentIDKey("tok", H)); raw == "42" {
+		t.Error("the stale id survived, and every later poll would keep it alive for another six hours")
+	}
+}
+
+// The two answers must stay apart in the other direction too: a mylist that does not answer is NOT
+// grounds to forget the id and buy the torrent again, or a blip costs an add against the hourly ceiling
+// and Status loses the id it needs to report the download in progress.
+func TestTorBox_aBlipListingFilesDoesNotReBuyThePack(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	adds := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case isAddEndpoint(r):
+			adds++
+			return resp(200, `{"data":{"torrent_id":77}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			return resp(500, `{}`), nil
+		}
+		return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+	for i := 0; i < 10; i++ {
+		if link, _ := s.Resolve(context.Background(),
+			ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)}); link != "" {
+			t.Fatalf("poll %d served %q without ever seeing the pack's file names", i, link)
+		}
+	}
+	if adds != 0 {
+		t.Errorf("made %d adds; a blip listing files says nothing about what the account holds", adds)
+	}
+	if raw, _ := cache.Get(torrentIDKey("tok", H)); raw != "42" {
+		t.Errorf("the id is %q — dropped on a blip, so Status can no longer report the download", raw)
+	}
+}
+
+// Premiumize's error text is not merely logged: the refused branch PERSISTS it into the refusal cache,
+// from where the probe route prints it verbatim on every later poll. The apikey rides in directdl's form
+// body, so an upstream error page quoting the request back would put it there to stay.
+func TestPremiumize_theServicesWordsCannotCarryTheToken(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	const token = "pmsecrettoken"
+	reached := false
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			reached = true
+			body, _ := io.ReadAll(r.Body)
+			return resp(500, `Gateway error handling `+string(body)), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if !reached {
+		t.Fatal("directdl was never called, so this asserts nothing")
+	}
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Errorf("the token reached an error that gets logged: %v", err)
+	}
+	// And it must not have been written into the refusal memory either, which outlives the request.
+	if reason, ok := backedOff(cache, ServicePremiumize, token, H); ok && strings.Contains(reason, token) {
+		t.Errorf("the token was persisted into the refusal cache: %s", reason)
+	}
+}

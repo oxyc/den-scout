@@ -697,7 +697,13 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	needFiles bool, t ResolveTarget) (string, error) {
 	var files []TorrentFile
 	if needFiles {
-		files = s.listFiles(ctx, torrentID)
+		var err error
+		if files, err = s.listFiles(ctx, torrentID); errors.Is(err, errTorrentGone) {
+			// Returned HERE, above the id re-stamp below, and left for the caller to act on: this is the
+			// account saying it no longer holds the torrent, so the id must be forgotten and the torrent
+			// bought again. Stamping it first would refresh a stale id's six hours on every poll.
+			return "", err
+		}
 	}
 	// audit #3: don't cache an empty file list when we needed one (avoids poisoning the pack for 6h).
 	if s.cache != nil && (!needFiles || len(files) > 0) {
@@ -714,17 +720,19 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	// No list, and an episode to pick out of a pack: refuse rather than guess — but only after the id
 	// above is remembered, or a just-queued episode stops reporting as "downloading" and reads as dead.
 	//
-	// `listFiles` answers nil for a transport blip, a non-200 and an unreadable body alike, and that nil
-	// went straight into `selectFileID`, where it falls through to the indexer's raw fileIdx used as a
-	// TorBox file id — the exact disagreement the name-match exists to correct. A blip on mylist
-	// therefore served S01E01 for a request for S01E02, with a 302 and no error: silently the wrong
-	// episode, and nothing downstream can tell. The cache-read path already refuses on the same evidence
-	// (`!needFiles || len(e.Files) > 0`); this is the live path's equivalent. Naming TorBox is accurate —
-	// it is the one that did not answer — so the pool moves on to a store that can, and /play answers
-	// 503 or, for a torrent still fetching, the 202 that `Status` produces from the id just written.
+	// A missing list used to fall straight through to `selectFileID`, where the indexer's raw fileIdx is
+	// used as a TorBox file id — the exact disagreement the name-match exists to correct. A blip on
+	// mylist therefore served S01E01 for a request for S01E02, with a 302 and no error: silently the
+	// wrong episode, and nothing downstream can tell. The cache-read path already refuses on the same
+	// evidence (`!needFiles || len(e.Files) > 0`); this is the live path's equivalent. Naming TorBox is
+	// accurate — it is the one that did not answer — so the pool moves on to a store that can, and /play
+	// answers 503 or, for a torrent still fetching, the 202 `Status` produces from the id just written.
+	//
+	// Only "no answer" reaches here. `listFiles` returns errTorrentGone above for the account saying it
+	// no longer holds the id, which heals by re-adding; answering both alike wedged every episode of a
+	// deleted pack at a permanent 503, since the id was re-stamped on each poll and nothing re-added.
 	if needFiles && len(files) == 0 {
-		return "", &StoreUnavailableError{Service: ServiceTorBox,
-			Reason: "could not list the pack's files, so the episode cannot be identified"}
+		return "", errNoFileList
 	}
 	fileID, err := selectFileID(files, t)
 	if err != nil {
@@ -970,20 +978,41 @@ func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (i
 	return 0, false
 }
 
-func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) []TorrentFile {
+// errNoFileList — mylist gave no usable answer. Distinct from errTorrentGone, which is mylist ANSWERING
+// that the account no longer holds this id. Collapsing the two is what wedged a stale id: the refusal to
+// guess an episode fired before requestDownload, whose 404 was the only producer of errTorrentGone and
+// so the only thing that could forget the id and re-add the torrent.
+var errNoFileList = &StoreUnavailableError{Service: ServiceTorBox, Reason: "mylist gave no usable answer"}
+
+// listFiles returns the pack's files, or says WHY it cannot. The bare nil it used to answer stood for
+// four different facts — a transport blip, a non-200, an unreadable body, and TorBox's own "no such
+// torrent" — and every caller had to guess between them.
+func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFile, error) {
 	resp, err := s.get(ctx, fmt.Sprintf("%s/torrents/mylist?id=%d&bypass_cache=true", s.api, torrentID))
 	if err != nil {
-		return nil
+		return nil, errNoFileList
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errTorrentGone
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		return nil, errNoFileList
 	}
 	var body struct {
-		Data json.RawMessage `json:"data"`
+		Success *bool           `json:"success"`
+		Data    json.RawMessage `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
-		return nil
+		return nil, errNoFileList
+	}
+	// TorBox answers 200 with success:false / data:null for an id it no longer holds — the same shape
+	// Status already rejects explicitly, and unmarshalling null into a struct succeeds silently. This is
+	// mylist ANSWERING, so it is `gone`, not `no answer`: the caller must forget the id and re-add rather
+	// than report the store unavailable forever. (On requestdl the same success:false means the opposite
+	// — "no link yet" — which is why that endpoint keys the verdict on a 404 instead.)
+	if (body.Success != nil && !*body.Success) || len(body.Data) == 0 || string(body.Data) == "null" {
+		return nil, errTorrentGone
 	}
 	type tbFile struct {
 		ID        int    `json:"id"`
@@ -998,7 +1027,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) []TorrentFil
 	if json.Unmarshal(body.Data, &e) != nil {
 		var arr []entry
 		if json.Unmarshal(body.Data, &arr) != nil || len(arr) == 0 {
-			return nil
+			return nil, errNoFileList
 		}
 		e = arr[0]
 	}
@@ -1010,7 +1039,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) []TorrentFil
 		}
 		out = append(out, TorrentFile{Index: f.ID, Name: name, SizeBytes: f.Size})
 	}
-	return out
+	return out, nil
 }
 
 func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID *int) (string, error) {
@@ -1569,15 +1598,18 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		if !queued {
 			refundUnusedAdd(ServicePremiumize, s.token)
 		}
+		// Redacted for the same reason TorBox's is: the apikey rides in directdl's form body, and this
+		// text is not merely logged but PERSISTED into the refusal cache, from where the probe route
+		// prints it verbatim. An upstream error page that quotes the request back would put it there.
+		detail := redactToken(readStoreError(resp), s.token)
 		// Same rule as the other two stores: being turned away says nothing about the release.
 		if storeRefusedUs(resp.StatusCode) {
 			refused := &StoreUnavailableError{Service: ServicePremiumize, Status: resp.StatusCode,
-				Reason: fmt.Sprintf("directdl http %d%s", resp.StatusCode, readStoreError(resp))}
+				Reason: fmt.Sprintf("directdl http %d%s", resp.StatusCode, detail)}
 			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
 			return "", refused
 		}
-		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d%s",
-			resp.StatusCode, readStoreError(resp))}
+		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d%s", resp.StatusCode, detail)}
 	}
 	// Premiumize accepted it. Same reason as RD: no Status endpoint, so without this the next poll
 	// queues the same transfer again.

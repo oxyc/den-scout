@@ -221,14 +221,36 @@ func TestFindTorrentByHash_failureModes(t *testing.T) {
 	}
 }
 
-// listFiles is best-effort: a failure yields no files rather than an error, because a pack whose file
-// list can't be read is still playable by index.
-func TestTorBoxListFiles_degradesToEmpty(t *testing.T) {
-	for _, fn := range []func() (*http.Response, error){boom, status(500), ok(`garbage`), ok(`{"data":{}}`)} {
-		s := &torBoxStore{token: "k", api: torboxAPI, client: routed{fallbk: fn}}
-		if files := s.listFiles(t.Context(), 1); len(files) != 0 {
-			t.Errorf("expected no files, got %d", len(files))
-		}
+// listFiles says WHY it has no files, because the callers need different things from each answer. It was
+// once best-effort — "a pack whose file list can't be read is still playable by index" — and that was
+// wrong twice over: the index comes from the indexer, not the pack, so playing by it serves the wrong
+// episode; and TorBox's own "no such torrent" is an answer that heals by re-adding, not a failure.
+func TestTorBoxListFiles_saysWhyItHasNoFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   func() (*http.Response, error)
+		want error
+	}{
+		{"a transport blip", boom, errNoFileList},
+		{"a 500", status(500), errNoFileList},
+		{"an unreadable body", ok(`garbage`), errNoFileList},
+		{"a 404", status(404), errTorrentGone},
+		{"the account no longer holds it", ok(`{"success":false,"data":null}`), errTorrentGone},
+		{"a null payload", ok(`{"data":null}`), errTorrentGone},
+		// Answered, with an entry that simply lists no files — not a failure, and not gone. The caller
+		// refuses to guess an episode from it, but must not forget the id over it.
+		{"an entry with no files", ok(`{"data":{}}`), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &torBoxStore{token: "k", api: torboxAPI, client: routed{fallbk: tc.fn}}
+			files, err := s.listFiles(t.Context(), 1)
+			if len(files) != 0 {
+				t.Errorf("expected no files, got %d", len(files))
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("got %v, want %v — the caller decides whether to re-add on this", err, tc.want)
+			}
+		})
 	}
 }
 
