@@ -610,3 +610,31 @@ func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
 		t.Errorf("scraped %d times: a partial list must be cached, or every request pays the full scrape", scrapes)
 	}
 }
+
+// A cached entry written by an older build has no completeness recorded, and must be read as INCOMPLETE.
+//
+// A redeploy is exactly when short lists are in flight. Claiming completeness for one served it with a
+// five-minute max-age and a day of stale-if-error — the harm the three-part format exists to prevent,
+// reached through the one branch that handles entries surviving a deploy.
+func TestSplitCached_readsAnOlderEntryConservatively(t *testing.T) {
+	complete, etag, body := splitCached("W/\"abc\"\x00{\"streams\":[]}")
+	if complete {
+		t.Error("an entry with no completeness recorded must not be assumed complete")
+	}
+	if etag != "W/\"abc\"" || body != "{\"streams\":[]}" {
+		t.Errorf("legacy entry mis-split: etag=%q body=%q", etag, body)
+	}
+
+	// And the round trip of the current format.
+	for _, want := range []bool{true, false} {
+		got, e, b := splitCached(joinCached(want, "E", "B"))
+		if got != want || e != "E" || b != "B" {
+			t.Errorf("round trip complete=%v: got %v %q %q", want, got, e, b)
+		}
+	}
+	// A body containing the separator must not be truncated.
+	_, _, weird := splitCached(joinCached(true, "E", "a\x00b"))
+	if weird != "a\x00b" {
+		t.Errorf("body with a separator was truncated: %q", weird)
+	}
+}

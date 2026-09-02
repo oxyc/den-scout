@@ -136,7 +136,12 @@ func readStoreError(resp *http.Response) string {
 // storeRefusedUs reports whether an HTTP status is the service declining to serve this account right now —
 // a throttle or a fault on their side — rather than a verdict about the torrent.
 func storeRefusedUs(status int) bool {
-	return status == http.StatusTooManyRequests || status >= 500
+	// 401/403 belong here too: an expired or wrong API key is the service declining to serve THIS ACCOUNT,
+	// which says nothing about the release. Left out, a stale token produced a plain dead link — so no
+	// backoff was recorded, every poll paid another add against scout's own allowance, and the eventual
+	// refusals read as scout being busy rather than as a key that needs replacing.
+	return status == http.StatusUnauthorized || status == http.StatusForbidden ||
+		status == http.StatusTooManyRequests || status >= 500
 }
 
 func magnetFor(infoHash string) string { return "magnet:?xt=urn:btih:" + infoHash }
@@ -332,10 +337,31 @@ func pmQueuedKey(token, infoHash string) string {
 // again within one sitting.
 const queuedTTL = 20 * time.Minute
 
+// How long "the transfer is coming" stays believable. Past this the release is reported dead so the
+// client can fall through, while the marker itself lives on to the full queuedTTL so the transfer is not
+// queued a second time.
+const pendingGiveUp = 10 * time.Minute
+
+// noteQueued stamps the moment the transfer was queued. The TIME, not a flag: a flag rewritten on every
+// poll never ages, and a claim that never ages is not a wait, it is a promise nothing can withdraw.
 func noteQueued(cache Cache, token, infoHash string) {
 	if cache != nil {
-		cache.Put(pmQueuedKey(token, infoHash), "1", queuedTTL)
+		cache.Put(pmQueuedKey(token, infoHash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
 	}
+}
+
+// pendingTooLong — this transfer was queued long enough ago that "still coming" has stopped being a
+// credible answer, so the client should be free to try something else.
+func pendingTooLong(cache Cache, token, infoHash string) bool {
+	if cache == nil {
+		return false
+	}
+	raw, ok := cache.Get(pmQueuedKey(token, infoHash))
+	if !ok {
+		return false
+	}
+	at, err := strconv.ParseInt(raw, 10, 64)
+	return err == nil && time.Since(time.Unix(at, 0)) >= pendingGiveUp
 }
 
 // settleQueuedTransfer clears the marker once Premiumize has something to serve — the transfer is done,
@@ -1353,6 +1379,12 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// the remaining eighteen. What the marker suppresses is the CHARGE: the transfer is already paid for,
 	// so asking about it again must not spend another add.
 	queued := alreadyQueued(s.cache, s.token, t.InfoHash)
+	// Charged BEFORE the call, because the budget has to be able to gate it — directdl queues a transfer
+	// for anything the account lacks, so a spent allowance must stop the request, not merely record it.
+	// But directdl is a READ for anything Premiumize already holds, and charging every one of those billed
+	// an add per play: twenty-four episodes of a pack the account already had spent twenty-four of the
+	// hourly fifty while adding nothing. So the charge is given back below the moment the answer shows
+	// nothing was queued.
 	if !queued {
 		if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
 			return "", err
@@ -1393,11 +1425,17 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		} `json:"content"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Status != "success" || len(body.Content) == 0 {
-		// Queued, nothing to serve yet. Remembering it stops the next poll paying for the same transfer,
-		// and errAddInFlight is what makes the route answer 202 "coming" rather than 404 "dead" — a
-		// DeadLinkError here had the client remember a perfectly good release as unplayable, which is the
-		// exact defect the in-flight sentinel was introduced to end.
-		noteQueued(s.cache, s.token, t.InfoHash)
+		// Nothing to serve: this call really did queue a transfer, so the charge stands.
+		if !queued {
+			noteQueued(s.cache, s.token, t.InfoHash)
+		}
+		// "Coming" is a claim with a deadline. Refreshing the marker on every poll made it an absorbing
+		// state: a dead magnet or a transfer that errored answered 202 at 0% forever, and the client
+		// cannot fall through to another release while it is being told one is on its way. Past the
+		// window the answer becomes a dead link, which is what it has turned out to be.
+		if pendingTooLong(s.cache, s.token, t.InfoHash) {
+			return "", &DeadLinkError{"premiumize queued this transfer and never produced anything"}
+		}
 		return "", fmt.Errorf("%w: %w", errAddInFlight,
 			&StoreUnavailableError{ServicePremiumize, "the transfer is queued and has nothing to serve yet"})
 	}
@@ -1412,8 +1450,12 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if idx == nil || *idx < 0 || *idx >= len(body.Content) || body.Content[*idx].Link == "" {
 		return "", &DeadLinkError{"premiumize no link"}
 	}
-	// It has something to serve, so the transfer is no longer pending — and a much later request must be
-	// free to pay for it again if Premiumize has since dropped it.
+	// It has something to serve, so this call was a read, not a purchase: give the charge back. And the
+	// transfer is no longer pending, so a much later request is free to pay for it again if Premiumize
+	// has since dropped it.
+	if !queued {
+		refundUnusedAdd(ServicePremiumize, s.token)
+	}
 	settleQueuedTransfer(s.cache, s.token, t.InfoHash)
 	return body.Content[*idx].Link, nil
 }

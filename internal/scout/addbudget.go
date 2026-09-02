@@ -177,6 +177,16 @@ func refundAdd(svc DebridService, token string, err error) {
 	}
 }
 
+// refundUnusedAdd gives a charge back when the request turned out not to be an add at all.
+//
+// Premiumize's directdl is the only caller: it is a purchase for a release the account lacks and a plain
+// read for one it holds, and which of those happened is only knowable from the answer. Charging first
+// keeps the budget able to GATE the call; refunding here keeps a library of held releases from costing
+// an add per play.
+func refundUnusedAdd(svc DebridService, token string) {
+	globalAddBudget.refund(budgetAccount(svc, token))
+}
+
 // errRequestNotSent marks the one case where nothing reached the service: the request could not even be
 // constructed. Everything past that point may have been received.
 var errRequestNotSent = errors.New("request was not sent")

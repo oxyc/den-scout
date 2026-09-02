@@ -249,7 +249,7 @@ type buildResult struct {
 	complete bool
 }
 
-// buildStreamList scrapes → cache-checks → ranks → serializes, caches "<etag>\x00<body>", returns it.
+// buildStreamList scrapes → cache-checks → ranks → serializes, caches "<complete>\x00<etag>\x00<body>".
 func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) (string, string, bool) {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
@@ -721,7 +721,11 @@ func splitCached(v string) (complete bool, etag, body string) {
 	rest := v[first+1:]
 	second := strings.IndexByte(rest, '\x00')
 	if second < 0 {
-		return true, v[:first], rest // an entry written before completeness was recorded
+		// An entry written before completeness was recorded. Treat it as INCOMPLETE: a redeploy is
+		// exactly when short lists are in flight, and claiming completeness for one would serve it with a
+		// five-minute max-age and a day of stale-if-error — the harm this format exists to prevent. The
+		// cost of being wrong the other way is one extra scrape within the minute.
+		return false, v[:first], rest
 	}
 	return v[:first] == "1", rest[:second], rest[second+1:]
 }

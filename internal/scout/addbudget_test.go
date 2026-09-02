@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1135,5 +1136,92 @@ func TestCacheKeys_theNewOnesAreScopedToo(t *testing.T) {
 	e2 := rdTorrentKey("tok", H, ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
 	if e1 == e2 {
 		t.Error("two episodes of one pack share a remembered torrent")
+	}
+}
+
+// Premiumize's "coming" has a deadline, and a release it already holds costs nothing.
+//
+// Two failures either side of the same line. Refreshing the marker on every poll made 202 an absorbing
+// state: a dead magnet answered "downloading 0%" forever and the client could never fall through. And
+// charging for every directdl billed an add per play of a release the account already had — directdl is
+// a purchase for what Premiumize lacks and a plain read for what it holds, and only the answer says
+// which.
+func TestPremiumize_pendingExpiresAndHeldReleasesAreFree(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+	acct := budgetAccount(ServicePremiumize, "tok")
+
+	// A release Premiumize holds: served, and net zero against the allowance however often it is played.
+	cache := NewMemoryCache(1 << 20)
+	held := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `{"status":"success","content":[{"path":"m.mkv","link":"https://pm/l","size":9}]}`), nil
+		}}}
+	for i := 0; i < 24; i++ { // a season of a pack the account already has
+		if _, err := held.Resolve(context.Background(), ResolveTarget{InfoHash: H}); err != nil {
+			t.Fatalf("a held release must serve: %v", err)
+		}
+	}
+	if left := globalAddBudget.remaining(acct); left != 50 {
+		t.Errorf("allowance %d after 24 plays of a release the account already holds", left)
+	}
+
+	// A transfer that never produces anything: "coming" until the deadline, then dead so the client can
+	// try something else.
+	pending := NewMemoryCache(1 << 20)
+	stuck := &premiumizeStore{token: "tok", cache: pending, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `{"status":"success","content":[]}`), nil
+		}}}
+	if _, err := stuck.Resolve(context.Background(), ResolveTarget{InfoHash: H}); !errors.Is(err, errAddInFlight) {
+		t.Fatalf("a freshly queued transfer is coming: %v", err)
+	}
+	// Backdate the stamp past the give-up window — the marker records WHEN, so it can age.
+	pending.Put(pmQueuedKey("tok", H), strconv.FormatInt(time.Now().Add(-pendingGiveUp-time.Minute).Unix(), 10), queuedTTL)
+	_, err := stuck.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if errors.Is(err, errAddInFlight) {
+		t.Error("a transfer that never arrived is still reported as coming; the client cannot move on")
+	}
+	if err == nil {
+		t.Error("it produced nothing, so it cannot be a success either")
+	}
+}
+
+// A refused key is the SERVICE declining this account, not a verdict on the release — so it backs off
+// instead of paying for another attempt every poll.
+func TestStoreRefusedUs_coversAnExpiredKey(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusTooManyRequests, http.StatusInternalServerError} {
+		if !storeRefusedUs(code) {
+			t.Errorf("http %d is the service refusing us, not a dead release", code)
+		}
+	}
+	for _, code := range []int{http.StatusOK, http.StatusNotFound} {
+		if storeRefusedUs(code) {
+			t.Errorf("http %d is an answer about the release, not a refusal", code)
+		}
+	}
+
+	// End to end: a stale token must cost one add and one backoff, not one per poll.
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	calls := 0
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: "stale", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			calls++
+			return resp(403, `{"status":"error","message":"invalid apikey"}`), nil
+		}}}
+	for i := 0; i < 10; i++ {
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if calls != 1 {
+		t.Errorf("asked a service with a bad key %d times", calls)
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "stale")); left < 49 {
+		t.Errorf("a stale key drained the allowance to %d", left)
 	}
 }
