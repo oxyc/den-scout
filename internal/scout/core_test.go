@@ -34,15 +34,24 @@ func TestDecodeConfig(t *testing.T) {
 	}
 
 	// valid optional filters + dedupe indexers (#10) + drop bogus
-	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","bogus","comet","torrentio"],"filters":{"resolutions":["2160p","nope","1080p"],"hdrOnly":true,"maxSizeGB":40}}`))
-	// comet is named here but centrally disabled (it 403s every request), so it is dropped despite being
+	c, _ = decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","bogus","torz","torrentio"],"filters":{"resolutions":["2160p","nope","1080p"],"hdrOnly":true,"maxSizeGB":40}}`))
+	// torz is named here but centrally disabled (its host has no DNS), so it is dropped despite being
 	// asked for: a sealed config cannot be edited from the server, and carrying a dead host makes the
 	// survivors look like a quorum when one of them sheds a request.
 	if len(c.Indexers) != 1 || c.Indexers[0] != "torrentio" {
 		t.Errorf("indexers: %v", c.Indexers)
 	}
+
 	if len(c.Filters.Resolutions) != 2 || !c.Filters.HDROnly || c.Filters.MaxSizeGB == nil || *c.Filters.MaxSizeGB != 40 {
 		t.Errorf("filters: %+v", c.Filters)
+	}
+
+	// A live host that needs a config PATH is not disabled. comet 403s the bare path and answers on a
+	// config path, which `configPathIndexers` already handles — disabling it stripped it before
+	// makeScrapers could mint one, leaving the install with a single real source.
+	withComet, _ := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"indexers":["torrentio","comet"]}`))
+	if len(withComet.Indexers) != 2 {
+		t.Errorf("comet needs a config path, not a headstone: %v", withComet.Indexers)
 	}
 
 	// defaults. A config carrying only the account defers everything else to the server, which is what

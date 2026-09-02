@@ -43,9 +43,16 @@ var configPathIndexers = map[Indexer]string{
 // from the server, so without this an old blob keeps paying for a host that has been gone for months —
 // and worse, the survivors look like a quorum: when torrentio shed a burst, mediafusion's empty answer
 // became the whole result, and an episode torrentio serves 50 releases for read as "no source found".
+//
+// Only a host that is GONE belongs here. Comet was listed as "403s every request", which was a
+// misreading of a live host: it 403s the BARE path and answers on a config path, exactly like
+// mediafusion. That is what `configPathIndexers` handles — asked without a config it becomes an
+// unaskable scraper, which costs no request and counts correctly in the quorum. Disabling it instead
+// stripped it in validateConfig, before makeScrapers ever saw it, so `mintCometURL` — which needs no
+// round trip at all, being local base64 — was dead code, and the install was left with one real source
+// while every resilience rule here assumed several.
 var disabledIndexers = map[Indexer]string{
-	"comet": "403s every request",
-	"torz":  "host no longer resolves",
+	"torz": "host no longer resolves (no DNS)",
 }
 var validResolutions = map[string]bool{"2160p": true, "1080p": true, "720p": true, "480p": true}
 
