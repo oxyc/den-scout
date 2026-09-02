@@ -66,20 +66,64 @@ func TestHostLimiter_respectsCancellation(t *testing.T) {
 
 // Concurrent callers queue in order rather than all waking to the same free slot — the token is spent
 // even when the bucket goes negative, which is what makes the wait fair.
+//
+// Asserted on the SPREAD of delays, not on the wall clock. A wall-clock bound measures only the slowest
+// caller, so it passed just as happily when every overflow caller was handed one identical delay — which
+// is a synchronised herd, the precise opposite of a queue, and was a real shipped behaviour.
 func TestHostLimiter_concurrentCallersQueue(t *testing.T) {
-	l := newHostLimiter(20*time.Millisecond, 2)
-	var wg sync.WaitGroup
-	start := time.Now()
+	b := &bucket{tokens: 2, last: time.Now()}
+	var delays []time.Duration
 	for i := 0; i < 6; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); l.wait(context.Background(), "h") }()
+		delays = append(delays, b.take(20*time.Millisecond, 2))
 	}
-	wg.Wait()
-	// Two pass free and the rest are paced, so this takes at least one interval — where a limiter the
-	// callers raced through would take none. The total is bounded by the debt floor rather than by the
-	// caller count, which is that floor's whole purpose and has its own test.
-	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
-		t.Errorf("concurrent callers bypassed the limiter: %v", elapsed)
+	if delays[0] != 0 || delays[1] != 0 {
+		t.Errorf("the burst should pass free: %v", delays[:2])
+	}
+	// Each overflow caller waits one interval longer than the one before it, so they leave in order
+	// instead of arriving at the host together.
+	for i := 2; i < len(delays); i++ {
+		want := time.Duration(i-1) * 20 * time.Millisecond
+		if delays[i] < want-time.Millisecond || delays[i] > want+time.Millisecond {
+			t.Errorf("caller %d waited %v, want ~%v (delays must fan out, not collapse)", i, delays[i], want)
+		}
+	}
+}
+
+// A cancel-heavy caller must not be able to defeat the limiter.
+//
+// This is the regression that a debt floor plus an unconditional refund produced together: a caller
+// clamped by the floor was charged nothing, but cancelling still gave a token back, so every abandoned
+// wait MINTED one. Measured on the shipped settings, ~4000 requests passed free in two seconds against a
+// budget of twelve. Each half looked reasonable in review; only together were they a hole.
+func TestHostLimiter_cancellationCannotMintTokens(t *testing.T) {
+	// Repeated WAVES, not one burst: minted tokens are only visible once a later caller spends them, so
+	// a single wave of cancels proves nothing and would pass against the very bug this exists to catch.
+	l := newHostLimiter(50*time.Millisecond, 4)
+	var free int
+	var mu sync.Mutex
+	for wave := 0; wave < 20; wave++ {
+		var wg sync.WaitGroup
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+				defer cancel()
+				start := time.Now()
+				l.wait(ctx, "h")
+				if time.Since(start) < 500*time.Microsecond {
+					mu.Lock()
+					free++
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	// 400 callers over ~20 waves. Only the burst of 4, plus whatever elapsed time genuinely earned,
+	// may pass without waiting; the bug this catches let hundreds through.
+	if free > 25 {
+		t.Errorf("%d of 400 callers passed free under a burst of 4: cancellation is minting tokens", free)
 	}
 }
 
@@ -108,7 +152,6 @@ func TestBucket_refillsByElapsedTime(t *testing.T) {
 
 // The configured rate, asserted as a rate. The timing tests accept a wide band; this pins the maths.
 func TestBucket_delayMatchesTheConfiguredRate(t *testing.T) {
-	// Burst 8 so the debt floor does not bind — that behaviour has its own test.
 	b := &bucket{tokens: 0, last: time.Now()}
 	b.take(time.Second, 8) // spends to -1
 	delay := b.take(time.Second, 8)
@@ -118,20 +161,54 @@ func TestBucket_delayMatchesTheConfiguredRate(t *testing.T) {
 	}
 }
 
-// Debt is floored, or a stampede queues the tail arbitrarily far past the caller's own deadline.
-func TestBucket_debtIsFloored(t *testing.T) {
+// Debt accumulates exactly, one token per caller. It is deliberately NOT floored: a caller that would
+// queue past its own deadline is released by its context, not by forgiving the debt, because forgiven
+// debt is indistinguishable from a token that was never spent and can be refunded into existence.
+func TestBucket_debtIsExact(t *testing.T) {
 	b := &bucket{tokens: 0, last: time.Now()}
-	var worst time.Duration
 	for i := 0; i < 100; i++ {
-		if d := b.take(10*time.Millisecond, 4); d > worst {
-			worst = d
-		}
+		b.take(time.Hour, 4) // an hour per token, so elapsed-time refill can't blur the count
 	}
-	if b.tokens < -4.001 {
-		t.Errorf("debt ran past the floor: %.2f", b.tokens)
+	if b.tokens > -99.9 || b.tokens < -100.1 {
+		t.Errorf("100 callers should owe 100 tokens, bucket holds %.2f", b.tokens)
 	}
-	if worst > 50*time.Millisecond {
-		t.Errorf("a stampede queued the tail %v out", worst)
+}
+
+// A refund can only ever undo a spend. Without the cap it is a way to create tokens: refunds outnumber
+// spends whenever a caller is released by its context, and an uncapped counter banks the difference.
+func TestBucket_refundCannotBankCredit(t *testing.T) {
+	b := &bucket{tokens: 4, last: time.Now()}
+	for i := 0; i < 10; i++ {
+		b.refund(4)
+	}
+	if b.tokens > 4.001 {
+		t.Errorf("refunds banked credit past the burst: %.2f", b.tokens)
+	}
+
+	// It still refunds where a token really was spent.
+	b = &bucket{tokens: 0, last: time.Now()}
+	b.take(time.Hour, 4)
+	b.refund(4)
+	if b.tokens < -0.001 || b.tokens > 0.001 {
+		t.Errorf("a spend followed by its refund should net zero: %.2f", b.tokens)
+	}
+}
+
+// The clamps in newHostLimiter, exercised. A zero interval makes the refill +Inf and every delay zero —
+// a limiter that reads as configured and silently isn't — and burst 0 would pace even the first request.
+func TestNewHostLimiter_clampsNonsenseSettings(t *testing.T) {
+	l := newHostLimiter(0, 0)
+	if l.every <= 0 {
+		t.Errorf("a non-positive interval was not clamped: %v", l.every)
+	}
+	if l.burst < 1 {
+		t.Errorf("burst was not clamped to at least one: %d", l.burst)
+	}
+	// And the clamped limiter genuinely paces: one free, the next waits.
+	l = newHostLimiter(-time.Second, -5)
+	l.wait(context.Background(), "h")
+	if d := l.buckets["h"].take(l.every, l.burst); d <= 0 {
+		t.Error("a clamped limiter does not pace at all")
 	}
 }
 

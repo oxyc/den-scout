@@ -69,7 +69,7 @@ func (l *hostLimiter) wait(ctx context.Context, host string) {
 		// Give the token back. The caller abandons the request, so nothing was asked of the host — and a
 		// token spent on a request never sent is debt the NEXT caller pays, at a rate comparable to the
 		// scrape budget itself.
-		b.refund()
+		b.refund(l.burst)
 	case <-timer.C:
 	}
 }
@@ -77,6 +77,14 @@ func (l *hostLimiter) wait(ctx context.Context, host string) {
 // take refills by elapsed time, spends a token, and reports how long the caller must wait for it. The
 // token is spent even when the bucket goes negative, so concurrent callers queue in order rather than all
 // waking to the same free slot.
+//
+// Debt is NOT floored. A floor was tried and had to come out: a clamped caller is charged nothing, but a
+// clamped caller that then cancels still refunds — so under a cancel-heavy load the floor MANUFACTURED
+// tokens and the limiter stopped limiting (measured: ~4000 free passes in two seconds against a budget
+// of twelve). It was also solving a problem that is not this function's to solve. The floor existed to
+// stop a caller queueing past its own deadline; `wait` already returns the moment the caller's context
+// ends, which is the same protection with none of the accounting damage — and without collapsing every
+// saturated caller onto one identical delay, which turned the queue into a synchronised herd.
 func (b *bucket) take(every time.Duration, burst int) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -87,20 +95,18 @@ func (b *bucket) take(every time.Duration, burst int) time.Duration {
 	}
 	b.last = now
 	b.tokens--
-	// Debt is floored at one burst. Unbounded, a stampede queues the tail arbitrarily far out — and the
-	// caller's own deadline is the wrong place to discover that, since a request that waits past its
-	// budget is exactly the "timed out because it queued" failure this must not cause.
-	if b.tokens < -float64(burst) {
-		b.tokens = -float64(burst)
-	}
 	if b.tokens >= 0 {
 		return 0
 	}
 	return time.Duration(-b.tokens * float64(every))
 }
 
-func (b *bucket) refund() {
+// refund returns the token a caller spent but never used, capped at the burst so it can only ever undo a
+// spend — never bank credit the bucket did not earn by elapsed time.
+func (b *bucket) refund(burst int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.tokens++
+	if b.tokens < float64(burst) {
+		b.tokens++
+	}
 }
