@@ -492,7 +492,12 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		if f.MaxSizeGB != nil && intOr(s.SizeBytes, 0) > *f.MaxSizeGB*gib {
 			continue
 		}
-		if f.CachedOnly && !s.Cached {
+		// "Show me only what plays now" is a filter on what we KNOW is not cached, not on what we failed
+		// to find out. Cache checks batch, so one failed batch leaves a hundred releases unknown while the
+		// rest of the list is perfectly well known — and dropping those removed up to a hundred playable
+		// releases from the list with nothing anywhere saying so. A release nobody could check survives
+		// and ranks below the confirmed-cached ones, which is the honest ordering.
+		if f.CachedOnly && !s.Cached && s.CacheKnown {
 			continue
 		}
 		out = append(out, scored{s, i, qualityScoreLower(lower, s, junk), intOr(s.Seeders, 0)})

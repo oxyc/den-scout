@@ -101,14 +101,29 @@ func TestDetectResolution(t *testing.T) {
 }
 
 func TestRankStreams(t *testing.T) {
+	// CacheKnown on all three: the check ran and answered for each of them. cachedOnly drops what is
+	// KNOWN not to be cached — see below for what it must not drop.
 	streams := []RawStream{
-		rs("A 1080p WEB-DL", func(s *RawStream) { s.Cached = true }),
-		rs("B 2160p HDCAM", func(s *RawStream) { s.Cached = true }),
-		rs("C 1080p WEB-DL", nil),
+		rs("A 1080p WEB-DL", func(s *RawStream) { s.Cached, s.CacheKnown = true, true }),
+		rs("B 2160p HDCAM", func(s *RawStream) { s.Cached, s.CacheKnown = true, true }),
+		rs("C 1080p WEB-DL", func(s *RawStream) { s.CacheKnown = true }),
 	}
 	ranked := rankStreams(streams, rankFilters{ExcludeCam: true, CachedOnly: true, ResultCap: 5})
 	if len(ranked) != 1 || ranked[0].Title != "A 1080p WEB-DL" {
 		t.Errorf("excludeCam+cachedOnly: got %v", titles(ranked))
+	}
+
+	// A release nobody could CHECK is not a release known to be uncached. Cache checks batch, so one
+	// failed batch leaves a hundred unknown while the rest of the list is perfectly well known — and
+	// dropping those removed up to a hundred playable releases with nothing anywhere saying so.
+	unchecked := []RawStream{
+		rs("A 1080p WEB-DL", func(s *RawStream) { s.Cached, s.CacheKnown = true, true }),
+		rs("B 1080p WEB-DL", func(s *RawStream) { s.CacheKnown = true }),  // known: not cached
+		rs("C 1080p WEB-DL", func(s *RawStream) { s.CacheKnown = false }), // its batch failed
+	}
+	keptUnchecked := rankStreams(unchecked, rankFilters{CachedOnly: true, ResultCap: 5})
+	if len(keptUnchecked) != 2 {
+		t.Errorf("cachedOnly dropped a release nobody could check: %v", titles(keptUnchecked))
 	}
 
 	// hdrOnly keeps only HDR/DV.

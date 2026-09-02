@@ -29,12 +29,26 @@ type ResolveTarget struct {
 	FileIdx  *int
 	Season   *int
 	Episode  *int
+	// NoAdd forbids queueing the torrent: resolve it from what the account already has, or fail.
+	//
+	// A background caller cannot promise this by choosing carefully, because whether a Resolve adds is
+	// decided deep inside each store. The probe path DID choose carefully — it only resolves releases a
+	// cache check reported as held — and still POSTed createtorrent, because TorBox's checkcached reports
+	// what TORBOX has, not what this ACCOUNT has. "Held" was never the same as "already added". Only the
+	// store can enforce this, so the caller states the requirement and the store obeys it.
+	NoAdd bool
 }
 
-// Store is a debrid backend. CacheCheck always returns a full map (missing hashes → false); the error
-// is non-nil only when the check itself could not be performed (API unreachable/non-200 for every
-// batch), which lets the pool distinguish "not cached" from "couldn't tell" and avoid caching an
-// empty list built during a store outage.
+// errWouldAdd — a NoAdd target could only be resolved by queueing the torrent, so it was not resolved.
+var errWouldAdd = &DeadLinkError{"not held by this account (add not permitted)"}
+
+// Store is a debrid backend.
+//
+// CacheCheck returns ONLY what it learned: a hash it could not check is ABSENT from the map, which the
+// pool reads as unknown. Do not pre-seed the map with false — "not cached" and "could not find out" have
+// opposite costs, and conflating them drops playable releases from a cached-only list and pays adds for
+// torrents the account already holds. The error is non-nil only when NOTHING could be checked (every
+// batch failed), which is what tells the pool a store is down rather than empty.
 type Store interface {
 	Service() DebridService
 	CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error)
@@ -386,6 +400,11 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 			return "", &StoreUnavailableError{ServiceTorBox, reason + " (backing off)"}
 		}
 	}
+	// A NoAdd caller gets here only when the cache above held nothing usable, which means the account does
+	// not have this torrent yet — and the only way onward is to queue it.
+	if t.NoAdd {
+		return "", errWouldAdd
+	}
 	torrentID, err := s.addMagnet(ctx, t.InfoHash)
 	if err != nil {
 		// Every refused add backs off, not only a 429. The refusal that caused the incident was a 400 —
@@ -435,6 +454,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	resp, err := s.client.Do(req)
 	if err != nil {
+		refundAdd(ServiceTorBox, s.token, err)
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -753,11 +773,15 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if reason, ok := backedOff(s.cache, ServiceRealDebrid, s.token, t.InfoHash); ok {
 		return "", &StoreUnavailableError{ServiceRealDebrid, reason + " (backing off)"}
 	}
+	if t.NoAdd {
+		return "", errWouldAdd // RD has no cache API, so every resolve here is an add
+	}
 	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
 	}
 	addResp, err := s.post(ctx, "/torrents/addMagnet", url.Values{"magnet": {magnetFor(t.InfoHash)}})
 	if err != nil {
+		refundAdd(ServiceRealDebrid, s.token, err)
 		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
 		return "", err
 	}
@@ -971,6 +995,9 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		return "", &StoreUnavailableError{ServicePremiumize, reason + " (backing off)"}
 	}
 	// directdl queues a transfer for anything the account does not already hold, so it is an add.
+	if t.NoAdd {
+		return "", errWouldAdd
+	}
 	if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
 		return "", err
 	}
@@ -982,6 +1009,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	resp, err := s.client.Do(req)
 	if err != nil {
+		refundAdd(ServicePremiumize, s.token, err)
 		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		return "", err
 	}
@@ -1160,32 +1188,16 @@ func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error
 // release nobody is seeding: the client waits on a download the service was never asked to start.
 func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	preferred []DebridService) (string, error) {
-	holds := make(map[DebridService]bool, len(preferred))
-	for _, svc := range preferred {
-		holds[svc] = true
-	}
 	var refused error
-	// When we KNOW who holds this, adds are bounded to one. A holder only reads, so asking every holder
-	// costs nothing; a non-holder ADDS, and the fallthrough did that once per configured account — one
-	// press of play could queue the same torrent on three services, spending three of an hourly sixty for
-	// a single file, and the second and third cannot help because the first is already fetching exactly
-	// what they would.
+	// Holders are tried FIRST, which is the whole point: a service that already holds the release serves
+	// it now, where another has to fetch it. Every store still gets a turn if the holders fail.
 	//
-	// With no holders known — a cache-check outage, or an RD-only install where there is no cache truth
-	// to have — the bound does NOT apply. There the fallthrough is the only way to resolve at all, and
-	// refusing it would turn "we could not find out" into "you cannot play this". The add budget is what
-	// bounds that case; this bounds the case where we have better information than a guess.
-	boundAdds := len(preferred) > 0
-	spentAdd := false
+	// An earlier version stopped after one non-holder, to keep a single play from queueing the same
+	// torrent on every account. That bound could not be made safe: it bites only when a store FAILS,
+	// which is exactly when the next store is the viewer's last chance, so it turned "the first two
+	// accounts couldn't serve this" into "you cannot play this" — a release that used to play. Adds are
+	// bounded by `spendAdd`, which is a ceiling rather than a coin flip on which store gets to try.
 	for _, st := range p.ordered(preferred) {
-		if boundAdds && !holds[st.Service()] {
-			if spentAdd {
-				log.Printf("scout: not also adding %s to %s — one fetch is already queued",
-					shortHash(t.InfoHash), st.Service())
-				continue
-			}
-			spentAdd = true
-		}
 		link, err := st.Resolve(ctx, t)
 		if err == nil {
 			return link, nil
@@ -1196,11 +1208,6 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 		var unavailable *StoreUnavailableError
 		if errors.As(err, &unavailable) && refused == nil {
 			refused = err
-		}
-		// A store that was REFUSED never got to add anything, so the allowance is still unspent and the
-		// next store may use it. Otherwise a throttled first account would block the fetch entirely.
-		if errors.As(err, &unavailable) {
-			spentAdd = false
 		}
 	}
 	if refused != nil {

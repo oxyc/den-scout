@@ -187,43 +187,24 @@ func TestResolvePreferring_ignoresUnknownServices(t *testing.T) {
 	}
 }
 
-// One press of play must not queue the same torrent on every configured account.
-//
-// A store that HOLDS the release only reads it, so asking every holder is free. A store that does not
-// hold it ADDS it — and the fallthrough did that once per account, spending three of an hourly sixty to
-// obtain a single file. The second and third adds cannot help: the first is already fetching exactly
-// what they would.
-func TestResolvePreferring_addsToOneStoreAtMost(t *testing.T) {
+// Every store gets a turn. An earlier version stopped after one non-holder had been asked, to keep a
+// single play from queueing the same torrent on every account — but that bound bites only when a store
+// FAILS, which is exactly when the next store is the viewer's last chance. It turned "the first two
+// accounts could not serve this" into "you cannot play this", for a release that used to play. Adds are
+// bounded by spendAdd instead, which is a ceiling rather than a coin flip on which store gets to try.
+func TestResolvePreferring_neverStopsShortOfAStoreThatCouldServe(t *testing.T) {
 	var calls []DebridService
 	pool := &StorePool{stores: []Store{
 		namedStore{svc: ServiceTorBox, resolves: &calls},     // holder, but cannot serve
-		namedStore{svc: ServiceRealDebrid, resolves: &calls}, // non-holder: may add
-		namedStore{svc: ServicePremiumize, resolves: &calls}, // non-holder: must be skipped
-	}}
-	_, err := pool.ResolvePreferring(t.Context(), ResolveTarget{InfoHash: H}, []DebridService{ServiceTorBox})
-	if err == nil {
-		t.Fatal("nothing could serve it; this should fail")
-	}
-	if len(calls) != 2 || calls[0] != ServiceTorBox || calls[1] != ServiceRealDebrid {
-		t.Errorf("stores asked: %v — a second non-holder was allowed to add the same torrent", calls)
-	}
-}
-
-// A store that REFUSED us never got to add anything, so the allowance is still unspent. Otherwise a
-// throttled first account would block the fetch outright.
-func TestResolvePreferring_arefusalDoesNotSpendTheAdd(t *testing.T) {
-	var calls []DebridService
-	pool := &StorePool{stores: []Store{
-		namedStore{svc: ServiceTorBox, resolves: &calls, refuse: true}, // holder, throttled
-		namedStore{svc: ServiceRealDebrid, resolves: &calls, refuse: true},
+		namedStore{svc: ServiceRealDebrid, resolves: &calls}, // dead-links too
 		namedStore{svc: ServicePremiumize, link: "https://pm/x", resolves: &calls},
 	}}
 	link, err := pool.ResolvePreferring(t.Context(), ResolveTarget{InfoHash: H}, []DebridService{ServiceTorBox})
 	if err != nil || link != "https://pm/x" {
-		t.Fatalf("a throttled account must not block the fetch: %q %v", link, err)
+		t.Fatalf("the third store could serve it and must be asked: %q %v", link, err)
 	}
 	if len(calls) != 3 {
-		t.Errorf("stores asked: %v — a refusal wrongly consumed the add allowance", calls)
+		t.Errorf("stores asked: %v — a store that could serve the release was skipped", calls)
 	}
 }
 

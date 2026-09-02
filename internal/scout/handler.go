@@ -109,9 +109,15 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	case "/health":
 		// Stays 200 (liveness — don't trip the container HEALTHCHECK), but reports the degraded scrape
 		// state so a monitor sees a total-indexer outage instead of just "empty results".
-		status := map[string]string{"status": "ok"}
+		status := map[string]any{"status": "ok"}
 		if h.scrapeFails.Load() >= scrapeFailThreshold {
-			status = map[string]string{"status": "degraded", "reason": "indexers"}
+			status = map[string]any{"status": "degraded", "reason": "indexers"}
+		}
+		// A spent add budget refuses every play with the same 503 a throttled debrid gives, and until now
+		// the only evidence was one log line per refusal. Report what is left, per account, so an
+		// exhausted allowance is visible before someone spends an evening blaming the debrid.
+		if spent := globalAddBudget.snapshot(); len(spent) > 0 {
+			status["addBudget"] = spent
 		}
 		writeJSON(w, http.StatusOK, status, noStore)
 		return
@@ -250,6 +256,17 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		// asserted the answer for exactly the hashes nobody had an answer for.
 		seeds[i].CacheKnown = truth.Known(hash)
 	}
+	// A PARTIALLY failed check is degraded too. `truthOK` only asks whether some store answered about
+	// something, so one failed batch out of five left it true: the list went out and was CACHED as
+	// authoritative with a hundred releases unexamined, and no header said so.
+	unchecked := 0
+	if hasCacheTruth(config) {
+		for i := range seeds {
+			if !seeds[i].CacheKnown {
+				unchecked++
+			}
+		}
+	}
 
 	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
 	// misleading empty/partial list; return it for this request but don't cache it, so the next request
@@ -261,7 +278,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		h.scrapeFails.Add(1)
 	}
 
-	truthDegraded := hasCacheTruth(config) && !truthOK
+	truthDegraded := hasCacheTruth(config) && (!truthOK || unchecked > 0)
 	degradedReason := ""
 	if !scrapeOK {
 		degradedReason = "indexers"
@@ -269,6 +286,9 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		degradedReason = "cache-check"
 	}
 	degraded := degradedReason != ""
+	if unchecked > 0 {
+		log.Printf("scout: %s %s: %d of %d releases could not be cache-checked", sid.Type, sid.IMDb, unchecked, len(seeds))
+	}
 
 	// audit #4: with no cache-truth store (RD-only), the cached-only filter would drop everything. Also
 	// skip it when the cache-truth stores are unreachable this request (don't drop everything on a blip).

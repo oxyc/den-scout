@@ -69,6 +69,24 @@ func (b *addBudget) take(account string) bool {
 	return true
 }
 
+// refund returns the most recent charge when the add did not happen. Without it a cancelled request is
+// indistinguishable from a torrent that was queued, and the client cancels constantly — fifty cancelled
+// polls of ONE release closed the whole hour, measured, after which every other title was refused too.
+// The same lesson the host limiter learned: a charge for a request that was never made is debt the next
+// caller pays.
+func (b *addBudget) refund(account string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	spent := b.spent[account]
+	if len(spent) == 0 {
+		return
+	}
+	b.spent[account] = spent[:len(spent)-1]
+}
+
 // remaining is for logging and /health — how many adds the account may still make this window.
 func (b *addBudget) remaining(account string) int {
 	if b == nil {
@@ -89,9 +107,35 @@ func (b *addBudget) remaining(account string) int {
 	return 0
 }
 
-// One per process, keyed by service+account, so every store built for every request shares the count. A
-// budget held on the store would reset on each request, which is every request — the stores are rebuilt
-// per call from the install's config.
+// snapshot reports the remaining allowance per account, for /health. Only accounts that have spent
+// something appear, so a fresh process reports nothing rather than a list of zeros.
+func (b *addBudget) snapshot() map[string]int {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	accounts := make([]string, 0, len(b.spent))
+	for acct := range b.spent {
+		accounts = append(accounts, acct)
+	}
+	b.mu.Unlock()
+	out := make(map[string]int, len(accounts))
+	for _, acct := range accounts {
+		if left := b.remaining(acct); left < b.limit {
+			// The account key is service:hash(token) — the hash keeps the token out of a response that is
+			// not otherwise authenticated, while still telling two accounts apart.
+			out[acct] = left
+		}
+	}
+	return out
+}
+
+// One per process, keyed by service+account, so every store built for every request shares the count.
+//
+// In memory, deliberately but not costlessly: a redeploy or crash-loop resets the count while the real
+// hourly ceiling keeps counting, so a restart hands back an allowance the service has not. The gap
+// between this limit and the real 60 is what absorbs that, which is one more reason not to close it.
+// A budget held on the store would be worse still — the stores are rebuilt per request.
 var globalAddBudget = newAddBudget(addBudgetWindow, addBudgetLimit)
 
 // spendAdd charges one add against a service's account, or refuses. Every store calls this immediately
@@ -102,9 +146,23 @@ var globalAddBudget = newAddBudget(addBudgetWindow, addBudgetLimit)
 // Real-Debrid close TorBox's budget, and a service with no published limit would still be worth bounding
 // — an unbounded add loop is a bug wherever it points.
 func spendAdd(svc DebridService, token, infoHash string) error {
-	if globalAddBudget.take(string(svc) + ":" + keyHash(token)) {
+	if globalAddBudget.take(budgetAccount(svc, token)) {
 		return nil
 	}
 	log.Printf("scout: %s add budget spent for the hour, refusing %s", svc, shortHash(infoHash))
 	return &StoreUnavailableError{svc, "hourly add budget spent"}
+}
+
+// refundAdd gives the charge back when the request that would have queued the torrent never completed —
+// a cancelled client, an expired deadline. Charging before the request is right (an add that succeeds
+// but whose response is lost must still count), but only if an add that demonstrably did not happen is
+// given back.
+func refundAdd(svc DebridService, token string, err error) {
+	if isCancellation(err) {
+		globalAddBudget.refund(budgetAccount(svc, token))
+	}
+}
+
+func budgetAccount(svc DebridService, token string) string {
+	return string(svc) + ":" + keyHash(token)
 }

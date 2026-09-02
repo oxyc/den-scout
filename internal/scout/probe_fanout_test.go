@@ -250,3 +250,51 @@ func TestWithProbe_emptyFieldsDoNotErase(t *testing.T) {
 		t.Fatalf("empty probe erased title data: %+v", got)
 	}
 }
+
+// The probe marks its target NoAdd, so the store refuses rather than queueing.
+//
+// Choosing only held releases was not enough, and this is the assertion that says why: TorBox's cache
+// check reports what TORBOX has, not what this ACCOUNT has, so a "held" release with no warm resolve
+// entry went straight to createtorrent. Six adds per newly-viewed title, from a read path, which is the
+// bug the holder-scoping was supposed to have ended.
+func TestProbeTop_marksItsTargetNoAdd(t *testing.T) {
+	seen := make(chan ResolveTarget, 1)
+	h := &handler{deps: Deps{
+		Cache:       NewMemoryCache(1 << 20),
+		ProbeClient: http.DefaultClient,
+		MakeStores: func(*Config) []Store {
+			return []Store{capturingStore{svc: ServiceTorBox, seen: seen}}
+		},
+	}}
+	streams := []RawStream{{InfoHash: "held-hash", Cached: true}}
+	h.probeTop(context.Background(), &Config{}, streams, nil, heldOnTorBox("held-hash"))
+
+	select {
+	case target := <-seen:
+		if !target.NoAdd {
+			t.Error("the probe resolved without NoAdd — the store is free to queue the torrent")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the background probe never ran")
+	}
+}
+
+type capturingStore struct {
+	svc  DebridService
+	seen chan ResolveTarget
+}
+
+func (c capturingStore) Service() DebridService { return c.svc }
+func (c capturingStore) CacheCheck(context.Context, []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+func (c capturingStore) Resolve(_ context.Context, t ResolveTarget) (string, error) {
+	select {
+	case c.seen <- t:
+	default:
+	}
+	return "", nil
+}
+func (c capturingStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}

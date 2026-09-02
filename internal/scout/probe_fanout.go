@@ -86,6 +86,10 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 			holders: holders,
 			target: ResolveTarget{
 				InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonOf(sid), Episode: episodeOf(sid),
+				// Enforced by the store, not promised by this caller. Picking only held releases was not
+				// enough: TorBox's cache check says what TORBOX has, not what this ACCOUNT has, so a
+				// "held" release with no warm resolve entry still went to createtorrent.
+				NoAdd: true,
 			},
 		})
 	}

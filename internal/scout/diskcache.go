@@ -118,8 +118,13 @@ const (
 //
 // Best-effort like the rest of the disk tier: an unreadable directory, or a file that vanishes underneath
 // us, is skipped rather than fatal.
+// Deliberately NOT gated on `disabled()`. `disable` is set for the process lifetime by one failed write,
+// and it also short-circuits Get before the on-read expiry removal — so a single ENOSPC or permissions
+// blip used to turn off BOTH ways an entry is ever reclaimed, leaving the store to grow untouched. The
+// directory may still be readable when it is not writable, and reaping is exactly what helps if the
+// problem was space.
 func (c *TieredCache) Sweep() int {
-	if c.disabled() {
+	if c.dir == "" {
 		return 0
 	}
 	entries, err := os.ReadDir(c.dir)
@@ -180,7 +185,7 @@ func (c *TieredCache) entryExpired(path string, now time.Time) bool {
 // SweepEvery runs Sweep on a ticker until ctx ends. Started once from main, so the goroutine lives as
 // long as the process and there is nothing to stop but the context.
 func (c *TieredCache) SweepEvery(ctx context.Context, every time.Duration) {
-	if c.disabled() {
+	if c.dir == "" {
 		return
 	}
 	// Once at startup: a redeploy is the most likely moment for the store to be holding a backlog of

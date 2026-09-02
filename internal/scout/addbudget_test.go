@@ -202,3 +202,80 @@ func TestStores_refuseToAddOnceTheBudgetIsSpent(t *testing.T) {
 		})
 	}
 }
+
+// A cancelled add must give its charge back, or the client wedges its own hour shut.
+//
+// The charge happens before the request, which is right — an add that succeeds but whose response is
+// lost must still count. But the tvOS client polls /play every couple of seconds on the request context
+// and cancels on a focus change, so without a refund fifty cancelled polls of ONE release closed the
+// whole allowance in under two minutes (measured), after which every other title was refused too.
+func TestAddBudget_cancelledAddsDoNotWedgeTheHour(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 5)
+	defer func() { globalAddBudget = prev }()
+
+	d := mockDoer{fn: func(*http.Request) (*http.Response, error) { return nil, context.Canceled }}
+	s := &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
+	for i := 0; i < 50; i++ {
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != 5 {
+		t.Errorf("%d of 5 adds left after fifty CANCELLED polls — cancellation is spending the budget", left)
+	}
+	// And an unrelated title is still playable.
+	if err := spendAdd(ServiceTorBox, "tok", repeat("c", 40)); err != nil {
+		t.Errorf("another title was refused because of cancelled polls elsewhere: %v", err)
+	}
+}
+
+// A real failure still counts. The request reached the service, so the add may well have happened —
+// refunding on anything but a cancellation would make the ceiling meaningless.
+func TestAddBudget_aRealFailureStillSpends(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 5)
+	defer func() { globalAddBudget = prev }()
+
+	d := mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(400, `{"error":"NOPE"}`), nil }}
+	s := &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != 4 {
+		t.Errorf("remaining = %d, want 4 — a delivered request must count", left)
+	}
+}
+
+// A NoAdd target can never queue a torrent, whatever the store would otherwise do.
+//
+// The probe path already chose carefully — it only resolves releases a cache check reported as held —
+// and still POSTed createtorrent, because TorBox's checkcached says what TORBOX has, not what this
+// ACCOUNT has. A caller cannot promise this by choosing well; only the store can enforce it.
+func TestNoAdd_neverReachesAnAddEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(doer) Store
+	}{
+		{"torbox", func(d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
+		}},
+		{"realdebrid", func(d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: realDebridAPI}
+		}},
+		{"premiumize", func(d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: premiumizeAPI}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reqs := 0
+			d := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				reqs++
+				return resp(200, `{"data":{"torrent_id":1}}`), nil
+			}}
+			_, err := tc.build(d).Resolve(context.Background(), ResolveTarget{InfoHash: H, NoAdd: true})
+			if err == nil {
+				t.Fatal("nothing is held, so a NoAdd resolve must fail rather than queue it")
+			}
+			if reqs != 0 {
+				t.Errorf("made %d requests for a NoAdd target — the store queued the torrent anyway", reqs)
+			}
+		})
+	}
+}
