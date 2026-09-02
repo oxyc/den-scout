@@ -2,6 +2,8 @@ package scout
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -164,6 +166,75 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "store_unavailable") {
 		t.Errorf("the client must be able to tell a refusal from an absence: %s", rec.Body.String())
+	}
+}
+
+// Every store draws the same line: being turned away is a fact about the account, not the release.
+//
+// Only TorBox did. On a Real-Debrid or Premiumize install a 429 became `DeadLinkError`, reached the app
+// as 404 "this release does not exist", and the player then walked the whole candidate list collecting
+// the identical non-answer — condemning healthy releases on the way. That is the bug that was fixed once
+// and left unfixed twice.
+func TestEveryStoreReportsARefusalAsARefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(doer) Store
+		want  DebridService
+	}{
+		{"realdebrid", func(d doer) Store {
+			return &realDebridStore{token: "t", client: d, api: "https://rd.example"}
+		}, ServiceRealDebrid},
+		{"premiumize", func(d doer) Store {
+			return &premiumizeStore{token: "t", client: d, api: "https://pm.example"}
+		}, ServicePremiumize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := tc.build(&stubDoer{status: http.StatusTooManyRequests, body: `{}`})
+			_, err := store.Resolve(context.Background(), ResolveTarget{InfoHash: repeat("e", 40)})
+			if err == nil {
+				t.Fatal("a 429 must be an error")
+			}
+			var unavailable *StoreUnavailableError
+			if !errors.As(err, &unavailable) {
+				t.Fatalf("a throttle must not read as a dead link: %T %v", err, err)
+			}
+			if unavailable.Service != tc.want {
+				t.Errorf("wrong service named: %s", unavailable.Service)
+			}
+		})
+	}
+}
+
+// An unconfigured indexer must not make "nobody has this" permanently unsayable.
+//
+// Counting an indexer that can never be asked as one that did not answer made the quorum unsatisfiable
+// on the shipped default (mediafusion has no config URL), so every genuinely empty result was reported
+// as an outage, negative caching never ran, and three unavailable titles in a row flipped /health to
+// degraded on a perfectly healthy service. A permanent misconfiguration is not a transient failure.
+func TestScrapeAll_unaskableIndexerDoesNotBlockAnEmptyVerdict(t *testing.T) {
+	answeredEmpty := fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) { return nil, nil }}
+	unaskable := unaskableScraper{indexer: "mediafusion"}
+
+	_, ok := scrapeAll(context.Background(), []scraper{answeredEmpty, unaskable}, scrapeQuery{}, time.Second)
+	if !ok {
+		t.Error("every askable indexer answered, so the empty result is authoritative")
+	}
+
+	// A non-empty list is trusted whatever the coverage: whatever came back is real.
+	found := fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+		return []RawStream{{InfoHash: repeat("d", 40), Title: "a release"}}, nil
+	}}
+	if seeds, ok := scrapeAll(context.Background(), []scraper{found, unaskable}, scrapeQuery{},
+		time.Second); !ok || len(seeds) != 1 {
+		t.Errorf("a non-empty result stands on its own: %d seeds, ok=%v", len(seeds), ok)
+	}
+
+	// A real failure still withholds the verdict — that is the rule this must not weaken.
+	failed := fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+		return nil, fmt.Errorf("502")
+	}}
+	if _, ok := scrapeAll(context.Background(), []scraper{failed, unaskable}, scrapeQuery{}, time.Second); ok {
+		t.Error("an indexer that failed means the empty result is not authoritative")
 	}
 }
 

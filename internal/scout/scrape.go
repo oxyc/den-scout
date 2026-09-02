@@ -382,8 +382,17 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 	// trust a non-empty list — whatever came back is real — but not enough to state that a release does
 	// not exist. torrentio 502s while another indexer legitimately has nothing, and the union of those
 	// two was reported to the app as a confident "not available" for an episode that does exist.
+	// An indexer that can NEVER be asked is excluded from this judgement. Counting it as one that did not
+	// answer looked right and made the condition unsatisfiable: with mediafusion unconfigured — the
+	// shipped default — every genuinely empty result was reported as an indexer outage, negative caching
+	// never ran, and three unavailable titles in a row flipped /health to degraded on a healthy service.
+	// A permanent misconfiguration is not a transient failure, and feeding both into one counter loses
+	// the difference. It is reported once per process by `logIndexerSkipOnce` instead.
 	if len(all) == 0 {
-		for _, ok := range respok {
+		for i, ok := range respok {
+			if _, unaskable := scrapers[i].(unaskableScraper); unaskable {
+				continue
+			}
 			if !ok {
 				anyOK = false
 				break

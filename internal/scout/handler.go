@@ -202,7 +202,16 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		w.Header().Set("X-Scout-Degraded", res.degraded)
 	}
 	etag, body := splitCached(res.value)
-	h.conditional(w, r, body, etag, jsonType, listCache)
+	// A degraded build is deliberately not cached server-side, "so the next request retries instead of
+	// serving the blip for the whole TTL" — and then the same body went out with `max-age=300,
+	// stale-if-error=86400`, which URLSession's shared cache honours. The guard was defeated one layer
+	// down, on the only client that matters: an outage's empty list stuck on the device for five minutes,
+	// and up to a day on any later error.
+	cacheHeader := listCache
+	if res.degraded != "" {
+		cacheHeader = noStore
+	}
+	h.conditional(w, r, body, etag, jsonType, cacheHeader)
 }
 
 // buildResult carries the singleflight build's body plus a degraded reason ("" when healthy).

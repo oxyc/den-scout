@@ -668,6 +668,14 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	dec := json.NewDecoder(io.LimitReader(addResp.Body, maxStoreBytes))
 	_ = dec.Decode(&added)
 	_ = addResp.Body.Close()
+	// A refusal is a fact about the account, not the release — the same distinction TorBox already draws.
+	// Every non-2xx here used to become a dead link, so on a Real-Debrid install a 429 or a 503 reached
+	// the app as "this release does not exist", and the player walked the whole candidate list collecting
+	// the identical non-answer and condemning healthy releases on the way.
+	if storeRefusedUs(addResp.StatusCode) {
+		return "", &StoreUnavailableError{ServiceRealDebrid,
+			fmt.Sprintf("addmagnet http %d", addResp.StatusCode)}
+	}
 	if addResp.StatusCode < 200 || addResp.StatusCode >= 300 || added.ID == "" {
 		return "", &DeadLinkError{"realdebrid no torrent id"}
 	}
@@ -861,6 +869,11 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// Same rule as the other two stores: being turned away says nothing about the release.
+	if storeRefusedUs(resp.StatusCode) {
+		return "", &StoreUnavailableError{ServicePremiumize,
+			fmt.Sprintf("directdl http %d", resp.StatusCode)}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d", resp.StatusCode)}
 	}
