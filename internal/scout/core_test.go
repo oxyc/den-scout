@@ -112,20 +112,21 @@ func TestPickEpisodeFile(t *testing.T) {
 		{Index: 2, Name: "Show.S01E02.sample.mkv", SizeBytes: intp(5)},
 		{Index: 3, Name: "readme.txt", SizeBytes: intp(1)},
 	}
-	if got := pickEpisodeFile(files, 1, 2); got == nil || *got != 1 {
-		t.Errorf("SxxExx pick (largest on ties): got %v want 1", got)
+	if got, err := pickEpisodeFile(files, 1, 2); err != nil || got == nil || *got != 1 {
+		t.Errorf("SxxExx pick (largest on ties): got %v, %v want 1", got, err)
 	}
-	if got := pickEpisodeFile([]TorrentFile{{Index: 7, Name: "Show 1x03.mp4"}}, 1, 3); got == nil || *got != 7 {
-		t.Errorf("1x03: got %v", got)
+	if got, err := pickEpisodeFile([]TorrentFile{{Index: 7, Name: "Show 1x03.mp4"}}, 1, 3); err != nil || got == nil || *got != 7 {
+		t.Errorf("1x03: got %v, %v", got, err)
 	}
-	if got := pickEpisodeFile([]TorrentFile{{Index: 8, Name: "Show.104.mp4"}}, 1, 4); got == nil || *got != 8 {
-		t.Errorf("104: got %v", got)
+	if got, err := pickEpisodeFile([]TorrentFile{{Index: 8, Name: "Show.104.mp4"}}, 1, 4); err != nil || got == nil || *got != 8 {
+		t.Errorf("104: got %v, %v", got, err)
 	}
-	if got := pickEpisodeFile([]TorrentFile{{Index: 4, Name: "a.mkv", SizeBytes: intp(10)}, {Index: 5, Name: "b.mkv", SizeBytes: intp(20)}}, 9, 9); got == nil || *got != 5 {
-		t.Errorf("no-match → largest: got %v want 5", got)
+	// Neither name is episode-labelled, so the largest-video fallback still applies.
+	if got, err := pickEpisodeFile([]TorrentFile{{Index: 4, Name: "a.mkv", SizeBytes: intp(10)}, {Index: 5, Name: "b.mkv", SizeBytes: intp(20)}}, 9, 9); err != nil || got == nil || *got != 5 {
+		t.Errorf("no-match → largest: got %v, %v want 5", got, err)
 	}
-	if got := pickEpisodeFile(nil, 1, 1); got != nil {
-		t.Error("no files → nil")
+	if got, err := pickEpisodeFile(nil, 1, 1); got != nil || err != nil {
+		t.Errorf("no files → nil: got %v, %v", got, err)
 	}
 }
 
@@ -137,21 +138,21 @@ func TestSelectFileIDTorBox(t *testing.T) {
 		{Index: 55, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
 	}
 	s1, e2, wrong := 1, 2, 99
-	if got := selectFileID(pack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); got == nil || *got != 55 {
-		t.Errorf("episode name-match wins over fileIdx: got %v want 55 (TorBox id)", got)
+	if got, err := selectFileID(pack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); err != nil || got == nil || *got != 55 {
+		t.Errorf("episode name-match wins over fileIdx: got %v, %v want 55 (TorBox id)", got, err)
 	}
 	// fileIdx-only → POSITION in the list mapped to TorBox's file id (files[1].Index == 55).
 	one := 1
-	if got := selectFileID(pack, ResolveTarget{FileIdx: &one}); got == nil || *got != 55 {
-		t.Errorf("fileIdx position → TorBox id: got %v want 55", got)
+	if got, err := selectFileID(pack, ResolveTarget{FileIdx: &one}); err != nil || got == nil || *got != 55 {
+		t.Errorf("fileIdx position → TorBox id: got %v, %v want 55", got, err)
 	}
 	// fileIdx-only with no file list (single-file fast path / list failure) → raw passthrough.
 	seven := 7
-	if got := selectFileID(nil, ResolveTarget{FileIdx: &seven}); got == nil || *got != 7 {
-		t.Errorf("fileIdx passthrough when no list: got %v want 7", got)
+	if got, err := selectFileID(nil, ResolveTarget{FileIdx: &seven}); err != nil || got == nil || *got != 7 {
+		t.Errorf("fileIdx passthrough when no list: got %v, %v want 7", got, err)
 	}
-	if got := selectFileID(pack, ResolveTarget{}); got != nil {
-		t.Errorf("no selector → nil, got %v", got)
+	if got, err := selectFileID(pack, ResolveTarget{}); got != nil || err != nil {
+		t.Errorf("no selector → nil, got %v, %v", got, err)
 	}
 }
 
@@ -161,15 +162,15 @@ func TestPickFileIDPrefersEpisodeMatch(t *testing.T) {
 		{Index: 10, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
 		{Index: 20, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
 	}
-	if got := (&realDebridStore{}).pickFileID(rdPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); got == nil || *got != 20 {
-		t.Errorf("RD episode match over fileIdx: got %v want 20", got)
+	if got, err := (&realDebridStore{}).pickFileID(rdPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); err != nil || got == nil || *got != 20 {
+		t.Errorf("RD episode match over fileIdx: got %v, %v want 20", got, err)
 	}
 	pmPack := []TorrentFile{ // Premiumize index == position
 		{Index: 0, Name: "Show.S01E01.mkv", SizeBytes: intp(100)},
 		{Index: 1, Name: "Show.S01E02.mkv", SizeBytes: intp(100)},
 	}
-	if got := (&premiumizeStore{}).pickIndex(pmPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); got == nil || *got != 1 {
-		t.Errorf("PM episode match over fileIdx: got %v want 1", got)
+	if got, err := (&premiumizeStore{}).pickIndex(pmPack, ResolveTarget{Season: &s1, Episode: &e2, FileIdx: &wrong}); err != nil || got == nil || *got != 1 {
+		t.Errorf("PM episode match over fileIdx: got %v, %v want 1", got, err)
 	}
 }
 

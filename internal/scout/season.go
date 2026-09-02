@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -49,36 +50,66 @@ func matchesEpisode(name string, patterns []*regexp2.Regexp) bool {
 	return false
 }
 
+// errEpisodeNotInTorrent — the file list is episode-labelled and holds no file for the episode asked
+// for. The release is a pack of OTHER episodes, so there is nothing here to play.
+var errEpisodeNotInTorrent = errors.New("torrent holds no file for that episode")
+
+// labelledEpisodeRe — does a filename DECLARE an episode, in a form that can't be anything else?
+//
+// Deliberately narrower than episodePatterns: the bare concatenated forms there (102, 0102) are fine for
+// confirming an episode you already expect, but useless as evidence that a name is episode-labelled at
+// all — "Movie.2019.1080p" is full of three- and four-digit runs. Only the unambiguous forms count, so
+// the mismatch below is claimed only when a filename really does name a different episode.
+var labelledEpisodeRe = mustRE2(`(s\d{1,2}[ ._-]*e\d{1,3}|\b\d{1,2}x\d{2}\b|season[ ._-]*\d{1,2}[ ._-]*episode[ ._-]*\d{1,3})`)
+
 // pickEpisodeFile picks the file index for an episode: an SxxExx match among video files (largest on
-// ties), else the largest video file; nil only when there's no file at all.
-func pickEpisodeFile(files []TorrentFile, season, episode int) *int {
+// ties), else the largest video file.
+//
+// Returns errEpisodeNotInTorrent when nothing matched but the pool IS episode-labelled. Falling back to
+// the largest file there serves a confidently wrong episode: the pack holds S01E01–E10, you asked for
+// E11, and it hands back E07 as though that were the answer. A single-episode release whose filename
+// carries no marker still falls back, because there the largest file is the only thing it could be.
+func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
+	pool := episodeFilePool(files)
+	if len(pool) == 0 {
+		return nil, nil
+	}
+
+	patterns := episodePatterns(season, episode)
+	var matched []TorrentFile
+	labelled := false
+	for _, f := range pool {
+		if matchesEpisode(f.Name, patterns) {
+			matched = append(matched, f)
+		}
+		if labelledEpisodeRe.match(strings.ToLower(f.Name)) {
+			labelled = true
+		}
+	}
+	if len(matched) > 0 {
+		idx := largest(matched).Index
+		return &idx, nil
+	}
+	if labelled {
+		return nil, errEpisodeNotInTorrent
+	}
+	idx := largest(pool).Index
+	return &idx, nil
+}
+
+// episodeFilePool — the files an episode may be picked from: the videos, or everything when a list
+// carries no recognised video extension.
+func episodeFilePool(files []TorrentFile) []TorrentFile {
 	var videos []TorrentFile
 	for _, f := range files {
 		if videoExtRe.match(strings.ToLower(f.Name)) {
 			videos = append(videos, f)
 		}
 	}
-	pool := videos
-	if len(pool) == 0 {
-		pool = files
+	if len(videos) == 0 {
+		return files
 	}
-	if len(pool) == 0 {
-		return nil
-	}
-
-	patterns := episodePatterns(season, episode)
-	var matched []TorrentFile
-	for _, f := range pool {
-		if matchesEpisode(f.Name, patterns) {
-			matched = append(matched, f)
-		}
-	}
-	if len(matched) > 0 {
-		idx := largest(matched).Index
-		return &idx
-	}
-	idx := largest(pool).Index
-	return &idx
+	return videos
 }
 
 func largest(files []TorrentFile) TorrentFile {
