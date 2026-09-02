@@ -140,6 +140,16 @@ func readStoreError(resp *http.Response) string {
 	return " (" + strings.TrimSpace(string(raw[:min(len(raw), 200)])) + ")"
 }
 
+// redactToken removes a credential from text that is about to be logged. The empty check is not
+// defensive tidiness: strings.ReplaceAll with an empty needle splices the replacement between every
+// character, so an unconfigured store would turn a short error into an unreadable one.
+func redactToken(text, token string) string {
+	if token == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, token, "<token>")
+}
+
 // storeRefusedUs reports whether an HTTP status is the service declining to serve this account right now —
 // a throttle or a fault on their side — rather than a verdict about the torrent.
 func storeRefusedUs(status int) bool {
@@ -701,6 +711,21 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	if s.cache != nil {
 		s.cache.Put(torrentIDKey(s.token, t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
 	}
+	// No list, and an episode to pick out of a pack: refuse rather than guess — but only after the id
+	// above is remembered, or a just-queued episode stops reporting as "downloading" and reads as dead.
+	//
+	// `listFiles` answers nil for a transport blip, a non-200 and an unreadable body alike, and that nil
+	// went straight into `selectFileID`, where it falls through to the indexer's raw fileIdx used as a
+	// TorBox file id — the exact disagreement the name-match exists to correct. A blip on mylist
+	// therefore served S01E01 for a request for S01E02, with a 302 and no error: silently the wrong
+	// episode, and nothing downstream can tell. The cache-read path already refuses on the same evidence
+	// (`!needFiles || len(e.Files) > 0`); this is the live path's equivalent. Naming TorBox is accurate —
+	// it is the one that did not answer — so the pool moves on to a store that can, and /play answers
+	// 503 or, for a torrent still fetching, the 202 that `Status` produces from the id just written.
+	if needFiles && len(files) == 0 {
+		return "", &StoreUnavailableError{Service: ServiceTorBox,
+			Reason: "could not list the pack's files, so the episode cannot be identified"}
+	}
 	fileID, err := selectFileID(files, t)
 	if err != nil {
 		return "", err
@@ -1011,11 +1036,20 @@ func (s *torBoxStore) requestDownload(ctx context.Context, torrentID int, fileID
 		return "", errTorrentGone
 	}
 	if resp.StatusCode != http.StatusOK {
-		// The same rule the add path follows: TorBox explains itself in the body, and an account at its
-		// active-download limit and a torrent id it cannot serve are both a bare 400. Reading it here is
-		// what lets the read path TELL those apart at all — discarding it meant a genuine account refusal
-		// arriving as a 400 was invisible, recorded nothing, and was re-asked on every poll.
-		detail := readStoreError(resp)
+		// TorBox explains itself in the body, and an account at its active-download limit and a torrent id
+		// it cannot serve are both a bare 400. What the text buys here is a DIAGNOSIS, not a
+		// classification: 400 is not in `storeRefusedUs`, so such an answer is still a dead link, still
+		// records no backoff, and is still re-asked on every poll. That is deliberate on the read path —
+		// a dead link means "no link yet", the ordinary state of a torrent still downloading, and
+		// requestdl costs no add quota — but it means the operator has to read the log to tell the two
+		// apart, and before this the log did not say.
+		//
+		// Redacted, because this is the ONE TorBox URL that carries the token as a query parameter and
+		// an upstream error page may quote the request URI back. The transport branch above goes to
+		// lengths to keep that URL out of the logs; a body spliced into the same error would be a second
+		// route to the same place, and `docs/SEALED-CONFIG.md` makes "the token is never logged" an
+		// acceptance criterion.
+		detail := redactToken(readStoreError(resp), s.token)
 		if storeRefusedUs(resp.StatusCode) {
 			return "", &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("requestdl http %d%s", resp.StatusCode, detail)}
@@ -1522,15 +1556,28 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	}
 	settleAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	defer func() { _ = resp.Body.Close() }()
-	// Same rule as the other two stores: being turned away says nothing about the release.
-	if storeRefusedUs(resp.StatusCode) {
-		refused := &StoreUnavailableError{Service: ServicePremiumize, Status: resp.StatusCode,
-			Reason: fmt.Sprintf("directdl http %d", resp.StatusCode)}
-		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
-		return "", refused
-	}
+	// Premiumize ANSWERED, and every answer below this line is one that queued nothing — so the charge
+	// goes back on all of them, the same rule the success path follows further down. Only the transport
+	// failure above keeps its charge, because there the outcome is genuinely unknown.
+	//
+	// Keeping it was the more expensive mistake by far. The allowance is a rolling in-memory window with
+	// no reset but a restart, so a single bad magnet polled every two seconds spent all fifty in about a
+	// hundred seconds — after which `spendAdd` refused EVERY Premiumize resolve for the rest of the hour,
+	// including releases the account already holds that directdl would have served instantly. A refused
+	// magnet is a nuisance; an hour of 503 scout_busy on a working store is an outage.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d", resp.StatusCode)}
+		if !queued {
+			refundUnusedAdd(ServicePremiumize, s.token)
+		}
+		// Same rule as the other two stores: being turned away says nothing about the release.
+		if storeRefusedUs(resp.StatusCode) {
+			refused := &StoreUnavailableError{Service: ServicePremiumize, Status: resp.StatusCode,
+				Reason: fmt.Sprintf("directdl http %d%s", resp.StatusCode, readStoreError(resp))}
+			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
+			return "", refused
+		}
+		return "", &DeadLinkError{fmt.Sprintf("premiumize directdl http %d%s",
+			resp.StatusCode, readStoreError(resp))}
 	}
 	// Premiumize accepted it. Same reason as RD: no Status endpoint, so without this the next poll
 	// queues the same transfer again.

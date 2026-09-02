@@ -1799,3 +1799,124 @@ func TestTorBox_aProvenWrongPackIsNotReAdded(t *testing.T) {
 		t.Errorf("got %v, want errEpisodeNotInTorrent", err)
 	}
 }
+
+// Every answer Premiumize gives that is not a 2xx is one that queued nothing, so the charge goes back.
+// Keeping it was the expensive mistake: the allowance is a rolling in-memory window with no reset but a
+// restart, so one bad magnet polled every two seconds spent all fifty in about a hundred seconds — after
+// which spendAdd refused EVERY Premiumize resolve for the rest of the hour, including releases the
+// account already holds that directdl would have served instantly. A refused magnet is a nuisance; an
+// hour of 503 scout_busy on a working store is an outage.
+func TestPremiumize_anAnsweredFailureIsNotACharge(t *testing.T) {
+	for _, status := range []int{400, 402, 404, 429, 500} {
+		t.Run(fmt.Sprintf("http %d", status), func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			cache := NewMemoryCache(1 << 20)
+			s := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+				client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+					return resp(status, `{"status":"error","message":"nope"}`), nil
+				}}}
+			for i := 0; i < 60; i++ {
+				_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			}
+			if left := globalAddBudget.remaining(budgetAccount(ServicePremiumize, "tok")); left != 50 {
+				t.Fatalf("allowance %d — a poll loop on an answered failure spent the hour's adds", left)
+			}
+			// The allowance still being there is only half of it: what it buys is that ANOTHER release —
+			// one the account holds, which directdl serves as a read — still resolves, instead of being
+			// refused by scout's own bookkeeping for the rest of the hour. A different infohash, because
+			// a 429/5xx correctly backs THIS release off for a minute; the damage being pinned here is
+			// the account-wide one.
+			held := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+				client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+					return resp(200, `{"status":"success","content":[{"path":"m.mkv","link":"https://pm/ok"}]}`), nil
+				}}}
+			other := ResolveTarget{InfoHash: repeat("b", 40)}
+			if link, err := held.Resolve(context.Background(), other); link != "https://pm/ok" {
+				t.Errorf("a held release answered %q %v — scout refused what Premiumize would have served", link, err)
+			}
+		})
+	}
+}
+
+// A blip listing a pack's files must never fall through to the indexer's positional index. listFiles
+// answers nil for a transport error, a non-200 and an unreadable body alike, and that nil reached
+// selectFileID, where the raw fileIdx is used as a TorBox file id — serving S01E01 for a request for
+// S01E02 with a 302 and no error. The cache-read path already refuses on the same evidence.
+func TestTorBox_aFailedFileListNeverGuessesTheEpisode(t *testing.T) {
+	list := func(fn func() (*http.Response, error)) mockDoer {
+		return mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "mylist") {
+				return fn()
+			}
+			return resp(200, `{"success":true,"data":"https://tb/link"}`), nil
+		}}
+	}
+	for _, tc := range []struct {
+		name string
+		doer mockDoer
+	}{
+		{"a transport blip", list(func() (*http.Response, error) { return nil, fmt.Errorf("connection reset") })},
+		{"a 500", list(func() (*http.Response, error) { return resp(500, `{}`), nil })},
+		{"an unreadable body", list(func() (*http.Response, error) { return resp(200, `<html>`), nil })},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+			s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI, client: tc.doer}
+			// The indexer says file 0; the pack's own names would have said file 1.
+			link, err := s.Resolve(context.Background(),
+				ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2), FileIdx: intp(0)})
+			if link != "" {
+				t.Fatalf("served %q blind — this is how the wrong episode plays", link)
+			}
+			var unavailable *StoreUnavailableError
+			if !errors.As(err, &unavailable) {
+				t.Fatalf("got %v, want the store saying it could not answer", err)
+			}
+			// Status still has to be able to report the download, so the id must survive the refusal.
+			if _, ok := cache.Get(torrentIDKey("tok", H)); !ok {
+				t.Error("the torrent id was dropped, so a fetch in progress now reads as dead")
+			}
+		})
+	}
+}
+
+// The one TorBox URL carrying the token as a query parameter must not gain a second route into the log
+// through an upstream error page that quotes the request URI back.
+func TestTorBox_theServicesWordsCannotCarryTheToken(t *testing.T) {
+	const token = "supersecrettoken"
+	cache := NewMemoryCache(1 << 20)
+	// Seeded under the store's OWN token: the id key is account-scoped, so seeding it under any other
+	// name leaves the account holding nothing and the request is never made.
+	cache.Put(torrentIDKey(token, H), "42", resolveCacheTTL)
+	reached := false
+	s := &torBoxStore{token: token, cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "requestdl") {
+				reached = true
+				return resp(400, `Bad Request on `+r.URL.String()), nil
+			}
+			return resp(200, `{"data":{"files":[{"id":0,"name":"m.mkv","size":9}]}}`), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0), NoAdd: true})
+	if !reached {
+		t.Fatal("requestdl was never called, so this asserts nothing")
+	}
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Errorf("the token reached an error that gets logged: %v", err)
+	}
+}
+
+// An empty needle would splice the replacement between every character, turning a short error from an
+// unconfigured store into an unreadable one.
+func TestRedactToken_anEmptyTokenLeavesTextAlone(t *testing.T) {
+	if got := redactToken("http 400 (nope)", ""); got != "http 400 (nope)" {
+		t.Errorf("got %q", got)
+	}
+	if got := redactToken("http 400 (tok=abc)", "abc"); got != "http 400 (tok=<token>)" {
+		t.Errorf("got %q", got)
+	}
+}
