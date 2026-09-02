@@ -157,7 +157,7 @@ func spendAdd(svc DebridService, token, infoHash string) error {
 	}
 	log.Printf("scout: %s add budget spent for the hour, refusing %s", svc, shortHash(infoHash))
 	// Wrapped so the refusal memory can tell scout's own ceiling from the service's — see errOurBudget.
-	return fmt.Errorf("%w: %w", errOurBudget,
+	return fmt.Errorf("%w: %w", errScoutSide,
 		&StoreUnavailableError{svc, "scout's own hourly add budget for this account is spent"})
 }
 

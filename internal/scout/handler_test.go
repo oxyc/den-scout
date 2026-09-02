@@ -378,7 +378,8 @@ func TestRoutesRDOnlyReturnsStreams(t *testing.T) {
 func TestStream_partialCacheCheckIsDegraded(t *testing.T) {
 	// The store answers for one hash and omits the other — what a half-failed batch looks like.
 	answered := repeat("a", 40)
-	unknown := repeat("b", 40)
+	notHeld := repeat("b", 40)
+	unknown := repeat("c", 40)
 	h := NewHandler(Deps{
 		Cache:         NewMemoryCache(1 << 20),
 		ScrapeTimeout: time.Second,
@@ -386,12 +387,17 @@ func TestStream_partialCacheCheckIsDegraded(t *testing.T) {
 			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
 				return []RawStream{
 					{InfoHash: answered, Title: "A 1080p WEB-DL", Seeders: intp(10)},
-					{InfoHash: unknown, Title: "B 1080p WEB-DL", Seeders: intp(10)},
+					{InfoHash: notHeld, Title: "B 1080p WEB-DL", Seeders: intp(10)},
+					{InfoHash: unknown, Title: "C 1080p WEB-DL", Seeders: intp(10)},
 				}, nil
 			}}}
 		},
 		MakeStores: func(*Config) []Store {
-			return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{answered: true}}}
+			// Answered for two of three: one held, one definitively NOT held, one its batch never covered.
+			// All three are needed — with only "held" and "unchecked", keeping the filter per-hash and
+			// switching it off entirely serve the same two streams, so the test cannot tell them apart.
+			return []Store{fakeStore{svc: ServiceTorBox,
+				check: map[string]bool{answered: true, notHeld: false}}}
 		},
 	})
 	rec := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil)
@@ -399,9 +405,46 @@ func TestStream_partialCacheCheckIsDegraded(t *testing.T) {
 	if got := rec.Header().Get("X-Scout-Degraded"); got != "cache-check" {
 		t.Errorf("X-Scout-Degraded = %q, want cache-check — a release nobody could check was served as fact", got)
 	}
-	// validBlob sets cachedOnly. The unchecked release must still be served — it is not KNOWN to be
-	// uncached, and a partial failure must not turn the whole filter off either (that was the bug).
+	// validBlob sets cachedOnly. The held release and the unchecked one are served; the one the store
+	// definitively does not hold is dropped. Switching the filter off wholesale on a partial failure —
+	// the reverted regression — would serve all three.
 	if n := streamsLen(rec); n != 2 {
-		t.Errorf("served %d streams, want 2: the cached one and the one nobody could check", n)
+		t.Errorf("served %d streams, want 2: the held one and the one nobody could check", n)
+	}
+	if strings.Contains(rec.Body.String(), notHeld) {
+		t.Error("a release the store said it does not hold was served to a cachedOnly request")
+	}
+}
+
+// Degraded is judged on what is SERVED, not on what was scraped.
+//
+// A failed cache-check batch covering releases every filter would drop still marked the response
+// degraded — which means not cached, which means the next /stream re-runs the whole 8s scrape. A
+// user-visible cost paid for a fact about releases nobody will ever see.
+func TestStream_uncheckedReleasesThatAreFilteredOutDoNotDegrade(t *testing.T) {
+	held := repeat("a", 40)
+	junk := repeat("b", 40) // unchecked AND dropped by excludeCam, so it cannot affect the answer
+	h := NewHandler(Deps{
+		Cache:         NewMemoryCache(1 << 20),
+		ScrapeTimeout: time.Second,
+		MakeScrapers: func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				return []RawStream{
+					{InfoHash: held, Title: "A 1080p WEB-DL", Seeders: intp(10)},
+					{InfoHash: junk, Title: "B 2160p HDCAM", Seeders: intp(10)},
+				}, nil
+			}}}
+		},
+		MakeStores: func(*Config) []Store {
+			return []Store{fakeStore{svc: ServiceTorBox, check: map[string]bool{held: true}}}
+		},
+	})
+	rec := do(h, "/"+validBlob+"/stream/movie/tt7654321.json", nil)
+
+	if got := rec.Header().Get("X-Scout-Degraded"); got != "" {
+		t.Errorf("X-Scout-Degraded = %q: an unchecked release nobody will see is not a degraded answer", got)
+	}
+	if n := streamsLen(rec); n != 1 {
+		t.Errorf("served %d streams, want 1", n)
 	}
 }

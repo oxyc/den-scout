@@ -225,3 +225,34 @@ func TestResolvePreferring_unknownHoldersStillFallsThrough(t *testing.T) {
 		t.Errorf("stores asked: %v — the bound applied where nothing was known", calls)
 	}
 }
+
+// A hash is KNOWN only when EVERY cache-truth store answered for it.
+//
+// The union was the same over-claim, one level up, as the batch bug it was written to fix: with two
+// accounts and one store's check down, a release that store holds came back known-and-not-cached — a
+// confident "nobody has this" from the only party that never voted — and a cachedOnly list then dropped
+// a release that would have played instantly.
+func TestCacheTruth_knownRequiresEveryCacheTruthStore(t *testing.T) {
+	var calls []DebridService
+	pool := &StorePool{stores: []Store{
+		namedStore{svc: ServiceTorBox, resolves: &calls},                                        // its check is down
+		namedStore{svc: ServicePremiumize, cached: map[string]bool{H: false}, resolves: &calls}, // answered
+	}}
+	truth, truthOK := pool.CacheCheck(t.Context(), []string{H})
+	if !truthOK {
+		t.Fatal("one store answered, so this is not a total outage")
+	}
+	if truth.Known(H) {
+		t.Error("TorBox never voted, so 'not cached' is not something we know")
+	}
+
+	// With both answering it IS known, or the filter would never drop anything again.
+	both := &StorePool{stores: []Store{
+		namedStore{svc: ServiceTorBox, cached: map[string]bool{H: false}, resolves: &calls},
+		namedStore{svc: ServicePremiumize, cached: map[string]bool{H: false}, resolves: &calls},
+	}}
+	agreed, _ := both.CacheCheck(t.Context(), []string{H})
+	if !agreed.Known(H) {
+		t.Error("both cache-truth stores answered; that is knowledge")
+	}
+}

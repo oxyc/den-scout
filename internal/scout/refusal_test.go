@@ -340,3 +340,66 @@ func TestRefusalBackoff_ignoresCancellation(t *testing.T) {
 func probeConfig() *Config {
 	return &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: "tok"}}}
 }
+
+// The probe never queues a torrent, and says so honestly when it cannot tell.
+//
+// Three answers that were each wrong at some point: "ready" from a cache check alone (which reports what
+// TorBox has, not what this account has), 404 "not_queued" when the check was simply unreachable, and a
+// resolve that queued the very torrent the probe exists to avoid queueing.
+func TestHandleProbe_neverQueuesAndSaysWhenItCannotTell(t *testing.T) {
+	// A store that resolves happily UNLESS told not to add — exactly like the real ones. A fake that
+	// refuses either way cannot tell "the probe asked for a read-only resolve" from "the probe let it
+	// queue", which is the whole assertion.
+	var sawNoAdd bool
+	held := noAddAwareStore{svc: ServiceTorBox, cached: "abc", sawNoAdd: &sawNoAdd}
+	h := &handler{deps: Deps{Cache: NewMemoryCache(1 << 20)}}
+
+	rec := httptest.NewRecorder()
+	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{held}}, "abc",
+		ResolveTarget{InfoHash: "abc"})
+	if rec.Code == http.StatusOK {
+		t.Error("cached-but-not-held answered 200 ready; playing it would start with a download")
+	}
+	if !sawNoAdd {
+		t.Error("the probe resolved WITHOUT NoAdd — it is free to queue the torrent it exists to avoid")
+	}
+
+	// The check could not be reached at all → say so, rather than claiming nothing is queued.
+	down := fakeStore{svc: ServiceTorBox, checkErr: errCheckFailed}
+	rec = httptest.NewRecorder()
+	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{down}}, "abc",
+		ResolveTarget{InfoHash: "abc"})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("an unreachable cache check should be 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "cache_check_unavailable") {
+		t.Errorf("the body must name the reason: %s", rec.Body.String())
+	}
+}
+
+// noAddAwareStore behaves like a real store: it can serve the release, but refuses when the caller
+// forbids queueing and the account does not already hold it.
+type noAddAwareStore struct {
+	svc      DebridService
+	cached   string
+	sawNoAdd *bool
+}
+
+func (n noAddAwareStore) Service() DebridService { return n.svc }
+func (n noAddAwareStore) CacheCheck(_ context.Context, hashes []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, h := range hashes {
+		out[h] = h == n.cached
+	}
+	return out, nil
+}
+func (n noAddAwareStore) Resolve(_ context.Context, t ResolveTarget) (string, error) {
+	if t.NoAdd {
+		*n.sawNoAdd = true
+		return "", errWouldAdd // TorBox has it; this ACCOUNT does not
+	}
+	return "https://cdn/queued-it", nil
+}
+func (n noAddAwareStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}

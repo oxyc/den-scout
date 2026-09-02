@@ -252,33 +252,47 @@ func torrentMissKey(token, infoHash string) string {
 // can be retried within the wait rather than at the end of it.
 const addAttemptTTL = 90 * time.Second
 
-func addAttemptKey(token, infoHash string) string {
-	return "torbox:adding:" + keyHash(token) + ":" + infoHash
+func addAttemptKey(svc DebridService, token, infoHash string) string {
+	return string(svc) + ":adding:" + keyHash(token) + ":" + infoHash
 }
 
-// noteAddAttempt records that a createtorrent went out, whatever comes back.
+// addInFlight reports an add this process sent and never heard back about.
 //
-// It also clears the torrent-miss marker. That marker suppresses the account listing for 15s, and the
-// listing is the only thing that can discover the torrent this add just created — so leaving it in place
-// kept every following poll on the "nothing is queued, add it" path instead of the "it is downloading"
-// one. The negative cache and the add loop were feeding each other.
-func (s *torBoxStore) noteAddAttempt(infoHash string) {
-	if s.cache == nil {
-		return
+// The error deliberately wraps errScoutSide: it is scout's own bookkeeping, not the service declining,
+// so it must not be written into the refusal memory or reported to the client as the debrid's doing —
+// the confusion errScoutSide exists to end.
+func addInFlight(cache Cache, svc DebridService, token, infoHash string) error {
+	if cache == nil {
+		return nil
 	}
-	s.cache.Put(addAttemptKey(s.token, infoHash), "1", addAttemptTTL)
-	s.cache.Put(torrentMissKey(s.token, infoHash), "", time.Nanosecond)
+	if _, inFlight := cache.Get(addAttemptKey(svc, token, infoHash)); !inFlight {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", errScoutSide,
+		&StoreUnavailableError{svc, "scout already sent an add for this release and is awaiting the result"})
+}
+
+// noteAddAttempt records that an add request went out, whatever comes back.
+//
+// EVERY store that can add needs this, not just the one where the loop was first measured. Giving it to
+// TorBox alone did not stop the loop — it moved it: a cancelling client simply spent Real-Debrid's
+// allowance instead, fifty adds in under two minutes, because ResolvePreferring walks on to the store
+// with no marker.
+func noteAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
+	if cache != nil {
+		cache.Put(addAttemptKey(svc, token, infoHash), "1", addAttemptTTL)
+	}
 }
 
 // settleAddAttempt clears the marker once the outcome IS known, whatever it was.
 //
 // The marker means "we do not know", not "an add happened" — so it must not outlive learning. A refused
-// add has the refusal backoff, and a successful one has its cached torrent id; both describe the state
-// better than this does. Keeping it would block the legitimate retry when createtorrent succeeded but
-// the follow-up file listing did not.
-func (s *torBoxStore) settleAddAttempt(infoHash string) {
-	if s.cache != nil {
-		s.cache.Put(addAttemptKey(s.token, infoHash), "", time.Nanosecond)
+// add has the refusal backoff, a successful one has its cached torrent id, and a torrent discovered in
+// the account listing is plainly no longer in flight; all three describe the state better than this
+// does. Keeping it would block the legitimate retry when the add succeeded but the follow-up did not.
+func settleAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
+	if cache != nil {
+		cache.Put(addAttemptKey(svc, token, infoHash), "", time.Nanosecond)
 	}
 }
 
@@ -373,10 +387,11 @@ func backedOff(cache Cache, svc DebridService, token, infoHash string) (string, 
 	return cache.Get(refusedKey(svc, token, infoHash))
 }
 
-// errOurBudget marks a refusal scout made on its own behalf. It must not be remembered as the store's,
-// and it must not be reported to the client as the store's — the budget exists so an operator stops
-// blaming the debrid, and saying "torbox refused" when scout did is the same confusion wearing a badge.
-var errOurBudget = errors.New("local add budget")
+// errScoutSide marks a refusal SCOUT made — its hourly allowance, or an add it already has in flight —
+// as opposed to one the service made. It must not be remembered as the store's refusal and must not be
+// reported to the client as the store's: saying "torbox refused" when scout did is exactly the confusion
+// these guards exist to end, and it condemns an account that is answering perfectly well.
+var errScoutSide = errors.New("refused by scout, not by the service")
 
 // recordRefusal remembers a refusal briefly, so a poll loop cannot sustain one.
 //
@@ -388,7 +403,7 @@ var errOurBudget = errors.New("local add budget")
 // A cancellation is not a refusal: the caller went away, and nothing about the store or the release can
 // be concluded from it.
 func recordRefusal(cache Cache, svc DebridService, token, infoHash string, err error) {
-	if cache == nil || isCancellation(err) || errors.Is(err, errOurBudget) {
+	if cache == nil || isCancellation(err) || errors.Is(err, errScoutSide) {
 		return
 	}
 	cache.Put(refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff)
@@ -439,6 +454,22 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		}
 	}
 
+	// Does the account ALREADY hold this? The entry above is a six-hour convenience cache, not a record
+	// of what the account has — so "not played in the last six hours", which is the normal state of most
+	// of a library, fell through to createtorrent and paid an add for a torrent already sitting there.
+	// The lookup that answers this properly already exists and is already used by Status; it simply was
+	// never consulted here.
+	if id, held := s.knownTorrentID(t.InfoHash); held {
+		return s.resolveHeldTorrent(ctx, id, key, needFiles, t)
+	}
+
+	// From here on, resolving MEANS queueing — so a caller that forbade that is answered now, before the
+	// add-backoff below. That backoff describes a state a read-only caller cannot have caused and must
+	// not be blocked by.
+	if t.NoAdd {
+		return "", errWouldAdd
+	}
+
 	// A client polls /play every few seconds for the whole fetch, and every poll that got this far ran a
 	// fresh createtorrent. Once TorBox starts throttling, that loop is what keeps it throttled: the add
 	// fails, nothing is cached, and the next poll adds again. Back off for a minute after a refusal so a
@@ -447,11 +478,6 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		if reason, ok := backedOff(s.cache, ServiceTorBox, s.token, t.InfoHash); ok {
 			return "", &StoreUnavailableError{ServiceTorBox, reason + " (backing off)"}
 		}
-	}
-	// A NoAdd caller gets here only when the cache above held nothing usable, which means the account does
-	// not have this torrent yet — and the only way onward is to queue it.
-	if t.NoAdd {
-		return "", errWouldAdd
 	}
 	torrentID, err := s.addMagnet(ctx, t.InfoHash)
 	if err != nil {
@@ -466,6 +492,14 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 		return "", err
 	}
+	return s.resolveHeldTorrent(ctx, torrentID, key, needFiles, t)
+}
+
+// resolveHeldTorrent turns a torrent the account HAS into a playable link: list its files if an episode
+// must be picked, remember what was learned, and mint the download. Shared by the just-added path and by
+// the one that discovered the torrent was already there — they differ only in how the id was obtained.
+func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key string,
+	needFiles bool, t ResolveTarget) (string, error) {
 	var files []TorrentFile
 	if needFiles {
 		files = s.listFiles(ctx, torrentID)
@@ -491,10 +525,8 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 
 func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, error) {
 	// An add we already sent and never heard back about must not be sent again — see addAttemptKey.
-	if s.cache != nil {
-		if _, inFlight := s.cache.Get(addAttemptKey(s.token, infoHash)); inFlight {
-			return 0, &StoreUnavailableError{ServiceTorBox, "an add for this release is already in flight"}
-		}
+	if err := addInFlight(s.cache, ServiceTorBox, s.token, infoHash); err != nil {
+		return 0, err
 	}
 	if err := spendAdd(ServiceTorBox, s.token, infoHash); err != nil {
 		return 0, err
@@ -507,14 +539,14 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 	}
 	req.Header.Set("authorization", "Bearer "+s.token)
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
-	s.noteAddAttempt(infoHash)
+	noteAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		// No response, so the outcome is genuinely unknown: the marker STAYS, and the next poll finds it
 		// rather than sending the same add again.
 		return 0, err
 	}
-	s.settleAddAttempt(infoHash)
+	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// TorBox explains itself in the body — an account at its active-download limit and a malformed
@@ -607,6 +639,26 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 	return out, true
 }
 
+// knownTorrentID answers "does this account already have this torrent?" from cache alone.
+//
+// Cache-only on purpose. The resolve entry is a six-hour convenience cache, not a record of what the
+// account holds, so anything not played within six hours fell through to createtorrent and paid an add
+// for a torrent already sitting there. The torrent id answers that — and by the time Resolve runs on the
+// /play and probe paths, Status has already looked it up and cached it, so this costs no request at all.
+// Asking the account directly here instead would put a full account-list fetch on every cold resolve,
+// which is the cost torrentMissKey exists to keep off the poll path.
+func (s *torBoxStore) knownTorrentID(infoHash string) (int, bool) {
+	if s.cache == nil {
+		return 0, false
+	}
+	raw, ok := s.cache.Get(torrentIDKey(s.token, infoHash))
+	if !ok {
+		return 0, false
+	}
+	id, err := strconv.Atoi(raw)
+	return id, err == nil
+}
+
 // torrentID finds the account's torrent id for an infohash: from the cache Resolve wrote, and failing
 // that by asking TorBox for the account's list and matching on hash.
 //
@@ -639,6 +691,10 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 	if s.cache != nil {
 		s.cache.Put(torrentIDKey(s.token, infoHash), strconv.Itoa(id), resolveCacheTTL)
 	}
+	// Finding the torrent settles any add we had in flight for it — that add plainly landed. Without
+	// this the marker outlives the fact it stood in for, and a release stays "awaiting the result" long
+	// after the result is sitting in the account listing.
+	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
 	return id, true
 }
 
@@ -834,14 +890,22 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if t.NoAdd {
 		return "", errWouldAdd // RD has no cache API, so every resolve here is an add
 	}
+	// The same in-flight guard TorBox has. Giving it to TorBox alone did not stop the cancel loop, it
+	// moved it: ResolvePreferring walks on to the store without a marker, and fifty cancelled polls shut
+	// this account's allowance instead.
+	if err := addInFlight(s.cache, ServiceRealDebrid, s.token, t.InfoHash); err != nil {
+		return "", err
+	}
 	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
 	}
+	noteAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	addResp, err := s.post(ctx, "/torrents/addMagnet", url.Values{"magnet": {magnetFor(t.InfoHash)}})
 	if err != nil {
 		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
 		return "", err
 	}
+	settleAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	var added struct {
 		ID string `json:"id"`
 	}
@@ -1055,6 +1119,9 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if t.NoAdd {
 		return "", errWouldAdd
 	}
+	if err := addInFlight(s.cache, ServicePremiumize, s.token, t.InfoHash); err != nil {
+		return "", err
+	}
 	if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
 		return "", err
 	}
@@ -1064,11 +1131,13 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		return "", err
 	}
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	noteAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		return "", err
 	}
+	settleAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	defer func() { _ = resp.Body.Close() }()
 	// Same rule as the other two stores: being turned away says nothing about the release.
 	if storeRefusedUs(resp.StatusCode) {
@@ -1208,17 +1277,36 @@ func (p *StorePool) CacheCheck(ctx context.Context, hashes []string) (CacheTruth
 	_ = g.Wait()
 	// Store order, so a hash several services hold lists them in configured priority.
 	truthOK := false
+	answers := make(map[string]int, len(hashes))
+	cacheTruthStores := 0
 	for i, m := range maps {
-		cacheTruth := isCacheTruthService(p.stores[i].Service())
+		if !isCacheTruthService(p.stores[i].Service()) {
+			for hash, cached := range m {
+				if cached {
+					truth.holders[hash] = append(truth.holders[hash], p.stores[i].Service())
+				}
+			}
+			continue
+		}
+		cacheTruthStores++
 		for hash, cached := range m {
 			// Presence in the map is the store's claim to have answered for that hash.
-			if cacheTruth {
-				truth.known[hash] = true
-				truthOK = true
-			}
+			answers[hash]++
+			truthOK = true
 			if cached {
 				truth.holders[hash] = append(truth.holders[hash], p.stores[i].Service())
 			}
+		}
+	}
+	// A hash is KNOWN only when EVERY cache-truth store answered for it, not when any did.
+	//
+	// The union was the same over-claim one level up from the batch bug it was written to fix: with two
+	// accounts and one store's check down, a release that store holds came back known-and-not-cached —
+	// a confident "nobody has this" from the only party that never voted — and a cached-only list then
+	// dropped a release that would have played instantly.
+	for hash, n := range answers {
+		if n == cacheTruthStores {
+			truth.known[hash] = true
 		}
 	}
 	return truth, truthOK

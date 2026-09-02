@@ -218,7 +218,10 @@ func TestAddBudget_aCancelStormCostsOneAdd(t *testing.T) {
 	defer func() { globalAddBudget = prev }()
 
 	sent := 0
-	d := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if !isAddEndpoint(r) {
+			return resp(200, `{"data":[]}`), nil // the account holds nothing; only the ADD is abandoned
+		}
 		sent++ // the request went out; the caller just never gets the answer
 		return nil, context.Canceled
 	}}
@@ -238,27 +241,44 @@ func TestAddBudget_aCancelStormCostsOneAdd(t *testing.T) {
 	}
 }
 
-// The in-flight marker means "we do not know", so it must not outlive learning. Once createtorrent
-// answers — even to refuse — the outcome is known and a legitimate retry has to be able to proceed.
-func TestAddBudget_aKnownOutcomeReleasesTheInFlightMarker(t *testing.T) {
+// A torrent the account already holds is resolved from the account, not bought again.
+//
+// The resolve entry is a six-hour convenience cache, not a record of what the account has — so anything
+// not played in the last six hours, which is most of a library, fell through to createtorrent and paid
+// an add for a torrent already sitting there. The account listing answers this and was already being
+// consulted by Status; it just was not consulted here.
+func TestAddBudget_aHeldTorrentIsNotBoughtAgain(t *testing.T) {
 	prev := globalAddBudget
 	globalAddBudget = newAddBudget(time.Hour, 50)
 	defer func() { globalAddBudget = prev }()
 
-	sent := 0
+	adds := 0
 	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
-		if strings.Contains(r.URL.Path, "createtorrent") {
-			sent++
+		switch {
+		case isAddEndpoint(r):
+			adds++
 			return resp(200, `{"data":{"torrent_id":9}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			return resp(200, `{"data":[{"id":9,"hash":"`+H+`"}]}`), nil
 		}
-		return resp(500, "boom"), nil // the follow-up listing fails, so the resolve is retried
+		return resp(200, `{"success":true,"data":"https://cdn/x"}`), nil
 	}}
 	s := &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
-	ep := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(1)}
-	_, _ = s.Resolve(context.Background(), ep)
-	_, _ = s.Resolve(context.Background(), ep)
-	if sent != 2 {
-		t.Errorf("sent %d adds; a completed-but-unusable add must not block the retry", sent)
+	target := ResolveTarget{InfoHash: H, FileIdx: intp(0)}
+	// The sequence /play actually runs: Status first — it finds the torrent in the account and remembers
+	// its id — then Resolve. Resolve must use what Status learned rather than buying the torrent again.
+	if _, downloading := s.Status(context.Background(), target); downloading {
+		t.Fatal("a finished torrent is not downloading")
+	}
+	link, err := s.Resolve(context.Background(), target)
+	if err != nil || link == "" {
+		t.Fatalf("a held torrent must resolve: %q %v", link, err)
+	}
+	if adds != 0 {
+		t.Errorf("spent %d adds on a torrent the account already holds", adds)
+	}
+	if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != 50 {
+		t.Errorf("allowance dropped to %d for a torrent that needed no add", left)
 	}
 }
 
@@ -298,17 +318,21 @@ func TestNoAdd_neverReachesAnAddEndpoint(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reqs := 0
-			d := mockDoer{fn: func(*http.Request) (*http.Response, error) {
-				reqs++
-				return resp(200, `{"data":{"torrent_id":1}}`), nil
+			adds := 0
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if isAddEndpoint(r) {
+					adds++
+				}
+				return resp(200, `{"data":[]}`), nil // an empty account: nothing held
 			}}
 			_, err := tc.build(d).Resolve(context.Background(), ResolveTarget{InfoHash: H, NoAdd: true})
 			if err == nil {
 				t.Fatal("nothing is held, so a NoAdd resolve must fail rather than queue it")
 			}
-			if reqs != 0 {
-				t.Errorf("made %d requests for a NoAdd target — the store queued the torrent anyway", reqs)
+			// Reads are fine and expected — asking the account what it holds is how NoAdd is answered.
+			// What must never happen is the queueing call.
+			if adds != 0 {
+				t.Errorf("made %d adds for a NoAdd target — the store queued the torrent anyway", adds)
 			}
 		})
 	}
@@ -381,5 +405,109 @@ func TestHealth_reportsTheBudgetWithoutNamingAccounts(t *testing.T) {
 	}
 	if strings.Contains(body, keyHash("secret-token")) || strings.Contains(body, "torbox") {
 		t.Errorf("/health discloses which account is spending: %s", body)
+	}
+}
+
+// isAddEndpoint — the three calls that actually queue a torrent. Reads (mylist, checkcached, requestdl)
+// are not adds, and a test that counts every request cannot tell the difference.
+func isAddEndpoint(r *http.Request) bool {
+	p := r.URL.Path
+	return strings.Contains(p, "createtorrent") ||
+		strings.Contains(p, "addMagnet") ||
+		strings.Contains(p, "directdl")
+}
+
+// Scout's own in-flight marker is not the STORE refusing, and must not be recorded or reported as one.
+//
+// It shipped returning a bare StoreUnavailableError{torbox,…}, which recordRefusal then wrote into the
+// per-hash refusal memory: /play and the probe answered 503 naming TorBox for a state TorBox had no part
+// in, the backoff outlived its own 90s window (60s refusal re-recorded on each poll), and the read-only
+// NoAdd path was blocked by a marker it cannot cause.
+func TestAddInFlight_isScoutSideNotTheStores(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	noteAddAttempt(cache, ServiceTorBox, "tok", H)
+
+	err := addInFlight(cache, ServiceTorBox, "tok", H)
+	if err == nil {
+		t.Fatal("an add in flight must be reported")
+	}
+	if !errors.Is(err, errScoutSide) {
+		t.Errorf("the in-flight marker is scout's own bookkeeping: %v", err)
+	}
+	recordRefusal(cache, ServiceTorBox, "tok", H, err)
+	if _, remembered := backedOff(cache, ServiceTorBox, "tok", H); remembered {
+		t.Error("scout's in-flight marker was written into the store's refusal memory")
+	}
+}
+
+// EVERY store that can add needs the in-flight guard. Giving it to TorBox alone did not stop the cancel
+// loop — it moved it: ResolvePreferring walks on to the store without a marker, and fifty cancelled
+// polls closed THAT account's allowance instead.
+func TestAddInFlight_appliesToEveryStoreThatAdds(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(doer, Cache) Store
+	}{
+		{"torbox", func(d doer, c Cache) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}},
+		{"realdebrid", func(d doer, c Cache) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+		{"premiumize", func(d doer, c Cache) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			adds := 0
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if !isAddEndpoint(r) {
+					return resp(200, `{"data":[]}`), nil
+				}
+				adds++
+				return nil, context.Canceled // sent, then abandoned by the client
+			}}
+			store := tc.build(d, NewMemoryCache(1<<20))
+			for i := 0; i < 30; i++ {
+				_, _ = store.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			}
+			if adds != 1 {
+				t.Errorf("sent %d adds across thirty cancelled polls of one release", adds)
+			}
+		})
+	}
+}
+
+// Finding the torrent in the account settles the in-flight marker — that add plainly landed.
+//
+// Without this the marker outlives the fact it stood in for: the release stays "awaiting the result"
+// for its full 90s window while the result is sitting in the account listing, and every poll in between
+// is refused for a state that has already resolved itself.
+func TestAddInFlight_discoveringTheTorrentSettlesTheMarker(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "mylist") {
+			return resp(200, `{"data":[{"id":9,"hash":"`+H+`"}]}`), nil
+		}
+		return resp(404, "{}"), nil
+	}}
+	s := &torBoxStore{token: "tok", client: d, cache: cache, api: torboxAPI}
+
+	// An add went out and was abandoned, so the marker is set.
+	noteAddAttempt(cache, ServiceTorBox, "tok", H)
+	if err := addInFlight(cache, ServiceTorBox, "tok", H); err == nil {
+		t.Fatal("the marker should be set")
+	}
+
+	// The account listing then shows the torrent: the add landed, so the marker must go.
+	if _, found := s.torrentID(context.Background(), H); !found {
+		t.Fatal("the account holds it")
+	}
+	if err := addInFlight(cache, ServiceTorBox, "tok", H); err != nil {
+		t.Errorf("the marker outlived the discovery it stood in for: %v", err)
 	}
 }
