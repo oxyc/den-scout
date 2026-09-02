@@ -342,7 +342,7 @@ func TestEpisodePatterns_bareNumberBoundaries(t *testing.T) {
 		{"Show.S01E03.1080p.mkv", 1080, false, "a resolution is not an episode"},
 		{"[Grp] Show - 03 [1080p][HEVC][10bit].mkv", 10, false, "10bit is not episode 10"},
 	} {
-		got := matchesEpisode(tc.name, episodePatterns(1, tc.episode))
+		got := matchesEpisode(tc.name, bareEpisodePatterns(tc.episode))
 		if got != tc.want {
 			t.Errorf("ep %d vs %q: got %v, want %v — %s", tc.episode, tc.name, got, tc.want, tc.why)
 		}
@@ -378,4 +378,60 @@ func TestPickEpisodeFile_modernPackNamesAreNotAllEpisodeOne(t *testing.T) {
 	}
 	got, err = selectFileID(sampled, ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(3)})
 	wantPick(t, got, err, 0, "a feature plus a sample is not a pack that lacks your episode")
+}
+
+// The precedence between the two kinds of evidence, which a union got wrong.
+//
+// A bare number carries no season and cannot say which show it belongs to. Where the filenames DO name
+// their episodes it is noise — `[10-bit]` is not episode 10, `SG-1` is not episode 1 — and unioning the
+// two, then breaking the tie by file size, let that noise outrank the file that really did name the
+// episode. Where the names carry no label it is the only evidence there is, and must still work.
+func TestPickEpisodeFile_aBareNumberNeverOutranksALabel(t *testing.T) {
+	// Every file is tagged [10-bit]; only one is E10. The tag must not win, and it is on the big file.
+	tenBit := []TorrentFile{
+		file(0, "Show.S01E10.1080p.WEB-DL.x265.[10-bit].mkv", 900),
+		file(1, "Show.S01E11.1080p.WEB-DL.x265.[10-bit].mkv", 9000),
+	}
+	got, err := pickEpisodeFile(tenBit, 1, 10)
+	wantPick(t, got, err, 0, "E10 is the file named E10, not the biggest one carrying a 10")
+
+	// A number in the show's own title, on a properly labelled pack.
+	titled := []TorrentFile{
+		file(0, "Stargate SG-1 - S03E01 - Into the Fire.mkv", 900),
+		file(1, "Stargate SG-1 - S03E02 - Seth.mkv", 9000),
+	}
+	got, err = pickEpisodeFile(titled, 3, 1)
+	wantPick(t, got, err, 0, "SG-1 is the show, not episode 1")
+
+	// And a labelled pack that lacks the episode is still refused, not answered from a title number.
+	got, err = pickEpisodeFile(titled, 3, 9)
+	wantNotInTorrent(t, got, err, "a labelled pack cannot be talked into an answer by a bare number")
+
+	// Unlabelled, the bare number is all there is and must still decide.
+	bare := []TorrentFile{
+		file(0, "[Grp] Show - 01 [1080p].mkv", 9000),
+		file(1, "[Grp] Show - 02 [1080p].mkv", 900),
+	}
+	got, err = pickEpisodeFile(bare, 1, 2)
+	wantPick(t, got, err, 1, "with nothing else to go on, the bare number decides")
+}
+
+// Real-Debrid's in-range fileIdx branch maps a POSITION to RD's own file id. Nothing verified it: every
+// fixture used ids equal to their slice positions, so the mapping and a raw pass-through were the same
+// value and deleting the branch changed nothing. RD ids are 1-based in practice, and never a slice index.
+func TestPickFileID_realDebridMapsPositionToItsOwnId(t *testing.T) {
+	files := []TorrentFile{file(11, "a.mkv", 10), file(22, "b.mkv", 20), file(33, "c.mkv", 15)}
+	got, err := (&realDebridStore{}).pickFileID(files, ResolveTarget{InfoHash: H, FileIdx: idx(2)})
+	wantPick(t, got, err, 33, "position 2 is RD's file id 33, not the number 2")
+}
+
+// The same gap on the other two, so the three are pinned alike.
+func TestPickers_mapPositionToTheStoresOwnId(t *testing.T) {
+	files := []TorrentFile{file(11, "a.mkv", 10), file(22, "b.mkv", 20), file(33, "c.mkv", 15)}
+	got, err := selectFileID(files, ResolveTarget{InfoHash: H, FileIdx: idx(1)})
+	wantPick(t, got, err, 22, "TorBox: position 1 is its file id 22")
+	// Premiumize indexes its own content array, so there the position IS the answer — asserted with ids
+	// that differ from positions so the two cannot be confused.
+	got, err = (&premiumizeStore{}).pickIndex(files, ResolveTarget{InfoHash: H, FileIdx: idx(1)})
+	wantPick(t, got, err, 1, "Premiumize: the position is the answer, and it is not the id")
 }

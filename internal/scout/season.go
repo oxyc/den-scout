@@ -21,8 +21,9 @@ type TorrentFile struct {
 var videoExtRe = mustRE2(`\.(mkv|mp4|avi|m4v|ts|mov|wmv|flv|webm)$`)
 
 // episodePatterns builds the SxxExx / 1x02 / "season 1 episode 2" / 102 / 0102 matchers once per pick.
+// These NAME the episode: each carries the season with it, so a match is a statement about the file.
 func episodePatterns(season, episode int) []*regexp2.Regexp {
-	specs := []string{
+	return compileAll(
 		fmt.Sprintf(`s0*%d[ ._-]*e0*%d(?!\d)`, season, episode),
 		fmt.Sprintf(`\b0*%dx0*%d(?!\d)`, season, episode),
 		fmt.Sprintf(`season[ ._-]*0*%d[ ._-]*episode[ ._-]*0*%d(?!\d)`, season, episode),
@@ -30,21 +31,28 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 		// makes "720" (S7E20) match "720p", so exclude those as well as a following digit.
 		fmt.Sprintf(`\b%d%02d(?![\dpi])`, season, episode),
 		fmt.Sprintf(`\b%02d%02d(?![\dpi])`, season, episode),
-		// The episode number standing alone as its own token: `[Grp] Show - 03 [1080p].mkv`, which is how
-		// most anime and a good deal of TV is packed. The delimiters must be real separators rather than
-		// "any non-digit", or `[Group8]` matches episode 8, and the token must be the WHOLE digit run,
-		// which keeps 1080p, 720p, x264 and a year out.
-		//
-		// A DOT CANNOT OPEN THE TOKEN, and can only close it when a digit does not follow. Both rules
-		// exist for the same family of names: `DDP5.1`, `TrueHD.7.1`, `AC3.5.1`, `H.264`, `AAC.2.0`,
-		// `2024.03.15`. With the dot as an ordinary separator every one of those is a standalone number,
-		// so on any pack with 5.1 audio — which is most of them — EVERY file matched episode 1 and the
-		// largest was served: ask for E01 of a ten-episode pack, get E10, with a 302 and no error. The
-		// cost of the rule is `Show.03.1080p.mkv`, a dot-separated bare number, which no longer matches;
-		// a missed match falls through to the indexer's own file index, while a false one plays the
-		// wrong episode.
-		fmt.Sprintf(`(?:^|[ _\-\[\]()])0*%d(?:[ _\-\[\]()]|\.(?!\d)|$)`, episode),
-	}
+	)
+}
+
+// bareEpisodePatterns is the episode number standing alone as its own token: `[Grp] Show - 03
+// [1080p].mkv`, which is how most anime and a good deal of TV is packed. The delimiters must be real
+// separators rather than "any non-digit", or `[Group8]` matches episode 8, and the token must be the
+// WHOLE digit run, which keeps 1080p, 720p, x264 and a year out.
+//
+// A DOT CANNOT OPEN THE TOKEN, and can only close it when a digit does not follow. Both rules exist for
+// the same family of names: `DDP5.1`, `TrueHD.7.1`, `AC3.5.1`, `H.264`, `AAC.2.0`, `2024.03.15`. With
+// the dot an ordinary separator, every one of those is a standalone number, so on any pack with 5.1
+// audio — which is most of them — EVERY file matched episode 1 and the largest was served.
+//
+// It is kept SEPARATE, and consulted only when nothing above matched, because it carries no season and
+// cannot say which show a number belongs to. Unioned with the patterns above and resolved by file size,
+// a number in the title (`Blake's 7`, `SG-1`) or a tag like `[10-bit]` outranked the file that really
+// did name the episode — the strong evidence losing to the weak, on the largest file.
+func bareEpisodePatterns(episode int) []*regexp2.Regexp {
+	return compileAll(fmt.Sprintf(`(?:^|[ _\-\[\]()])0*%d(?:[ _\-\[\]()]|\.(?!\d)|$)`, episode))
+}
+
+func compileAll(specs ...string) []*regexp2.Regexp {
 	out := make([]*regexp2.Regexp, 0, len(specs))
 	for _, s := range specs {
 		if re, err := regexp2.Compile(s, regexp2.None); err == nil {
@@ -90,7 +98,7 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 	}
 
 	patterns := episodePatterns(season, episode)
-	var matched []TorrentFile
+	var matched, bare []TorrentFile
 	labelled := false
 	for _, f := range pool {
 		if matchesEpisode(f.Name, patterns) {
@@ -103,6 +111,22 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 	if len(matched) > 0 {
 		idx := largest(matched).Index
 		return &idx, nil
+	}
+	// Only now the weak evidence, and never against a pool that labels its episodes properly. A bare
+	// number carries no season and cannot say which show it belongs to, so where the names DO carry
+	// SxxExx it is noise — `[10-bit]` is not episode 10 and `SG-1` is not episode 1 — and where they do
+	// not it is the only thing there is.
+	if !labelled {
+		bareRe := bareEpisodePatterns(episode)
+		for _, f := range pool {
+			if matchesEpisode(f.Name, bareRe) {
+				bare = append(bare, f)
+			}
+		}
+		if len(bare) > 0 {
+			idx := largest(bare).Index
+			return &idx, nil
+		}
 	}
 	// Only an UNAMBIGUOUS label can condemn a pack. A bare number is good enough to recognise the episode
 	// when it matches, and never good enough to prove absence: bare numbering is frequently ABSOLUTE, so
