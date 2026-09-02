@@ -2458,3 +2458,126 @@ func TestPremiumize_anAnsweredFailureIsAskedOnlyOnce(t *testing.T) {
 		t.Errorf("allowance %d — a refused magnet was charged", left)
 	}
 }
+
+// A cancelled poll is not the store refusing. /play runs on the client's context — a focus change is
+// enough — and the add's response BODY is read inside it, so a cancellation lands there on every store.
+// Nothing covered that: the existing guard test hands recordRefusal a context.Canceled directly, which
+// certifies the helper but not the property that matters (no production path files a cancellation as a
+// refusal). A caller that builds its own error satisfies the helper test and breaks the property, which
+// is exactly how it shipped.
+func TestStores_aCancelledAddBodyIsNotARefusal(t *testing.T) {
+	// hangingBody sends the status line, then blocks until the poll's context is cancelled.
+	type store struct {
+		name string
+		svc  DebridService
+		make func(Cache, doer) Store
+		path string
+		head string
+	}
+	for _, st := range []store{
+		{"realdebrid", ServiceRealDebrid, func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}, "addMagnet", `{"id":"t1"}`},
+		{"torbox", ServiceTorBox, func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}, "createtorrent", `{"data":{"torrent_id":7}}`},
+		{"premiumize", ServicePremiumize, func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}, "directdl", `{"status":"success","content":[]}`},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cache := NewMemoryCache(1 << 20)
+			d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, st.path) {
+					// The add was accepted; the body then dies because the viewer moved on.
+					cancel()
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(cancelledReader{ctx})}, nil
+				}
+				return resp(200, st.head), nil
+			}}
+			_, _ = st.make(cache, d).Resolve(ctx, ResolveTarget{InfoHash: H})
+			if reason, ok := backedOff(cache, st.svc, "tok", H); ok {
+				t.Errorf("a cancelled poll was filed as %s refusing: %s", st.svc, reason)
+			}
+		})
+	}
+}
+
+// cancelledReader fails the way a body does when the request's context goes away mid-read.
+type cancelledReader struct{ ctx context.Context }
+
+func (c cancelledReader) Read([]byte) (int, error) {
+	<-c.ctx.Done()
+	return 0, c.ctx.Err()
+}
+
+// An add whose answer never arrived is what the in-flight marker is for. It must survive, so the next
+// poll says "downloading" — honest for an add that went out and whose result we never saw — rather than
+// buying the torrent again or blaming the store.
+func TestRealDebrid_anUnreadAnswerLeavesTheAddInFlight(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	created := 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "addMagnet") {
+			created++
+			return &http.Response{StatusCode: 201, Body: io.NopCloser(brokenReader{})}, nil
+		}
+		return resp(200, `{}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	s := &realDebridStore{token: "tok", client: d, cache: cache, api: realDebridAPI}
+
+	_, first := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if !errors.Is(first, errAddInFlight) {
+		t.Errorf("got %v, want the add reported as still in flight", first)
+	}
+	for i := 0; i < 60; i++ {
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	}
+	if created > 1 {
+		t.Errorf("created %d torrents on the account across 61 polls", created)
+	}
+	// The charge stays: the add was written to the wire, and assuming otherwise is the expensive guess.
+	if left := globalAddBudget.remaining(budgetAccount(ServiceRealDebrid, "tok")); left != 49 {
+		t.Errorf("allowance %d — an add that went out was treated as one that never happened", left)
+	}
+	// And it is not a refusal, so no store gets blamed for a body scout could not read.
+	if reason, ok := backedOff(cache, ServiceRealDebrid, "tok", H); ok {
+		t.Errorf("filed as RD refusing: %s", reason)
+	}
+}
+
+// TorBox's createtorrent detail is persisted into the refusal cache, which writes through to disk — so
+// it gets the redaction the other three detail sites have. The token rides in a header here rather than
+// the URL, so a leak needs the service to echo the header back; this was the one site not following the
+// rule, which is reason enough.
+func TestTorBox_theAddDetailCannotCarryTheToken(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	const token = "torboxsecrettoken"
+	cache := NewMemoryCache(1 << 20)
+	s := &torBoxStore{token: token, cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if isAddEndpoint(r) {
+				return resp(403, `{"error":"rejected for `+r.Header.Get("authorization")+`"}`), nil
+			}
+			return resp(200, `{}`), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Errorf("the token reached an error that gets logged: %v", err)
+	}
+	if reason, ok := backedOff(cache, ServiceTorBox, token, H); ok && strings.Contains(reason, token) {
+		t.Errorf("the token was persisted into the refusal cache: %s", reason)
+	}
+}

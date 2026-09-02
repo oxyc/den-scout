@@ -152,8 +152,11 @@ func TestPickFileID_realDebrid(t *testing.T) {
 	}
 	got, err := s.pickFileID(files, ResolveTarget{InfoHash: H, FileIdx: idx(1)})
 	wantPick(t, got, err, 4, "in-range index")
+	// An out-of-range index describes a file list that is not this one, so it is no opinion at all — and
+	// files[0] handed back whatever sorted first, which on a release with a Sample/ directory is the
+	// sample. The largest file is the same guess Premiumize makes, and what "no index at all" already got.
 	got, err = s.pickFileID(files, ResolveTarget{InfoHash: H, FileIdx: idx(99)})
-	wantPick(t, got, err, 3, "out of range → first file")
+	wantPick(t, got, err, 4, "out of range → largest, not whatever sorted first")
 
 	named := []TorrentFile{file(3, "Show.S01E04.mkv", 10), file(4, "Show.S01E05.mkv", 20)}
 	got, err = s.pickFileID(named, ep(1, 5))
@@ -198,7 +201,7 @@ func TestPickers_rejectNegativeIndex(t *testing.T) {
 	got, err := selectFileID(files, neg)
 	wantPick(t, got, err, -1, "TorBox hands a negative back as an id, never as an offset")
 	got, err = (&realDebridStore{}).pickFileID(files, neg)
-	wantPick(t, got, err, 0, "RD falls back to the first file")
+	wantPick(t, got, err, 1, "RD falls back to the largest")
 	got, err = (&premiumizeStore{}).pickIndex(files, neg)
 	wantPick(t, got, err, 1, "Premiumize falls back to the largest")
 }

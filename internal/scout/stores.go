@@ -838,19 +838,35 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		// TorBox explains itself in the body — an account at its active-download limit and a malformed
 		// magnet are both a bare 400, and only the text says which. Discarding it left the status code as
 		// the entire diagnosis, which is how a hard refusal came to look like a slow download.
-		detail := readStoreError(resp)
+		//
+		// Redacted like the other three detail sites: recordRefusal does not merely log this, it PERSISTS
+		// it into the refusal cache, which in production writes through to disk. TorBox's token rides in
+		// a header here rather than the URL, so a leak needs the service to echo the header back — but
+		// this was the one call site not following the rule, which is reason enough.
+		detail := redactToken(readStoreError(resp), s.token)
 		if storeRefusedUs(resp.StatusCode) {
 			return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
 		}
 		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d%s", resp.StatusCode, detail)}
 	}
+	// The same distinction RD's add draws: a body that could not be READ is an add whose outcome we never
+	// saw, not one that created nothing. Collapsing them turned a cancelled poll — /play runs on the
+	// client's context, and a focus change is enough — into `torbox no torrent_id`, which Resolve records
+	// as a refusal, so the next minute of polls answered 503 naming TorBox for a torrent it had just
+	// accepted. That only escaped notice because handlePlay asks Status first and findTorrentByHash
+	// rediscovers the torrent; RD, which has no Status, had no such rescue.
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxStoreBytes))
+	if readErr != nil {
+		return 0, fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServiceTorBox,
+			Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
+	}
 	var body struct {
 		Data *struct {
 			TorrentID *int `json:"torrent_id"`
 		} `json:"data"`
 	}
-	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Data == nil || body.Data.TorrentID == nil {
+	if json.Unmarshal(raw, &body) != nil || body.Data == nil || body.Data.TorrentID == nil {
 		return 0, &DeadLinkError{"torbox no torrent_id"}
 	}
 	return *body.Data.TorrentID, nil
@@ -1300,28 +1316,32 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
 		return "", err
 	}
-	settleAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	// Read once, keep the bytes: the id and the explanation of a failure live in the same body, and
 	// decoding straight off the reader left nothing for readStoreError further down.
 	raw, readErr := io.ReadAll(io.LimitReader(addResp.Body, maxStoreBytes))
 	_ = addResp.Body.Close()
+	// A body that could not be READ is not an answer that nothing was created. RD had already sent its
+	// status line — a 201 means the torrent exists on the account — and a mid-body reset, a TLS
+	// truncation or the client's context expiring after the headers arrived all land here. So this is
+	// precisely what the in-flight marker is for: an add that went out whose result we never saw. It is
+	// settled BELOW, once there is an answer to settle on, so the next poll says "downloading" — honest,
+	// and it neither adds again nor blames RD.
+	//
+	// It must NOT be recorded as a refusal. Doing that meant building a StoreUnavailableError here, which
+	// laundered the cause: recordRefusal's isCancellation guard could no longer see it, so a viewer
+	// changing focus mid-poll — /play runs on the client's context, and this read is inside it — was
+	// filed as Real-Debrid refusing the account, and every /play and probe of that release answered 503
+	// store_unavailable for the next minute. RD has no Status for handlePlay to rescue it with. That is
+	// the exact confusion the guard, errScoutSide and errAddInFlight all exist to end.
+	if readErr != nil {
+		return "", fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: ServiceRealDebrid,
+			Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
+	}
+	settleAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	var added struct {
 		ID string `json:"id"`
 	}
 	_ = json.Unmarshal(raw, &added)
-	// A body that could not be READ is not an answer that nothing was created. RD had already sent its
-	// status line — a 201 means the torrent exists on the account — and a mid-body reset, a TLS
-	// truncation or the client's context expiring after the headers arrived all land here. Folding it in
-	// with "RD created nothing" refunded the charge for a torrent that does exist, and since this branch
-	// records no backoff either, the budget was the only thing bounding the loop: sixty polls created
-	// sixty torrents on the account with the allowance untouched. So the charge STAYS, and the release is
-	// backed off — the outcome is unknown, which is exactly when re-asking is the expensive mistake.
-	if readErr != nil {
-		unknown := &StoreUnavailableError{Service: ServiceRealDebrid,
-			Reason: "the add was answered but its body could not be read, so the outcome is unknown"}
-		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, unknown)
-		return "", unknown
-	}
 	// A refusal is a fact about the account, not the release — the same distinction TorBox already draws.
 	// Every non-2xx here used to become a dead link, so on a Real-Debrid install a 429 or a 503 reached
 	// the app as "this release does not exist", and the player walked the whole candidate list collecting
@@ -1583,12 +1603,14 @@ func (s *realDebridStore) pickFileID(files []TorrentFile, t ResolveTarget) (*int
 			return id, nil
 		}
 	}
-	if t.FileIdx != nil {
-		if *t.FileIdx >= 0 && *t.FileIdx < len(files) {
-			return &files[*t.FileIdx].Index, nil
-		}
-		return &files[0].Index, nil
+	if t.FileIdx != nil && *t.FileIdx >= 0 && *t.FileIdx < len(files) {
+		return &files[*t.FileIdx].Index, nil
 	}
+	// An index out of range is the indexer describing a file list that is not this one — it arrives
+	// unvalidated from the scrape and is never checked against what the debrid actually holds. Falling
+	// back to files[0] handed back whatever sorted first, which on a release with a Sample/ directory is
+	// the sample: a stream that plays, for one second. The largest file is the same guess Premiumize
+	// makes and the better one, and it is the answer for "no index at all" here already.
 	idx := largest(files).Index
 	return &idx, nil
 }
