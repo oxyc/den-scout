@@ -63,13 +63,27 @@ func compileAll(specs ...string) []*regexp2.Regexp {
 }
 
 func matchesEpisode(name string, patterns []*regexp2.Regexp) bool {
-	n := strings.ToLower(name)
+	n := strings.ToLower(baseName(name))
 	for _, re := range patterns {
 		if ok, _ := re.MatchString(n); ok {
 			return true
 		}
 	}
 	return false
+}
+
+// baseName drops the directories. All three stores hand back PATHS — TorBox's `name`, RD's `path`,
+// Premiumize's `path` — so the torrent's root directory is part of every file's name, and matching the
+// whole thing let one directory speak for every file in the pack. A scene pack rooted at
+// `Show.S01E01-E10.1080p…/` matched a request for S01E01 in all ten files and served the largest; an
+// anime pack rooted at `[Grp] Show (Season 1) [BD 1080p][HEVC 10-bit]/` did the same for episodes 1 and
+// 10. In both cases a correct fileIdx was discarded on the way past. A directory describes the pack; only
+// the filename describes the file.
+func baseName(name string) string {
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		return name[i+1:]
+	}
+	return name
 }
 
 // errEpisodeNotInTorrent — the file list is episode-labelled and holds no file for the episode asked
@@ -98,43 +112,50 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 	}
 
 	patterns := episodePatterns(season, episode)
-	var matched, bare []TorrentFile
-	labelled := false
+	var matched, unlabelled []TorrentFile
 	for _, f := range pool {
 		if matchesEpisode(f.Name, patterns) {
 			matched = append(matched, f)
 		}
-		if labelledEpisodeRe.match(strings.ToLower(f.Name)) {
-			labelled = true
+		// Per FILE, not per pool. A pool-wide OR let one labelled file speak for the rest: an anime batch
+		// carrying a single `S00E01` special alongside bare-numbered episodes had the weak tier switched
+		// off for all of them, and the miss then became a hard refusal — a release that plays, answered
+		// 404 and recorded dead by the client.
+		if !labelledEpisodeRe.match(strings.ToLower(baseName(f.Name))) {
+			unlabelled = append(unlabelled, f)
 		}
 	}
 	if len(matched) > 0 {
 		idx := largest(matched).Index
 		return &idx, nil
 	}
-	// Only now the weak evidence, and never against a pool that labels its episodes properly. A bare
-	// number carries no season and cannot say which show it belongs to, so where the names DO carry
-	// SxxExx it is noise — `[10-bit]` is not episode 10 and `SG-1` is not episode 1 — and where they do
-	// not it is the only thing there is.
-	if !labelled {
+	// Only now the weak evidence, and only against the files that do NOT name their own episode. A bare
+	// number carries no season and cannot say which show it belongs to, so on a file already labelled
+	// S01E05 it is noise; on one labelled nothing it is all there is.
+	if len(unlabelled) > 0 {
 		bareRe := bareEpisodePatterns(episode)
-		for _, f := range pool {
+		var bare []TorrentFile
+		for _, f := range unlabelled {
 			if matchesEpisode(f.Name, bareRe) {
 				bare = append(bare, f)
 			}
 		}
-		if len(bare) > 0 {
+		// Evidence that picks out everything picks out nothing. When a bare number matches EVERY
+		// candidate it is part of what they share — the show's own title — rather than what tells them
+		// apart: `Stargate SG-1 - 02 - The Enemy Within.mkv` matches episode 1 in every file of the pack,
+		// and the largest was served for a request for episode 1. Discarding it leaves the indexer's
+		// fileIdx to decide, which is the thing that actually knows.
+		if len(bare) > 0 && !(len(bare) == len(unlabelled) && len(unlabelled) > 1) {
 			idx := largest(bare).Index
 			return &idx, nil
 		}
 	}
-	// Only an UNAMBIGUOUS label can condemn a pack. A bare number is good enough to recognise the episode
-	// when it matches, and never good enough to prove absence: bare numbering is frequently ABSOLUTE, so
-	// season 2 episode 1 is packed as `[Grp] Show - 13` and nothing in the name says so. Counting numbered
-	// files as evidence of a pack therefore refused every episode of an ordinary anime season — a release
-	// that plays, answered 404 and discarded by the client. SxxExx carries its season and can be trusted
-	// to mean what it says; this is why only it decides.
-	if labelled {
+	// Only an UNAMBIGUOUS label can condemn a pack, and only when EVERY candidate carries one: a pack
+	// whose files all name their episodes, none of them yours, holds nothing to play. A bare number can
+	// never prove absence — bare numbering is frequently ABSOLUTE, so season 2 episode 1 is packed as
+	// `[Grp] Show - 13` and nothing in the name says so, and refusing there kills every episode of an
+	// ordinary anime season.
+	if len(unlabelled) == 0 {
 		return nil, errEpisodeNotInTorrent
 	}
 	// No opinion, rather than a guess. The fallback below is sound only for a pool of ONE, where "the

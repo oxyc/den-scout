@@ -435,3 +435,95 @@ func TestPickers_mapPositionToTheStoresOwnId(t *testing.T) {
 	got, err = (&premiumizeStore{}).pickIndex(files, ResolveTarget{InfoHash: H, FileIdx: idx(1)})
 	wantPick(t, got, err, 1, "Premiumize: the position is the answer, and it is not the id")
 }
+
+// All three stores hand back PATHS, so the torrent's root directory is part of every file's name — and
+// no fixture in this suite was path-shaped, which is why the directory could speak for every file.
+// A directory describes the pack; only the filename describes the file.
+func TestPickEpisodeFile_theDirectoryIsNotEvidenceAboutTheFile(t *testing.T) {
+	// A scene pack whose root names the whole range: every file matched a request for S01E01 through the
+	// directory, and the largest was served.
+	root := "Show.S01E01-E10.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb/"
+	scene := []TorrentFile{
+		file(201, root+"Show.S01E01.1080p.mkv", 900),
+		file(208, root+"Show.S01E08.1080p.mkv", 9000),
+	}
+	got, err := pickEpisodeFile(scene, 1, 1)
+	wantPick(t, got, err, 201, "E01 is the file named E01, not every file under a directory that says E01-E10")
+
+	// An anime pack whose root carries a season and a bit-depth tag. `(Season 1)` and `[10-bit]` matched
+	// episodes 1 and 10 in every file.
+	anime := "[Anime Time] Show (Season 1) [BD 1080p][HEVC 10-bit][AAC]/"
+	tagged := []TorrentFile{
+		file(101, anime+"[Anime Time] Show - 01.mkv", 900),
+		file(107, anime+"[Anime Time] Show - 07.mkv", 9000),
+	}
+	got, err = pickEpisodeFile(tagged, 1, 1)
+	wantPick(t, got, err, 101, "episode 1 is the file numbered 01, not the one under a (Season 1) directory")
+	if got, err := pickEpisodeFile(tagged, 1, 10); got != nil || err != nil {
+		t.Errorf("[10-bit] in the directory is not episode 10: got %v, %v", got, err)
+	}
+	// Windows-style separators too, since the name comes from whatever the torrent carries.
+	back := []TorrentFile{
+		file(301, `Show.S01E01-E10\Show.S01E01.mkv`, 900),
+		file(308, `Show.S01E01-E10\Show.S01E08.mkv`, 9000),
+	}
+	got, err = pickEpisodeFile(back, 1, 1)
+	wantPick(t, got, err, 301, "a backslash separates a directory too")
+}
+
+// A number that matches EVERY candidate is part of what they share — the show's own title — not what
+// tells them apart. Serving the largest of "all of them" is how a request for episode 1 of Stargate
+// SG-1 returned episode 2.
+func TestPickEpisodeFile_aTitleNumberIsNotAnEpisode(t *testing.T) {
+	sg1 := []TorrentFile{
+		file(301, "Stargate SG-1 - 01 - Children of the Gods.mkv", 900),
+		file(302, "Stargate SG-1 - 02 - The Enemy Within.mkv", 9000),
+	}
+	// Every file matches episode 1 — one by its number, both by the title — so the match tells them apart
+	// not at all, and the honest answer is to say nothing and let the indexer's own file index decide.
+	// What must NOT happen is what did: taking the largest of "all of them" and serving episode 2 for a
+	// request for episode 1.
+	if got, err := pickEpisodeFile(sg1, 1, 1); got != nil || err != nil {
+		t.Errorf("a number matching every file decides nothing: got %v, %v", got, err)
+	}
+	// Episode 2 is told apart by its own number, so it is still found.
+	got, err := pickEpisodeFile(sg1, 1, 2)
+	wantPick(t, got, err, 302, "episode 2 is named by one file only, so it is found")
+
+	// Episode 7 is not here. "SG-1" must not answer for it, and neither must the largest file.
+	blake := []TorrentFile{
+		file(401, "Blake's 7 - 01 - The Way Back.mkv", 900),
+		file(402, "Blake's 7 - 02 - Space Fall.mkv", 9000),
+	}
+	if got, err := pickEpisodeFile(blake, 1, 7); got != nil || err != nil {
+		t.Errorf("a number in the title is not an episode: got %v, %v", got, err)
+	}
+}
+
+// One labelled file must not switch the weak tier off for the rest of the pack. An anime batch commonly
+// carries a single labelled special beside bare-numbered episodes; treating the pool as labelled turned
+// a hit into a hard refusal, and the client records a release that plays as dead.
+func TestPickEpisodeFile_oneLabelledFileDoesNotCondemnTheRest(t *testing.T) {
+	batch := []TorrentFile{
+		file(0, "[Grp] Show - 01 [1080p].mkv", 900),
+		file(1, "[Grp] Show - 02 [1080p].mkv", 950),
+		file(2, "[Grp] Show - 03 [1080p].mkv", 980),
+		file(3, "[Grp] Show OVA S00E01 [1080p].mkv", 9000),
+	}
+	got, err := pickEpisodeFile(batch, 1, 3)
+	wantPick(t, got, err, 2, "the special's label says nothing about the numbered episodes")
+
+	// And when the bare tier finds nothing either, a mixed pack must DEFER rather than refuse — the
+	// unlabelled files could be absolutely numbered, so their silence proves nothing about episode 9.
+	if got, err := pickEpisodeFile(batch, 1, 9); got != nil || err != nil {
+		t.Errorf("a mixed pack cannot be condemned by its one labelled file: got %v, %v", got, err)
+	}
+
+	// And a pack where EVERY file names its episode still refuses when none of them is yours.
+	allLabelled := []TorrentFile{
+		file(0, "Show.S01E01.mkv", 900),
+		file(1, "Show.S01E02.mkv", 950),
+	}
+	got, err = pickEpisodeFile(allLabelled, 1, 9)
+	wantNotInTorrent(t, got, err, "a fully labelled pack that lacks the episode holds nothing to play")
+}
