@@ -656,3 +656,53 @@ func TestSplitCached_treatsEveryUnknownFormTheSameWay(t *testing.T) {
 		t.Errorf("a separator-less value must be served whole: %q", bareBody)
 	}
 }
+
+// deadlineStore records the deadline each call arrives with, so a test can assert which budget the
+// handler built rather than which one it meant to.
+type deadlineStore struct {
+	svc DebridService
+	// EVERY call, not the last one: handlePlay reads status twice on the plain route, and the second
+	// read was already correct — so keeping only the newest made the first one's budget invisible.
+	statusAt []time.Duration
+	resolve  func() (string, error)
+}
+
+func (d *deadlineStore) Service() DebridService { return d.svc }
+func (d *deadlineStore) CacheCheck(context.Context, []string) (map[string]bool, error) {
+	return nil, nil
+}
+func (d *deadlineStore) Resolve(context.Context, ResolveTarget) (string, error) { return d.resolve() }
+func (d *deadlineStore) Status(ctx context.Context, _ ResolveTarget) (StoreStatus, bool) {
+	if dl, ok := ctx.Deadline(); ok {
+		d.statusAt = append(d.statusAt, time.Until(dl).Round(time.Second))
+	}
+	return StoreStatus{}, false
+}
+
+// A read that exists to answer a POLL must run under the status budget. A client polls /play for the
+// length of a fetch, so a read meant to answer promptly must not be able to hold that poll for
+// forty-five seconds against a slow debrid. Nothing asserted which budget these used, so the two that
+// were already right and the one that was not looked identical to the suite.
+func TestHandlePlay_pollReadsUseTheStatusBudget(t *testing.T) {
+	for _, route := range []string{"", "?probe=1"} {
+		t.Run("play"+route, func(t *testing.T) {
+			store := &deadlineStore{svc: ServiceTorBox,
+				resolve: func() (string, error) { return "", &DeadLinkError{"nothing here"} }}
+			h := NewHandler(testDeps(func(d *Deps) {
+				d.MakeStores = func(*Config) []Store { return []Store{store} }
+			}))
+			tok := encodePlayToken(PlayTarget{InfoHash: repeat("a", 40)})
+			do(h, "/"+validBlob+"/play/"+tok+route, nil)
+
+			if len(store.statusAt) == 0 {
+				t.Fatal("the status read never happened, so this asserts nothing")
+			}
+			for i, left := range store.statusAt {
+				if left > statusBudget {
+					t.Errorf("status read %d carried a %v deadline, want no more than %v — a poll read "+
+						"must not be able to hold the poll for the whole resolve budget", i, left, statusBudget)
+				}
+			}
+		})
+	}
+}

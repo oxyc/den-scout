@@ -3213,3 +3213,97 @@ func TestTorBox_aTimedOutListingIsNotAMiss(t *testing.T) {
 		t.Error("an answered miss must still be remembered, or every poll re-fetches the whole list")
 	}
 }
+
+// mylist is asked BY id, but it can answer with the whole account list — which is why the array fallback
+// exists at all. Taking the first entry blind is the mistake listFiles was hardened against, and here it
+// was worse: a finished first entry made a live download read as "no status", which handlePlay answers
+// 404 dead_link, so the client blacklists a release that is downloading right now — the one failure
+// Status exists to prevent. A downloading first entry is quieter and no better: the viewer watches
+// another torrent's percentage, ETA and rate.
+func TestTorBoxStatus_reportsOnTheTorrentItAskedAbout(t *testing.T) {
+	const ours = 100
+	list := func(entries string) doer {
+		return mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			return resp(200, `{"data":[`+entries+`]}`), nil
+		}}
+	}
+	finishedOther := `{"id":42,"progress":1,"download_finished":true,"eta":0,"download_speed":0}`
+	busyOther := `{"id":42,"progress":0.43,"download_finished":false,"eta":900,"download_speed":1500000}`
+	oursBusy := `{"id":100,"progress":0.02,"download_finished":false,"eta":60,"download_speed":10}`
+
+	for _, tc := range []struct{ name, entries string }{
+		{"ours behind a finished torrent", finishedOther + "," + oursBusy},
+		{"ours behind a busy torrent", busyOther + "," + oursBusy},
+		{"ours last of several", finishedOther + "," + busyOther + "," + oursBusy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(torrentIDKey("tok", H), strconv.Itoa(ours), resolveCacheTTL)
+			s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI, client: list(tc.entries)}
+			got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H})
+			if !ok {
+				t.Fatal("our torrent is in the list and downloading; this must report on it")
+			}
+			if got.Progress != 0.02 || got.BytesPerSecond == nil || *got.BytesPerSecond != 10 {
+				t.Errorf("reported %+v — that is another torrent's progress", got)
+			}
+		})
+	}
+
+	// A list that does not mention our torrent says nothing about it, and must not borrow an answer.
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), strconv.Itoa(ours), resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI, client: list(busyOther)}
+	if got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H}); ok {
+		t.Errorf("reported %+v for a torrent the answer never mentions", got)
+	}
+
+	// The ordinary single-entry answer to a by-id query need not repeat the id, and still counts.
+	cache = NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), strconv.Itoa(ours), resolveCacheTTL)
+	s = &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			return resp(200, `{"data":{"progress":0.25,"download_finished":false,"eta":30}}`), nil
+		}}}
+	got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H})
+	if !ok || got.Progress != 0.25 {
+		t.Errorf("an unlabelled single entry is still ours: %+v ok=%v", got, ok)
+	}
+	// But an object naming a DIFFERENT torrent is not.
+	cache = NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), strconv.Itoa(ours), resolveCacheTTL)
+	s = &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			return resp(200, `{"data":{"id":42,"progress":0.9,"download_finished":false}}`), nil
+		}}}
+	if got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H}); ok {
+		t.Errorf("reported %+v from an entry that names torrent 42", got)
+	}
+}
+
+// A 200 with no `data` key is TorBox's envelope missing, not the account saying it holds nothing —
+// listFiles reads the identical body as silence. Calling it a miss wrote a marker that then suppressed
+// the only lookup able to rediscover a queued torrent.
+func TestTorBox_anEnvelopeWithoutDataIsNotAMiss(t *testing.T) {
+	for _, body := range []string{`{}`, `{"success":false}`, `{"success":false,"data":null}`} {
+		cache := NewMemoryCache(1 << 20)
+		s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+			client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				return resp(200, body), nil
+			}}}
+		_, _ = s.Status(context.Background(), ResolveTarget{InfoHash: H})
+		if _, missed := cache.Get(torrentMissKey("tok", H)); missed {
+			t.Errorf("%s was remembered as the account not holding the torrent", body)
+		}
+	}
+	// A real, readable list that lacks the hash still is one.
+	cache := NewMemoryCache(1 << 20)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			return resp(200, `{"success":true,"data":[]}`), nil
+		}}}
+	_, _ = s.Status(context.Background(), ResolveTarget{InfoHash: H})
+	if _, missed := cache.Get(torrentMissKey("tok", H)); !missed {
+		t.Error("an answered miss must still be remembered")
+	}
+}

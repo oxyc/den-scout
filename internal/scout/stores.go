@@ -1049,19 +1049,43 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 	if body.Success != nil && !*body.Success {
 		return StoreStatus{}, false
 	}
+	// The ID is what makes an answer about OUR torrent. mylist is asked by id and should reply with one
+	// entry, but it can reply with the account list — that is why the array fallback below exists at all
+	// — and this took arr[0] blind, the very mistake listFiles was hardened against. It has no id field
+	// even in principle, so it could not check. A finished arr[0] made a live download read as ok=false,
+	// which handlePlay answers 404 dead_link: the client blacklists a release that is downloading right
+	// now, which is the single failure Status exists to prevent. A downloading arr[0] is quieter and no
+	// better — the viewer watches another torrent's percentage, ETA and rate.
 	type entryState struct {
+		ID               *int     `json:"id"`
 		Progress         *float64 `json:"progress"`
 		DownloadFinished *bool    `json:"download_finished"`
 		ETA              *int     `json:"eta"`
 		DownloadSpeed    *int64   `json:"download_speed"`
 	}
+	// describesOurs — an entry with no id is taken at its word, since the single-entry answer to a
+	// by-id query need not repeat it; one that names a DIFFERENT torrent never is.
+	describesOurs := func(e entryState) bool { return e.ID == nil || *e.ID == torrentID }
 	var st entryState
 	if len(body.Data) == 0 || json.Unmarshal(body.Data, &st) != nil {
 		var arr []entryState
 		if json.Unmarshal(body.Data, &arr) != nil || len(arr) == 0 {
 			return StoreStatus{}, false
 		}
-		st = arr[0]
+		st = entryState{}
+		found := false
+		for _, e := range arr {
+			if describesOurs(e) {
+				st, found = e, true
+				break
+			}
+		}
+		if !found {
+			return StoreStatus{}, false
+		}
+	}
+	if !describesOurs(st) {
+		return StoreStatus{}, false
 	}
 	// Finished but Resolve still failed → not a wait we can promise anything about; reads as dead.
 	if st.DownloadFinished != nil && *st.DownloadFinished {
@@ -1176,7 +1200,8 @@ func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (i
 		return 0, false, false
 	}
 	var body struct {
-		Data []struct {
+		Success *bool `json:"success"`
+		Data    *[]struct {
 			ID   int    `json:"id"`
 			Hash string `json:"hash"`
 		} `json:"data"`
@@ -1184,8 +1209,15 @@ func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (i
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
 		return 0, false, false
 	}
+	// No list, no verdict. A 200 carrying no `data` key at all, or an explicit success:false, is not the
+	// account saying it holds nothing — it is TorBox's envelope missing, and listFiles reads exactly the
+	// same body as silence ("not a claim about the account"). Calling it authoritative wrote a 15s miss
+	// marker that then suppressed the only lookup able to rediscover a queued torrent.
+	if body.Data == nil || (body.Success != nil && !*body.Success) {
+		return 0, false, false
+	}
 	want := strings.ToLower(infoHash)
-	for _, e := range body.Data {
+	for _, e := range *body.Data {
 		if strings.ToLower(e.Hash) == want {
 			return e.ID, true, true
 		}
