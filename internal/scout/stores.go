@@ -1304,8 +1304,8 @@ func selectFileID(files []TorrentFile, t ResolveTarget) (*int, error) {
 	// function return before FileIdx was ever read, so a guess beat a fact. Here it is what it should be:
 	// the fallback after the fact rather than instead of it.
 	if t.Season != nil && t.Episode != nil {
-		if pool := episodeFilePool(files); len(pool) > 0 {
-			idx := largest(pool).Index
+		if len(episodeFilePool(files)) > 0 {
+			idx := largestEpisodeCandidate(files).Index
 			return &idx, nil
 		}
 	}
@@ -1707,6 +1707,10 @@ func (s *realDebridStore) pickFileID(files []TorrentFile, t ResolveTarget) (*int
 	// video-only pool, so this tail was unreachable for a multi-file unlabelled pack; moving the fallback
 	// out here exposed it, and a pack whose biggest entry is a .iso or a .rar then resolved to that, with
 	// a 302 and no error.
+	if t.Season != nil && t.Episode != nil {
+		idx := largestEpisodeCandidate(files).Index
+		return &idx, nil
+	}
 	idx := largestPlayable(files).Index
 	return &idx, nil
 }
@@ -2008,6 +2012,10 @@ func (s *premiumizeStore) pickIndex(files []TorrentFile, t ResolveTarget) (*int,
 	}
 	// Largest VIDEO — see the note on RD's tail: this fallback was unreachable for an unlabelled pack
 	// until pickEpisodeFile stopped answering for one, and it picks from every file, .iso included.
+	if t.Season != nil && t.Episode != nil {
+		idx := largestEpisodeCandidate(files).Index
+		return &idx, nil
+	}
 	idx := largestPlayable(files).Index
 	return &idx, nil
 }

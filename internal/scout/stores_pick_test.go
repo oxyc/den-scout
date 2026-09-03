@@ -668,3 +668,94 @@ func TestPickers_aDuplicateNumberIsStillTheEpisode(t *testing.T) {
 	got, err = selectFileID(dual, withIdx)
 	wantPick(t, got, err, 5, "a position in this torrent beats a number that named several files")
 }
+
+// A file that names an episode has named a DIFFERENT one by the time any guess is reached, so it can
+// never be the answer, whatever its size. Counting rules decide whether a pack is condemned and there is
+// always a band they miss — labelled files present but not a majority — where control used to reach
+// "the largest video anywhere", pick a file whose filename says S01E02, and serve it for a request for
+// S03E09 with a 302 and no error.
+func TestPickers_neverServeAFileThatNamesADifferentEpisode(t *testing.T) {
+	// Walk the whole counting band, including the equal counts the majority rule leaves open.
+	for _, counts := range []struct{ labelled, unlabelled int }{{2, 1}, {2, 2}, {2, 4}, {3, 3}, {3, 5}, {4, 4}, {4, 6}} {
+		var files []TorrentFile
+		for i := 1; i <= counts.labelled; i++ {
+			files = append(files, file(i, fmt.Sprintf("Show.S01E%02d.1080p.mkv", i), 1000*i))
+		}
+		for i := 1; i <= counts.unlabelled; i++ {
+			files = append(files, file(100+i, fmt.Sprintf("Extras/featurette-%d.mkv", i), 10))
+		}
+		target := ResolveTarget{InfoHash: H, Season: intp(3), Episode: intp(9)}
+		for _, tc := range []struct {
+			name string
+			pick func() (*int, error)
+		}{
+			{"torbox", func() (*int, error) { return selectFileID(files, target) }},
+			{"realdebrid", func() (*int, error) { return (&realDebridStore{}).pickFileID(files, target) }},
+			{"premiumize", func() (*int, error) { return (&premiumizeStore{}).pickIndex(files, target) }},
+		} {
+			got, err := tc.pick()
+			if err != nil {
+				continue // a refusal is always a safe answer here
+			}
+			if got == nil {
+				t.Errorf("%s %d/%d: got no answer and no error", tc.name, counts.labelled, counts.unlabelled)
+				continue
+			}
+			if *got >= 1 && *got <= counts.labelled {
+				t.Errorf("%s %d/%d labelled/unlabelled: served Show.S01E%02d for a request for S03E09",
+					tc.name, counts.labelled, counts.unlabelled, *got)
+			}
+		}
+	}
+}
+
+// The demoted bare tier must weigh the same candidates the tier it continues weighs. Over the whole pool
+// it admitted a file naming its own, different episode — and since the guess outranks the last-resort
+// largest, that file won over both copies of the episode actually asked for.
+func TestAmbiguousEpisodeGuess_ignoresFilesThatNameTheirOwnEpisode(t *testing.T) {
+	files := []TorrentFile{
+		file(0, "Show.S01E12 - Part 5.mkv", 9000), // labelled, and carries a standalone 5
+		file(1, "[Grp] Show - 05 [1080p].mkv", 4000),
+		file(2, "[Grp] Show - 05 [720p].mkv", 900),
+	}
+	if got := ambiguousEpisodeGuess(files, 5); got == nil || *got != 1 {
+		t.Errorf("guess = %v, want the 1080p copy of episode 5 (index 1)", got)
+	}
+	target := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(5)}
+	got, err := selectFileID(files, target)
+	wantPick(t, got, err, 1, "torbox serves episode 5, not the file that says S01E12")
+	got, err = (&realDebridStore{}).pickFileID(files, target)
+	wantPick(t, got, err, 1, "realdebrid likewise")
+	got, err = (&premiumizeStore{}).pickIndex(files, target)
+	wantPick(t, got, err, 1, "premiumize likewise")
+}
+
+// The bare tier's own candidate restriction, asserted where it can fail: over the whole pool the labelled
+// file also matches the number, so the match is no longer unique and the tier answers nothing.
+func TestPickEpisodeFile_theBareTierIgnoresLabelledFiles(t *testing.T) {
+	files := []TorrentFile{
+		file(0, "Show.S01E12 - Part 5.mkv", 9000),
+		file(1, "[Grp] Show - 05 [1080p].mkv", 4000),
+	}
+	got, err := pickEpisodeFile(files, 1, 5)
+	wantPick(t, got, err, 1, "the one unlabelled file carrying the number is the answer")
+}
+
+// The majority rule's boundary. Equal counts must NOT condemn: the unlabelled files may be absolutely
+// numbered, and a refusal short-circuits every store's picker before the indexer's position is read.
+func TestPickEpisodeFile_equalCountsDeferRatherThanCondemn(t *testing.T) {
+	files := []TorrentFile{
+		file(0, "Show.S01E01.1080p.mkv", 900),
+		file(1, "Show.S01E02.1080p.mkv", 950),
+		file(2, "[Grp] Show - 13 [1080p].mkv", 980),
+		file(3, "[Grp] Show - 14 [1080p].mkv", 990),
+	}
+	if got, err := pickEpisodeFile(files, 2, 1); got != nil || err != nil {
+		t.Errorf("two labelled and two unlabelled must defer to the indexer: got %v, %v", got, err)
+	}
+	// A strict majority of labels still condemns.
+	majority := append(append([]TorrentFile{}, files[:2]...),
+		file(4, "Show.S01E03.1080p.mkv", 960), file(5, "Extras/featurette.mkv", 10))
+	got, err := pickEpisodeFile(majority, 2, 1)
+	wantNotInTorrent(t, got, err, "three labelled episodes against one extra is a labelled pack")
+}

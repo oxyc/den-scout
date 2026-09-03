@@ -221,13 +221,17 @@ func largest(files []TorrentFile) TorrentFile {
 // through to. On a dual-quality release the two copies of the episode are the matches and the better one
 // wins; where the number is really the show's title the guess is no worse than the fallback it replaces.
 func ambiguousEpisodeGuess(files []TorrentFile, episode int) *int {
-	pool := episodeFilePool(files)
-	if len(pool) == 0 {
+	// The same candidates the tier it continues uses. Iterating the whole pool admitted files that name
+	// their OWN, different episode — and since this ranks above the last-resort largest, one of them won:
+	// `Show.S01E12 - Part 5.mkv` was served for a request for episode 5, beating both copies of
+	// `[Grp] Show - 05` sitting beside it. A bare number is noise on a file that already says what it is.
+	candidates := unlabelledCandidates(files)
+	if len(candidates) == 0 {
 		return nil
 	}
 	var bare []TorrentFile
 	patterns := bareEpisodePatterns(episode)
-	for _, f := range pool {
+	for _, f := range candidates {
 		if matchesEpisode(f.Name, patterns) {
 			bare = append(bare, f)
 		}
@@ -237,6 +241,36 @@ func ambiguousEpisodeGuess(files []TorrentFile, episode int) *int {
 	}
 	idx := largest(bare).Index
 	return &idx
+}
+
+// unlabelledCandidates is the pool minus every file whose own name declares an episode. It is only ever
+// reached once the strong matcher has found nothing, so a file that names an episode has named a
+// DIFFERENT one and cannot be the answer, whatever its size.
+//
+// Every guess below the strong tier has to be taken from this set rather than the pool. Counting rules
+// decide whether a pack is condemned, and there is always a band they do not cover — labelled files
+// present but not a majority — where control fell through to "the largest video anywhere", picked a file
+// whose filename says S01E02, and served it for a request for S03E09 with a 302 and no error. Re-tuning
+// the threshold only moves that band; excluding the files that rule themselves out removes it.
+func unlabelledCandidates(files []TorrentFile) []TorrentFile {
+	pool := episodeFilePool(files)
+	var out []TorrentFile
+	for _, f := range pool {
+		if !labelledEpisodeRe.match(strings.ToLower(baseName(f.Name))) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// largestEpisodeCandidate is the last resort when an episode was asked for: the biggest file that has
+// not ruled itself out by naming a different episode. Where every file names one it falls back to the
+// whole playable pool, since something must be served and there is nothing left to prefer.
+func largestEpisodeCandidate(files []TorrentFile) TorrentFile {
+	if c := unlabelledCandidates(files); len(c) > 0 {
+		return largest(c)
+	}
+	return largestPlayable(files)
 }
 
 // largestPlayable is largest() over the files that could be the feature — the same video-only pool
