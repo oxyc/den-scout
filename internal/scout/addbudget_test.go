@@ -3711,3 +3711,75 @@ func TestTorBox_theAccountListingIsFetchedOncePerAccount(t *testing.T) {
 		t.Error("a hash the account does not hold must not be found")
 	}
 }
+
+// The same hash is asked about three times within seconds — by /stream, by ?probe=1, and by /play on a
+// two-account install. "Held" is stable, so one answer serves all three. "Not held" is not: it becomes
+// held the instant a download finishes, and noticing that transition is the entire job of the poll loop,
+// so a negative is never memoised.
+func TestCacheCheck_remembersHeldButNeverNotHeld(t *testing.T) {
+	for _, st := range []struct {
+		name string
+		svc  DebridService
+		body func(held bool) string
+		make func(Cache, doer) Store
+	}{
+		{"torbox", ServiceTorBox, func(held bool) string {
+			if held {
+				return `{"data":{"` + H + `":{"name":"x"}}}`
+			}
+			return `{"data":{}}`
+		}, func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", cache: c, api: torboxAPI, client: d}
+		}},
+		{"premiumize", ServicePremiumize, func(held bool) string {
+			if held {
+				return `{"status":"success","response":[true]}`
+			}
+			return `{"status":"success","response":[false]}`
+		}, func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", cache: c, api: premiumizeAPI, client: d}
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			// A release the account HOLDS: asked once, answered three times.
+			calls := 0
+			cache := NewMemoryCache(1 << 20)
+			s := st.make(cache, mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				calls++
+				return resp(200, st.body(true)), nil
+			}})
+			for i := 0; i < 3; i++ {
+				got, err := s.CacheCheck(context.Background(), []string{H})
+				if err != nil || !got[H] {
+					t.Fatalf("check %d: %v %v", i, got, err)
+				}
+			}
+			if calls != 1 {
+				t.Errorf("asked %d times about a release the account holds", calls)
+			}
+
+			// A release it does NOT hold: asked every time, because the answer is what changes when the
+			// download lands.
+			calls = 0
+			cache = NewMemoryCache(1 << 20)
+			held := false
+			s = st.make(cache, mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				calls++
+				return resp(200, st.body(held)), nil
+			}})
+			for i := 0; i < 3; i++ {
+				if got, _ := s.CacheCheck(context.Background(), []string{H}); got[H] {
+					t.Fatalf("check %d claimed a release that is still downloading", i)
+				}
+			}
+			if calls != 3 {
+				t.Errorf("asked %d times about a downloading release — the poll must see it land", calls)
+			}
+			// It lands, and the very next check must notice.
+			held = true
+			if got, _ := s.CacheCheck(context.Background(), []string{H}); !got[H] {
+				t.Error("the download finished and the next check did not notice")
+			}
+		})
+	}
+}

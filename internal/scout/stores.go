@@ -203,8 +203,51 @@ func (s *torBoxStore) get(ctx context.Context, u string) (*http.Response, error)
 	return s.client.Do(req)
 }
 
+// cachedTTL — how long "this account holds it" answers for.
+//
+// Only a POSITIVE is memoised, and that asymmetry is the whole point. "Held" is stable: a release does
+// not stop being held while a viewer picks it, so the same question asked by /stream, then by ?probe=1,
+// then by /play on a two-account install — three times within seconds, about the hash the viewer just
+// chose — has one answer. "Not held" is the opposite: it becomes "held" the instant a download finishes,
+// and that transition is exactly what the probe route polls to notice. Memoising a negative would make
+// the client wait up to cachedTTL to be told its own download is ready.
+const cachedTTL = 60 * time.Second
+
+func cachedKey(svc DebridService, token, infoHash string) string {
+	return string(svc) + ":cached:" + keyHash(token) + ":" + infoHash
+}
+
+// knownCached splits hashes into those already known to be held and those still worth asking about.
+func knownCached(cache Cache, svc DebridService, token string, hashes []string) (map[string]bool, []string) {
+	known := make(map[string]bool, len(hashes))
+	if cache == nil {
+		return known, hashes
+	}
+	ask := make([]string, 0, len(hashes))
+	for _, h := range hashes {
+		if _, hit := cache.Get(cachedKey(svc, token, h)); hit {
+			known[h] = true
+			continue
+		}
+		ask = append(ask, h)
+	}
+	return known, ask
+}
+
+// rememberCached records the positives from an answer. Negatives are deliberately not recorded.
+func rememberCached(cache Cache, svc DebridService, token string, result map[string]bool) {
+	if cache == nil {
+		return
+	}
+	for h, held := range result {
+		if held {
+			cache.Put(cachedKey(svc, token, h), "1", cachedTTL)
+		}
+	}
+}
+
 func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error) {
-	result := make(map[string]bool, len(hashes))
+	result, hashes := knownCached(s.cache, ServiceTorBox, s.token, hashes)
 	if len(hashes) == 0 {
 		return result, nil
 	}
@@ -256,6 +299,7 @@ func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[stri
 			result[h] = cached[i]
 		}
 	}
+	rememberCached(s.cache, ServiceTorBox, s.token, result)
 	return result, batchesFailed(batchOK)
 }
 
@@ -2025,7 +2069,7 @@ type premiumizeStore struct {
 func (s *premiumizeStore) Service() DebridService { return ServicePremiumize }
 
 func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error) {
-	result := make(map[string]bool, len(hashes))
+	result, hashes := knownCached(s.cache, ServicePremiumize, s.token, hashes)
 	if len(hashes) == 0 {
 		return result, nil
 	}
@@ -2079,6 +2123,7 @@ func (s *premiumizeStore) CacheCheck(ctx context.Context, hashes []string) (map[
 			result[h] = cached[i]
 		}
 	}
+	rememberCached(s.cache, ServicePremiumize, s.token, result)
 	return result, batchesFailed(batchOK)
 }
 
