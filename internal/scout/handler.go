@@ -505,7 +505,14 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// 60 adds an hour; a single three-minute wait spent thirty-six of them, and the account was throttled
 	// out of playing anything at all. A probe reports what is true right now and starts nothing.
 	if r.URL.Query().Get("probe") == "1" {
-		h.handleProbe(w, ctx, config, pool, target.InfoHash, rt)
+		// On the STATUS budget, not the resolve one. A probe answers and starts nothing, and the client
+		// polls it on a two-second cadence — so it belongs under the ceiling statusBudget's own comment
+		// describes ("far under the resolve budget so a wait answers promptly instead of hanging the
+		// poll"), rather than pinning a goroutine and a connection for forty-five seconds against a slow
+		// debrid. It makes up to three upstream calls, all reads.
+		probeCtx, probeCancel := context.WithTimeout(r.Context(), statusBudget)
+		defer probeCancel()
+		h.handleProbe(w, probeCtx, config, pool, target.InfoHash, rt)
 		return
 	}
 

@@ -792,8 +792,16 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		// this store consults FIRST, pre-empt it on the next poll: errAddInFlight became unreachable and
 		// the client was told its debrid was refusing for a release scout had an add out for.
 		if addOutcomeUnknown(s.cache, ServiceTorBox, s.token, t.InfoHash) {
+			// Not on a cancellation. /play runs on the client's context and a focus change is enough, so
+			// a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every resolve
+			// of that release answered a dead link for the rest of unknownOutcomeTTL, with no upstream
+			// call able to clear it — RD and Premiumize have no Status to rediscover the torrent with. A
+			// deadline belongs on a service that never answered, not on a client that hung up. This is
+			// the same guard recordRefusal applies one branch over, for the same reason.
 			// Start the clock on not knowing, so this cannot cycle forever.
-			noteUnknownOutcome(s.cache, ServiceTorBox, s.token, t.InfoHash)
+			if !isCancellation(err) {
+				noteUnknownOutcome(s.cache, ServiceTorBox, s.token, t.InfoHash)
+			}
 		} else {
 			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 		}
@@ -955,6 +963,10 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		// a header here rather than the URL, so a leak needs the service to echo the header back — but
 		// this was the one call site not following the rule, which is reason enough.
 		detail := redactToken(storeErrorText(raw), s.token)
+		// TorBox answered and created nothing, so the charge goes back — the rule RD and Premiumize
+		// already follow on their own answered failures. Kept here, a repeatedly polled bad magnet ate
+		// this account's hourly allowance where the other two were already immune.
+		refundUnusedAdd(ServiceTorBox, s.token)
 		if storeRefusedUs(resp.StatusCode) {
 			return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
@@ -1437,7 +1449,15 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		// See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
 		// case, having no Status for handlePlay to rescue the answer with.
 		if addOutcomeUnknown(s.cache, ServiceRealDebrid, s.token, t.InfoHash) {
-			noteUnknownOutcome(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
+			// Not on a cancellation. /play runs on the client's context and a focus change is enough, so
+			// a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every resolve
+			// of that release answered a dead link for the rest of unknownOutcomeTTL, with no upstream
+			// call able to clear it — RD and Premiumize have no Status to rediscover the torrent with. A
+			// deadline belongs on a service that never answered, not on a client that hung up. This is
+			// the same guard recordRefusal applies one branch over, for the same reason.
+			if !isCancellation(err) {
+				noteUnknownOutcome(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
+			}
 		} else {
 			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
 		}
@@ -1895,7 +1915,15 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		// client saw the right thing — but the refusal was still written, and a refusal is read by the
 		// probe route and by every other release on this account's per-hash key.
 		if addOutcomeUnknown(s.cache, ServicePremiumize, s.token, t.InfoHash) {
-			noteUnknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
+			// Not on a cancellation. /play runs on the client's context and a focus change is enough, so
+			// a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every resolve
+			// of that release answered a dead link for the rest of unknownOutcomeTTL, with no upstream
+			// call able to clear it — RD and Premiumize have no Status to rediscover the torrent with. A
+			// deadline belongs on a service that never answered, not on a client that hung up. This is
+			// the same guard recordRefusal applies one branch over, for the same reason.
+			if !isCancellation(err) {
+				noteUnknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
+			}
 		} else {
 			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		}

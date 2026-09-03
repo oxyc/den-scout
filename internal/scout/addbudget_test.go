@@ -285,18 +285,37 @@ func TestAddBudget_aHeldTorrentIsNotBoughtAgain(t *testing.T) {
 	}
 }
 
-// A real failure still counts. The request reached the service, so the add may well have happened —
-// refunding on anything but a cancellation would make the ceiling meaningless.
-func TestAddBudget_aRealFailureStillSpends(t *testing.T) {
-	prev := globalAddBudget
-	globalAddBudget = newAddBudget(time.Hour, 5)
-	defer func() { globalAddBudget = prev }()
+// What the ceiling counts is adds that may HAVE HAPPENED, and the dividing line is whether the service
+// answered. A request that reached the wire and was never answered keeps its charge — the torrent may
+// well exist, which is why refundAdd will not give it back. An answered non-2xx is the opposite: the
+// service said it created nothing, so holding the charge only erodes the allowance. All three stores
+// draw the line in the same place; TorBox used to keep both, so a repeatedly polled bad magnet ate its
+// hourly allowance where RD and Premiumize were immune.
+func TestAddBudget_theChargeFollowsWhetherTheServiceAnswered(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   func(*http.Request) (*http.Response, error)
+		want int
+	}{
+		{"answered, created nothing", func(*http.Request) (*http.Response, error) {
+			return resp(400, `{"error":"NOPE"}`), nil
+		}, 5},
+		{"never answered", func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("read tcp 10.0.0.2:443: connection reset by peer")
+		}, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 5)
+			defer func() { globalAddBudget = prev }()
 
-	d := mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(400, `{"error":"NOPE"}`), nil }}
-	s := &torBoxStore{token: "tok", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
-	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
-	if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != 4 {
-		t.Errorf("remaining = %d, want 4 — a delivered request must count", left)
+			s := &torBoxStore{token: "tok", client: mockDoer{fn: tc.fn},
+				cache: NewMemoryCache(1 << 20), api: torboxAPI}
+			_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != tc.want {
+				t.Errorf("remaining = %d, want %d", left, tc.want)
+			}
+		})
 	}
 }
 
@@ -2952,3 +2971,61 @@ func (s stubStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
 	return StoreStatus{}, false
 }
 func (s stubStore) CacheCheck(context.Context, []string) (map[string]bool, error) { return nil, nil }
+
+// A viewer backing out must not condemn a release. /play runs on the client's context and a focus change
+// is enough to cancel it, so a cancelled add landed in the same branch as a service that never answered
+// — and once the give-up clock was stamped, every later resolve of that release answered a dead link for
+// the rest of unknownOutcomeTTL, with no upstream call able to clear it. RD and Premiumize have no
+// Status to rediscover the torrent with, so nothing escaped it. A deadline belongs on a service that
+// went quiet, not on a client that hung up.
+func TestStores_aCancelledAddDoesNotStartTheGiveUpClock(t *testing.T) {
+	for _, st := range []struct {
+		name string
+		svc  DebridService
+		path string
+		make func(Cache, doer) Store
+	}{
+		{"torbox", ServiceTorBox, "createtorrent", func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}},
+		{"realdebrid", ServiceRealDebrid, "addMagnet", func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+		{"premiumize", ServicePremiumize, "directdl", func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			cache := NewMemoryCache(1 << 20)
+			for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+				s := st.make(cache, mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+					if strings.Contains(r.URL.Path, st.path) {
+						return nil, fmt.Errorf("Post %q: %w", "https://example/add", cause)
+					}
+					return resp(200, `{}`), nil
+				}})
+				_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+				if stamp, ok := cache.Get(unknownOutcomeKey(st.svc, "tok", H)); ok && stamp != "" {
+					t.Fatalf("%v started the give-up clock: the release is condemned for %v", cause, addGiveUp)
+				}
+				settleAddAttempt(cache, st.svc, "tok", H)
+			}
+			// A service that genuinely went quiet still starts it — the guard must be about the CAUSE,
+			// not about switching the deadline off.
+			s := st.make(cache, mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, st.path) {
+					return nil, fmt.Errorf("read tcp 10.0.0.2:443: connection reset by peer")
+				}
+				return resp(200, `{}`), nil
+			}})
+			_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			if stamp, ok := cache.Get(unknownOutcomeKey(st.svc, "tok", H)); !ok || stamp == "" {
+				t.Errorf("a service that never answered left no give-up clock")
+			}
+		})
+	}
+}
