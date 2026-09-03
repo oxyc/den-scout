@@ -145,14 +145,15 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 				bare = append(bare, f)
 			}
 		}
-		// Exactly one, or it is not evidence. In a numbered pack the episode's own number appears in one
-		// file; a number that turns up in several is something they share — the show's title — and
-		// picking the biggest of those served `Stargate SG-1 - 03` for a request for episode 1.
+		// Exactly one, and it decides. In a numbered pack the episode's own number appears in one file; a
+		// number turning up in several is either something they share — the show's title, which served
+		// `Stargate SG-1 - 03` for a request for episode 1 — or the same episode twice, as in a
+		// dual-quality pack. This function cannot tell those apart, so it does not try: several matches
+		// answer nothing HERE and are offered to the caller lower down, beneath the indexer's fileIdx.
 		//
-		// The test used to be "did it match EVERY candidate", which asked about set sizes rather than
-		// about whether the evidence tells the files apart, and one odd file was enough to disarm it: add
-		// a sample to the same SG-1 pack and 3 of 4 matched, so the equality failed and the largest was
-		// served again. Counting to one has no such seam.
+		// Discarding them outright was wrong in the other direction: a dual-quality pack, or a bare pack
+		// with an extras file sharing an episode number, fell all the way through to "largest video in
+		// the pack" and served the wrong episode.
 		if len(bare) == 1 {
 			idx := bare[0].Index
 			return &idx, nil
@@ -163,12 +164,14 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 	// numbering is frequently ABSOLUTE, so season 2 episode 1 is packed as `[Grp] Show - 13` and nothing
 	// in the name says so, so refusing on that would kill every episode of an ordinary anime season.
 	//
-	// It counts the LABELLED files rather than requiring every file to be labelled. The stricter test
-	// asked about the pool instead of about the pack, so a single unlabelled extra — a sample, a
-	// featurette, a bonus rip, all of which are videos and all of which are ordinary in a season pack —
-	// disarmed the refusal for every episode of that pack, and the stores then served their largest
-	// video: a 302, no error, the wrong episode. One stray file cannot unmake a pack.
-	if len(pool)-len(unlabelled) > 1 {
+	// The labelled files must also be the MAJORITY, which is what makes them the pack rather than a few
+	// extras inside one. Requiring every file to be labelled let a single sample disarm the refusal for a
+	// pack that plainly held other episodes; requiring merely two let the opposite happen — an anime
+	// batch of twelve absolutely-numbered episodes plus two labelled OVAs was condemned whole, and since
+	// the error short-circuits every store's picker the indexer's correct fileIdx was never read. A
+	// release that plays, answered 404. Both mistakes are the same one: counting labels instead of asking
+	// whether the labels describe the pack.
+	if labelled := len(pool) - len(unlabelled); labelled > 1 && labelled > len(unlabelled) {
 		return nil, errEpisodeNotInTorrent
 	}
 	// No opinion, rather than a guess. The fallback below is sound only for a pool of ONE, where "the
@@ -209,6 +212,31 @@ func largest(files []TorrentFile) TorrentFile {
 		}
 	}
 	return best
+}
+
+// ambiguousEpisodeGuess is the answer pickEpisodeFile declined to give: the largest file whose name
+// carries the episode's number, when more than one does. It ranks BELOW the indexer's fileIdx — a
+// position in this very torrent beats a number that did not tell the files apart — and above the
+// last-resort "largest video anywhere in the pack", which is what a duplicate-numbered pack used to fall
+// through to. On a dual-quality release the two copies of the episode are the matches and the better one
+// wins; where the number is really the show's title the guess is no worse than the fallback it replaces.
+func ambiguousEpisodeGuess(files []TorrentFile, episode int) *int {
+	pool := episodeFilePool(files)
+	if len(pool) == 0 {
+		return nil
+	}
+	var bare []TorrentFile
+	patterns := bareEpisodePatterns(episode)
+	for _, f := range pool {
+		if matchesEpisode(f.Name, patterns) {
+			bare = append(bare, f)
+		}
+	}
+	if len(bare) == 0 {
+		return nil
+	}
+	idx := largest(bare).Index
+	return &idx
 }
 
 // largestPlayable is largest() over the files that could be the feature — the same video-only pool

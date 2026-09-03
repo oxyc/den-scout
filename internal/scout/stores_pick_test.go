@@ -601,3 +601,70 @@ func TestBaseName_onlySplitsWhereADirectoryReallyEnds(t *testing.T) {
 	got, err := pickEpisodeFile(backslashed, 1, 1)
 	wantPick(t, got, err, 0, "a backslash in the filename does not erase its episode label")
 }
+
+// An anime batch numbered absolutely, with a couple of labelled OVAs alongside — the shape the refusal
+// must never fire on. The bare tier cannot match S02E01 against `- 13`, so control reaches the refusal,
+// and because the error short-circuits every store's picker the indexer's correct fileIdx is never read:
+// a release that plays, answered 404 and recorded dead by the client.
+func TestPickEpisodeFile_labelledExtrasDoNotCondemnANumberedBatch(t *testing.T) {
+	batch := []TorrentFile{}
+	for i := 13; i <= 24; i++ {
+		batch = append(batch, file(i, fmt.Sprintf("[Grp] Show S2 - %d [1080p].mkv", i), 900+i))
+	}
+	specials := []TorrentFile{
+		file(90, "[Grp] Show OVA S00E01 [1080p].mkv", 500),
+		file(91, "[Grp] Show OVA S00E02 [1080p].mkv", 500),
+	}
+	// Two labelled specials among twelve numbered episodes: the labels describe the extras, not the pack.
+	mixed := append(append([]TorrentFile{}, batch...), specials...)
+	if got, err := pickEpisodeFile(mixed, 2, 1); got != nil || err != nil {
+		t.Errorf("a numbered batch with labelled extras must defer to the indexer: got %v, %v", got, err)
+	}
+	// The store then uses the position the indexer gave, which is right.
+	got, err := selectFileID(mixed, ResolveTarget{InfoHash: H, Season: intp(2), Episode: intp(1), FileIdx: idx(0)})
+	wantPick(t, got, err, 13, "the indexer's position names episode 13, which is S02E01")
+
+	// The majority rule in the other direction: labels that DO describe the pack still condemn it, even
+	// with an unlabelled extra or two alongside.
+	pack := []TorrentFile{
+		file(0, "Show.S01E01.1080p.mkv", 900),
+		file(1, "Show.S01E02.1080p.mkv", 950),
+		file(2, "Show.S01E03.1080p.mkv", 980),
+		file(3, "Sample/show-sample.mkv", 20),
+	}
+	got, err = pickEpisodeFile(pack, 2, 1)
+	wantNotInTorrent(t, got, err, "three labelled episodes and one sample is still a labelled pack")
+}
+
+// A number naming several files does not tell them apart — but on a dual-quality pack those several ARE
+// the episode, and the better copy is the answer. Discarding the match sent all three stores to "largest
+// video anywhere in the pack", which is a different episode.
+func TestPickers_aDuplicateNumberIsStillTheEpisode(t *testing.T) {
+	var dual []TorrentFile
+	for i := 1; i <= 4; i++ {
+		dual = append(dual,
+			file(i*2, fmt.Sprintf("[Grp] Show - 0%d [1080p].mkv", i), 4000+i),
+			file(i*2+1, fmt.Sprintf("[Grp] Show - 0%d [720p].mkv", i), 900+i))
+	}
+	// pickEpisodeFile itself declines: two files carry the number, so it cannot say which.
+	if got, err := pickEpisodeFile(dual, 1, 1); got != nil || err != nil {
+		t.Errorf("two matches is not a unique answer: got %v, %v", got, err)
+	}
+	// The stores then take the largest of the files that DO carry the number — episode 1 in 1080p —
+	// rather than the largest of the pack, which is episode 4.
+	target := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(1)}
+	got, err := selectFileID(dual, target)
+	wantPick(t, got, err, 2, "torbox: the 1080p copy of episode 1, not the biggest episode")
+	got, err = (&realDebridStore{}).pickFileID(dual, target)
+	wantPick(t, got, err, 2, "realdebrid: likewise")
+	// Premiumize answers with an index into its own content array, and builds TorrentFile.Index from
+	// exactly that position — so the same value is the right answer there too.
+	got, err = (&premiumizeStore{}).pickIndex(dual, target)
+	wantPick(t, got, err, 2, "premiumize: likewise, by its own content index")
+
+	// And the indexer's own position still outranks the guess: position 3 is the fourth file, whose
+	// TorBox id is 5, where the guess would have said 2.
+	withIdx := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(1), FileIdx: idx(3)}
+	got, err = selectFileID(dual, withIdx)
+	wantPick(t, got, err, 5, "a position in this torrent beats a number that named several files")
+}

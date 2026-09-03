@@ -1289,6 +1289,15 @@ func selectFileID(files []TorrentFile, t ResolveTarget) (*int, error) {
 		}
 		return t.FileIdx, nil
 	}
+	// Below the indexer's position, above the last-resort largest: a number that named several files did
+	// not tell them apart, but on a dual-quality pack those several ARE the episode and the better copy
+	// wins. Falling straight through to "largest video anywhere" served episode 4 of an eight-file pack
+	// for a request for episode 1.
+	if t.Season != nil && t.Episode != nil {
+		if id := ambiguousEpisodeGuess(files, *t.Episode); id != nil {
+			return id, nil
+		}
+	}
 	// An episode was asked for, no filename named one, and the indexer gave no position either: the
 	// largest video is the last thing left to go on, and for the common shape — one feature plus a
 	// sample — it is right. This used to live inside pickEpisodeFile, where being non-nil made this
@@ -1684,6 +1693,16 @@ func (s *realDebridStore) pickFileID(files []TorrentFile, t ResolveTarget) (*int
 	// the sample: a stream that plays, for one second. The largest is the same guess Premiumize makes and
 	// the better one, and it is the answer for "no index at all" here already.
 	//
+	// Below the indexer's position, above the last-resort largest: a number that named several files did
+	// not tell them apart, but on a dual-quality pack those several ARE the episode and the better copy
+	// wins. Falling straight through to "largest video anywhere" served episode 4 of an eight-file pack
+	// for a request for episode 1.
+	if t.Season != nil && t.Episode != nil {
+		if id := ambiguousEpisodeGuess(files, *t.Episode); id != nil {
+			return id, nil
+		}
+	}
+	//
 	// Largest VIDEO, not largest file. pickEpisodeFile used to end in this same fallback over its
 	// video-only pool, so this tail was unreachable for a multi-file unlabelled pack; moving the fallback
 	// out here exposed it, and a pack whose biggest entry is a .iso or a .rar then resolved to that, with
@@ -1977,6 +1996,15 @@ func (s *premiumizeStore) pickIndex(files []TorrentFile, t ResolveTarget) (*int,
 	}
 	if t.FileIdx != nil && *t.FileIdx >= 0 && *t.FileIdx < len(files) {
 		return t.FileIdx, nil
+	}
+	// Below the indexer's position, above the last-resort largest: a number that named several files did
+	// not tell them apart, but on a dual-quality pack those several ARE the episode and the better copy
+	// wins. Falling straight through to "largest video anywhere" served episode 4 of an eight-file pack
+	// for a request for episode 1.
+	if t.Season != nil && t.Episode != nil {
+		if id := ambiguousEpisodeGuess(files, *t.Episode); id != nil {
+			return id, nil
+		}
 	}
 	// Largest VIDEO — see the note on RD's tail: this fallback was unreachable for an unlabelled pack
 	// until pickEpisodeFile stopped answering for one, and it picks from every file, .iso included.
