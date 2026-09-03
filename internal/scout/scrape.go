@@ -234,6 +234,14 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 	if parsed, perr := url.Parse(strings.TrimRight(s.baseURL, "/")); perr == nil {
 		indexerLimiter.wait(ctx, parsed.Host)
 	}
+	// The limiter returns two different ways — the token arrived, or the caller's deadline passed — and
+	// only one of them means "go ahead". Falling through on the second sends a request that cannot
+	// succeed and then reports its failure as `indexer unreachable`: scout's own queue, logged and
+	// counted as the upstream's outage. The caller still learns nothing came back, which is true and is
+	// what keeps an empty result non-authoritative; it just stops learning it as a lie about the indexer.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: queued past the scrape budget: %w", s.indexer, err)
+	}
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		streams, err, retryable := s.scrapeOnce(ctx, q)

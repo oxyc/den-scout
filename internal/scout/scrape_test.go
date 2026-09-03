@@ -2,6 +2,7 @@ package scout
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -165,3 +166,42 @@ func TestScrapeAll(t *testing.T) {
 }
 
 func gibBytes(f float64) int { return int(f*float64(gib) + 0.5) }
+
+// A scrape that spends its whole budget queueing behind the limiter must not then ask the indexer.
+//
+// The request cannot succeed — its context is already dead — and its failure was reported as
+// "indexer unreachable", so scout's own queue was logged and counted as the upstream's outage. That is
+// the difference between "we could not get to it in time" and "it is down", and only the second is a
+// reason to go looking at the indexer.
+func TestScrape_aBudgetSpentQueueingIsNotAnIndexerOutage(t *testing.T) {
+	const host = "queued-past-budget.example"
+	// Drain the burst so the next caller genuinely has to wait for a token. These are free by
+	// definition — the burst exists so a household's normal use never queues.
+	for range 30 {
+		indexerLimiter.wait(context.Background(), host)
+	}
+
+	var asked bool
+	sc := &stremioScraper{indexer: "torrentio", baseURL: "https://" + host, client: mockDoer{
+		fn: func(*http.Request) (*http.Response, error) {
+			asked = true
+			return resp(200, `{"streams":[]}`), nil
+		}}}
+
+	// Shorter than the ~1s the drained bucket now makes a caller wait.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	streams, err := sc.scrape(ctx, scrapeQuery{IMDb: "tt0111161", Type: "movie"})
+
+	if asked {
+		t.Error("asked the indexer with a context that had already expired")
+	}
+	if err == nil {
+		t.Fatalf("a scrape that never happened must report an error, got %d streams", len(streams))
+	}
+	// The caller still learns nothing came back — that is what keeps an empty result non-authoritative.
+	// What it must be able to tell is WHY, so a deadline is not filed against the indexer's health.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the budget running out must be reported as such, got %v", err)
+	}
+}
