@@ -31,6 +31,14 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 		// makes "720" (S7E20) match "720p", so exclude those as well as a following digit.
 		fmt.Sprintf(`\b%d%02d(?![\dpi])`, season, episode),
 		fmt.Sprintf(`\b%02d%02d(?![\dpi])`, season, episode),
+		// A double episode names TWO of them, and only the first was ever matched: `Show.S01E05-E06.mkv`,
+		// `S01E05E06`, `S01E05-06`, `S01E05.E06`. Asked for the second, nothing matched — and because such
+		// a file DOES declare an episode it then ruled itself out of every guess below it, so a pack of
+		// them answered 404 for half the season, while a lone unlabelled file beside them (the sample) was
+		// served for the other half. The first number is left free and the requested one anchored second.
+		// The first number needs its own `(?!\d)` or the match backtracks into a false split: without it
+		// `s01e11-e12` read as "e1" followed by "1", and episode 1 matched the last double in the pack.
+		fmt.Sprintf(`s0*%d[ ._-]*e\d{1,3}(?!\d)[ ._-]*e?0*%d(?!\d)`, season, episode),
 	)
 }
 
@@ -49,7 +57,18 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 // a number in the title (`Blake's 7`, `SG-1`) or a tag like `[10-bit]` outranked the file that really
 // did name the episode — the strong evidence losing to the weak, on the largest file.
 func bareEpisodePatterns(episode int) []*regexp2.Regexp {
-	return compileAll(fmt.Sprintf(`(?:^|[ _\-\[\]()])0*%d(?:[ _\-\[\]()]|\.(?!\d)|$)`, episode))
+	return compileAll(
+		fmt.Sprintf(`(?:^|[ _\-\[\]()])0*%d(?:[ _\-\[\]()]|\.(?!\d)|$)`, episode),
+		// `Show - E05 [1080p].mkv` and `Show.E05.1080p.mkv`: an episode number with no season anywhere, so
+		// the strong patterns cannot fire and labelledEpisodeRe (which needs the `s`) does not see it
+		// either. Every file then looked identical to every other and the largest was served for all
+		// twelve episodes of a pack.
+		//
+		// The `e` is what makes this safe where the bare token is not: it is why a dot may open the token
+		// and why the trailing rule can relax to any separator. `DDP5.1`, `H.264` and `AAC.2.0` have no
+		// `e` against their digits, and a file that names a season is excluded from this tier already.
+		fmt.Sprintf(`(?:^|[ ._\-\[\]()])e0*%d(?:[ ._\-\[\]()]|$)`, episode),
+	)
 }
 
 func compileAll(specs ...string) []*regexp2.Regexp {

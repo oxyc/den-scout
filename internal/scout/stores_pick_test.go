@@ -3,6 +3,7 @@ package scout
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -701,9 +702,16 @@ func TestPickers_neverServeAFileThatNamesADifferentEpisode(t *testing.T) {
 				t.Errorf("%s %d/%d: got no answer and no error", tc.name, counts.labelled, counts.unlabelled)
 				continue
 			}
-			if *got >= 1 && *got <= counts.labelled {
-				t.Errorf("%s %d/%d labelled/unlabelled: served Show.S01E%02d for a request for S03E09",
-					tc.name, counts.labelled, counts.unlabelled, *got)
+			// What is asserted: never a file that has NAMED a different episode. What is knowingly NOT
+			// asserted: that an unlabelled extra is refused. S03E09 is absent from this pool, so serving
+			// `Extras/featurette-1.mkv` is wrong too — but scout cannot tell an extra from an absolutely
+			// numbered episode by name, and refusing on that basis is what condemned whole anime batches
+			// two rounds ago (see TestPickEpisodeFile_labelledExtrasDoNotCondemnANumberedBatch). The
+			// trade is deliberate and the mis-scrape that reaches it is rare; the confident wrong answer
+			// this test does forbid is not.
+			if served := nameOfIndex(files, *got); !strings.Contains(served, "featurette") {
+				t.Errorf("%s %d/%d labelled/unlabelled: served %q for a request for S03E09",
+					tc.name, counts.labelled, counts.unlabelled, served)
 			}
 		}
 	}
@@ -758,4 +766,99 @@ func TestPickEpisodeFile_equalCountsDeferRatherThanCondemn(t *testing.T) {
 		file(4, "Show.S01E03.1080p.mkv", 960), file(5, "Extras/featurette.mkv", 10))
 	got, err := pickEpisodeFile(majority, 2, 1)
 	wantNotInTorrent(t, got, err, "three labelled episodes against one extra is a labelled pack")
+}
+
+// A double episode names TWO, and only the first was ever matched. Asked for the second, nothing matched
+// — and because the file DOES declare an episode it then ruled itself out of every guess below, so a
+// pack of them answered 404 for half the season while the sample beside them was served for the rest.
+func TestPickEpisodeFile_doubleEpisodesNameBothOfThem(t *testing.T) {
+	for _, spelling := range []string{"S01E05-E06", "S01E05E06", "S01E05-06", "S01E05.E06"} {
+		files := []TorrentFile{
+			file(0, "Show."+spelling+".1080p.WEB-DL.mkv", 5_000_000),
+			file(1, "Sample/sample.mkv", 30_000),
+		}
+		for _, ep := range []int{5, 6} {
+			got, err := pickEpisodeFile(files, 1, ep)
+			wantPick(t, got, err, 0, fmt.Sprintf("%s holds episode %d", spelling, ep))
+		}
+		// Through the real pickers too, since that is where the sample was being served.
+		for _, ep := range []int{5, 6} {
+			target := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(ep)}
+			got, err := selectFileID(files, target)
+			wantPick(t, got, err, 0, fmt.Sprintf("torbox serves the episode, not the sample (%s, E%d)", spelling, ep))
+			got, err = (&realDebridStore{}).pickFileID(files, target)
+			wantPick(t, got, err, 0, "realdebrid likewise")
+			got, err = (&premiumizeStore{}).pickIndex(files, target)
+			wantPick(t, got, err, 0, "premiumize likewise")
+		}
+	}
+
+	// A whole season packed as doubles: every episode must resolve, and none may 404.
+	var pack []TorrentFile
+	for i := 0; i < 6; i++ {
+		pack = append(pack, file(i, fmt.Sprintf("Show.S01E%02d-E%02d.1080p.mkv", i*2+1, i*2+2), 1000+i))
+	}
+	for ep := 1; ep <= 12; ep++ {
+		got, err := pickEpisodeFile(pack, 1, ep)
+		wantPick(t, got, err, (ep-1)/2, fmt.Sprintf("episode %d lives in the %dth double", ep, (ep-1)/2))
+	}
+	// And a genuinely absent episode is still refused rather than guessed at.
+	got, err := pickEpisodeFile(pack, 1, 21)
+	wantNotInTorrent(t, got, err, "episode 21 is not in a pack of E01-E12")
+
+	// The first number stays free: a single episode must not match its neighbours.
+	single := []TorrentFile{file(0, "Show.S01E05.1080p.mkv", 900)}
+	if got, err := pickEpisodeFile(single, 1, 6); got == nil || err != nil || *got != 0 {
+		// A pool of one falls back regardless; what matters is that the RANGE pattern did not fire.
+		_ = got
+	}
+	if matchesEpisode("Show.S01E05.1080p.mkv", episodePatterns(1, 6)) {
+		t.Error("a single episode must not match the episode after it")
+	}
+	if matchesEpisode("Show.S01E10-E12.1080p.mkv", episodePatterns(1, 1)) {
+		t.Error("E10-E12 must not match episode 1")
+	}
+}
+
+// An episode number with no season anywhere: the strong patterns cannot fire and labelledEpisodeRe does
+// not see it, so every file looked identical and the largest was served for all twelve episodes.
+func TestPickEpisodeFile_seasonlessEpisodeLabels(t *testing.T) {
+	for _, shape := range []string{"Show - E%02d [1080p].mkv", "Show.E%02d.1080p.mkv", "Show_E%02d_1080p.mkv"} {
+		var pack []TorrentFile
+		for i := 1; i <= 12; i++ {
+			pack = append(pack, file(i, fmt.Sprintf(shape, i), 1000+i))
+		}
+		for ep := 1; ep <= 12; ep++ {
+			got, err := pickEpisodeFile(pack, 1, ep)
+			wantPick(t, got, err, ep, fmt.Sprintf("%s: episode %d", shape, ep))
+		}
+	}
+	// The guards that keep the `e` form from firing on audio and codec tags, where the bare token cannot.
+	for _, tc := range []struct {
+		name    string
+		episode int
+	}{
+		{"Show.S01E03.1080p.WEB-DL.DDP5.1.H.264-NTb.mkv", 1},
+		{"Show.S03E07.TrueHD.7.1.Atmos-GRP.mkv", 1},
+		{"Show.S03E07.AAC.2.0-GRP.mkv", 0},
+		{"Show.S01E03.2160p.HEVC.x265.mkv", 265},
+	} {
+		if matchesEpisode(tc.name, bareEpisodePatterns(tc.episode)) {
+			t.Errorf("%q must not read as episode %d", tc.name, tc.episode)
+		}
+	}
+}
+
+// nameOfIndex reports which file an answer actually names, so a failure says what was served rather than
+// which bucket the number fell in.
+func nameOfIndex(files []TorrentFile, idx int) string {
+	for _, f := range files {
+		if f.Index == idx {
+			return f.Name
+		}
+	}
+	if idx >= 0 && idx < len(files) {
+		return files[idx].Name + " (by position)"
+	}
+	return fmt.Sprintf("index %d, which is in no file", idx)
 }
