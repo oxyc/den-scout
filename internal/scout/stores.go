@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // maxStoreBytes caps a debrid API response body — these JSON payloads are small; the limit stops a
@@ -1238,16 +1239,72 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 // ANSWER is authoritative — the list was read and the hash was not in it — as opposed to the list not
 // having been read at all. Only the first justifies remembering a miss.
 func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (int, bool, bool) {
-	if s.client == nil {
+	ids, ok := s.accountListing(ctx)
+	if !ok {
 		return 0, false, false
 	}
+	id, held := ids[strings.ToLower(infoHash)]
+	return id, held, true
+}
+
+// listingTTL — how long one account listing answers for. The same fifteen seconds torrentMissKey
+// already imposes, and deliberately so: a miss is remembered for that long anyway, so memoising the
+// listing adds no staleness that was not already there. A torrent this process just added is known by id
+// directly (resolveHeldTorrent writes torrentIDKey), so it never needs the list to find itself.
+const listingTTL = 15 * time.Second
+
+// torrentListKey — the account's hash → torrent-id map. Account-scoped like every other key here.
+func torrentListKey(token string) string { return "torbox:list:" + keyHash(token) }
+
+// listingFlight collapses concurrent fetches of one account's listing into a single round trip. The
+// cache alone only helps SEQUENTIAL callers, and the case this exists for — a poster grid probing eight
+// releases at once — is anything but sequential.
+var listingFlight singleflight.Group
+
+// accountListing returns the account's hash → torrent-id map, fetching it at most once per listingTTL.
+//
+// The listing is the whole account and it was pulled once per INFOHASH, because the only memo was the
+// per-hash miss marker. A poster grid probing eight releases made eight identical full-list requests —
+// 253 KiB on a 300-torrent account, and around 13 MB on a 2,000-torrent one, close enough to the 4 MiB
+// parse cap that answers would start being dropped rather than merely repeated. The question "what does
+// this account hold?" has one answer at a time, so it is asked that way.
+func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool) {
+	if s.client == nil {
+		return nil, false
+	}
+	key := torrentListKey(s.token)
+	if s.cache != nil {
+		if raw, hit := s.cache.Get(key); hit && raw != "" {
+			var ids map[string]int
+			if json.Unmarshal([]byte(raw), &ids) == nil {
+				return ids, true
+			}
+		}
+	}
+	out, _, _ := listingFlight.Do(key, func() (any, error) {
+		ids, ok := s.fetchAccountListing(ctx)
+		if !ok {
+			return nil, nil
+		}
+		if s.cache != nil {
+			if b, err := json.Marshal(ids); err == nil {
+				s.cache.Put(key, string(b), listingTTL)
+			}
+		}
+		return ids, nil
+	})
+	ids, _ := out.(map[string]int)
+	return ids, ids != nil
+}
+
+func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, bool) {
 	resp, err := s.get(ctx, s.api+"/torrents/mylist?bypass_cache=true")
 	if err != nil {
-		return 0, false, false
+		return nil, false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0, false, false
+		return nil, false
 	}
 	var body struct {
 		Success *bool `json:"success"`
@@ -1257,22 +1314,20 @@ func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (i
 		} `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
-		return 0, false, false
+		return nil, false
 	}
 	// No list, no verdict. A 200 carrying no `data` key at all, or an explicit success:false, is not the
 	// account saying it holds nothing — it is TorBox's envelope missing, and listFiles reads exactly the
 	// same body as silence ("not a claim about the account"). Calling it authoritative wrote a 15s miss
 	// marker that then suppressed the only lookup able to rediscover a queued torrent.
 	if body.Data == nil || (body.Success != nil && !*body.Success) {
-		return 0, false, false
+		return nil, false
 	}
-	want := strings.ToLower(infoHash)
+	ids := make(map[string]int, len(*body.Data))
 	for _, e := range *body.Data {
-		if strings.ToLower(e.Hash) == want {
-			return e.ID, true, true
-		}
+		ids[strings.ToLower(e.Hash)] = e.ID
 	}
-	return 0, false, true
+	return ids, true
 }
 
 // errNoFileList — mylist gave no usable answer. Distinct from errTorrentGone, which is mylist ANSWERING

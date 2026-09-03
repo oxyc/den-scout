@@ -3664,3 +3664,50 @@ func TestTorBox_aReadOnlyResolveWritesOnlyTheAccountRefusal(t *testing.T) {
 		t.Error("a queueing resolve must still remember the refusal")
 	}
 }
+
+// The account listing is the WHOLE account, and it was pulled once per infohash because the only memo
+// was the per-hash miss marker. A poster grid probing eight releases made eight identical full-list
+// requests. The question "what does this account hold?" has one answer at a time.
+func TestTorBox_theAccountListingIsFetchedOncePerAccount(t *testing.T) {
+	// A realistic account: 300 torrents, one of which is the one being asked about.
+	var entries []string
+	for i := 0; i < 300; i++ {
+		entries = append(entries, fmt.Sprintf(`{"id":%d,"hash":"%s"}`, i, repeat(fmt.Sprintf("%x", i%16), 40)))
+	}
+	entries = append(entries, fmt.Sprintf(`{"id":999,"hash":%q}`, H))
+	payload := `{"success":true,"data":[` + strings.Join(entries, ",") + `]}`
+
+	fetches, bytesOut := 0, 0
+	cache := NewMemoryCache(1 << 20)
+	newStore := func() *torBoxStore {
+		return &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+			client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, "mylist") && !strings.Contains(r.URL.RawQuery, "id=") {
+					fetches++
+					bytesOut += len(payload)
+					return resp(200, payload), nil
+				}
+				return resp(200, `{"data":{"progress":0.5,"download_finished":false}}`), nil
+			}}}
+	}
+
+	// Eight different releases, the poster-grid shape. Only one is in the account.
+	hashes := []string{H}
+	for i := 0; i < 7; i++ {
+		hashes = append(hashes, repeat(fmt.Sprintf("%x", i), 40))
+	}
+	for _, h := range hashes {
+		_, _ = newStore().Status(context.Background(), ResolveTarget{InfoHash: h})
+	}
+	if fetches != 1 {
+		t.Errorf("fetched the account listing %d times for %d releases (%d bytes)", fetches, len(hashes), bytesOut)
+	}
+	// And the answer is still right for both a hash it holds and one it does not.
+	if _, ok := newStore().Status(context.Background(), ResolveTarget{InfoHash: H}); !ok {
+		t.Error("a held, downloading torrent must still be found through the memo")
+	}
+	absent := strings.Repeat("dead", 10) // 40 chars, and not one of the generated single-digit hashes
+	if _, ok := newStore().Status(context.Background(), ResolveTarget{InfoHash: absent}); ok {
+		t.Error("a hash the account does not hold must not be found")
+	}
+}
