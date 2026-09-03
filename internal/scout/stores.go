@@ -709,6 +709,20 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 	}
 
+	// And the per-release backoff, for the same reason the account one is here rather than below: this
+	// path returns without ever reaching the gate further down, so recording a refusal here bought
+	// nothing — the very next poll asked the throttled endpoint again. Classifying and remembering are
+	// only worth anything if something then reads the memory.
+	//
+	// Not for a NoAdd caller, which the guards below also let past: a read-only resolve cannot have
+	// caused a backoff and must not be blocked by one — the probe route depends on that, and a test
+	// pins it.
+	if !t.NoAdd {
+		if reason, ok := backedOff(s.cache, ServiceTorBox, s.token, t.InfoHash); ok {
+			return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
+		}
+	}
+
 	// Fast path: a warm entry from an earlier episode of the same pack. Skip it when episode-select is
 	// needed but the cached file list is empty (audit #3 — a transient blip would otherwise mis-serve).
 	if s.cache != nil {
@@ -728,8 +742,15 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 				// A throttled link request on a torrent this account ALREADY holds must not fall through
 				// to createtorrent: that turns a read into a write, on an account whose whole problem is
 				// that it has written too much.
+				//
+				// Remembered, like the identical error from the identical call on the held path. The
+				// account gate a few lines up already noted that this branch "records no refusal either,
+				// so it could not even set the key it skipped" — stated and then left. A warm entry is
+				// the normal state during a binge, so a rejected key was re-asked once per poll and the
+				// probe route, which reads the backoff, reported nothing queued.
 				var unavailable *StoreUnavailableError
 				if errors.As(err, &unavailable) {
+					recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 					return "", err
 				}
 			}
@@ -1314,12 +1335,21 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		// Checked at ANY length. Guarding only `len(arr) > 1` left the one-element case blind, so a
 		// single foreign entry still handed back its files — and Status, which parses this same payload,
 		// is stricter in exactly that spot. Two readers of one shape should not disagree about it.
-		match := -1
+		// An EXACT id wins, and an unlabelled entry is only a fallback. Taking the first of either meant
+		// an id-less entry ahead of ours in a multi-entry answer was chosen over the entry that actually
+		// names our torrent — worse than the blind arr[0] this replaced, since it looks like a check.
+		match, unlabelled := -1, -1
 		for i, cand := range arr {
-			if cand.ID == torrentID || cand.ID == 0 {
+			if cand.ID == torrentID {
 				match = i
 				break
 			}
+			if cand.ID == 0 && unlabelled < 0 {
+				unlabelled = i
+			}
+		}
+		if match < 0 {
+			match = unlabelled
 		}
 		if match < 0 {
 			return nil, errNoFileList
@@ -1732,6 +1762,12 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 	}
 	ready, err := s.info(ctx, id)
 	if err != nil {
+		// The fourth call of the chain, remembered like the other three. Left out, a throttle here cost
+		// one extra walk of the whole chain before the first `info` caught it on the next poll.
+		var refusedUs *StoreUnavailableError
+		if errors.As(err, &refusedUs) {
+			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+		}
 		return "", err
 	}
 	if len(ready.Links) == 0 {
@@ -1824,8 +1860,12 @@ func (s *realDebridStore) unrestrict(ctx context.Context, link string) (string, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// See selectFiles: the last call of the chain classifies like the first.
-		if storeRefusedUs(resp.StatusCode) {
+		// See selectFiles: the last call of the chain classifies like the first — except for 403, which
+		// on THIS call is RD refusing a particular file rather than the account. realDebridBlocked exists
+		// because RD rejects specific files, and `refusalIsAboutTheAccount` keys on 401/403, so passing
+		// it through here escalated one unplayable file into a sixty-second account-wide outage that
+		// took unrelated releases down with it.
+		if resp.StatusCode != http.StatusForbidden && storeRefusedUs(resp.StatusCode) {
 			return "", &StoreUnavailableError{Service: ServiceRealDebrid, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("unrestrict http %d", resp.StatusCode)}
 		}

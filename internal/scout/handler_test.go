@@ -706,3 +706,58 @@ func TestHandlePlay_pollReadsUseTheStatusBudget(t *testing.T) {
 		})
 	}
 }
+
+// The probe DISCOVERS refusals; it just used to throw them away, inspecting only `err == nil` and then
+// relying on the backoff cache to have been written by someone else. A refusal that reaches it
+// unrecorded fell through to 404 "not_queued" — a claim, not a shrug — so during a throttle the very URL
+// the client polls to draw its progress bar said nothing was queued while /play said the debrid was
+// refusing. Both unrecorded classes are driven here: errNoFileList, which is never recorded anywhere,
+// and TorBox's warm-entry fast path.
+func TestHandleProbe_reportsARefusalItDiscoversItself(t *testing.T) {
+	held := repeat("a", 40)
+	for _, tc := range []struct {
+		name  string
+		warm  bool
+		reply func(*http.Request) *http.Response
+	}{
+		{"mylist answers something unusable", false, func(r *http.Request) *http.Response {
+			if strings.Contains(r.URL.Path, "mylist") {
+				return resp(200, `{"unexpected":"envelope"}`)
+			}
+			return resp(200, `{"data":{"`+held+`":{"name":"x"}}}`)
+		}},
+		{"a throttled link request on a warm entry", true, func(r *http.Request) *http.Response {
+			if strings.Contains(r.URL.Path, "requestdl") {
+				return resp(429, `{}`)
+			}
+			if strings.Contains(r.URL.Path, "mylist") {
+				return resp(200, `{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}`)
+			}
+			return resp(200, `{"data":{"`+held+`":{"name":"x"}}}`)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			// The account HOLDS it, so the probe's NoAdd resolve reaches the read path rather than
+			// returning "this would queue" before it asks anything.
+			cache.Put(torrentIDKey("tb-secret", held), "42", resolveCacheTTL)
+			if tc.warm {
+				cache.Put(resolveKey("tb-secret", held),
+					`{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}`, resolveCacheTTL)
+			}
+			store := &torBoxStore{token: "tb-secret", cache: cache, api: torboxAPI,
+				client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+					return tc.reply(r), nil
+				}}}
+			h := NewHandler(testDeps(func(d *Deps) {
+				d.MakeStores = func(*Config) []Store { return []Store{store} }
+			}))
+			tok := encodePlayToken(PlayTarget{InfoHash: held, Season: intp(1), Episode: intp(2)})
+			rec := do(h, "/"+validBlob+"/play/"+tok+"?probe=1", nil)
+			if rec.Code == http.StatusNotFound {
+				t.Errorf("probe answered %d %s — a refusal it saw itself was reported as an absence",
+					rec.Code, strings.TrimSpace(rec.Body.String()))
+			}
+		})
+	}
+}

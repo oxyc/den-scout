@@ -3421,3 +3421,100 @@ func TestTorBoxListFiles_matchesTheIdAtAnyLength(t *testing.T) {
 		})
 	}
 }
+
+// An exact id wins; an unlabelled entry is only a fallback. Taking the first of either meant an id-less
+// entry ahead of ours in a multi-entry answer was chosen over the entry that actually names our torrent
+// — worse than the blind arr[0] it replaced, because it looks like a check.
+func TestTorBoxListFiles_anExactIdBeatsAnUnlabelledEntry(t *testing.T) {
+	ours := `{"id":100,"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}`
+	unlabelled := `{"files":[{"id":7,"name":"OTHER.mkv","size":10}]}`
+	zeroID := `{"id":0,"files":[{"id":7,"name":"OTHER.mkv","size":10}]}`
+	for _, tc := range []struct{ name, payload, want string }{
+		{"unlabelled first", `{"data":[` + unlabelled + `,` + ours + `]}`, "Show.S01E01.mkv"},
+		{"id 0 first", `{"data":[` + zeroID + `,` + ours + `]}`, "Show.S01E01.mkv"},
+		{"ours first", `{"data":[` + ours + `,` + unlabelled + `]}`, "Show.S01E01.mkv"},
+		// With no exact match anywhere, an unlabelled entry is still better than nothing.
+		{"only unlabelled", `{"data":[` + unlabelled + `]}`, "OTHER.mkv"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &torBoxStore{token: "tok", api: torboxAPI, client: routed{fallbk: ok(tc.payload)}}
+			files, err := s.listFiles(context.Background(), 100)
+			if err != nil || len(files) != 1 || files[0].Name != tc.want {
+				t.Errorf("got %+v, %v — want %s", files, err, tc.want)
+			}
+		})
+	}
+}
+
+// A 403 from unrestrict is RD refusing a FILE, not the account: realDebridBlocked exists because RD
+// rejects specific files, and refusalIsAboutTheAccount keys on 401/403 — so passing it through escalated
+// one unplayable file into a sixty-second account-wide outage that took unrelated releases with it.
+func TestRealDebrid_aForbiddenLinkIsNotAForbiddenAccount(t *testing.T) {
+	const infoOK = `{"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}],"links":["l1"]}`
+	chain := func(unrestrictCode int) doer {
+		return routed{routes: map[string]func() (*http.Response, error){
+			"addMagnet":     ok(`{"id":"t1"}`),
+			"torrents/info": ok(infoOK),
+			"selectFiles":   ok(`{}`),
+			"unrestrict":    status(unrestrictCode),
+		}}
+	}
+	for _, tc := range []struct {
+		code    int
+		account bool
+	}{
+		{403, false}, // one file RD will not serve
+		{401, true},  // the key itself
+		{429, false}, // a throttle: per-release, not account-wide
+	} {
+		cache := NewMemoryCache(1 << 20)
+		s := &realDebridStore{token: "tok", cache: cache, api: realDebridAPI, client: chain(tc.code)}
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+		if _, got := accountBackedOff(cache, ServiceRealDebrid, "tok"); got != tc.account {
+			t.Errorf("unrestrict %d: account backoff = %v, want %v", tc.code, got, tc.account)
+		}
+	}
+}
+
+// The warm-entry fast path returns a refusal from the same requestdl call the held path uses, and only
+// the held path remembered it. A warm entry is the normal state during a binge, so a rejected key was
+// re-asked once per poll — and the account gate a few lines above already said as much ("that branch
+// records no refusal either, so it could not even set the key it skipped") without fixing it.
+func TestTorBox_theWarmPathRemembersItsRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		account bool
+	}{
+		{"a throttle", 429, false},
+		{"a rejected key", 401, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(resolveKey("tok", H),
+				`{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}`, resolveCacheTTL)
+			s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+				client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+					if strings.Contains(r.URL.Path, "requestdl") {
+						calls++
+						return resp(tc.status, `{}`), nil
+					}
+					return resp(200, `{}`), nil
+				}}}
+			target := ResolveTarget{InfoHash: H, FileIdx: intp(0)}
+			for i := 0; i < 10; i++ {
+				_, _ = s.Resolve(context.Background(), target)
+			}
+			if _, ok := backedOff(cache, ServiceTorBox, "tok", H); !ok {
+				t.Error("the refusal was not remembered, so every poll re-asks")
+			}
+			if calls > 1 {
+				t.Errorf("asked %d times across ten polls", calls)
+			}
+			if _, ok := accountBackedOff(cache, ServiceTorBox, "tok"); ok != tc.account {
+				t.Errorf("account backoff = %v, want %v", ok, tc.account)
+			}
+		})
+	}
+}

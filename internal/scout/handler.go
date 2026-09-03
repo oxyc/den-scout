@@ -454,19 +454,35 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// not-held release correctly falls through to the "nothing queued" answer instead of promising a
 	// playback that would start with a download.
 	probeTruth, truthOK := pool.CacheCheck(ctx, []string{infoHash})
+	var refusedUs *StoreUnavailableError
 	if probeTruth.Cached(infoHash) {
 		readOnly := rt
 		readOnly.NoAdd = true
-		if _, err := pool.ResolveCachedOnly(ctx, readOnly, probeTruth.HeldBy(infoHash)); err == nil {
+		_, err := pool.ResolveCachedOnly(ctx, readOnly, probeTruth.HeldBy(infoHash))
+		if err == nil {
 			log.Printf("scout: probe %s → 200 ready", shortHash(infoHash))
 			writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
 			return
 		}
+		// The probe DOES discover refusals — it just used to throw them away, inspecting only `err ==
+		// nil` and then relying on the backoff cache to have been written by someone else. Any refusal
+		// that reaches here unrecorded fell through to the 404 below, which this file calls a claim
+		// rather than a shrug: `errNoFileList` is never recorded at all, and TorBox's warm-entry fast
+		// path returns a refusal without recording it, so during a throttle the very URL the client
+		// polls to draw its progress bar said "nothing is queued" while /play said the debrid was
+		// refusing. Reading the error we already have needs no cache to have been written first.
+		_ = errors.As(err, &refusedUs)
+	}
+	if refusedUs != nil {
+		log.Printf("scout: probe %s → 503, %s %s", shortHash(infoHash), refusedUs.Service, refusedUs.Reason)
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]any{"error": "store_unavailable", "service": refusedUs.Service}, noStore)
+		return
 	}
 	// A refusal the store recorded moments ago outranks "nothing queued". Without this the probe reports
 	// a throttled account as an absence, which reads as a release nobody can deliver — and the client
-	// condemns a perfectly good one. The probe cannot discover a refusal itself (it never calls the API
-	// that refuses), so it reads the backoff the queueing path wrote.
+	// condemns a perfectly good one. This still matters for a refusal recorded by an EARLIER poll, whose
+	// store the probe may not reach again.
 	if svc, reason, ok := pool.RecentRefusal(infoHash); ok {
 		log.Printf("scout: probe %s → 503, %s %s", shortHash(infoHash), svc, reason)
 		writeJSON(w, http.StatusServiceUnavailable,
