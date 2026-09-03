@@ -496,11 +496,21 @@ func unknownTooLong(cache Cache, svc DebridService, token, infoHash string) bool
 
 // unknownOutcome is what an add whose answer never arrived returns: "still coming" until the deadline,
 // then a dead link so the client can fall through to another release.
-func unknownOutcome(cache Cache, svc DebridService, token, infoHash string) error {
+//
+// `cause` decides whether the deadline starts at all. A viewer backing out cancels the request context,
+// and which of the two unknown-outcome branches that lands in — this one, or the transport failure above
+// it — is decided only by whether the response headers had arrived first. The transport branch got the
+// isCancellation guard; this one was not even passed the error to ask with, so the same back-out still
+// condemned the release: past addGiveUp every resolve answered a dead link for the rest of
+// unknownOutcomeTTL, with no upstream call able to clear it. A deadline is for a service that went
+// quiet.
+func unknownOutcome(cache Cache, svc DebridService, token, infoHash string, cause error) error {
 	if unknownTooLong(cache, svc, token, infoHash) {
 		return &DeadLinkError{string(svc) + " never reported what its add did"}
 	}
-	noteUnknownOutcome(cache, svc, token, infoHash)
+	if !isCancellation(cause) {
+		noteUnknownOutcome(cache, svc, token, infoHash)
+	}
 	return fmt.Errorf("%w: %w", errAddInFlight, &StoreUnavailableError{Service: svc,
 		Reason: "the add was answered but its body could not be read, so the outcome is unknown"})
 }
@@ -799,7 +809,10 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 			// deadline belongs on a service that never answered, not on a client that hung up. This is
 			// the same guard recordRefusal applies one branch over, for the same reason.
 			// Start the clock on not knowing, so this cannot cycle forever.
-			if !isCancellation(err) {
+			// Nor when the add itself already judged the outcome: it returns errAddInFlight from the
+			// body-read branch, which is not recognisably a cancellation out here, so stamping again
+			// undid the guard one layer down.
+			if !isCancellation(err) && !errors.Is(err, errAddInFlight) {
 				noteUnknownOutcome(s.cache, ServiceTorBox, s.token, t.InfoHash)
 			}
 		} else {
@@ -950,7 +963,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 	if readErr != nil {
 		// Marker left set on purpose: the next poll answers 202 from it rather than buying the torrent
 		// again. The charge stays too — the add was written to the wire.
-		return 0, unknownOutcome(s.cache, ServiceTorBox, s.token, infoHash)
+		return 0, unknownOutcome(s.cache, ServiceTorBox, s.token, infoHash, readErr)
 	}
 	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -979,6 +992,13 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		} `json:"data"`
 	}
 	if json.Unmarshal(raw, &body) != nil || body.Data == nil || body.Data.TorrentID == nil {
+		// Answered, and created nothing — the same rule as the non-2xx branch above, and the same one RD
+		// applies to `added.ID == ""`. TorBox reports plenty of errors as HTTP 200 with `success:false`,
+		// and a proxy page served as 200 lands here too. Keeping the charge walked the whole hourly
+		// allowance in a single sitting: this branch answers a dead link, which is exactly what makes the
+		// client fall through to the next candidate, so one bad title spends fifty adds without any poll
+		// loop at all — after which every TorBox resolve on the account is 503 scout_busy for the hour.
+		refundUnusedAdd(ServiceTorBox, s.token)
 		return 0, &DeadLinkError{"torbox no torrent_id"}
 	}
 	return *body.Data.TorrentID, nil
@@ -1455,7 +1475,10 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			// call able to clear it — RD and Premiumize have no Status to rediscover the torrent with. A
 			// deadline belongs on a service that never answered, not on a client that hung up. This is
 			// the same guard recordRefusal applies one branch over, for the same reason.
-			if !isCancellation(err) {
+			// Nor when the add itself already judged the outcome: it returns errAddInFlight from the
+			// body-read branch, which is not recognisably a cancellation out here, so stamping again
+			// undid the guard one layer down.
+			if !isCancellation(err) && !errors.Is(err, errAddInFlight) {
 				noteUnknownOutcome(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 			}
 		} else {
@@ -1481,7 +1504,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// store_unavailable for the next minute. RD has no Status for handlePlay to rescue it with. That is
 	// the exact confusion the guard, errScoutSide and errAddInFlight all exist to end.
 	if readErr != nil {
-		return "", unknownOutcome(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
+		return "", unknownOutcome(s.cache, ServiceRealDebrid, s.token, t.InfoHash, readErr)
 	}
 	settleAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	var added struct {
@@ -1921,7 +1944,10 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			// call able to clear it — RD and Premiumize have no Status to rediscover the torrent with. A
 			// deadline belongs on a service that never answered, not on a client that hung up. This is
 			// the same guard recordRefusal applies one branch over, for the same reason.
-			if !isCancellation(err) {
+			// Nor when the add itself already judged the outcome: it returns errAddInFlight from the
+			// body-read branch, which is not recognisably a cancellation out here, so stamping again
+			// undid the guard one layer down.
+			if !isCancellation(err) && !errors.Is(err, errAddInFlight) {
 				noteUnknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
 			}
 		} else {
@@ -1941,7 +1967,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if readErr != nil {
 		// Marker left set and the charge kept: the next poll answers 202 from the marker instead of
 		// buying the transfer again.
-		return "", unknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
+		return "", unknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash, readErr)
 	}
 	settleAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	// Premiumize ANSWERED, and every answer below this line is one that queued nothing — so the charge

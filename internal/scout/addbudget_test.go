@@ -2734,7 +2734,7 @@ func TestStores_anAddWhoseOutcomeIsNeverKnownGivesUp(t *testing.T) {
 		t.Run(string(svc), func(t *testing.T) {
 			cache := NewMemoryCache(1 << 20)
 			// The first failure starts the clock and reads as "still coming".
-			first := unknownOutcome(cache, svc, "tok", H)
+			first := unknownOutcome(cache, svc, "tok", H, errServiceWentQuiet)
 			if !errors.Is(first, errAddInFlight) {
 				t.Fatalf("got %v, want the add reported as still in flight", first)
 			}
@@ -2745,7 +2745,7 @@ func TestStores_anAddWhoseOutcomeIsNeverKnownGivesUp(t *testing.T) {
 			cache.Put(unknownOutcomeKey(svc, "tok", H),
 				strconv.FormatInt(aged.Unix(), 10), unknownOutcomeTTL)
 			for i := 0; i < 20; i++ {
-				_ = unknownOutcome(cache, svc, "tok", H)
+				_ = unknownOutcome(cache, svc, "tok", H, errServiceWentQuiet)
 			}
 			if raw, _ := cache.Get(unknownOutcomeKey(svc, "tok", H)); raw != strconv.FormatInt(aged.Unix(), 10) {
 				t.Errorf("the clock was restamped to %s — twenty polls just bought another ten minutes", raw)
@@ -2753,12 +2753,12 @@ func TestStores_anAddWhoseOutcomeIsNeverKnownGivesUp(t *testing.T) {
 			cache.Put(unknownOutcomeKey(svc, "tok", H),
 				strconv.FormatInt(time.Now().Add(-addGiveUp-time.Minute).Unix(), 10), unknownOutcomeTTL)
 			var dead *DeadLinkError
-			if err := unknownOutcome(cache, svc, "tok", H); !errors.As(err, &dead) {
+			if err := unknownOutcome(cache, svc, "tok", H, errServiceWentQuiet); !errors.As(err, &dead) {
 				t.Errorf("got %v, want a dead link so the client can fall through", err)
 			}
 			// An outcome of any kind ends the run of not knowing, so the next add starts fresh.
 			settleAddAttempt(cache, svc, "tok", H)
-			if err := unknownOutcome(cache, svc, "tok", H); !errors.Is(err, errAddInFlight) {
+			if err := unknownOutcome(cache, svc, "tok", H, errServiceWentQuiet); !errors.Is(err, errAddInFlight) {
 				t.Errorf("got %v — the give-up outlived the answer that resolved it", err)
 			}
 		})
@@ -3025,6 +3025,111 @@ func TestStores_aCancelledAddDoesNotStartTheGiveUpClock(t *testing.T) {
 			_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
 			if stamp, ok := cache.Get(unknownOutcomeKey(st.svc, "tok", H)); !ok || stamp == "" {
 				t.Errorf("a service that never answered left no give-up clock")
+			}
+		})
+	}
+}
+
+// errServiceWentQuiet stands for the cause these tests mean: the service stopped answering, as opposed
+// to the client hanging up. Only the former starts the give-up clock.
+var errServiceWentQuiet = errors.New("read tcp 10.0.0.2:443: connection reset by peer")
+
+// The body-read branch is the other half of the same fact, and which one a back-out lands in is decided
+// only by whether the response headers arrived first. Guarding the transport branch alone left the same
+// release condemned by the same viewer action.
+func TestStores_aCancelledBodyReadDoesNotStartTheGiveUpClock(t *testing.T) {
+	for _, st := range []struct {
+		name string
+		svc  DebridService
+		path string
+		make func(Cache, doer) Store
+	}{
+		{"torbox", ServiceTorBox, "createtorrent", func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}},
+		{"realdebrid", ServiceRealDebrid, "addMagnet", func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+		{"premiumize", ServicePremiumize, "directdl", func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			cache := NewMemoryCache(1 << 20)
+			// The add is ACCEPTED — 201 on RD, 200 elsewhere — and the body then dies because the viewer
+			// moved on. The torrent very likely exists, which is exactly why condemning it is wrong.
+			s := st.make(cache, mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, st.path) {
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					return &http.Response{StatusCode: 201, Body: io.NopCloser(cancelledReader{ctx})}, nil
+				}
+				return resp(200, `{}`), nil
+			}})
+			_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			if stamp, ok := cache.Get(unknownOutcomeKey(st.svc, "tok", H)); ok && stamp != "" {
+				t.Errorf("a back-out mid-body started the give-up clock: the release is condemned for %v", addGiveUp)
+			}
+
+			// A body that dies for the SERVICE's own reasons still starts it.
+			settleAddAttempt(cache, st.svc, "tok", H)
+			s = st.make(cache, mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, st.path) {
+					return &http.Response{StatusCode: 201, Body: io.NopCloser(brokenReader{})}, nil
+				}
+				return resp(200, `{}`), nil
+			}})
+			_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			if stamp, ok := cache.Get(unknownOutcomeKey(st.svc, "tok", H)); !ok || stamp == "" {
+				t.Errorf("a truncated answer left no give-up clock, so nothing bounds the retries")
+			}
+		})
+	}
+}
+
+// TorBox reports plenty of errors as HTTP 200 with no torrent id, and a proxy page served as 200 lands
+// there too. Keeping the charge walked the whole hourly allowance in one sitting — this branch answers a
+// dead link, which is what makes the client fall through to the next candidate, so no poll loop is even
+// needed. RD already refunded the same shape.
+func TestAddBudget_anEmptyTwoHundredIsNotAnAdd(t *testing.T) {
+	for _, st := range []struct {
+		name string
+		svc  DebridService
+		path string
+		body string
+		make func(Cache, doer) Store
+	}{
+		{"torbox", ServiceTorBox, "createtorrent", `{"success":false}`, func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}},
+		{"realdebrid", ServiceRealDebrid, "addMagnet", `{"ok":true}`, func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			adds := 0
+			// Sixty DISTINCT releases: the client falling through candidates, not a poll loop.
+			for i := 0; i < 60; i++ {
+				cache := NewMemoryCache(1 << 20)
+				s := st.make(cache, mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+					if strings.Contains(r.URL.Path, st.path) {
+						adds++
+						return resp(200, st.body), nil
+					}
+					return resp(200, `{}`), nil
+				}})
+				_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: repeat(fmt.Sprintf("%x", i%16), 40)})
+			}
+			if left := globalAddBudget.remaining(budgetAccount(st.svc, "tok")); left != 50 {
+				t.Errorf("allowance %d after %d empty answers — one bad title walks the hour", left, adds)
 			}
 		})
 	}
