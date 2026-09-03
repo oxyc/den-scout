@@ -3134,3 +3134,82 @@ func TestAddBudget_anEmptyTwoHundredIsNotAnAdd(t *testing.T) {
 		})
 	}
 }
+
+// Refund what the ANSWER says was not created, and nothing more. `success:false` and an unparseable body
+// are the two cases the empty-2xx branch exists for; a body that parses, claims no failure and simply
+// carries an id under a name this struct does not know may describe a torrent that WAS created, and
+// refunding there would manufacture allowance against a real add.
+func TestAddBudget_torBoxRefundsOnlyWhatTheAnswerDenies(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want int // remaining out of 50
+	}{
+		{"success:false", `{"success":false}`, 50},
+		{"an html proxy page", `<html>502 Bad Gateway</html>`, 50},
+		{"an id under a name we do not know", `{"data":{"queued_id":91}}`, 49},
+		{"a string id", `{"data":{"torrent_id":"7"}}`, 49},
+		{"a one-element array", `{"data":[{"torrent_id":7}]}`, 49},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			s := &torBoxStore{token: "tok", cache: NewMemoryCache(1 << 20), api: torboxAPI,
+				client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+					if isAddEndpoint(r) {
+						return resp(200, tc.body), nil
+					}
+					return resp(200, `{}`), nil
+				}}}
+			_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			if left := globalAddBudget.remaining(budgetAccount(ServiceTorBox, "tok")); left != tc.want {
+				t.Errorf("remaining = %d, want %d", left, tc.want)
+			}
+		})
+	}
+}
+
+// A miss is only worth remembering when the account list was READ and the hash was not in it. A timeout
+// or a cancelled poll is not the account saying no, and remembering it suppressed the one call that can
+// rediscover a queued torrent — for fifteen seconds, on /play as well as the probe route.
+func TestTorBox_aTimedOutListingIsNotAMiss(t *testing.T) {
+	calls := 0
+	cache := NewMemoryCache(1 << 20)
+	failing := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			calls++
+			return nil, context.DeadlineExceeded
+		}}}
+	if _, ok := failing.Status(context.Background(), ResolveTarget{InfoHash: H}); ok {
+		t.Fatal("a timed-out listing cannot report a status")
+	}
+	if _, missed := cache.Get(torrentMissKey("tok", H)); missed {
+		t.Error("a timeout was remembered as the account not holding the torrent")
+	}
+
+	// The list recovers, and the very next poll must be allowed to ask again.
+	healthy := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			calls++
+			if strings.Contains(r.URL.RawQuery, "id=") {
+				return resp(200, `{"data":{"progress":0.5,"download_finished":false}}`), nil
+			}
+			return resp(200, fmt.Sprintf(`{"data":[{"id":77,"hash":%q}]}`, H)), nil
+		}}}
+	if _, ok := healthy.Status(context.Background(), ResolveTarget{InfoHash: H}); !ok {
+		t.Error("the torrent was rediscoverable, but the miss marker suppressed the lookup")
+	}
+
+	// An authoritative miss — the list was read and the hash is not in it — IS still remembered.
+	other := NewMemoryCache(1 << 20)
+	absent := &torBoxStore{token: "tok", cache: other, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			return resp(200, `{"data":[]}`), nil
+		}}}
+	_, _ = absent.Status(context.Background(), ResolveTarget{InfoHash: H})
+	if _, missed := other.Get(torrentMissKey("tok", H)); !missed {
+		t.Error("an answered miss must still be remembered, or every poll re-fetches the whole list")
+	}
+}

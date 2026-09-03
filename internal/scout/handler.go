@@ -520,7 +520,14 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// the whole fetch, and a full resolve is ~3 upstream calls (cache miss → add → link), so re-running it
 	// per poll is how an account gets itself throttled — and a throttled 5xx is exactly what a client
 	// cannot distinguish from a real answer.
-	if status, ok := pool.Status(ctx, rt); ok {
+	//
+	// On the STATUS budget, like the probe route and the post-failure retry below. This one had kept the
+	// 45-second resolve budget, so the read that exists to answer a poll PROMPTLY could hold the poll for
+	// forty-five seconds against a slow debrid — the thing statusBudget's own comment forbids. Two of its
+	// three siblings already agreed; this was the third.
+	statusCtx, statusCancel := context.WithTimeout(r.Context(), statusBudget)
+	defer statusCancel()
+	if status, ok := pool.Status(statusCtx, rt); ok {
 		writeQueued(w, target.InfoHash, status)
 		return
 	}

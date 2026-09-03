@@ -214,7 +214,7 @@ func TestFindTorrentByHash_failureModes(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			s := &torBoxStore{token: "k", api: torboxAPI, cache: NewMemoryCache(1 << 16),
 				client: routed{fallbk: c.fn}}
-			if _, found := s.findTorrentByHash(t.Context(), H); found {
+			if _, found, _ := s.findTorrentByHash(t.Context(), H); found {
 				t.Errorf("%s: claimed to find a torrent id", c.name)
 			}
 		})

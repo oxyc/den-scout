@@ -987,18 +987,30 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d%s", resp.StatusCode, detail)}
 	}
 	var body struct {
-		Data *struct {
+		Success *bool `json:"success"`
+		Data    *struct {
 			TorrentID *int `json:"torrent_id"`
 		} `json:"data"`
 	}
 	if json.Unmarshal(raw, &body) != nil || body.Data == nil || body.Data.TorrentID == nil {
 		// Answered, and created nothing — the same rule as the non-2xx branch above, and the same one RD
-		// applies to `added.ID == ""`. TorBox reports plenty of errors as HTTP 200 with `success:false`,
-		// and a proxy page served as 200 lands here too. Keeping the charge walked the whole hourly
-		// allowance in a single sitting: this branch answers a dead link, which is exactly what makes the
-		// client fall through to the next candidate, so one bad title spends fifty adds without any poll
-		// loop at all — after which every TorBox resolve on the account is 503 scout_busy for the hour.
-		refundUnusedAdd(ServiceTorBox, s.token)
+		// applies to `added.ID == ""`. Keeping the charge walked the whole hourly allowance in a single
+		// sitting: this branch answers a dead link, which is exactly what makes the client fall through to
+		// the next candidate, so one bad title spends fifty adds without any poll loop at all, after which
+		// every TorBox resolve on the account is 503 scout_busy for the hour.
+		//
+		// But only when nothing was created is what the ANSWER says. TorBox reports errors as HTTP 200
+		// with `success:false`, and a proxy page served as 200 does not parse at all — those two are the
+		// cases this branch exists for. A body that parses, says nothing about success and simply carries
+		// an id under a name this struct does not know (`queued_id`, a string id, a one-element array)
+		// may well describe a torrent that WAS created, and refunding there would manufacture allowance
+		// against a real add. Unrecognised is not the same as failed.
+		// `readable` is the wrong test for that: a string id or a one-element array is VALID JSON that
+		// simply does not fit this struct, and either may describe a torrent that exists. Only a body
+		// that is not JSON at all — a proxy or gateway page — proves nothing was created.
+		if !json.Valid(raw) || (body.Success != nil && !*body.Success) {
+			refundUnusedAdd(ServiceTorBox, s.token)
+		}
 		return 0, &DeadLinkError{"torbox no torrent_id"}
 	}
 	return *body.Data.TorrentID, nil
@@ -1123,10 +1135,14 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 			return 0, false
 		}
 	}
-	id, ok := s.findTorrentByHash(ctx, infoHash)
+	id, ok, authoritative := s.findTorrentByHash(ctx, infoHash)
 	if !ok {
-		// Remember the miss too, or every poll re-fetches the whole account list to learn the same thing.
-		if s.cache != nil {
+		// Remember the miss, or every poll re-fetches the whole account list to learn the same thing —
+		// but only when the list was actually READ and the hash was not in it. A timeout or a cancelled
+		// poll is not the account saying no, and remembering it suppressed the one call that can
+		// rediscover a queued torrent for the next fifteen seconds, on /play as well as the probe route.
+		// The probe now runs on an eight-second budget, so this is easier to hit than it was.
+		if s.cache != nil && authoritative {
 			s.cache.Put(torrentMissKey(s.token, infoHash), "1", torrentMissTTL)
 		}
 		return 0, false
@@ -1144,17 +1160,20 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 
 // findTorrentByHash scans the account's torrent list for an infohash. TorBox reports hashes lower-case;
 // indexers are inconsistent about it, so both sides are folded before comparing.
-func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (int, bool) {
+// findTorrentByHash reports the account's torrent id for a hash. The third result says whether the
+// ANSWER is authoritative — the list was read and the hash was not in it — as opposed to the list not
+// having been read at all. Only the first justifies remembering a miss.
+func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (int, bool, bool) {
 	if s.client == nil {
-		return 0, false
+		return 0, false, false
 	}
 	resp, err := s.get(ctx, s.api+"/torrents/mylist?bypass_cache=true")
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return 0, false
+		return 0, false, false
 	}
 	var body struct {
 		Data []struct {
@@ -1163,15 +1182,15 @@ func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (i
 		} `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
-		return 0, false
+		return 0, false, false
 	}
 	want := strings.ToLower(infoHash)
 	for _, e := range body.Data {
 		if strings.ToLower(e.Hash) == want {
-			return e.ID, true
+			return e.ID, true, true
 		}
 	}
-	return 0, false
+	return 0, false, true
 }
 
 // errNoFileList — mylist gave no usable answer. Distinct from errTorrentGone, which is mylist ANSWERING
