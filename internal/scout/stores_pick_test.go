@@ -1052,3 +1052,61 @@ func TestNamesEpisode_aRangeHoldsEveryEpisodeInIt(t *testing.T) {
 	got, err := pickEpisodeFile(pack, 1, 20)
 	wantNotInTorrent(t, got, err, "episode 20 is not in a pack of E01-E12")
 }
+
+// Sonarr writes six multi-episode styles and three of them chain past two numbers. Capturing exactly one
+// far end read those as ending at the SECOND number, so the third episode matched nothing — and since
+// the file is labelled, that miss became a hard refusal: a third of a playing release answered 404.
+func TestNamesEpisode_readsEveryEpisodeInAChain(t *testing.T) {
+	for _, shape := range []struct{ name, style string }{
+		{"Show - S01E01-02-03 - Title.mkv", "Extend"},
+		{"Show - S01E01E02E03 - Title.mkv", "Repeat"},
+		{"Show - S01E01-E02-E03 - Title.mkv", "Scene"},
+		{"Show - S01E01-03 - Title.mkv", "Range"},
+		{"Show - S01E01-E03 - Title.mkv", "PrefixedRange"},
+	} {
+		for ep := 1; ep <= 3; ep++ {
+			if !namesEpisode(shape.name, 1, ep) {
+				t.Errorf("%s: %q does not name episode %d", shape.style, shape.name, ep)
+			}
+		}
+		for _, ep := range []int{4, 9, 42} {
+			if namesEpisode(shape.name, 1, ep) {
+				t.Errorf("%s: %q must not name episode %d", shape.style, shape.name, ep)
+			}
+		}
+	}
+
+	// A LIST names exactly what it lists; only a two-number range fills in the middle.
+	if namesEpisode("Show - S01E01E02E09 - Title.mkv", 1, 5) {
+		t.Error("a list of 1, 2 and 9 does not hold episode 5")
+	}
+	if !namesEpisode("Show - S01E01E02E09 - Title.mkv", 1, 9) {
+		t.Error("a list of 1, 2 and 9 does hold episode 9")
+	}
+
+	// A chain whose bare element is written differently is a tag, not a chain.
+	if namesEpisode("Show.S01E01-2-3D.mkv", 1, 3) {
+		t.Error("a mixed-width chain is not an episode list")
+	}
+
+	// End to end: every episode of a three-per-file pack resolves, on all three stores.
+	var pack []TorrentFile
+	for i := 0; i < 4; i++ {
+		pack = append(pack, file(i, fmt.Sprintf("Show.S01E%02dE%02dE%02d.1080p.mkv",
+			i*3+1, i*3+2, i*3+3), 1000+i))
+	}
+	for ep := 1; ep <= 12; ep++ {
+		want := (ep - 1) / 3
+		got, err := pickEpisodeFile(pack, 1, ep)
+		wantPick(t, got, err, want, fmt.Sprintf("episode %d lives in file %d", ep, want))
+		target := ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(ep)}
+		got, err = selectFileID(pack, target)
+		wantPick(t, got, err, want, "torbox")
+		got, err = (&realDebridStore{}).pickFileID(pack, target)
+		wantPick(t, got, err, want, "realdebrid")
+		got, err = (&premiumizeStore{}).pickIndex(pack, target)
+		wantPick(t, got, err, want, "premiumize")
+	}
+	got, err := pickEpisodeFile(pack, 1, 20)
+	wantNotInTorrent(t, got, err, "episode 20 is not in a pack of E01-E12")
+}

@@ -2850,3 +2850,105 @@ func TestAddBudget_forgetsAccountsWhoseWindowHasDrained(t *testing.T) {
 		t.Errorf("remaining = %d, want 49", left)
 	}
 }
+
+// An add that keeps failing at the transport must not cycle forever. The marker lives 90 seconds and
+// every attempt writes a fresh one, so without a deadline it went marker → expiry → another charged add,
+// about forty an hour, until the allowance was gone and every release on the account answered 503
+// scout_busy. That is the cycle unknownOutcomeKey exists to end; it was wired only to the body-read path.
+func TestStores_aTransportFailedAddGivesUpEventually(t *testing.T) {
+	for _, st := range []struct {
+		name string
+		svc  DebridService
+		path string
+		make func(Cache, doer) Store
+	}{
+		{"torbox", ServiceTorBox, "createtorrent", func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}},
+		{"realdebrid", ServiceRealDebrid, "addMagnet", func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+		{"premiumize", ServicePremiumize, "directdl", func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			adds := 0
+			cache := NewMemoryCache(1 << 20)
+			s := st.make(cache, mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, st.path) {
+					adds++
+					return nil, fmt.Errorf("dial tcp 10.0.0.2:443: connect: connection refused")
+				}
+				return resp(200, `{}`), nil
+			}})
+			target := ResolveTarget{InfoHash: H}
+			_, _ = s.Resolve(context.Background(), target)
+
+			// PRODUCTION must have started the clock. Writing it here instead would test the deadline
+			// against a stamp the service never makes — the proxy shape that has hidden a defect in nine
+			// of the last ten rounds.
+			stamp, ok := cache.Get(unknownOutcomeKey(st.svc, "tok", H))
+			if !ok || stamp == "" {
+				t.Fatalf("a transport-failed add left no give-up clock, so nothing bounds the retries")
+			}
+			// While it is running, the polls behind it read as "coming".
+			if _, err := s.Resolve(context.Background(), target); !errors.Is(err, errAddInFlight) {
+				t.Fatalf("got %v, want the add reported as still in flight", err)
+			}
+			// Wind the clock the service wrote past its deadline, and lapse the 90s marker with it. Every
+			// later poll must answer a dead link the client can move past, and must not buy the torrent
+			// again.
+			settleAddAttempt(cache, st.svc, "tok", H)
+			cache.Put(unknownOutcomeKey(st.svc, "tok", H),
+				strconv.FormatInt(time.Now().Add(-addGiveUp-time.Minute).Unix(), 10), unknownOutcomeTTL)
+
+			before := adds
+			for i := 0; i < 20; i++ {
+				_, err := s.Resolve(context.Background(), target)
+				var dead *DeadLinkError
+				if !errors.As(err, &dead) {
+					t.Fatalf("poll %d answered %v, want a dead link the client can move past", i, err)
+				}
+			}
+			if adds != before {
+				t.Errorf("sent %d more adds past the give-up deadline", adds-before)
+			}
+		})
+	}
+}
+
+// An add of ours already out outranks any refusal, whichever store said what and in whichever order.
+// errAddInFlight wraps a StoreUnavailableError, so the first refusal used to claim the verdict and store
+// ORDER decided whether /play answered 202 "downloading" or 503 naming a store that had said nothing.
+func TestResolvePreferring_anAddInFlightOutranksARefusal(t *testing.T) {
+	refusing := stubStore{svc: ServiceTorBox, err: &StoreUnavailableError{
+		Service: ServiceTorBox, Reason: "createtorrent http 429 (backing off)"}}
+	fetching := stubStore{svc: ServiceRealDebrid, err: fmt.Errorf("%w: %w", errAddInFlight,
+		&StoreUnavailableError{Service: ServiceRealDebrid, Reason: "scout already sent an add"})}
+
+	for _, order := range [][]Store{{refusing, fetching}, {fetching, refusing}} {
+		pool := &StorePool{stores: order}
+		_, err := pool.ResolvePreferring(context.Background(), ResolveTarget{InfoHash: H}, nil)
+		if !errors.Is(err, errAddInFlight) {
+			t.Errorf("store order decided the verdict: got %v, want the add reported in flight", err)
+		}
+	}
+}
+
+// stubStore answers with a fixed error, so the pool's own precedence is what is under test.
+type stubStore struct {
+	svc DebridService
+	err error
+}
+
+func (s stubStore) Service() DebridService                                 { return s.svc }
+func (s stubStore) Resolve(context.Context, ResolveTarget) (string, error) { return "", s.err }
+func (s stubStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}
+func (s stubStore) CacheCheck(context.Context, []string) (map[string]bool, error) { return nil, nil }

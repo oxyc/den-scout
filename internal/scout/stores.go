@@ -321,6 +321,14 @@ func addAttemptKey(svc DebridService, token, infoHash string) string {
 // bookkeeping, not the service declining, so it must not be written into the refusal memory or reported
 // to the client as the debrid's doing — the confusion errScoutSide exists to end.
 func addInFlight(cache Cache, svc DebridService, token, infoHash string) error {
+	// The deadline is checked whether or not a marker is live, because it is what has to stop the NEXT
+	// add. The marker lives ninety seconds and every attempt writes a fresh one, so an add that keeps
+	// failing at the transport cycled marker → expiry → another charged add, about forty an hour, until
+	// the allowance was gone and every release on the account answered 503 scout_busy. That is exactly
+	// the cycle unknownOutcomeKey was written to end; it had only ever been wired to the body-read branch.
+	if unknownTooLong(cache, svc, token, infoHash) {
+		return &DeadLinkError{string(svc) + " never reported what its add did"}
+	}
 	if !addOutcomeUnknown(cache, svc, token, infoHash) {
 		return nil
 	}
@@ -783,7 +791,10 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		// deliberately leaves set says the outcome is unknown, and filing that here made backedOff, which
 		// this store consults FIRST, pre-empt it on the next poll: errAddInFlight became unreachable and
 		// the client was told its debrid was refusing for a release scout had an add out for.
-		if !addOutcomeUnknown(s.cache, ServiceTorBox, s.token, t.InfoHash) {
+		if addOutcomeUnknown(s.cache, ServiceTorBox, s.token, t.InfoHash) {
+			// Start the clock on not knowing, so this cannot cycle forever.
+			noteUnknownOutcome(s.cache, ServiceTorBox, s.token, t.InfoHash)
+		} else {
 			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 		}
 		return "", err
@@ -1425,7 +1436,9 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if err != nil {
 		// See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
 		// case, having no Status for handlePlay to rescue the answer with.
-		if !addOutcomeUnknown(s.cache, ServiceRealDebrid, s.token, t.InfoHash) {
+		if addOutcomeUnknown(s.cache, ServiceRealDebrid, s.token, t.InfoHash) {
+			noteUnknownOutcome(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
+		} else {
 			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
 		}
 		return "", err
@@ -1881,7 +1894,9 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		// The third store gets the same rule. Its ordering already answered 202 from the marker, so the
 		// client saw the right thing — but the refusal was still written, and a refusal is read by the
 		// probe route and by every other release on this account's per-hash key.
-		if !addOutcomeUnknown(s.cache, ServicePremiumize, s.token, t.InfoHash) {
+		if addOutcomeUnknown(s.cache, ServicePremiumize, s.token, t.InfoHash) {
+			noteUnknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
+		} else {
 			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		}
 		return "", err
@@ -2223,7 +2238,7 @@ func (p *StorePool) Resolve(ctx context.Context, t ResolveTarget) (string, error
 // release nobody is seeding: the client waits on a download the service was never asked to start.
 func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	preferred []DebridService) (string, error) {
-	var refused error
+	var refused, coming error
 	// Holders are tried FIRST, which is the whole point: a service that already holds the release serves
 	// it now, where another has to fetch it. Every store still gets a turn if the holders fail.
 	//
@@ -2238,12 +2253,27 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 			return link, nil
 		}
 		log.Printf("scout: %s could not resolve %s: %v", st.Service(), shortHash(t.InfoHash), err)
+		// An add of ours already out for this release outranks any refusal, whichever store said what and
+		// in whichever order. It is the one answer that is about US rather than about a service: the
+		// release is being fetched right now, so 202 "downloading" is simply true.
+		//
+		// It was being lost because errAddInFlight wraps a StoreUnavailableError, so the first refusal
+		// claimed `refused` and nothing downstream could tell them apart. Store order then decided the
+		// verdict: TorBox throttled with RD fetching answered 503 naming TorBox, while the same two facts
+		// in the other order answered 202. The 503 tells the viewer their debrid is refusing and stops the
+		// client trying other sources — for a release scout has an add out for.
+		if coming == nil && errors.Is(err, errAddInFlight) {
+			coming = err
+		}
 		// A service refusing US outranks a dead link as an explanation: if even one store was throttled
 		// or faulting, "this release is dead" is not a conclusion the evidence supports.
 		var unavailable *StoreUnavailableError
 		if errors.As(err, &unavailable) && refused == nil {
 			refused = err
 		}
+	}
+	if coming != nil {
+		return "", coming
 	}
 	if refused != nil {
 		return "", refused

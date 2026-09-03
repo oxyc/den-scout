@@ -75,9 +75,44 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 	return compileAll(specs...)
 }
 
-// episodeRangeRe finds a written range and captures its parts: season, near end, far end. The far end is
-// either `e`-marked (`S01E05-E06`, `S01E05E06`, `S01E05.E06`) or bare behind a tight dash (`S01E05-06`).
-var episodeRangeRe = regexp2.MustCompile(`s0*(\d{1,2})[ ._-]*e(\d{1,3})(?:[ ._-]*e(\d{1,3})(?!\d)|-(\d{1,3})(?![\da-z]))`, regexp2.None)
+// episodeRangeRe finds a multi-episode label: a season, a first episode, and everything chained onto it.
+// The chain is captured whole and read by episodeChain, because a file may name more than two.
+//
+// Sonarr writes six styles and three of them chain past two numbers — `S01E01E02E03`,
+// `S01E01-E02-E03`, `S01E01-02-03`. Capturing exactly one far end read those as ending at the SECOND
+// number, so the third episode matched nothing; the file is labelled, so the miss became a hard refusal
+// and a third of a playing release answered 404 on all three stores.
+var episodeRangeRe = regexp2.MustCompile(
+	`s0*(\d{1,2})[ ._-]*e(\d{1,3})((?:[ ._-]*e\d{1,3}|-\d{1,3})*)(?![\da-z])`, regexp2.None)
+
+// episodeChainRe splits the chain into its elements, keeping whether each carried its own `e`.
+var episodeChainRe = regexp2.MustCompile(`(?:[ ._-]*e(\d{1,3})|-(\d{1,3}))`, regexp2.None)
+
+// chainedEpisode is one number after the first, and whether it named itself with an `e`.
+type chainedEpisode struct {
+	value  int
+	digits int
+	marked bool
+}
+
+func episodeChain(tail string) []chainedEpisode {
+	var out []chainedEpisode
+	m, err := episodeChainRe.FindStringMatch(tail)
+	for ; err == nil && m != nil; m, err = episodeChainRe.FindNextMatch(m) {
+		marked := m.GroupByNumber(1).String()
+		bare := m.GroupByNumber(2).String()
+		text := marked
+		if text == "" {
+			text = bare
+		}
+		v, ok := atoiOK(text)
+		if !ok {
+			continue
+		}
+		out = append(out, chainedEpisode{value: v, digits: len(text), marked: marked != ""})
+	}
+	return out
+}
 
 // namesEpisode reports whether a filename declares this exact episode, by a single label or by a range
 // that contains it.
@@ -88,16 +123,23 @@ func namesEpisode(name string, season, episode int) bool {
 	return rangeHoldsEpisode(strings.ToLower(baseName(name)), season, episode)
 }
 
-// rangeHoldsEpisode applies the three rules a written range has to satisfy. Each excludes a different
-// family of names that is not a range at all:
+// rangeHoldsEpisode reports whether a multi-episode label covers this episode.
 //
-//  1. It reads as one: the near number is below the far one. `E08-4K` is not a range ending at 4.
-//  2. A BARE far end is written the same width as the near one. Releases pad a range consistently —
-//     `E01-06`, `E05-06`, `E01-12` — while a tag or a title is whatever it is: `E01-7.Minutes`,
-//     `E07-8.Mile`, `E01-2.Broke.Girls`, `E04-5.1.AC3`, Sonarr's `S02E01-014`. All mix widths.
-//  3. It spans a season at most. `E01-42` is not one file.
+// TWO numbers are a range and the episode may lie between them; THREE OR MORE are a list, and only the
+// numbers actually written count. `S01E01-06` holds episodes 2 to 5 without naming them, while
+// `S01E01E02E03` names exactly what it holds — reading the latter as a range would be harmless here but
+// would start guessing the moment a release lists non-consecutive episodes.
 //
-// An `e`-marked far end is exempt from rules 2 and 3: the explicit `e` is evidence enough on its own.
+// The rules exist to keep names that are not episode labels at all out of this. Each excludes a
+// different family:
+//
+//  1. It reads as a range: the near number is below the far one. `E08-4K` is not a range ending at 4.
+//  2. A BARE element is written the same width as the first. Releases pad consistently — `E01-06`,
+//     `E05-06`, `E01-12` — while a tag or a title is whatever it is: `E01-7.Minutes`, `E07-8.Mile`,
+//     `E01-2.Broke.Girls`, `E04-5.1.AC3`, Sonarr's `S02E01-014`. All mix widths.
+//  3. A bare range spans a season at most. `E01-42` is not one file.
+//
+// An `e`-marked element is exempt from 2 and 3: the explicit `e` is evidence enough on its own.
 func rangeHoldsEpisode(name string, season, episode int) bool {
 	m, err := episodeRangeRe.FindStringMatch(name)
 	for ; err == nil && m != nil; m, err = episodeRangeRe.FindNextMatch(m) {
@@ -105,24 +147,45 @@ func rangeHoldsEpisode(name string, season, episode int) bool {
 		if !ok || gotSeason != season {
 			continue
 		}
-		lo, ok := atoiOK(m.GroupByNumber(2).String())
+		firstText := m.GroupByNumber(2).String()
+		first, ok := atoiOK(firstText)
 		if !ok {
 			continue
 		}
-		marked := m.GroupByNumber(3).String()
-		bare := m.GroupByNumber(4).String()
-		far := marked
-		if far == "" {
-			far = bare
+		chain := episodeChain(m.GroupByNumber(3).String())
+		if len(chain) == 0 {
+			continue // a lone SxxExx: the plain patterns already answered for it
 		}
-		hi, ok := atoiOK(far)
-		if !ok || hi <= lo || episode < lo || episode > hi {
+		// A bare element that is not written like the first is not part of this label.
+		malformed := false
+		for _, c := range chain {
+			if !c.marked && c.digits != len(firstText) {
+				malformed = true
+				break
+			}
+		}
+		if malformed {
 			continue
 		}
-		if bare != "" && (len(bare) != len(m.GroupByNumber(2).String()) || hi-lo > 12) {
-			continue
+		if len(chain) == 1 {
+			hi := chain[0].value
+			if hi <= first || episode < first || episode > hi {
+				continue
+			}
+			if !chain[0].marked && hi-first > 12 {
+				continue
+			}
+			return true
 		}
-		return true
+		// Three or more: a list of exactly these episodes.
+		if episode == first {
+			return true
+		}
+		for _, c := range chain {
+			if c.value == episode {
+				return true
+			}
+		}
 	}
 	return false
 }
