@@ -57,6 +57,7 @@ func (b *addBudget) take(account string) bool {
 	defer b.mu.Unlock()
 	now := b.now()
 	cutoff := now.Add(-b.window)
+	b.dropDrainedLocked(cutoff)
 	kept := b.spent[account][:0]
 	for _, t := range b.spent[account] {
 		if t.After(cutoff) {
@@ -69,6 +70,24 @@ func (b *addBudget) take(account string) bool {
 	}
 	b.spent[account] = append(kept, now)
 	return true
+}
+
+// dropDrainedLocked forgets accounts whose window has emptied. Entries were only ever rewritten, never
+// deleted, so the map grew one key per distinct service+token ever seen and never shrank — and the token
+// comes from the install's own config URL on an unauthenticated route, so the set of keys is not bounded
+// by anything this process controls. `pruneMintedLocked` is the same idea two files over. Caller holds
+// b.mu.
+func (b *addBudget) dropDrainedLocked(cutoff time.Time) {
+	for acct, spent := range b.spent {
+		if len(spent) == 0 {
+			delete(b.spent, acct)
+			continue
+		}
+		// The slice is append-only in time order, so the last entry is the newest.
+		if !spent[len(spent)-1].After(cutoff) {
+			delete(b.spent, acct)
+		}
+	}
 }
 
 // refund returns the most recent charge. Only for an add that was never sent — see refundAdd; refunding

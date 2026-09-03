@@ -1839,6 +1839,13 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if t.NoAdd {
 		return "", errWouldAdd
 	}
+	// The account gate the other two have. It was genuinely redundant here — `backedOff` consults the
+	// account key first, and nothing that returned above it spoke to Premiumize — but `addInFlight` now
+	// does return above it, so a live marker pre-empted a rejected key and answered 202 "downloading"
+	// where TorBox and RD answer 503. A dead key is not a wait.
+	if reason, ok := accountBackedOff(s.cache, ServicePremiumize, s.token); ok {
+		return "", &StoreUnavailableError{Service: ServicePremiumize, Reason: reason + " (backing off)"}
+	}
 	if err := addInFlight(s.cache, ServicePremiumize, s.token, t.InfoHash); err != nil {
 		return "", err
 	}

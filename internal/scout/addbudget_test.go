@@ -2803,3 +2803,50 @@ func TestStores_anUnansweredAddReadsAsComingNotAsRefusing(t *testing.T) {
 		})
 	}
 }
+
+// The account gate the other two stores have. It was redundant on Premiumize until addInFlight was moved
+// above backedOff, at which point a live in-flight marker pre-empted a rejected key and answered 202
+// "downloading" where TorBox and RD answer 503. A dead key is not a wait.
+func TestPremiumize_aRejectedKeyOutranksAnInFlightMarker(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	recordRefusal(cache, ServicePremiumize, "tok", repeat("f", 40),
+		&StoreUnavailableError{Service: ServicePremiumize, Status: 401, Reason: "directdl http 401"})
+	noteAddAttempt(cache, ServicePremiumize, "tok", H)
+	s := &premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			t.Error("a rejected key must stop the request before it is made")
+			return resp(200, `{}`), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if errors.Is(err, errAddInFlight) {
+		t.Errorf("a dead key was reported as a transfer on its way: %v", err)
+	}
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Errorf("got %v, want the store reported unavailable", err)
+	}
+}
+
+// The window is per account and the account comes from the install's own config URL, on a route with no
+// authentication — so a map that only ever grows is not bounded by anything this process controls.
+func TestAddBudget_forgetsAccountsWhoseWindowHasDrained(t *testing.T) {
+	now := time.Now()
+	b := newAddBudget(time.Hour, 50)
+	b.now = func() time.Time { return now }
+	for i := 0; i < 5000; i++ {
+		b.take(fmt.Sprintf("torbox:%d", i))
+	}
+	if len(b.spent) != 5000 {
+		t.Fatalf("setup: %d accounts", len(b.spent))
+	}
+	// An hour later every one of those windows has drained; the next caller must not inherit them.
+	now = now.Add(2 * time.Hour)
+	b.take("torbox:live")
+	if len(b.spent) != 1 {
+		t.Errorf("map holds %d accounts, want just the live one", len(b.spent))
+	}
+	// And the live account still accounts correctly.
+	if left := b.remaining("torbox:live"); left != 49 {
+		t.Errorf("remaining = %d, want 49", left)
+	}
+}

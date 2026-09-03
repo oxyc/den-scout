@@ -23,7 +23,7 @@ var videoExtRe = mustRE2(`\.(mkv|mp4|avi|m4v|ts|mov|wmv|flv|webm)$`)
 // episodePatterns builds the SxxExx / 1x02 / "season 1 episode 2" / 102 / 0102 matchers once per pick.
 // These NAME the episode: each carries the season with it, so a match is a statement about the file.
 func episodePatterns(season, episode int) []*regexp2.Regexp {
-	return compileAll(
+	specs := []string{
 		fmt.Sprintf(`s0*%d[ ._-]*e0*%d(?!\d)`, season, episode),
 		fmt.Sprintf(`\b0*%dx0*%d(?!\d)`, season, episode),
 		fmt.Sprintf(`season[ ._-]*0*%d[ ._-]*episode[ ._-]*0*%d(?!\d)`, season, episode),
@@ -46,12 +46,32 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 		// for episode 14. Strong matches outrank the indexer's fileIdx, so a correct position was
 		// overridden by a title that happens to start with a digit.
 		//
-		// So: either the second number carries its own `e`, or it is joined to the first by a TIGHT dash.
-		// The tight dash is what separates `S01E05-06` from `S02E01 - 014`, where the spaces mark the
-		// absolute number as a separate field rather than the other end of a range.
+		// So the second number must carry its own `e` — an explicit marker nothing else in a release name
+		// wears.
 		fmt.Sprintf(`s0*%d[ ._-]*e\d{1,3}(?!\d)[ ._-]*e0*%d(?!\d)`, season, episode),
-		fmt.Sprintf(`s0*%d[ ._-]*e\d{1,3}(?!\d)-0*%d(?!\d)`, season, episode),
-	)
+	}
+	// `S01E05-06` writes the far end without an `e`, and a tight dash was tried as the thing that made it
+	// safe. It is not: `Show.S01E01-7.Minutes.mkv`, `Show.S01E08-4K.HDR.mkv` and `Show - S02E01-014 -
+	// Title.mkv` are the same failures one separator over, and a pack of `Show.S01E%02d-60fps.mkv` stopped
+	// refusing an episode it does not hold. Any digit-initial tag joined to the label does it: -4K, -8bit,
+	// -2CH, -3D, -60fps, a group tag like -2HD, or a title starting with a number.
+	//
+	// What actually identifies this form is not the punctuation but the ARITHMETIC: it is a range, so the
+	// number before the dash is the one just below the number after it. Asking for episode 6, only
+	// `E05-06`, `E04-06` and `E03-06` can be ranges ending at 6 — `E01-42` and `E08-4K` cannot be
+	// anything of the sort. A double episode spans two, occasionally three; beyond that the far end is
+	// written with its own `e` anyway and the pattern above has it.
+	//
+	// The arithmetic is necessary but not sufficient: `S01E02-3D` and `S01E01-2HD` are consecutive by
+	// coincidence. So the far end must also END there — a separator or the end of the name, never a
+	// letter, which is what makes `-3D` a tag rather than a range. (The e-marked branch above keeps the
+	// looser rule on purpose, so a version suffix like `-E06v2` still matches.)
+	for span := 1; span <= 3; span++ {
+		if prev := episode - span; prev >= 1 {
+			specs = append(specs, fmt.Sprintf(`s0*%d[ ._-]*e0*%d-0*%d(?![\da-z])`, season, prev, episode))
+		}
+	}
+	return compileAll(specs...)
 }
 
 // bareEpisodePatterns is the episode number standing alone as its own token: `[Grp] Show - 03

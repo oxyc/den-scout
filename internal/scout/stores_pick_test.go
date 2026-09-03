@@ -910,3 +910,50 @@ func TestEpisodePatterns_theRangeSecondElementMustBeAnEpisode(t *testing.T) {
 	got, err = pickEpisodeFile(uhd, 1, 4)
 	wantPick(t, got, err, 4, "the 4K tag names no episode")
 }
+
+// A range is arithmetic, not punctuation. A tight dash was tried as the thing that made a bare second
+// number safe; it is not, because every digit-initial tag joined to the label wears one. What identifies
+// the form is that the number before the dash is the one just below the number after it.
+func TestEpisodePatterns_aTightDashIsNotEnoughToMakeARange(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		season  int
+		episode int
+		want    bool
+		why     string
+	}{
+		{"Show.S01E05-06.1080p.mkv", 1, 6, true, "a real range, bare far end"},
+		{"Show.S01E04-06.1080p.mkv", 1, 6, true, "a three-episode range still ends at 6"},
+		{"Show.S01E05-E06.1080p.mkv", 1, 6, true, "the e-marked form is unaffected"},
+		// Every one of these is a digit-initial tag or title joined tightly to the label.
+		{"Show.S01E01-7.Minutes.1080p.WEB-DL.mkv", 1, 7, false, "a title starting with a digit"},
+		{"Show.S01E01-42.1080p.WEB-DL.mkv", 1, 42, false, "a numeric title"},
+		{"Show.S01E08-4K.HDR.WEB-DL.mkv", 1, 4, false, "a 4K tag"},
+		{"Show.S01E02-60fps.mkv", 1, 60, false, "a frame-rate tag"},
+		{"Show.S01E02-8bit.mkv", 1, 8, false, "a bit-depth tag"},
+		{"Show.S01E02-3D.mkv", 1, 3, false, "a 3D tag"},
+		{"Show - S02E01-014 - Title.mkv", 2, 14, false, "an absolute number"},
+		{"Show.S01E01-2HD.mkv", 1, 2, false, "a group tag starting with a digit"},
+	} {
+		got := matchesEpisode(tc.name, episodePatterns(tc.season, tc.episode))
+		if got != tc.want {
+			t.Errorf("S%02dE%02d vs %q: got %v, want %v — %s", tc.season, tc.episode, tc.name, got, tc.want, tc.why)
+		}
+	}
+
+	// End to end: a pack tagged -4K must not have every file claim to be episode 4, and a pack tagged
+	// -60fps must still REFUSE an episode it does not hold rather than hand back a file.
+	var uhd []TorrentFile
+	for i := 1; i <= 8; i++ {
+		uhd = append(uhd, file(i, fmt.Sprintf("Show.S01E%02d-4K.HDR.WEB-DL.mkv", i), 1000+i))
+	}
+	got, err := pickEpisodeFile(uhd, 1, 4)
+	wantPick(t, got, err, 4, "the 4K tag names no episode")
+
+	var fps []TorrentFile
+	for i := 1; i <= 6; i++ {
+		fps = append(fps, file(i, fmt.Sprintf("Show.S01E%02d-60fps.mkv", i), 1000+i))
+	}
+	got, err = pickEpisodeFile(fps, 1, 60)
+	wantNotInTorrent(t, got, err, "a pack of E01-E06 does not hold episode 60")
+}
