@@ -3592,3 +3592,75 @@ func TestTorBox_aReadOnlyResolveWritesNoBackoff(t *testing.T) {
 		t.Error("a queueing resolve must still remember the refusal")
 	}
 }
+
+// recordRefusal feeds two memories and a read-only caller stands differently to each. The per-release
+// key is an add-path guard, so a probe must not write one — it would gate the /play behind it for a
+// minute with no upstream call. The ACCOUNT key is read unconditionally at the top of Resolve, NoAdd
+// included, because a rejected key makes every request pointless; guarding both together left the probe
+// unable to set the very key it then reads, so it re-asked a rejected endpoint once per poll.
+func TestTorBox_aReadOnlyResolveWritesOnlyTheAccountRefusal(t *testing.T) {
+	// Both paths that record: the warm resolve entry, and the held torrent id.
+	for _, path := range []string{"warm", "held"} {
+		for _, tc := range []struct {
+			name           string
+			status         int
+			wantPerRelease bool
+			wantAccount    bool
+		}{
+			{"a throttle", 429, false, false},
+			// A rejected key writes both, because recordRefusal writes the per-release key alongside the
+			// account one. That is harmless where it would not be for a throttle: the account gate blocks
+			// every release on this token anyway, so the narrower key gates nothing that was not already
+			// gated. What matters is that a THROTTLE — an add-path fact — writes neither.
+			{"a rejected key", 401, true, true},
+		} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				calls := 0
+				cache := NewMemoryCache(1 << 20)
+				if path == "warm" {
+					cache.Put(resolveKey("tok", H),
+						`{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}`, resolveCacheTTL)
+				} else {
+					cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+				}
+				s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+					client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+						if strings.Contains(r.URL.Path, "requestdl") {
+							calls++
+							return resp(tc.status, `{}`), nil
+						}
+						return resp(200, `{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}`), nil
+					}}}
+				probe := ResolveTarget{InfoHash: H, FileIdx: intp(0), NoAdd: true}
+				for i := 0; i < 5; i++ {
+					_, _ = s.Resolve(context.Background(), probe)
+				}
+				if _, ok := backedOff(cache, ServiceTorBox, "tok", H); ok != tc.wantPerRelease {
+					t.Errorf("per-release backoff = %v, want %v — a probe must not gate /play", ok, tc.wantPerRelease)
+				}
+				if _, ok := accountBackedOff(cache, ServiceTorBox, "tok"); ok != tc.wantAccount {
+					t.Errorf("account backoff = %v, want %v", ok, tc.wantAccount)
+				}
+				// A dead key must stop the probe re-asking; a throttle is an add-path fact and does not.
+				if tc.wantAccount && calls > 1 {
+					t.Errorf("asked a rejected endpoint %d times across five polls", calls)
+				}
+			})
+		}
+	}
+
+	// And a queueing resolve still writes the per-release key, which is where the bound is wanted.
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), "42", resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "requestdl") {
+				return resp(429, `{}`), nil
+			}
+			return resp(200, `{"data":{"id":42,"files":[{"id":0,"name":"m.mkv","size":9}]}}`), nil
+		}}}
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0)})
+	if _, ok := backedOff(cache, ServiceTorBox, "tok", H); !ok {
+		t.Error("a queueing resolve must still remember the refusal")
+	}
+}

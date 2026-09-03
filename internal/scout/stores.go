@@ -542,6 +542,20 @@ func isCancellation(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// recordRefusalFor writes a refusal on behalf of a caller that may be read-only.
+//
+// recordRefusal feeds TWO memories and a NoAdd caller stands differently to each. The per-release key is
+// an add-path guard — a read-only resolve is exempt from reading it, so it must not write one either, or
+// the probe route gates the /play behind it for a minute with no upstream call. The ACCOUNT key is not:
+// `accountBackedOff` is read unconditionally at the top of Resolve, NoAdd callers included, because a
+// rejected key makes every request pointless whatever it is asking for. Guarding both together made the
+// probe unable to set the very key it then reads, so it re-asked a rejected endpoint once per poll.
+func recordRefusalFor(cache Cache, svc DebridService, token, infoHash string, err error, noAdd bool) {
+	if !noAdd || refusalIsAboutTheAccount(err) {
+		recordRefusal(cache, svc, token, infoHash, err)
+	}
+}
+
 // refusalReason renders an add failure for the backoff cache, keeping the service's own words where it
 // gave any — that string is what the probe route later reports and the log later prints.
 func refusalReason(err error) string {
@@ -750,13 +764,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 				// probe route, which reads the backoff, reported nothing queued.
 				var unavailable *StoreUnavailableError
 				if errors.As(err, &unavailable) {
-					// Not from a NoAdd caller. It is exempt from the gate that READS this a few lines
-					// up — a read-only resolve cannot have caused a backoff — so recording from it wrote
-					// state it would never consult, and re-stamped it on every poll, which kept /play
-					// gated for exactly as long as the probe route kept polling.
-					if !t.NoAdd {
-						recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
-					}
+					recordRefusalFor(s.cache, ServiceTorBox, s.token, t.InfoHash, err, t.NoAdd)
 					return "", err
 				}
 			}
@@ -945,7 +953,10 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	// backoff its own contract says it cannot cause.
 	var refusedUs *StoreUnavailableError
 	if errors.As(err, &refusedUs) {
-		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
+		// The same rule as the warm path one branch up: this is reached BEFORE Resolve's NoAdd return,
+		// so a probe poll landed here and wrote the add-path backoff its own contract says it cannot
+		// cause — the sentence two lines above says exactly that and the code did it anyway.
+		recordRefusalFor(s.cache, ServiceTorBox, s.token, t.InfoHash, err, t.NoAdd)
 	}
 	if errors.Is(err, errTorrentGone) {
 		// The id we were just handed is not one TorBox has. Undo the two writes above: leaving them
