@@ -1286,6 +1286,12 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		Files []tbFile `json:"files"`
 	}
 	var e entry
+	if json.Unmarshal(body.Data, &e) == nil && e.ID != 0 && e.ID != torrentID {
+		// The object form gets the same test. An entry naming a different torrent is not an answer about
+		// ours, whichever shape it arrives in; one carrying no id is taken at its word, since a
+		// single-entry answer to a by-id query need not repeat it.
+		return nil, errNoFileList
+	}
 	if json.Unmarshal(body.Data, &e) != nil {
 		var arr []entry
 		// Two different facts, and folding them together reproduced the wedge the errTorrentGone split
@@ -1304,20 +1310,21 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		// should answer with one, but taking arr[0] blind means a multi-entry answer picks a file id out
 		// of another torrent's file list — the wrong-episode failure, by a route the name-match cannot
 		// catch, since the names it matches would be the other torrent's.
-		e = arr[0]
-		if len(arr) > 1 {
-			match := -1
-			for i, cand := range arr {
-				if cand.ID == torrentID {
-					match = i
-					break
-				}
+		//
+		// Checked at ANY length. Guarding only `len(arr) > 1` left the one-element case blind, so a
+		// single foreign entry still handed back its files — and Status, which parses this same payload,
+		// is stricter in exactly that spot. Two readers of one shape should not disagree about it.
+		match := -1
+		for i, cand := range arr {
+			if cand.ID == torrentID || cand.ID == 0 {
+				match = i
+				break
 			}
-			if match < 0 {
-				return nil, errNoFileList
-			}
-			e = arr[match]
 		}
+		if match < 0 {
+			return nil, errNoFileList
+		}
+		e = arr[match]
 	}
 	out := make([]TorrentFile, 0, len(e.Files))
 	for _, f := range e.Files {
@@ -1708,6 +1715,19 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 	}
 	_ = sel.Body.Close()
 	if sel.StatusCode < 200 || sel.StatusCode >= 300 {
+		// A refusal is a fact about the ACCOUNT, not the release — the rule `info` applies one call
+		// earlier on this same read path, and the one TorBox's final call applies too. Mapping every
+		// non-2xx to a dead link here meant a throttle, on a release RD demonstrably holds and would
+		// serve, reached the app as "this release does not exist": the client blacklists it and walks the
+		// rest of the list, every candidate hitting the same throttled endpoint for the same answer.
+		// Nothing was recorded either, since resolveExisting only remembers a *StoreUnavailableError, so
+		// no backoff slowed the retries and the probe route had nothing to report.
+		if storeRefusedUs(sel.StatusCode) {
+			refused := &StoreUnavailableError{Service: ServiceRealDebrid, Status: sel.StatusCode,
+				Reason: fmt.Sprintf("selectFiles http %d", sel.StatusCode)}
+			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, refused)
+			return "", refused
+		}
 		return "", &DeadLinkError{fmt.Sprintf("realdebrid selectFiles http %d", sel.StatusCode)}
 	}
 	ready, err := s.info(ctx, id)
@@ -1721,7 +1741,15 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 	if !ok {
 		return "", &DeadLinkError{"realdebrid has no link for the selected file"}
 	}
-	return s.unrestrict(ctx, link)
+	got, err := s.unrestrict(ctx, link)
+	// Classifying a refusal only matters if it is REMEMBERED: `info`'s branch above records its own, and
+	// without this the two calls after it were classified and then forgotten, so every poll walked the
+	// whole chain again to reach the same throttled endpoint.
+	var refusedUs *StoreUnavailableError
+	if errors.As(err, &refusedUs) {
+		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+	}
+	return got, err
 }
 
 // rdLinkFor picks the link belonging to a file id.
@@ -1796,6 +1824,11 @@ func (s *realDebridStore) unrestrict(ctx context.Context, link string) (string, 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// See selectFiles: the last call of the chain classifies like the first.
+		if storeRefusedUs(resp.StatusCode) {
+			return "", &StoreUnavailableError{Service: ServiceRealDebrid, Status: resp.StatusCode,
+				Reason: fmt.Sprintf("unrestrict http %d", resp.StatusCode)}
+		}
 		return "", &DeadLinkError{fmt.Sprintf("realdebrid unrestrict http %d", resp.StatusCode)}
 	}
 	var body struct {
@@ -2091,9 +2124,15 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		if !readable {
 			dead = &DeadLinkError{"premiumize directdl answered something unreadable"}
 		} else {
-			msg := strings.TrimSpace(body.Message)
+			// Redacted like its sibling a few lines up, and for the reason that comment already gives:
+			// this text is not merely logged, it is PERSISTED into the refusal cache, which writes
+			// through to disk, and the probe route prints it back verbatim. The apikey rides in this
+			// very request's form body, so an upstream message quoting the request carries it — the
+			// same premise every other redaction site here is built on. This branch was the one left
+			// out, and it is the one carrying Premiumize's real refusals.
+			msg := redactToken(strings.TrimSpace(body.Message), s.token)
 			dead = &DeadLinkError{"premiumize directdl: " +
-				strings.TrimSpace(body.Status+" "+msg[:min(len(msg), 200)])}
+				strings.TrimSpace(redactToken(body.Status, s.token)+" "+msg[:min(len(msg), 200)])}
 		}
 		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
 		return "", dead

@@ -3307,3 +3307,117 @@ func TestTorBox_anEnvelopeWithoutDataIsNotAMiss(t *testing.T) {
 		t.Error("an answered miss must still be remembered")
 	}
 }
+
+// A refusal is a fact about the account, not the release — and the last calls of RD's chain classified
+// nothing. `info`, one call earlier on the same read path, has drawn that line for a long time. So the
+// same throttle answered 503 or 404 depending only on which call it landed on: a release RD is holding
+// and would serve was reported dead, the client blacklisted it and walked the rest of the list, and
+// every candidate hit the same throttled endpoint for the same answer. Nothing was recorded either,
+// since resolveExisting only remembers a *StoreUnavailableError.
+func TestRealDebrid_everyCallInTheChainClassifiesARefusal(t *testing.T) {
+	const infoOK = `{"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}],"links":["l1"]}`
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   bool // want a StoreUnavailableError rather than a dead link
+	}{
+		{"selectFiles throttled", 429, true},
+		{"selectFiles faulting", 503, true},
+		{"selectFiles rejecting the file", 400, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			s := &realDebridStore{token: "tok", cache: cache, api: realDebridAPI,
+				client: routed{routes: map[string]func() (*http.Response, error){
+					"addMagnet":     ok(`{"id":"t1"}`),
+					"torrents/info": ok(infoOK),
+					"selectFiles":   status(tc.status),
+				}}}
+			_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+			var unavailable *StoreUnavailableError
+			if got := errors.As(err, &unavailable); got != tc.want {
+				t.Errorf("got %v (unavailable=%v), want unavailable=%v", err, got, tc.want)
+			}
+		})
+	}
+
+	// The last call of the chain, on a release the account demonstrably holds.
+	for _, code := range []int{429, 503} {
+		cache := NewMemoryCache(1 << 20)
+		s := &realDebridStore{token: "tok", cache: cache, api: realDebridAPI,
+			client: routed{routes: map[string]func() (*http.Response, error){
+				"addMagnet":     ok(`{"id":"t1"}`),
+				"torrents/info": ok(infoOK),
+				"selectFiles":   ok(`{}`),
+				"unrestrict":    status(code),
+			}}}
+		_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+		var unavailable *StoreUnavailableError
+		if !errors.As(err, &unavailable) {
+			t.Errorf("unrestrict %d answered %v — a throttle is not a dead release", code, err)
+		}
+		// And being classified is what gets it remembered, so the next poll costs one call rather than four.
+		if _, backed := backedOff(cache, ServiceRealDebrid, "tok", H); !backed {
+			t.Errorf("unrestrict %d left no backoff, so nothing slows the retries", code)
+		}
+	}
+}
+
+// Premiumize's HTTP-200 `status:error` branch is the one carrying its real refusals, and it was the only
+// detail site splicing the upstream message in unredacted — into text that is logged AND persisted into
+// a refusal cache that writes through to disk, from where the probe route prints it back.
+func TestPremiumize_theStatusErrorMessageCannotCarryTheToken(t *testing.T) {
+	prev := globalAddBudget
+	globalAddBudget = newAddBudget(time.Hour, 50)
+	defer func() { globalAddBudget = prev }()
+
+	const token = "pm-super-secret-apikey"
+	cache := NewMemoryCache(1 << 20)
+	s := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(r.Body)
+			return resp(200, `{"status":"error","message":"invalid src for `+string(body)+`"}`), nil
+		}}}
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H})
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Errorf("the token reached an error that gets logged: %v", err)
+	}
+	if reason, ok := backedOff(cache, ServicePremiumize, token, H); ok && strings.Contains(reason, token) {
+		t.Errorf("the token was persisted into the refusal cache: %s", reason)
+	}
+}
+
+// listFiles and Status parse the same mylist payload; they must not disagree about whose entry it is.
+// listFiles checked the id only when the array had more than one element, so a single foreign entry
+// still handed back its files.
+func TestTorBoxListFiles_matchesTheIdAtAnyLength(t *testing.T) {
+	foreign := `{"id":42,"files":[{"id":7,"name":"Wanted.S01E01.mkv","size":10}]}`
+	ours := `{"id":100,"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}`
+	for _, tc := range []struct {
+		name    string
+		payload string
+		wantErr bool
+	}{
+		{"a lone foreign entry, object form", `{"data":` + foreign + `}`, true},
+		{"a lone foreign entry, array form", `{"data":[` + foreign + `]}`, true},
+		{"ours, object form", `{"data":` + ours + `}`, false},
+		{"ours, array form", `{"data":[` + ours + `]}`, false},
+		{"ours behind a foreign entry", `{"data":[` + foreign + `,` + ours + `]}`, false},
+		// An entry with no id at all is still taken at its word.
+		{"an unlabelled entry", `{"data":{"files":[{"id":3,"name":"Show.S01E01.mkv","size":10}]}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &torBoxStore{token: "tok", api: torboxAPI, client: routed{fallbk: ok(tc.payload)}}
+			files, err := s.listFiles(context.Background(), 100)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("accepted another torrent's file list: %+v", files)
+				}
+				return
+			}
+			if err != nil || len(files) != 1 || files[0].Name != "Show.S01E01.mkv" {
+				t.Errorf("got %+v, %v", files, err)
+			}
+		})
+	}
+}
