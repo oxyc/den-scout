@@ -3518,3 +3518,77 @@ func TestTorBox_theWarmPathRemembersItsRefusal(t *testing.T) {
 		})
 	}
 }
+
+// listFiles and Status read the same mylist payload and must agree about whose entry it is. Status was
+// left on first-of-either, and it is the reader that decides "downloading" against "dead": a finished
+// stranger at the head of the array made a live download report nothing, which /play answers 404
+// dead_link — the client blacklists a release that is downloading right now.
+func TestTorBoxStatus_anExactIdBeatsAnUnlabelledEntry(t *testing.T) {
+	const ours = 42
+	unlabelledFinished := `{"progress":1,"download_finished":true,"eta":0,"download_speed":0}`
+	strangerBusy := `{"id":9,"progress":0.11,"download_finished":false,"eta":9999,"download_speed":5}`
+	oursBusy := `{"id":42,"progress":0.5,"download_finished":false,"eta":600,"download_speed":900000}`
+
+	for _, tc := range []struct {
+		name    string
+		entries string
+	}{
+		{"an unlabelled finished entry first", unlabelledFinished + "," + oursBusy},
+		{"a stranger downloading first", strangerBusy + "," + oursBusy},
+		{"both ahead of ours", unlabelledFinished + "," + strangerBusy + "," + oursBusy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(torrentIDKey("tok", H), strconv.Itoa(ours), resolveCacheTTL)
+			s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+				client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+					return resp(200, `{"data":[`+tc.entries+`]}`), nil
+				}}}
+			got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H})
+			if !ok {
+				t.Fatal("our torrent is in the list and downloading; this must report on it")
+			}
+			if got.Progress != 0.5 {
+				t.Errorf("reported %+v — that is another torrent's progress", got)
+			}
+		})
+	}
+
+	// With no exact match anywhere, an id-less entry is still the best available answer.
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey("tok", H), strconv.Itoa(ours), resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			return resp(200, `{"data":[{"progress":0.25,"download_finished":false}]}`), nil
+		}}}
+	if got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H}); !ok || got.Progress != 0.25 {
+		t.Errorf("an unlabelled lone entry is still ours: %+v ok=%v", got, ok)
+	}
+}
+
+// A read-only caller is exempt from the gate that READS the per-release backoff, so it must not WRITE
+// one either: the probe re-stamped a refusal it would never consult, which kept /play gated for exactly
+// as long as the probe kept polling.
+func TestTorBox_aReadOnlyResolveWritesNoBackoff(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(resolveKey("tok", H),
+		`{"torrentId":42,"files":[{"Index":0,"Name":"m.mkv","SizeBytes":9}]}`, resolveCacheTTL)
+	s := &torBoxStore{token: "tok", cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "requestdl") {
+				return resp(429, `{}`), nil
+			}
+			return resp(200, `{}`), nil
+		}}}
+	for i := 0; i < 5; i++ {
+		_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0), NoAdd: true})
+	}
+	if _, ok := backedOff(cache, ServiceTorBox, "tok", H); ok {
+		t.Error("a read-only resolve wrote the backoff that gates /play")
+	}
+	// And a real play still records it, so the poll loop is bounded where it matters.
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0)})
+	if _, ok := backedOff(cache, ServiceTorBox, "tok", H); !ok {
+		t.Error("a queueing resolve must still remember the refusal")
+	}
+}

@@ -750,7 +750,13 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 				// probe route, which reads the backoff, reported nothing queued.
 				var unavailable *StoreUnavailableError
 				if errors.As(err, &unavailable) {
-					recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
+					// Not from a NoAdd caller. It is exempt from the gate that READS this a few lines
+					// up — a read-only resolve cannot have caused a backoff — so recording from it wrote
+					// state it would never consult, and re-stamped it on every poll, which kept /play
+					// gated for exactly as long as the probe route kept polling.
+					if !t.NoAdd {
+						recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
+					}
 					return "", err
 				}
 			}
@@ -1093,13 +1099,25 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 		if json.Unmarshal(body.Data, &arr) != nil || len(arr) == 0 {
 			return StoreStatus{}, false
 		}
+		// An EXACT id wins; an id-less entry is only a fallback — the rule listFiles uses on this very
+		// payload. First-of-either let an unlabelled entry ahead of ours answer for it, and here that is
+		// the reading that decides "downloading" against "dead": a finished stranger at the head of the
+		// array made a live download report nothing, which handlePlay answers 404 dead_link, so the
+		// client blacklists a release that is downloading right now. Two readers of one shape must not
+		// disagree about it.
 		st = entryState{}
-		found := false
-		for _, e := range arr {
-			if describesOurs(e) {
+		found, fallback := false, -1
+		for i, e := range arr {
+			if e.ID != nil && *e.ID == torrentID {
 				st, found = e, true
 				break
 			}
+			if e.ID == nil && fallback < 0 {
+				fallback = i
+			}
+		}
+		if !found && fallback >= 0 {
+			st, found = arr[fallback], true
 		}
 		if !found {
 			return StoreStatus{}, false
