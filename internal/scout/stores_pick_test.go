@@ -888,7 +888,7 @@ func TestEpisodePatterns_theRangeSecondElementMustBeAnEpisode(t *testing.T) {
 		{"Show.S01E05-E06.1080p.mkv", 2, 6, false, "the season still has to match"},
 		{"Show.S01E11-E12.1080p.mkv", 1, 1, false, "no backtracking into a false split"},
 	} {
-		got := matchesEpisode(tc.name, episodePatterns(tc.season, tc.episode))
+		got := namesEpisode(tc.name, tc.season, tc.episode)
 		if got != tc.want {
 			t.Errorf("S%02dE%02d vs %q: got %v, want %v — %s", tc.season, tc.episode, tc.name, got, tc.want, tc.why)
 		}
@@ -935,7 +935,7 @@ func TestEpisodePatterns_aTightDashIsNotEnoughToMakeARange(t *testing.T) {
 		{"Show - S02E01-014 - Title.mkv", 2, 14, false, "an absolute number"},
 		{"Show.S01E01-2HD.mkv", 1, 2, false, "a group tag starting with a digit"},
 	} {
-		got := matchesEpisode(tc.name, episodePatterns(tc.season, tc.episode))
+		got := namesEpisode(tc.name, tc.season, tc.episode)
 		if got != tc.want {
 			t.Errorf("S%02dE%02d vs %q: got %v, want %v — %s", tc.season, tc.episode, tc.name, got, tc.want, tc.why)
 		}
@@ -956,4 +956,99 @@ func TestEpisodePatterns_aTightDashIsNotEnoughToMakeARange(t *testing.T) {
 	}
 	got, err = pickEpisodeFile(fps, 1, 60)
 	wantNotInTorrent(t, got, err, "a pack of E01-E06 does not hold episode 60")
+}
+
+// A bare range wider than a double episode is an ordinary release, and refusing it condemns a pack that
+// plays: the refusal short-circuits every store's picker before the indexer's fileIdx is read, so /play
+// answers 404 for a file sitting right there. What excludes the tags is not how WIDE the span is but
+// that both ends are written the same way and the far end stops at a separator.
+func TestEpisodePatterns_bareRangesSpanAWholeSeason(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		episode int
+		want    bool
+		why     string
+	}{
+		{"Show.S01E05-06.1080p.mkv", 6, true, "a double"},
+		{"Show.S01E01-06.1080p.mkv", 6, true, "six episodes in one file"},
+		{"Show.S01E01-08.1080p.mkv", 8, true, "eight"},
+		{"Show.S01E01-12.1080p.mkv", 12, true, "a whole season"},
+		{"Show.S1E5-6.1080p.mkv", 6, true, "unpadded on both ends"},
+		{"Show.S01E01-E12.1080p.mkv", 12, true, "the e-marked form spans freely"},
+		// Mixed widths are how a tag or a title gives itself away.
+		{"Show.S01E01-7.Minutes.1080p.WEB-DL.mkv", 7, false, "a title starting with a digit"},
+		{"Show.S01E07-8.Mile.mkv", 8, false, "consecutive, but mixed widths"},
+		{"Show.S01E01-2.Broke.Girls.1080p.mkv", 2, false, "likewise"},
+		{"Show.S01E04-5.1.AC3.mkv", 5, false, "an audio tag"},
+		{"Show - S02E01-014 - Title.mkv", 14, false, "an absolute number is three wide"},
+		{"Show.S01E01-42.1080p.WEB-DL.mkv", 42, false, "no release packs 42 episodes in one file"},
+		// And the terminator still does its half.
+		{"Show.S01E02-3D.mkv", 3, false, "a 3D tag"},
+		{"Show.S01E01-2HD.mkv", 2, false, "a group tag"},
+		{"Show.S01E08-4K.HDR.WEB-DL.mkv", 4, false, "a 4K tag"},
+		{"Show.S01E02-60fps.mkv", 60, false, "a frame-rate tag"},
+	} {
+		season := 1
+		if tc.name[7] == '2' { // the S02 fixture
+			season = 2
+		}
+		got := namesEpisode(tc.name, season, tc.episode)
+		if got != tc.want {
+			t.Errorf("episode %d vs %q: got %v, want %v — %s", tc.episode, tc.name, got, tc.want, tc.why)
+		}
+	}
+
+	// End to end: a pack of six-episode files must resolve every episode it holds, and still refuse one
+	// it does not.
+	var pack []TorrentFile
+	for i := 0; i < 2; i++ {
+		pack = append(pack, file(i, fmt.Sprintf("Show.S01E%02d-%02d.1080p.mkv", i*6+1, i*6+6), 1000+i))
+	}
+	for ep := 1; ep <= 12; ep++ {
+		got, err := pickEpisodeFile(pack, 1, ep)
+		wantPick(t, got, err, (ep-1)/6, fmt.Sprintf("episode %d lives in file %d", ep, (ep-1)/6))
+	}
+	got, err := pickEpisodeFile(pack, 1, 20)
+	wantNotInTorrent(t, got, err, "episode 20 is not in a pack of E01-E12")
+}
+
+// A range is MEMBERSHIP, not two endpoints. Anchoring only the far end matched episodes 1 and 6 of
+// `S01E01-06.mkv` and none of the four between, so a pack of such files was condemned for two thirds of
+// its episodes — and that refusal short-circuits every picker before the indexer's fileIdx is read.
+func TestNamesEpisode_aRangeHoldsEveryEpisodeInIt(t *testing.T) {
+	for ep := 1; ep <= 6; ep++ {
+		if !namesEpisode("Show.S01E01-06.1080p.mkv", 1, ep) {
+			t.Errorf("S01E01-06 holds episode %d", ep)
+		}
+	}
+	for _, ep := range []int{7, 12, 42} {
+		if namesEpisode("Show.S01E01-06.1080p.mkv", 1, ep) {
+			t.Errorf("S01E01-06 does not hold episode %d", ep)
+		}
+	}
+	// The e-marked form spans freely and is likewise membership.
+	for ep := 1; ep <= 12; ep++ {
+		if !namesEpisode("Show.S01E01-E12.1080p.mkv", 1, ep) {
+			t.Errorf("S01E01-E12 holds episode %d", ep)
+		}
+	}
+	// The season still has to match, and a range cannot run backwards.
+	if namesEpisode("Show.S01E01-06.1080p.mkv", 2, 3) {
+		t.Error("an S01 range says nothing about season 2")
+	}
+	if namesEpisode("Show.S01E06-01.1080p.mkv", 1, 3) {
+		t.Error("a backwards range is not a range")
+	}
+
+	// Every episode of a six-per-file pack resolves, through the real picker.
+	var pack []TorrentFile
+	for i := 0; i < 2; i++ {
+		pack = append(pack, file(i, fmt.Sprintf("Show.S01E%02d-%02d.1080p.mkv", i*6+1, i*6+6), 1000+i))
+	}
+	for ep := 1; ep <= 12; ep++ {
+		got, err := pickEpisodeFile(pack, 1, ep)
+		wantPick(t, got, err, (ep-1)/6, fmt.Sprintf("episode %d lives in file %d", ep, (ep-1)/6))
+	}
+	got, err := pickEpisodeFile(pack, 1, 20)
+	wantNotInTorrent(t, got, err, "episode 20 is not in a pack of E01-E12")
 }

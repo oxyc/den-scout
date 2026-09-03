@@ -3,6 +3,7 @@ package scout
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/dlclark/regexp2"
@@ -56,22 +57,82 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 	// refusing an episode it does not hold. Any digit-initial tag joined to the label does it: -4K, -8bit,
 	// -2CH, -3D, -60fps, a group tag like -2HD, or a title starting with a number.
 	//
-	// What actually identifies this form is not the punctuation but the ARITHMETIC: it is a range, so the
-	// number before the dash is the one just below the number after it. Asking for episode 6, only
-	// `E05-06`, `E04-06` and `E03-06` can be ranges ending at 6 — `E01-42` and `E08-4K` cannot be
-	// anything of the sort. A double episode spans two, occasionally three; beyond that the far end is
-	// written with its own `e` anyway and the pattern above has it.
+	// What identifies this form is not the punctuation but how the two numbers RELATE. Three rules, and
+	// each one is load-bearing against a different family of names:
 	//
-	// The arithmetic is necessary but not sufficient: `S01E02-3D` and `S01E01-2HD` are consecutive by
-	// coincidence. So the far end must also END there — a separator or the end of the name, never a
-	// letter, which is what makes `-3D` a tag rather than a range. (The e-marked branch above keeps the
-	// looser rule on purpose, so a version suffix like `-E06v2` still matches.)
-	for span := 1; span <= 3; span++ {
-		if prev := episode - span; prev >= 1 {
-			specs = append(specs, fmt.Sprintf(`s0*%d[ ._-]*e0*%d-0*%d(?![\da-z])`, season, prev, episode))
-		}
-	}
+	//   1. It reads as a range: the near number is below the far one. `E08-4K` is not a range ending at 4.
+	//   2. Both ends are written the same way. Releases pad a range consistently — `E01-06`, `E05-06`,
+	//      `E01-12` — while a tag or a title is just whatever it is: `E01-7.Minutes`, `E07-8.Mile`,
+	//      `E01-2.Broke.Girls`, `E04-5.1.AC3`, and Sonarr's `S02E01-014`, all of which mix widths.
+	//   3. The far end ENDS there, at a separator or the end of the name, never running into letters —
+	//      which is what makes `-3D` and `-2HD` tags rather than ranges, since those are consecutive by
+	//      coincidence.
+	//
+	// Those rules are checked by reading the two numbers rather than by generating a pattern per span —
+	// see episodeRangeRe. Generating them anchored only the far END, so a bare `S01E01-06.mkv` matched
+	// episodes 1 and 6 and not the four in between, and a pack of such files was condemned for two thirds
+	// of its episodes. A range is membership, and membership is arithmetic.
 	return compileAll(specs...)
+}
+
+// episodeRangeRe finds a written range and captures its parts: season, near end, far end. The far end is
+// either `e`-marked (`S01E05-E06`, `S01E05E06`, `S01E05.E06`) or bare behind a tight dash (`S01E05-06`).
+var episodeRangeRe = regexp2.MustCompile(`s0*(\d{1,2})[ ._-]*e(\d{1,3})(?:[ ._-]*e(\d{1,3})(?!\d)|-(\d{1,3})(?![\da-z]))`, regexp2.None)
+
+// namesEpisode reports whether a filename declares this exact episode, by a single label or by a range
+// that contains it.
+func namesEpisode(name string, season, episode int) bool {
+	if matchesEpisode(name, episodePatterns(season, episode)) {
+		return true
+	}
+	return rangeHoldsEpisode(strings.ToLower(baseName(name)), season, episode)
+}
+
+// rangeHoldsEpisode applies the three rules a written range has to satisfy. Each excludes a different
+// family of names that is not a range at all:
+//
+//  1. It reads as one: the near number is below the far one. `E08-4K` is not a range ending at 4.
+//  2. A BARE far end is written the same width as the near one. Releases pad a range consistently —
+//     `E01-06`, `E05-06`, `E01-12` — while a tag or a title is whatever it is: `E01-7.Minutes`,
+//     `E07-8.Mile`, `E01-2.Broke.Girls`, `E04-5.1.AC3`, Sonarr's `S02E01-014`. All mix widths.
+//  3. It spans a season at most. `E01-42` is not one file.
+//
+// An `e`-marked far end is exempt from rules 2 and 3: the explicit `e` is evidence enough on its own.
+func rangeHoldsEpisode(name string, season, episode int) bool {
+	m, err := episodeRangeRe.FindStringMatch(name)
+	for ; err == nil && m != nil; m, err = episodeRangeRe.FindNextMatch(m) {
+		gotSeason, ok := atoiOK(m.GroupByNumber(1).String())
+		if !ok || gotSeason != season {
+			continue
+		}
+		lo, ok := atoiOK(m.GroupByNumber(2).String())
+		if !ok {
+			continue
+		}
+		marked := m.GroupByNumber(3).String()
+		bare := m.GroupByNumber(4).String()
+		far := marked
+		if far == "" {
+			far = bare
+		}
+		hi, ok := atoiOK(far)
+		if !ok || hi <= lo || episode < lo || episode > hi {
+			continue
+		}
+		if bare != "" && (len(bare) != len(m.GroupByNumber(2).String()) || hi-lo > 12) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func atoiOK(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	return n, err == nil
 }
 
 // bareEpisodePatterns is the episode number standing alone as its own token: `[Grp] Show - 03
@@ -167,10 +228,9 @@ func pickEpisodeFile(files []TorrentFile, season, episode int) (*int, error) {
 		return nil, nil
 	}
 
-	patterns := episodePatterns(season, episode)
 	var matched, unlabelled []TorrentFile
 	for _, f := range pool {
-		if matchesEpisode(f.Name, patterns) {
+		if namesEpisode(f.Name, season, episode) {
 			matched = append(matched, f)
 		}
 		// Per FILE, not per pool. A pool-wide OR let one labelled file speak for the rest: an anime batch
