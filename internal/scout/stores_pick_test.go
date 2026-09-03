@@ -862,3 +862,51 @@ func nameOfIndex(files []TorrentFile, idx int) string {
 	}
 	return fmt.Sprintf("index %d, which is in no file", idx)
 }
+
+// The second element of a double-episode range must look like an episode. Written as an optional `e`
+// over a possibly-empty separator it accepted whatever number came next after the label, and because
+// this is a STRONG match it also overrode the indexer's correct fileIdx.
+func TestEpisodePatterns_theRangeSecondElementMustBeAnEpisode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		season  int
+		episode int
+		want    bool
+		why     string
+	}{
+		{"Show.S01E05-E06.1080p.mkv", 1, 6, true, "the range form it exists for"},
+		{"Show.S01E05E06.1080p.mkv", 1, 6, true, "no separator"},
+		{"Show.S01E05-06.1080p.mkv", 1, 6, true, "a tight dash needs no second e"},
+		{"Show.S01E05.E06.1080p.mkv", 1, 6, true, "a dot separator"},
+		{"Show.S1E05-E06.1080p.mkv", 1, 6, true, "an unpadded season"},
+		// The false matches that made every one of these a strong match for a number in the title.
+		{"Show.S01E01.7.Minutes.1080p.WEB-DL.mkv", 1, 7, false, "a title starting with a digit"},
+		{"Show.S01E01.42.1080p.WEB-DL.mkv", 1, 42, false, "a title that IS a number"},
+		{"Show.S01E08.4K.HDR.WEB-DL.mkv", 1, 4, false, "a 4K tag is not episode 4"},
+		{"Show - S02E01 - 014 - Title.mkv", 2, 14, false, "an absolute number in its own field"},
+		{"Show.S01E05-E06.1080p.mkv", 1, 50, false, "not a prefix of the second number"},
+		{"Show.S01E05-E06.1080p.mkv", 2, 6, false, "the season still has to match"},
+		{"Show.S01E11-E12.1080p.mkv", 1, 1, false, "no backtracking into a false split"},
+	} {
+		got := matchesEpisode(tc.name, episodePatterns(tc.season, tc.episode))
+		if got != tc.want {
+			t.Errorf("S%02dE%02d vs %q: got %v, want %v — %s", tc.season, tc.episode, tc.name, got, tc.want, tc.why)
+		}
+	}
+
+	// End to end: a pack whose titles start with digits must still resolve each episode to its own file.
+	pack := []TorrentFile{
+		file(0, "Show.S01E01.7.Minutes.1080p.WEB-DL.mkv", 9000),
+		file(1, "Show.S01E07.Real.Episode.1080p.WEB-DL.mkv", 1000),
+	}
+	got, err := pickEpisodeFile(pack, 1, 7)
+	wantPick(t, got, err, 1, "episode 7 is the file named E07, not the one whose title starts with 7")
+
+	// And every file in a 4K pack must not claim to be episode 4.
+	var uhd []TorrentFile
+	for i := 1; i <= 8; i++ {
+		uhd = append(uhd, file(i, fmt.Sprintf("Show.S01E%02d.4K.HDR.WEB-DL.mkv", i), 1000+i))
+	}
+	got, err = pickEpisodeFile(uhd, 1, 4)
+	wantPick(t, got, err, 4, "the 4K tag names no episode")
+}

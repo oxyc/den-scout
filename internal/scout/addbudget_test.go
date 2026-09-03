@@ -2745,3 +2745,61 @@ func TestStores_anAddWhoseOutcomeIsNeverKnownGivesUp(t *testing.T) {
 		})
 	}
 }
+
+// An add that went out and was never answered is scout's own uncertainty, not the debrid refusing. All
+// three stores set the in-flight marker for exactly that; two of them then recorded the transport
+// failure as a refusal as well, and since they consulted backedOff FIRST the refusal pre-empted the
+// marker: errAddInFlight became unreachable and the client was told its debrid was refusing — and, per
+// this codebase's own account of that answer, stopped trying other sources — for a release scout had an
+// add out for. Real-Debrid is the sharp case: it has no Status for handlePlay to rescue the answer with.
+func TestStores_anUnansweredAddReadsAsComingNotAsRefusing(t *testing.T) {
+	for _, st := range []struct {
+		name string
+		svc  DebridService
+		path string
+		make func(Cache, doer) Store
+	}{
+		{"torbox", ServiceTorBox, "createtorrent", func(c Cache, d doer) Store {
+			return &torBoxStore{token: "tok", client: d, cache: c, api: torboxAPI}
+		}},
+		{"realdebrid", ServiceRealDebrid, "addMagnet", func(c Cache, d doer) Store {
+			return &realDebridStore{token: "tok", client: d, cache: c, api: realDebridAPI}
+		}},
+		{"premiumize", ServicePremiumize, "directdl", func(c Cache, d doer) Store {
+			return &premiumizeStore{token: "tok", client: d, cache: c, api: premiumizeAPI}
+		}},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			prev := globalAddBudget
+			globalAddBudget = newAddBudget(time.Hour, 50)
+			defer func() { globalAddBudget = prev }()
+
+			adds := 0
+			cache := NewMemoryCache(1 << 20)
+			s := st.make(cache, mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, st.path) {
+					adds++
+					return nil, fmt.Errorf("read tcp 10.0.0.2:443: connection reset by peer")
+				}
+				return resp(200, `{}`), nil
+			}})
+			target := ResolveTarget{InfoHash: H}
+			_, _ = s.Resolve(context.Background(), target)
+
+			// The store said nothing, so nothing may be recorded against it.
+			if reason, ok := backedOff(cache, st.svc, "tok", H); ok {
+				t.Errorf("an unanswered add was filed as %s refusing: %s", st.svc, reason)
+			}
+			// And the polls behind it read as "coming", which handlePlay answers 202, rather than 503.
+			for i := 0; i < 5; i++ {
+				_, err := s.Resolve(context.Background(), target)
+				if !errors.Is(err, errAddInFlight) {
+					t.Fatalf("poll %d answered %v, want the add reported as still in flight", i, err)
+				}
+			}
+			if adds != 1 {
+				t.Errorf("sent the add %d times; the marker exists to stop exactly that", adds)
+			}
+		})
+	}
+}

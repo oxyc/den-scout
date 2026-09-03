@@ -317,18 +317,32 @@ func addAttemptKey(svc DebridService, token, infoHash string) string {
 
 // addInFlight reports an add this process sent and never heard back about.
 //
-// The error deliberately wraps errScoutSide: it is scout's own bookkeeping, not the service declining,
-// so it must not be written into the refusal memory or reported to the client as the debrid's doing —
-// the confusion errScoutSide exists to end.
+// The error wraps errAddInFlight, which handlePlay answers with 202 "downloading": it is scout's own
+// bookkeeping, not the service declining, so it must not be written into the refusal memory or reported
+// to the client as the debrid's doing — the confusion errScoutSide exists to end.
 func addInFlight(cache Cache, svc DebridService, token, infoHash string) error {
-	if cache == nil {
-		return nil
-	}
-	if _, inFlight := cache.Get(addAttemptKey(svc, token, infoHash)); !inFlight {
+	if !addOutcomeUnknown(cache, svc, token, infoHash) {
 		return nil
 	}
 	return fmt.Errorf("%w: %w", errAddInFlight,
 		&StoreUnavailableError{Service: svc, Reason: "scout already sent an add for this release and is awaiting the result"})
+}
+
+// addOutcomeUnknown reports that an add went out and nothing came back — the marker is written before
+// the request and cleared only once a response arrives.
+//
+// It is what keeps scout's own uncertainty out of the refusal memory. A connection reset mid-add is not
+// the service refusing: TorBox's addMagnet says exactly that ("the outcome is genuinely unknown: the
+// marker STAYS") and then its caller recorded a refusal anyway, which pre-empted this marker on the next
+// poll — backedOff is consulted first there — so errAddInFlight became unreachable and the client was
+// told its debrid was refusing, for a release scout had an add out for. Premiumize was right by
+// accident: it happens to ask addInFlight before backedOff.
+func addOutcomeUnknown(cache Cache, svc DebridService, token, infoHash string) bool {
+	if cache == nil {
+		return false
+	}
+	_, inFlight := cache.Get(addAttemptKey(svc, token, infoHash))
+	return inFlight
 }
 
 // noteAddAttempt records that an add request went out, whatever comes back.
@@ -739,6 +753,12 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		return "", errWouldAdd
 	}
 
+	// Scout's own bookkeeping first, the store's verdict second — the order Premiumize already uses. An
+	// add we sent and never heard back about is a 202 "downloading", and asking backedOff ahead of it let
+	// any refusal recorded in the meantime answer 503 instead, naming a store that had said nothing.
+	if err := addInFlight(s.cache, ServiceTorBox, s.token, t.InfoHash); err != nil {
+		return "", err
+	}
 	// A client polls /play every few seconds for the whole fetch, and every poll that got this far ran a
 	// fresh createtorrent. Once TorBox starts throttling, that loop is what keeps it throttled: the add
 	// fails, nothing is cached, and the next poll adds again. Back off for a minute after a refusal so a
@@ -758,7 +778,14 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		// aggressively — a focus change is enough — so one cancelled add wrote "context canceled" into the
 		// backoff and served that release 503 store_unavailable for the next minute, on both /play and the
 		// probe route. An accusation TorBox never made, about a release that is very likely fine.
-		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
+		//
+		// An add that went out and was never answered is not a refusal either — the marker addMagnet
+		// deliberately leaves set says the outcome is unknown, and filing that here made backedOff, which
+		// this store consults FIRST, pre-empt it on the next poll: errAddInFlight became unreachable and
+		// the client was told its debrid was refusing for a release scout had an add out for.
+		if !addOutcomeUnknown(s.cache, ServiceTorBox, s.token, t.InfoHash) {
+			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
+		}
 		return "", err
 	}
 	link, err := s.resolveHeldTorrent(ctx, torrentID, key, needFiles, t)
@@ -1380,14 +1407,15 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// this magnet once per poll — hundreds of adds for one wait, each leaving a duplicate torrent on the
 	// account. TorBox backing off correctly made this worse, not better: ResolvePreferring fell straight
 	// through to whichever store had no memory of being refused.
-	if reason, ok := backedOff(s.cache, ServiceRealDebrid, s.token, t.InfoHash); ok {
-		return "", &StoreUnavailableError{Service: ServiceRealDebrid, Reason: reason + " (backing off)"}
-	}
-	// The same in-flight guard TorBox has. Giving it to TorBox alone did not stop the cancel loop, it
-	// moved it: ResolvePreferring walks on to the store without a marker, and fifty cancelled polls shut
-	// this account's allowance instead.
+	// The same in-flight guard TorBox has, and ahead of the backoff for the same reason: an add of ours
+	// that was never answered must read as "coming", not as RD refusing. Giving the guard to TorBox alone
+	// did not stop the cancel loop, it moved it: ResolvePreferring walks on to the store without a
+	// marker, and fifty cancelled polls shut this account's allowance instead.
 	if err := addInFlight(s.cache, ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
+	}
+	if reason, ok := backedOff(s.cache, ServiceRealDebrid, s.token, t.InfoHash); ok {
+		return "", &StoreUnavailableError{Service: ServiceRealDebrid, Reason: reason + " (backing off)"}
 	}
 	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
@@ -1395,7 +1423,11 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	noteAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
 	addResp, err := s.post(ctx, "/torrents/addMagnet", url.Values{"magnet": {magnetFor(t.InfoHash)}})
 	if err != nil {
-		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+		// See TorBox's twin: an unanswered add is scout's uncertainty, not RD refusing. RD is the sharp
+		// case, having no Status for handlePlay to rescue the answer with.
+		if !addOutcomeUnknown(s.cache, ServiceRealDebrid, s.token, t.InfoHash) {
+			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+		}
 		return "", err
 	}
 	// Read once, keep the bytes: the id and the explanation of a failure live in the same body, and
@@ -1839,7 +1871,12 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	noteAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
+		// The third store gets the same rule. Its ordering already answered 202 from the marker, so the
+		// client saw the right thing — but the refusal was still written, and a refusal is read by the
+		// probe route and by every other release on this account's per-hash key.
+		if !addOutcomeUnknown(s.cache, ServicePremiumize, s.token, t.InfoHash) {
+			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
+		}
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()

@@ -38,7 +38,19 @@ func episodePatterns(season, episode int) []*regexp2.Regexp {
 		// served for the other half. The first number is left free and the requested one anchored second.
 		// The first number needs its own `(?!\d)` or the match backtracks into a false split: without it
 		// `s01e11-e12` read as "e1" followed by "1", and episode 1 matched the last double in the pack.
-		fmt.Sprintf(`s0*%d[ ._-]*e\d{1,3}(?!\d)[ ._-]*e?0*%d(?!\d)`, season, episode),
+		//
+		// The SECOND element has to look like an episode too. Written as an optional `e` over a possibly
+		// empty separator it accepted the next bare number after the label, whatever that number was:
+		// `Show.S01E01.7.Minutes.mkv` became a strong match for episode 7, `Show.S01E08.4K.HDR.mkv` for
+		// episode 4 — every file in a 4K pack claimed to be episode 4 — and `Show - S02E01 - 014 - Title`
+		// for episode 14. Strong matches outrank the indexer's fileIdx, so a correct position was
+		// overridden by a title that happens to start with a digit.
+		//
+		// So: either the second number carries its own `e`, or it is joined to the first by a TIGHT dash.
+		// The tight dash is what separates `S01E05-06` from `S02E01 - 014`, where the spaces mark the
+		// absolute number as a separate field rather than the other end of a range.
+		fmt.Sprintf(`s0*%d[ ._-]*e\d{1,3}(?!\d)[ ._-]*e0*%d(?!\d)`, season, episode),
+		fmt.Sprintf(`s0*%d[ ._-]*e\d{1,3}(?!\d)-0*%d(?!\d)`, season, episode),
 	)
 }
 
