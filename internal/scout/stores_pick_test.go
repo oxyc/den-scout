@@ -1110,3 +1110,44 @@ func TestNamesEpisode_readsEveryEpisodeInAChain(t *testing.T) {
 	got, err := pickEpisodeFile(pack, 1, 20)
 	wantNotInTorrent(t, got, err, "episode 20 is not in a pack of E01-E12")
 }
+
+// The compiled pattern set is shared across picks, and the thing to prove about any cache is not that
+// it is fast — it is that it hands back the set that was asked for. A cache keyed too loosely would
+// answer episode 3 with episode 2's patterns, which is the whole pick decided wrong, silently.
+func TestCachedEpisodePatterns_answersForTheEpisodeAskedAbout(t *testing.T) {
+	// The same question, twice, gets literally the same compiled set — that IS the memo.
+	first := cachedEpisodePatterns(4, 7)
+	if second := cachedEpisodePatterns(4, 7); &first[0] != &second[0] {
+		t.Error("the same episode compiled its patterns twice")
+	}
+
+	// And every neighbouring key stays its own answer. Each of these differs from (4,7) in one number,
+	// so a cache that drops either from the key hands back the wrong set here.
+	for _, tc := range []struct{ season, episode int }{{4, 7}, {4, 8}, {5, 7}, {3, 7}} {
+		patterns := cachedEpisodePatterns(tc.season, tc.episode)
+		mine := fmt.Sprintf("Show.S%02dE%02d.1080p.mkv", tc.season, tc.episode)
+		if !matchesEpisode(mine, patterns) {
+			t.Errorf("s%de%d's patterns do not match %q", tc.season, tc.episode, mine)
+		}
+		for _, other := range []struct{ season, episode int }{{4, 7}, {4, 8}, {5, 7}, {3, 7}} {
+			if other == tc {
+				continue
+			}
+			theirs := fmt.Sprintf("Show.S%02dE%02d.1080p.mkv", other.season, other.episode)
+			if matchesEpisode(theirs, patterns) {
+				t.Errorf("s%de%d's patterns also claimed %q", tc.season, tc.episode, theirs)
+			}
+		}
+	}
+
+	// Past the cap the map is dropped whole. The pick that lands on a FULL cache is the one to check,
+	// and it has to be an episode not already held — re-asking a cached key is answered by the hit
+	// above the cap branch, which proves nothing about it. The reset may cost a compile, never a wrong
+	// set.
+	for i := range episodePatternCap + 2 {
+		cachedEpisodePatterns(90, i)
+	}
+	if !matchesEpisode("Show.S06E11.1080p.mkv", cachedEpisodePatterns(6, 11)) {
+		t.Error("the pick that filled the cache was answered with someone else's patterns")
+	}
+}

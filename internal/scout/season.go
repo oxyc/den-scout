@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/dlclark/regexp2"
 )
@@ -117,7 +118,7 @@ func episodeChain(tail string) []chainedEpisode {
 // namesEpisode reports whether a filename declares this exact episode, by a single label or by a range
 // that contains it.
 func namesEpisode(name string, season, episode int) bool {
-	return episodeNamer{season, episode, episodePatterns(season, episode)}.names(name)
+	return newEpisodeNamer(season, episode).names(name)
 }
 
 // episodeNamer holds the compiled patterns for ONE (season, episode) so a pick pays for them once
@@ -135,7 +136,42 @@ type episodeNamer struct {
 }
 
 func newEpisodeNamer(season, episode int) episodeNamer {
-	return episodeNamer{season, episode, episodePatterns(season, episode)}
+	return episodeNamer{season, episode, cachedEpisodePatterns(season, episode)}
+}
+
+// cachedEpisodePatterns keeps one compiled set per (season, episode) for the life of the process.
+//
+// The set depends on nothing but those two numbers, so per-pick is still one compile too many: a viewer
+// working through a season re-compiles the same seven patterns for every episode of it, and a second
+// pack for an episode already picked re-compiles that one. This is the same cost the per-file form had
+// — work whose price grows every time a pattern is added — one level further out.
+//
+// Sharing a compiled set across requests is safe: regexp2 guards its runner pool with a mutex, and that
+// contention measures far cheaper than the compile it replaces.
+//
+// Bounded, because season and episode arrive from the request. Full is the rare case — no real library
+// reaches 512 distinct episodes in a process lifetime — so it drops everything and refills rather than
+// carrying the machinery to decide what to evict.
+const episodePatternCap = 512
+
+var (
+	episodePatternMu    sync.Mutex
+	episodePatternCache = map[[2]int][]*regexp2.Regexp{}
+)
+
+func cachedEpisodePatterns(season, episode int) []*regexp2.Regexp {
+	key := [2]int{season, episode}
+	episodePatternMu.Lock()
+	defer episodePatternMu.Unlock()
+	if patterns, ok := episodePatternCache[key]; ok {
+		return patterns
+	}
+	if len(episodePatternCache) >= episodePatternCap {
+		clear(episodePatternCache)
+	}
+	patterns := episodePatterns(season, episode)
+	episodePatternCache[key] = patterns
+	return patterns
 }
 
 func (n episodeNamer) names(name string) bool {
