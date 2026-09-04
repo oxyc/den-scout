@@ -4,7 +4,7 @@
 
 # Build on the native builder arch, cross-compile to the target (set by `docker build --platform`;
 # the homelab publishes linux/amd64). CGO off → a fully static binary regardless of target.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
