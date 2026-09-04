@@ -30,6 +30,7 @@ Added under `profiles: ["scout"]` so a plain `docker compose up` doesn't start i
       # TEXT; the feature is built and tested but does nothing until this key exists.
       SCOUT_CONFIG_KEY: "${SCOUT_CONFIG_KEY:-}"             # base64 32-byte X25519 private key
       SCOUT_CONFIG_KEYS_PREV: "${SCOUT_CONFIG_KEYS_PREV:-}" # prior keys (rotation), comma-separated
+      SCOUT_METRICS_TOKEN: "${SCOUT_METRICS_TOKEN:-}"       # bearer token for /metrics; unset = route 404s
     read_only: true
     volumes:
       - den-scout-cache:/cache        # durable cache tier; MUST be a volume (read_only rootfs)
@@ -90,6 +91,7 @@ DEN_SCOUT_VERSION=latest                # ghcr.io/oxyc/den-scout (profile: scout
 # SCOUT_MEDIAFUSION_URL=                 # optional: self-hosted MediaFusion base incl. config segment
 # SCOUT_CONFIG_KEY=                      # base64 X25519 private key → sealed (not plaintext) addon URLs
 # SCOUT_CONFIG_KEYS_PREV=                # prior keys, comma-separated, so a rotation keeps old links working
+# SCOUT_METRICS_TOKEN=                   # bearer token for /metrics (unset = the route 404s)
 ```
 
 Generate a config key with:

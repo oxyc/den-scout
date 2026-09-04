@@ -27,6 +27,9 @@ type Settings struct {
 	// ConfigKeysPrev = comma-separated prior keys (rotation). Empty ConfigKey → sealed URLs disabled.
 	ConfigKey      string
 	ConfigKeysPrev string
+	// Bearer token for /metrics. Empty = the route 404s. The counters say when this install is being
+	// watched and which indexers it uses, so they are not served to anyone who asks.
+	MetricsToken string
 	// Let scout build comet's and mediafusion's per-install config segments from the debrid account it
 	// already holds, instead of skipping those indexers for want of a pasted URL. **This sends the debrid
 	// token to those hosts**, so it is off unless the operator turns it on. An explicit SCOUT_<name>_URL
@@ -52,6 +55,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 		CinemetaURL:    orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
 		ConfigKey:      get("SCOUT_CONFIG_KEY"),
 		ConfigKeysPrev: get("SCOUT_CONFIG_KEYS_PREV"),
+		MetricsToken:   get("SCOUT_METRICS_TOKEN"),
 		MintIndexerConfigs: strings.EqualFold(get("SCOUT_MINT_INDEXER_CONFIGS"), "true") ||
 			get("SCOUT_MINT_INDEXER_CONFIGS") == "1",
 	}
@@ -71,6 +75,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		MakeStores:    func(c *Config) []Store { return buildStores(c, client, cache) },
 		Meta:          cinemetaMeta(client, settings.CinemetaURL),
 		SealKeyring:   buildKeyring(settings.ConfigKey, settings.ConfigKeysPrev),
+		MetricsToken:  settings.MetricsToken,
 	}
 }
 

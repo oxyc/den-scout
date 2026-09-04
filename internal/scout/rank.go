@@ -326,12 +326,20 @@ func realDebridBlocked(title string) bool {
 
 // preferenceSink is what a soft preference costs a release that does not match it.
 //
-// Derived, not picked: it has to outweigh every QUALITY signal so the preferred bucket really does come
-// first, and it must not outweigh cachedness or junk, which are facts about playability rather than
-// taste. The quality signals span at most resolutionBase (3900) + remux (230) + HDR (30) + audio (30) +
-// size (600) = 4790, so 5000 clears them all. Cached (+8000) still wins: a cached 4K above an uncached
-// 1080p is the right answer even for someone who asked for 1080p, because the alternative is a wait.
-// Junk (-100000) is untouched — a preference must never lift a CAM.
+// Derived, not picked, and the bound is one-sided on purpose. It clears the highest score any release can
+// REACH on quality alone — a 2160p BluRay REMUX, DV + HDR10, DD+ Atmos, at the 600-point size ceiling,
+// measures 4860 — so 5000 puts the preferred bucket above every non-preferred release the ranker does not
+// actively penalise.
+//
+// It does NOT cover the full span (max 4860 to min -2170 = 7030), and should not. The bottom of that
+// range is where the ranker has decided something is wrong with a release: 3D half-SBS (-2000), AV1 at 4K
+// (-1500), a TVRip source (-300). A 3D 1080p rip therefore still sorts below a good 4K remux even for
+// someone who asked for 1080p, which is the right answer — a preference is a taste, not an instruction to
+// surface something the ranker is actively warning about.
+//
+// Above, it stays under cached (+8000): a cached 4K over an uncached 1080p is right even for someone who
+// asked for 1080p, because the alternative is a wait. Junk (-100000) is untouched — a preference must
+// never lift a CAM.
 const preferenceSink = 5000
 
 type rankFilters struct {
@@ -366,7 +374,9 @@ type rankFilters struct {
 // Collected only when ?debug=1 asked for it. Every method is nil-safe so the normal path pays one
 // not-taken branch per filter and allocates nothing.
 type rankDebug struct {
-	// Releases the indexers returned, after dedupe by infohash.
+	// Releases the indexers returned, after dedupe by infohash and BEFORE anything trims them — the
+	// 500-seed cap and the RD filename filter both run outside rankStreams and both report into
+	// DroppedBy, so this number minus the drops really does reconcile to Ranked.
 	Deduped int `json:"deduped"`
 	// Releases actually served, after filtering and the result cap.
 	Ranked int `json:"ranked"`

@@ -45,6 +45,11 @@ func main() {
 		Addr:              ":" + settings.Port,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bounds the whole request read, body included. ReadHeaderTimeout alone covers only the headers:
+		// net/http clears the read deadline once they are parsed, so a body arriving one byte per minute
+		// held a goroutine and a connection indefinitely. That cost nothing while every route was a GET
+		// with no body — /validate is the first one that reads a body, and it is unauthenticated.
+		ReadTimeout: 15 * time.Second,
 		// Bound the full response so a slow/stuck client (or a slow debrid write) can't pin a goroutine
 		// and connection indefinitely. Comfortably above the handler's own list-build/resolve budgets.
 		WriteTimeout: 60 * time.Second,

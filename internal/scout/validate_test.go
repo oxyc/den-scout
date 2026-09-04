@@ -97,6 +97,43 @@ func TestValidateDebridToken_unreachableIsNotInvalid(t *testing.T) {
 	}
 }
 
+// Refused, not queued. The route is an unauthenticated credential-testing oracle pointed at three third
+// parties, and the first version made it WAIT for its token — so a flood did not slow down, it parked a
+// goroutine and a connection per request for the whole budget, inside a 230 MiB heap. 429 costs nothing.
+func TestValidateRoute_refusesRatherThanQueues(t *testing.T) {
+	saved := validateLimiter
+	validateLimiter = newHostLimiter(time.Hour, 1) // one allowed, then the allowance is gone for an hour
+	t.Cleanup(func() { validateLimiter = saved })
+
+	var upstream int
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.ProbeClient = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			upstream++
+			return resp(200, `{"data":{}}`), nil
+		})}
+	}))
+	body := `{"service":"torbox","token":"tb-secret"}`
+
+	if rr := postJSON(h, "/validate", body); rr.Code != 200 {
+		t.Fatalf("first check: %d, want 200", rr.Code)
+	}
+	start := time.Now()
+	rr := postJSON(h, "/validate", body)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("second check: %d, want 429", rr.Code)
+	}
+	// The point of the 429 is that it is immediate — a queued request is the cost being avoided.
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("the refusal took %s — it queued instead of shedding", elapsed)
+	}
+	if rr.Header().Get("retry-after") == "" {
+		t.Error("429 without a Retry-After")
+	}
+	if upstream != 1 {
+		t.Errorf("upstream called %d times, want 1 — a refused check must not reach the provider", upstream)
+	}
+}
+
 // The route: POST only, strict about what it accepts, and never cached.
 func TestValidateRoute(t *testing.T) {
 	unthrottleValidate(t)

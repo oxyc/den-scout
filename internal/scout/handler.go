@@ -2,6 +2,7 @@ package scout
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,8 +53,21 @@ const (
 	// finishes well inside it — and every second added here is a second every cached list occupies memory
 	// and disk. It also bounds how wrong a served list may be: torrent availability moves, and a list
 	// stale by an hour is not a kindness.
-	staleServeWindow = 2 * time.Minute
+	//
+	// A CEILING, not the value: staleWindowFor caps it at the configured TTL as well. Left absolute, an
+	// operator who set SCOUT_LIST_TTL_SECONDS=30 got a 30-second freshness followed by a two-minute stale
+	// window — an entry spending 80% of its life stale, which is not what "briefly serve the old one
+	// while it refreshes" means.
+	maxStaleServeWindow = 2 * time.Minute
 )
+
+// staleWindowFor bounds the stale window by the freshness it follows, so shortening the TTL shortens both.
+func staleWindowFor(ttl time.Duration) time.Duration {
+	if ttl < maxStaleServeWindow {
+		return ttl
+	}
+	return maxStaleServeWindow
+}
 
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
 // (mocked in tests).
@@ -67,14 +81,17 @@ type Deps struct {
 	PublicURL     string // audit #8: fixed public origin; when empty, fall back to forwarded headers
 	MakeScrapers  func(*Config) []scraper
 	MakeStores    func(*Config) []Store
-	// Meta resolves an id → title, plus a release year for MOVIES only, so mistagged torrents can be
-	// dropped. A series deliberately carries no year (cinemeta.go explains why), which leaves it judged
-	// by the title-token check alone. Optional (nil = no year/title filter); a lookup failure returns
-	// ok=false and the list is served unfiltered.
+	// Meta resolves an id → title + release year, for MOVIES only, so mistagged torrents can be dropped.
+	// Series are not looked up at all and get no mistag filter — cinemeta.go records the two independent
+	// reasons, both of which were verified the hard way. Optional (nil = no year/title filter); a lookup
+	// failure returns ok=false and the list is served unfiltered.
 	Meta func(ctx context.Context, typ, imdb string) (cineMeta, bool)
 	// SealKeyring decrypts a sealed config path segment (docs/SEALED-CONFIG.md). nil = sealed URLs
 	// disabled (legacy plaintext still works); the current key's public half is served at /config-key.
 	SealKeyring *sealKeyring
+	// MetricsToken gates /metrics. Empty disables the route entirely (404) — the counters describe when
+	// this install is being watched and which indexers it uses, which is not public information.
+	MetricsToken string
 }
 
 type handler struct {
@@ -93,6 +110,11 @@ type handler struct {
 
 // After this many consecutive builds where no indexer responded, /health reports "degraded".
 const scrapeFailThreshold = 3
+
+// debugLimiter paces ?debug=1, per stream-list cache key. A diagnostic is run by a person a handful of
+// times in a row, so three then one every ten seconds is invisible to that and puts a ceiling on the one
+// /stream path that has neither the list cache nor a shared singleflight in front of the debrid.
+var debugLimiter = newHostLimiter(10*time.Second, 3)
 
 // NewHandler builds the scout HTTP handler.
 func NewHandler(deps Deps) http.Handler {
@@ -156,8 +178,24 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, status, noStore)
 		return
 	case "/metrics":
-		// Prometheus text format. Unauthenticated like /health, and safe to be, because of what it does
-		// NOT carry: no debrid service or account labels, no ids, no titles — see metrics.go's render.
+		// Prometheus text format, behind a bearer token, and OFF when no token is configured.
+		//
+		// The first version was unauthenticated on the grounds that it carries no debrid service or
+		// account labels. That answered the credential-oracle question addbudget.go raises about /health
+		// and missed two the counters create on their own. scout_list_cache_total{result="miss"} rises
+		// once per title opened cold, so polling this endpoint is a timeline of when the household is
+		// watching and how much it browses — /health exposes nothing comparable. And per-indexer counters
+		// disclose which indexers this install has configured, which IS per-install configuration: with
+		// SCOUT_MINT_INDEXER_CONFIGS on, a nonzero mediafusion counter says the debrid token was minted
+		// and sent to that host.
+		//
+		// Dropping the useful labels would have left an endpoint not worth scraping, so the other option
+		// is taken: a token. Unset means 404 rather than an empty 200, so an operator who has not
+		// configured one is not told there is something here to poke at.
+		if !h.metricsAuthorized(r) {
+			writeJSON(w, http.StatusNotFound, errBody("not_found"), noStore)
+			return
+		}
 		w.Header().Set("content-type", "text/plain; version=0.0.4; charset=utf-8")
 		w.Header().Set("cache-control", noStore)
 		w.WriteHeader(http.StatusOK)
@@ -222,19 +260,42 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	// A stale body carries a short freshness window and no stale-if-error: the client should come back
 	// soon, by which time the rebuild this response kicked off has landed. Holding a stale list for the
 	// full TTL — and a day on any later error — is what the server is fixing, not something to pass on.
-	staleListCache := fmt.Sprintf("public, max-age=%d", partialSec)
+	//
+	// Never longer than the operator's own freshness. Pinned to partialListTTL's 60s alone, a deployment
+	// with SCOUT_LIST_TTL_SECONDS=30 told clients to hold a KNOWINGLY STALE list for twice as long as a
+	// fresh one.
+	staleSec := partialSec
+	if s := int(h.deps.ListTTL.Seconds()); s < staleSec {
+		staleSec = s
+	}
+	staleListCache := fmt.Sprintf("public, max-age=%d", staleSec)
 	origin := h.publicOrigin(r)
 	// audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
 	cacheKey := "list:" + keyHash(configBlob) + ":" + keyHash(origin) + ":" + streamCacheID(sid)
 
 	// ?debug=1 — "where did this list go", answered exactly instead of guessed from a log line.
 	//
-	// Deliberately bypasses the cache and the singleflight: a cached entry carries no accounting, and
-	// joining an in-flight normal build would return a body with nothing in it. So this really does run
-	// a scrape, and it is not written back to the cache — a hand-run diagnostic pays for itself rather
-	// than displacing a good entry. It grants nothing new: the caller already holds the config segment,
-	// which is what /play needs, and the indexers are still paced by the host limiter.
+	// Bypasses the CACHE deliberately: a cached entry carries no accounting, so answering from one would
+	// return a body with nothing in it, and the result is not written back either — a hand-run diagnostic
+	// should pay for itself rather than displace a good entry.
+	//
+	// It does NOT bypass singleflight; it uses a key of its own. Sharing the normal key would hand a
+	// debug request whatever an in-flight plain build produced (no accounting), while having no key at
+	// all meant every concurrent debug request ran its own scrape AND its own debrid cache-check fan-out.
+	//
+	// And it is PACED, because collapsing concurrent requests does nothing about sequential ones — a
+	// single-connection `while true; do curl …?debug=1; done` was still an unbounded stream of scrapes
+	// and cache-check batches. That is the cost worth naming precisely: the host limiter in scrape.go
+	// paces the INDEXERS and there is no equivalent anywhere on the debrid side, so with the list cache
+	// and the singleflight both stepped around, this was the one route that could put unpaced repeated
+	// checkcached batches on a debrid account — and a throttled debrid reads back to a viewer as "this
+	// release does not exist". Per cache key, so debugging one title never blocks debugging another.
 	if r.URL.Query().Get("debug") == "1" {
+		if !debugLimiter.allow(cacheKey) {
+			w.Header().Set("retry-after", "10")
+			writeJSON(w, http.StatusTooManyRequests, errBody("debug_rate_limited"), noStore)
+			return
+		}
 		config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 		if !ok {
 			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
@@ -243,12 +304,16 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()),
 			h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
-		value, degraded, _ := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey,
-			&rankDebug{})
-		if degraded != "" {
-			w.Header().Set("X-Scout-Degraded", degraded)
+		v, _, _ := h.sf.Do(cacheKey+":debug", func() (any, error) {
+			value, degraded, complete := h.buildStreamList(buildCtx, config, configBlob, sid, origin,
+				cacheKey, &rankDebug{})
+			return buildResult{value: value, degraded: degraded, complete: complete}, nil
+		})
+		res := v.(buildResult)
+		if res.degraded != "" {
+			w.Header().Set("X-Scout-Degraded", res.degraded)
 		}
-		_, _, _, body := splitCached(value)
+		_, _, _, body := splitCached(res.value)
 		writeJSON(w, http.StatusOK, json.RawMessage(body), noStore)
 		return
 	}
@@ -318,26 +383,30 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	h.conditional(w, r, body, etag, jsonType, cacheHeader)
 }
 
-// rebuildBehind refreshes an expired list after the stale answer has gone out.
+// rebuildBehind refreshes an expired list alongside the stale answer, which is written by the caller the
+// moment this returns.
 //
 // Deduped through the same singleflight key the foreground build uses, so a burst of viewers arriving on
 // an expired title produces one scrape — and a foreground build already in flight absorbs this one rather
 // than racing it.
 //
-// Its own context, not the request's: the reply is already written, so inheriting it would cancel the
-// rebuild immediately. The config is decoded HERE rather than on the hit path, because a warm hit must
-// keep paying nothing for decode/validate — this runs only on the rare stale hit.
+// The context is detached from the request and taken HERE, on the request goroutine: an *http.Request is
+// not valid once ServeHTTP returns, and this goroutine outlives it. probe_fanout.go sidesteps the same
+// problem with context.Background(); this keeps the request's values, which is the only difference.
+//
+// The config is decoded on this path rather than on the hit path, because a warm hit must keep paying
+// nothing for decode/validate — this runs only on the rare stale hit.
 func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamID, origin, cacheKey string) {
 	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
 		return // it decoded when the entry was built; if it no longer does, serving stale is all we can do
 	}
+	parent := context.WithoutCancel(r.Context())
 	go func() {
 		// The same lesson as the probe fan-out: this is a background goroutine, so the recover() on the
 		// request goroutine cannot see a panic raised here, and an unrecovered one takes the process down.
-		defer recoverProbe("stale list rebuild")
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()),
-			h.deps.ScrapeTimeout+listBuildSlack)
+		defer recoverBackground("stale list rebuild")
+		ctx, cancel := context.WithTimeout(parent, h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
 		_, _, _ = h.sf.Do(cacheKey, func() (any, error) {
 			value, degraded, complete := h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil)
@@ -362,6 +431,13 @@ type buildResult struct {
 func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string, dbg *rankDebug) (string, string, bool) {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
+	// Recorded HERE, before anything trims it. Taken after the two filters below instead, the count read
+	// as "this is all the indexers had" while both of them had already removed releases that appear in no
+	// drop tally either — on an RD-only install that is most of the list, which is exactly the confusion
+	// this route exists to end.
+	if dbg != nil {
+		dbg.Deduped = len(seeds)
+	}
 
 	// Cap the seed set before the cache-check fan-out: a misbehaving/hostile indexer returning thousands
 	// of tiny stream objects would otherwise mean hundreds of concurrent outbound debrid requests. The
@@ -369,6 +445,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// the most promising releases rather than the first ones the scrape happened to return.
 	if len(seeds) > maxSeeds {
 		log.Printf("scout: %s %s: %d seeds capped to %d (best-scored kept)", sid.Type, sid.IMDb, len(seeds), maxSeeds)
+		dbg.dropN("seedCap", len(seeds)-maxSeeds)
 		seeds = capSeeds(seeds, maxSeeds)
 	}
 
@@ -421,6 +498,10 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 				kept = append(kept, s)
 			}
 		}
+		// The biggest dropper on an RD-only install by far — realDebridBlocked matches web-dl, webrip,
+		// bdrip, hdrip and dvdrip as substrings, which is most of what indexers return. Attributed, or
+		// ?debug=1 reports a list that shrank for no stated reason.
+		dbg.dropN("realDebridBlocked", len(seeds)-len(kept))
 		seeds = kept
 	}
 
@@ -454,9 +535,6 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		ExpectedTitleTokens: expectedTitleTokens,
 		Debug:               dbg,
 	})
-	if dbg != nil {
-		dbg.Deduped = len(seeds)
-	}
 
 	// Degraded is judged on what is actually SERVED, not on what was scraped.
 	//
@@ -526,7 +604,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	hold := ttl
 	if scrapeComplete {
 		freshUntil = now.Add(ttl).Unix()
-		hold = ttl + staleServeWindow
+		hold = ttl + staleWindowFor(ttl)
 	}
 	value := joinCached(scrapeComplete, freshUntil, etag, string(body))
 	switch {
@@ -837,6 +915,16 @@ func rdOnly(config *Config) bool {
 		}
 	}
 	return true
+}
+
+// metricsAuthorized reports whether this request may read /metrics. Compared in constant time: the token
+// is a shared secret and a timing-variable compare on a route anyone can reach is a needless gift.
+func (h *handler) metricsAuthorized(r *http.Request) bool {
+	if h.deps.MetricsToken == "" {
+		return false
+	}
+	given := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("authorization"), "Bearer "))
+	return subtle.ConstantTimeCompare([]byte(given), []byte(h.deps.MetricsToken)) == 1
 }
 
 // publicOrigin: SCOUT_PUBLIC_URL when set (audit #8), else forwarded headers / Host.

@@ -27,12 +27,24 @@ type validateResult struct {
 	// Why not, in words a configure page can show. Never the upstream body: it is not ours to relay and
 	// may carry account detail.
 	Reason string `json:"reason,omitempty"`
+	// Refused by our own pacing rather than judged. Not serialised — it only decides the status code, and
+	// the distinction the CLIENT needs is already in Reason.
+	throttled bool `json:"-"`
 }
 
-// Paced per upstream host. This route takes a token and reports whether it works, which is the shape of a
-// credential-stuffing oracle even though the caller must already hold the token to use it — so the thing
-// worth protecting is the debrid provider, and pacing the outbound side is what does that. Queueing
-// rather than refusing, as everywhere else here: one person clicking "test" never waits.
+// Paced per upstream host, and REFUSED rather than queued when the allowance is gone.
+//
+// This route takes a token and reports whether it works, from an unauthenticated path — every other route
+// is behind an unguessable config segment. So it is a credential-testing oracle pointed at three third
+// parties, relayed from this server's egress address, which is the one Real-Debrid pins tokens to.
+//
+// Queueing was the first attempt and was wrong twice over. It capped throughput but did nothing about the
+// real cost: a blocked request holds a goroutine and a connection for the whole budget, so ten thousand
+// POSTs park ten thousand goroutines inside a 230 MiB heap. And it made the route the only one in the
+// service that absorbs load instead of shedding it. `allow` refuses instantly with a 429, which is the
+// honest answer to "you are asking too fast" and costs the server nothing.
+//
+// Sized for a person, not a script: five presses of the button, then one every two seconds.
 var validateLimiter = newHostLimiter(2*time.Second, 5)
 
 // How long the whole check may take. One upstream read; a configure page is waiting on it.
@@ -69,6 +81,11 @@ func (h *handler) handleValidate(w http.ResponseWriter, r *http.Request) {
 	// page seals the config in the browser, so this is the one request in the system where the server is
 	// handed a token in the clear — it is used once, for one upstream read, and not written anywhere.
 	res := validateDebridToken(ctx, h.deps.ProbeClient, DebridService(body.Service), body.Token)
+	if res.throttled {
+		w.Header().Set("retry-after", "2")
+		writeJSON(w, http.StatusTooManyRequests, res, noStore)
+		return
+	}
 	writeJSON(w, http.StatusOK, res, noStore)
 }
 
@@ -83,8 +100,8 @@ func validateDebridToken(ctx context.Context, client doer, svc DebridService, to
 	if err != nil {
 		return validateResult{Reason: "validation unavailable"}
 	}
-	if parsed, perr := url.Parse(u); perr == nil {
-		validateLimiter.wait(ctx, parsed.Host)
+	if parsed, perr := url.Parse(u); perr == nil && !validateLimiter.allow(parsed.Host) {
+		return validateResult{throttled: true, Reason: "too many checks just now — try again in a moment"}
 	}
 	if err := ctx.Err(); err != nil {
 		return validateResult{Reason: "timed out"}

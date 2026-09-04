@@ -771,6 +771,46 @@ func TestStreamDebug_isNeverCached(t *testing.T) {
 	}
 }
 
+// ?debug=1 is the only /stream path with neither the list cache nor a shared singleflight in front of the
+// debrid cache-check fan-out, and there is no host limiter anywhere on the debrid side — so without a
+// ceiling here, one sequential curl loop is an unbounded stream of scrapes and checkcached batches.
+func TestStreamDebug_isRateLimited(t *testing.T) {
+	saved := debugLimiter
+	debugLimiter = newHostLimiter(time.Hour, 2)
+	t.Cleanup(func() { debugLimiter = saved })
+
+	scrapes := 0
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = func(*Config) []scraper {
+			scrapes++
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				return testSeeds(), nil
+			}}}
+		}
+	}))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json?debug=1"
+
+	for i := 0; i < 2; i++ {
+		if rr := do(h, path, nil); rr.Code != 200 {
+			t.Fatalf("debug %d: %d, want 200", i, rr.Code)
+		}
+	}
+	rr := do(h, path, nil)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("third debug: %d, want 429", rr.Code)
+	}
+	if rr.Header().Get("retry-after") == "" {
+		t.Error("429 without a Retry-After")
+	}
+	if scrapes != 2 {
+		t.Errorf("%d builds ran, want 2 — a refused debug must not reach the indexers or the debrid", scrapes)
+	}
+	// A plain request is unaffected: the ceiling is on the diagnostic, not on watching things.
+	if rr := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil); rr.Code != 200 {
+		t.Errorf("normal request after debug throttling: %d", rr.Code)
+	}
+}
+
 // The one thing this route must never emit. MediaFusion's base URL carries an encrypted config minted
 // from the debrid token, which is why scrape.go logs the indexer name and never the address.
 func TestStreamDebug_leaksNoUpstreamURLsOrTokens(t *testing.T) {
@@ -855,6 +895,35 @@ func TestStreamList_servesStaleWhileRebuilding(t *testing.T) {
 	case <-scraped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("no rebuild ran behind the stale answer — the entry would just expire")
+	}
+}
+
+// The stale window is a ceiling scaled by the configured TTL, not an absolute. Pinned at two minutes, an
+// operator running SCOUT_LIST_TTL_SECONDS=30 got 30 seconds of freshness followed by two minutes of
+// staleness — an entry spending 80% of its life stale — and was told to hold the stale body for 60s,
+// twice the freshness they configured.
+func TestStreamList_staleWindowScalesWithTheTTL(t *testing.T) {
+	if got := staleWindowFor(30 * time.Second); got != 30*time.Second {
+		t.Errorf("short TTL: window %s, want it capped at the TTL", got)
+	}
+	if got := staleWindowFor(5 * time.Minute); got != maxStaleServeWindow {
+		t.Errorf("long TTL: window %s, want the %s ceiling", got, maxStaleServeWindow)
+	}
+
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.Cache = cache
+		d.ListTTL = 30 * time.Second
+	}))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+	do(h, path, nil)
+
+	held, _ := cache.Get(cache.lastKey())
+	complete, _, etag, body := splitCached(held)
+	cache.Put(cache.lastKey(), joinCached(complete, time.Now().Add(-time.Second).Unix(), etag, body), time.Minute)
+	// The stale reply must never claim a longer freshness than the operator configured.
+	if cc := do(h, path, nil).Header().Get("cache-control"); cc != "public, max-age=30" {
+		t.Errorf("stale cache-control = %q, want max-age capped at the 30s TTL", cc)
 	}
 }
 

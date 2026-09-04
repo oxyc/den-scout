@@ -78,6 +78,46 @@ func (l *hostLimiter) wait(ctx context.Context, host string) {
 	}
 }
 
+// allow reports whether a token was free RIGHT NOW, spending one if so, and never queues.
+//
+// The opposite choice from `wait`, for the opposite situation. `wait` queues because its caller is a
+// scrape whose deadline belongs to us, and a shed scrape became "this release does not exist" — waiting
+// 300 ms is invisible next to an eight-second budget. An INBOUND request is the other way round: the
+// caller is anonymous, the thing being spent is one of our own goroutines and connections, and parking it
+// for ten seconds is not politeness but the cost itself. Ten thousand parked requests is the attack.
+//
+// Spends only a whole token, so this can never drive the bucket negative and never needs a refund — which
+// is what keeps it clear of the token-manufacturing trap documented on `take`.
+func (l *hostLimiter) allow(key string) bool {
+	if l == nil || key == "" {
+		return true
+	}
+	l.mu.Lock()
+	b := l.buckets[key]
+	if b == nil {
+		b = &bucket{tokens: float64(l.burst), last: time.Now()}
+		l.buckets[key] = b
+	}
+	l.mu.Unlock()
+	return b.tryTake(l.every, l.burst)
+}
+
+func (b *bucket) tryTake(every time.Duration, burst int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	b.tokens += now.Sub(b.last).Seconds() / every.Seconds()
+	if b.tokens > float64(burst) {
+		b.tokens = float64(burst)
+	}
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
 // take refills by elapsed time, spends a token, and reports how long the caller must wait for it. The
 // token is spent even when the bucket goes negative, so concurrent callers queue in order rather than all
 // waking to the same free slot.

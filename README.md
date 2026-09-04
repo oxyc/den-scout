@@ -48,7 +48,7 @@ resolve to a server you control, so the app just renders what comes back.
 GET  /                                   configure page
 GET  /configure                          configure page
 GET  /health                             { status: "ok" | "degraded" }
-GET  /metrics                            Prometheus text: indexer, cache, build and probe counters
+GET  /metrics                            Prometheus text (bearer token; 404 unless SCOUT_METRICS_TOKEN is set)
 GET  /config-key                         { key } — X25519 public key for sealing (404 if unset)
 POST /validate                           { service, token } → { valid, reason } — check a debrid key
 GET  /manifest.json                      unconfigured manifest (configurationRequired)
@@ -97,6 +97,7 @@ Env only tunes runtime behavior (see `.env.example`):
 | `SCOUT_CACHE_DIR` | durable cache tier; **needs a writable mount** — see `DEPLOY.md` |
 | `SCOUT_PUBLIC_URL` | external origin for `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored |
 | `SCOUT_CINEMETA_URL` | metadata source for the mistag filter (default: public Cinemeta) |
+| `SCOUT_METRICS_TOKEN` | bearer token for `/metrics`; unset = the route 404s (the counters reveal when the install is being watched) |
 | `SCOUT_CONFIG_KEY` | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |
 | `SCOUT_CONFIG_KEYS_PREV` | prior keys, comma-separated, so a rotation doesn't break live installs |
 | `SCOUT_MINT_INDEXER_CONFIGS` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts** — off unless set |

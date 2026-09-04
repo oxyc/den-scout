@@ -31,7 +31,10 @@ type metricSet struct {
 
 	probeCacheHit  atomic.Int64
 	probeCacheMiss atomic.Int64
-	probePanic     atomic.Int64
+	// Panics recovered on ANY background goroutine — the probe fan-out and the stale-list rebuild both
+	// route here. Deliberately not named for the probe: the two share one recover helper, and booking a
+	// rebuild's panic to a probe series would ruin the metric an operator alerts on for a parser crash.
+	backgroundPanic atomic.Int64
 
 	// Fixed keys, populated once at construction and never written again, so concurrent reads need no
 	// lock. Every indexer this build knows about gets an entry whether or not any install names it —
@@ -103,8 +106,8 @@ func (m *metricSet) render(cachePersistent int) string {
 			{`result="hit"`, num(m.probeCacheHit.Load())},
 			{`result="miss"`, num(m.probeCacheMiss.Load())},
 		})
-	counter(&b, "scout_probe_panics_total", "Panics recovered in the background probe.",
-		[][2]string{{"", num(m.probePanic.Load())}})
+	counter(&b, "scout_background_panics_total", "Panics recovered on a background goroutine (probe fan-out, stale list rebuild).",
+		[][2]string{{"", num(m.backgroundPanic.Load())}})
 
 	reqs := make([][2]string, 0, len(allIndexers))
 	fails := make([][2]string, 0, len(allIndexers))
