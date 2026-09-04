@@ -150,14 +150,14 @@ func boxes(buf []byte) []mp4Box {
 		size := int(binary.BigEndian.Uint32(buf[i : i+4]))
 		typ := string(buf[i+4 : i+8])
 		body := i + 8
-		switch {
-		case size == 1: // 64-bit size follows the type
+		switch size {
+		case 1: // 64-bit size follows the type
 			if body+8 > len(buf) {
 				return out
 			}
 			size = int(binary.BigEndian.Uint64(buf[body : body+8]))
 			body += 8
-		case size == 0: // runs to the end
+		case 0: // runs to the end
 			size = len(buf) - i
 		}
 		end := i + size
