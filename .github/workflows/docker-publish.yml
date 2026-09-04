@@ -20,7 +20,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The manifest emits `manifestVersion` and the image tag is the git tag — so a v* release must
       # equal v<manifestVersion> or the reported version would be a lie. Fail fast on a mismatch.
@@ -32,7 +32,7 @@ jobs:
           test "v$v" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME != manifestVersion v$v — bump internal/scout/manifest.go before tagging"; exit 1; }
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -40,7 +40,7 @@ jobs:
 
       - name: Derive tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           # a v1.2.3 tag → :1.2.3, :1.2, :1, :latest (+ :sha). Publish runs on tags only, so :latest
@@ -52,10 +52,10 @@ jobs:
             type=sha
             type=raw,value=latest
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
