@@ -105,6 +105,17 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, errBody("internal"), noStore)
 		}
 	}()
+	// Every route here is a read, so GET/HEAD is the entire vocabulary — and until this gate existed the
+	// handler dispatched on PATH ALONE, which made that an assumption rather than a rule. `/play` is the
+	// one that mattered: it resolves, and resolving an uncached release ADDS it, against an allowance of
+	// fifty an hour. So any verb at all — a link unfurler's POST, a crawler's PUT — reached the one code
+	// path this package spends the most effort keeping accidental callers out of (see the probe route's
+	// `?probe=1`, probeTop's held-only rule, and addbudget.go).
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("allow", "GET, HEAD")
+		writeJSON(w, http.StatusMethodNotAllowed, errBody("method_not_allowed"), noStore)
+		return
+	}
 	path := r.URL.Path
 	switch path {
 	case "/", "/configure", "/configure/":
@@ -501,6 +512,22 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 }
 
 func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob string, parts []string) {
+	// GET only — HEAD is refused rather than answered.
+	//
+	// A HEAD here would have to either resolve (the whole point of not allowing it: an uncached release
+	// is ADDED by that resolve) or be answered from the read-only path `?probe=1` uses. The second was
+	// the tempting option and it is worse than useless: what a caller wants from this route is the
+	// `location` of a freshly-minted link, and a HEAD that starts nothing cannot produce one — so it
+	// would spend up to three upstream reads per prefetch to return a header no client can play from.
+	//
+	// Nothing legitimate issues it: Stremio asks for the list, and Den's AVPlayer follows the 302 with a
+	// GET. What does issue HEAD is link prefetchers and unfurlers, which is precisely the traffic that
+	// must not reach a debrid account.
+	if r.Method != http.MethodGet {
+		w.Header().Set("allow", "GET")
+		writeJSON(w, http.StatusMethodNotAllowed, errBody("method_not_allowed"), noStore)
+		return
+	}
 	target, ok := decodePlayToken(at(parts, 2))
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_token"), noStore)

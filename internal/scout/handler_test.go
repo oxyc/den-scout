@@ -46,7 +46,11 @@ func testDeps(over func(*Deps)) Deps {
 }
 
 func do(h http.Handler, path string, headers map[string]string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodGet, "https://scout.example"+path, nil)
+	return doMethod(h, http.MethodGet, path, headers)
+}
+
+func doMethod(h http.Handler, method, path string, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "https://scout.example"+path, nil)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -151,6 +155,79 @@ func TestRoutesStream(t *testing.T) {
 	if rr := do(h, "/"+validBlob+"/stream/movie/nope.json", nil); rr.Code != 400 {
 		t.Errorf("bad id: %d", rr.Code)
 	}
+}
+
+// The handler dispatched on PATH alone, so /play answered any verb — and /play resolves, which ADDS an
+// uncached release against a fifty-an-hour allowance. A link unfurler's HEAD or a crawler's POST reached
+// the one route this package works hardest to keep accidental callers out of.
+func TestRoutesRejectNonReadMethods(t *testing.T) {
+	resolves := 0
+	h := NewHandler(testDeps(func(d *Deps) {
+		inner := d.MakeStores
+		d.MakeStores = func(c *Config) []Store {
+			stores := inner(c)
+			return []Store{countingStore{Store: stores[0], resolved: &resolves}}
+		}
+	}))
+
+	// Get a real play token the honest way, so the route under test is the one clients actually hit.
+	rr := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil)
+	var body struct {
+		Streams []struct {
+			URL string `json:"url"`
+		} `json:"streams"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if len(body.Streams) == 0 {
+		t.Fatal("no streams to build a play URL from")
+	}
+	playURL := body.Streams[0].URL
+	playPath := playURL[strings.Index(playURL, "/"+validBlob):]
+
+	// GET is the one verb that may resolve.
+	if got := do(h, playPath, nil); got.Code != 302 {
+		t.Fatalf("GET /play: %d, want 302", got.Code)
+	}
+	if resolves != 1 {
+		t.Fatalf("GET /play resolved %d times, want 1", resolves)
+	}
+
+	// HEAD is refused, not answered: what a caller wants here is a `location`, and a HEAD that starts
+	// nothing cannot produce one — so answering it would spend upstream reads for a useless reply.
+	for _, method := range []string{http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete} {
+		got := doMethod(h, method, playPath, nil)
+		if got.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /play: %d, want 405", method, got.Code)
+		}
+		if got.Header().Get("allow") == "" {
+			t.Errorf("%s /play: 405 without an Allow header", method)
+		}
+	}
+	if resolves != 1 {
+		t.Fatalf("a non-GET verb reached the debrid: %d resolves, want 1", resolves)
+	}
+
+	// Every other route is a plain read: POST is refused, HEAD is served.
+	for _, path := range []string{"/", "/configure", "/health", "/manifest.json",
+		"/" + validBlob + "/manifest.json", "/" + validBlob + "/stream/movie/tt1234567.json"} {
+		if got := doMethod(h, http.MethodPost, path, nil); got.Code != http.StatusMethodNotAllowed {
+			t.Errorf("POST %s: %d, want 405", path, got.Code)
+		}
+		if got := doMethod(h, http.MethodHead, path, nil); got.Code != 200 {
+			t.Errorf("HEAD %s: %d, want 200", path, got.Code)
+		}
+	}
+}
+
+// countingStore counts resolves so a test can prove a route never reached the debrid.
+type countingStore struct {
+	Store
+	resolved *int
+}
+
+func (c countingStore) Resolve(ctx context.Context, rt ResolveTarget) (string, error) {
+	*c.resolved++
+	return c.Store.Resolve(ctx, rt)
 }
 
 func TestRoutesETagAndSingleflight(t *testing.T) {
