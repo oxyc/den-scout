@@ -27,23 +27,34 @@ Added under `profiles: ["scout"]` so a plain `docker compose up` doesn't start i
       SCOUT_LIST_TTL_SECONDS: "${SCOUT_LIST_TTL_SECONDS:-300}"
       SCOUT_MEDIAFUSION_URL: "${SCOUT_MEDIAFUSION_URL:-}"   # base incl. its encrypted-config segment
     read_only: true
+    volumes:
+      - den-scout-cache:/cache        # durable cache tier; MUST be a volume (read_only rootfs)
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
     mem_limit: 256m
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }   # log rotation
+
+volumes:
+  den-scout-cache:
 ```
 
 - **No secrets in env** — the debrid token is per-install, encoded in the addon URL, never here.
 - The distroless/static image runs as non-root (uid 65532) with no shell or libc; `read_only` +
   `no-new-privileges` + `cap_drop` harden it further (it only needs outbound https + the listen
   socket). The single static Go binary idles well under the 256 MiB `mem_limit`.
-- **Cache backend**: the in-container byte-bounded `MemoryCache` (TTL, per-process, sized by
-  `SCOUT_CACHE_BYTES`, default 48 MiB) is the default and is right for a single replica — stream
-  lists live for minutes. If you ever scale to >1 replica, add a `redis` service and back the cache
-  with it (the `Cache` interface in `internal/scout/cache.go` is a drop-in); a SQLite volume is the
-  alternative. Not needed for the homelab's single container.
+- **Cache backend**: a `TieredCache` (`internal/scout/diskcache.go`) — the byte-bounded `MemoryCache`
+  (TTL + LRU, sized by `SCOUT_CACHE_BYTES`, default 48 MiB) as the hot tier, backed by a durable disk
+  tier at `SCOUT_CACHE_DIR` (`/cache` in the image). **The volume is not optional.** `read_only: true`
+  makes the rootfs unwritable, so without a mount at that path `MkdirAll` fails, persistence disables
+  itself after one log line, and every image push re-pays a debrid resolve per probed release — track
+  probes are cached for 30 days precisely so it doesn't. A tmpfs would survive a restart but not a
+  redeploy, which is the case the tier was written for. Expired entries are swept hourly, so the
+  volume has a ceiling rather than growing without bound; it holds stream lists (minutes) and track
+  probes (30 days), and stays in the low tens of MB.
+- If you ever scale to >1 replica, add a `redis` service and back the cache with it (the `Cache`
+  interface in `internal/scout/cache.go` is a drop-in). Not needed for the homelab's single container.
 
 ## 2. Caddy route (homelab `docker/caddy/Caddyfile`)
 
@@ -84,6 +95,11 @@ docker compose --profile scout up -d
 # --- LAN (now) — <lxc-ip> is the Docker LXC's IP, e.g. 192.168.86.193 ---
 curl -fsS http://<lxc-ip>:8080/health                        # {"status":"ok"}
 curl -fsS http://<lxc-ip>:8080/configure | grep "Configure Den Scout"
+
+# The disk tier is silent when it fails, so check it once after the first deploy: no match here, and
+# .ent files appearing under the volume once a title has been opened.
+docker compose --profile scout logs den-scout | grep "persistence disabled"   # expect no output
+docker run --rm -v den-scout-cache:/c busybox ls /c | head
 
 # build <config> at http://<lxc-ip>:8080/configure (pick your debrid, paste the token) then:
 curl -fsS "http://<lxc-ip>:8080/<config>/stream/movie/tt0111161.json" | jq '.streams[0]'
