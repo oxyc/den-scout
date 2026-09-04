@@ -150,6 +150,76 @@ func TestProbeTop_cachedProbesBehindTheResponse(t *testing.T) {
 	}
 }
 
+// panicTransport stands in for the one thing the probe path cannot vouch for: bytes chosen by a remote
+// server, reaching parsers that index into them. Whether a real header could provoke this is not the
+// point — the parsers are bounds-checked today and a later edit is what this guards.
+type panicTransport struct{}
+
+func (panicTransport) RoundTrip(*http.Request) (*http.Response, error) { panic("malformed head") }
+
+// A panic while probing must cost the probe, not the process.
+//
+// This work runs on a background goroutine, and the service's only recover() sits on the request
+// goroutine — so before this, one release with a header that upset a parser took down playback for
+// everyone. Both goroutines are covered because errgroup gives each job its own: a recover on the parent
+// catches nothing raised inside a job. If this regresses, the whole test binary dies here rather than
+// failing, which is exactly the production symptom.
+func TestProbeBehind_panicDoesNotKillTheProcess(t *testing.T) {
+	probed := make(chan struct{}, 1)
+	h := &handler{deps: Deps{
+		Cache:       NewMemoryCache(1 << 20),
+		ProbeClient: &http.Client{Transport: panicTransport{}},
+		MakeStores: func(*Config) []Store {
+			return []Store{fakeStore{svc: ServiceTorBox, resolve: func() (string, error) {
+				select {
+				case probed <- struct{}{}:
+				default:
+				}
+				return "https://debrid.example/file.mkv", nil
+			}}}
+		},
+	}}
+	streams := []RawStream{{InfoHash: "panic-hash", Cached: true}}
+	h.probeTop(context.Background(), &Config{}, streams, nil, heldOnTorBox("panic-hash"))
+
+	select {
+	case <-probed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the background probe never ran")
+	}
+	// The handler is still usable afterwards — a dead process would never get here, but a poisoned
+	// singleflight or a half-released pool would show up as this second call hanging or panicking.
+	h.probeTop(context.Background(), &Config{}, []RawStream{{InfoHash: "other", Cached: true}}, nil,
+		heldOnTorBox("other"))
+}
+
+// The same guarantee for the parent goroutine, which builds the store pool before any job starts — a
+// panic there is raised outside every errgroup job, so the per-job recover cannot see it.
+func TestProbeBehind_panicBuildingTheStorePool(t *testing.T) {
+	built := make(chan struct{}, 1)
+	h := &handler{deps: Deps{
+		Cache:       NewMemoryCache(1 << 20),
+		ProbeClient: http.DefaultClient,
+		MakeStores: func(*Config) []Store {
+			select {
+			case built <- struct{}{}:
+			default:
+			}
+			panic("store construction failed")
+		},
+	}}
+	h.probeTop(context.Background(), &Config{}, []RawStream{{InfoHash: "pool-hash", Cached: true}}, nil,
+		heldOnTorBox("pool-hash"))
+
+	select {
+	case <-built:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the background probe never ran")
+	}
+	// Give the panic a moment to either be recovered or take the process with it.
+	time.Sleep(50 * time.Millisecond)
+}
+
 // The file is the identity, not the request: the same release serves every user of this instance.
 func TestProbeCacheKey_identifiesTheFile(t *testing.T) {
 	idx := 3

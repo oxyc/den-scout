@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"strconv"
 	"time"
 
@@ -115,6 +116,7 @@ type probeJob struct {
 // probed once, not once per request.
 func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 	go func() {
+		defer recoverProbe("probe fan-out")
 		ctx, cancel := context.WithTimeout(context.Background(), probeBudget)
 		defer cancel()
 		pool := &StorePool{stores: h.deps.MakeStores(config)}
@@ -122,6 +124,9 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 		g.SetLimit(3) // gentle on the debrid account: a handful of resolves, not a burst
 		for _, job := range jobs {
 			g.Go(func() error {
+				// Per job, and not only on the goroutine above: errgroup runs each job on its OWN
+				// goroutine, so a recover in the parent catches nothing that happens here.
+				defer recoverProbe("probe " + shortHash(job.target.InfoHash))
 				_, _, _ = h.sf.Do("probe:"+job.key, func() (any, error) {
 					link, err := pool.ResolveCachedOnly(gctx, job.target, job.holders)
 					if err != nil || link == "" {
@@ -141,6 +146,24 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 		}
 		_ = g.Wait()
 	}()
+}
+
+// recoverProbe turns a panic in the background probe into a logged, skipped probe.
+//
+// This work moved off the request goroutine so the list would not wait for it, and left the only
+// recover() in the service behind (handler.go's, which converts a panic into a 500). What runs here now
+// is the one code path in the whole addon where bytes chosen by a remote server reach code that indexes
+// into buffers — three container parsers walking length-prefixed structures they did not write. An
+// unrecovered panic on that path takes the PROCESS down, not the probe: every viewer loses playback
+// because one release had a malformed header.
+//
+// Skipping is already a first-class outcome here — a release that cannot be resolved, a server that
+// ignores Range, a container nobody parses all leave the entry exactly as the indexer described it — so
+// a panic simply joins them rather than needing an answer of its own.
+func recoverProbe(what string) {
+	if rec := recover(); rec != nil {
+		log.Printf("scout: %s panicked, skipping it: %v", what, rec)
+	}
 }
 
 // probeCacheKey identifies the FILE, not the request: the same release serves every user of this instance
