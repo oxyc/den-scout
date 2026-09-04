@@ -1,5 +1,14 @@
 # Tasks
 
+**Status: all 11 done** (branch `audit-fixes`). Nothing was skipped; two items were implemented
+differently from the sketch below, and both are recorded in their commit messages:
+
+- **#5** stamps freshness inside the cached entry instead of adding a `Cache` method — one lookup on
+  the hot path instead of two, and neither backend changes.
+- **#1** fixes the deployment with a named volume, not a tmpfs: a tmpfs survives a restart but not the
+  container recreate an image push performs, which is the case `diskcache.go` was written for. The
+  "make it louder" half became the `scout_cache_persistent` gauge in #6.
+
 Audited work list. Every item was checked against the source before it was written down — the
 "Verified dead" section at the bottom records the ones that did **not** survive, so they don't get
 proposed again.
