@@ -102,7 +102,11 @@
 <div class="field"><label for="resultCap">Max results</label>
   <input id="resultCap" type="number" min="1" max="200" value="20"></div>
 </div>
-<button id="go" class="primary">Build install link</button>
+<div class="row">
+  <button id="go" class="primary">Build install link</button>
+  <button id="test" type="button">Test token</button>
+</div>
+<p class="note" id="testResult"></p>
 <div class="err" id="err"></div>
 <div id="out" class="hidden">
   <h2>Your install link</h2>
@@ -3522,6 +3526,36 @@ function fillForm(s) {
     copyInstallURL(); // selects the whole URL, focuses it, and copies to the clipboard
   }
 
+  // Ask the addon to check the token against the service now, rather than letting a typo surface hours
+  // later on the sofa as an empty list. This is the ONE request that sends the token to the server
+  // unsealed — everything else on this page is sealed in the browser first — so it happens only when
+  // this button is pressed, and the server neither logs nor stores it.
+  function testToken() {
+    var out = $("testResult"), token = $("token").value.trim();
+    if (!token) { out.textContent = "Paste a token first."; out.className = "note"; return; }
+    out.textContent = "Checking…";
+    out.className = "note";
+    fetch("/validate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ service: $("service").value, token: token })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j && j.valid) {
+          out.textContent = "✓ This token works.";
+          out.className = "note sealed";
+        } else {
+          out.textContent = "✗ " + ((j && j.reason) || "That token did not work.");
+          out.className = "note unsealed";
+        }
+      })
+      .catch(function () {
+        out.textContent = "Could not reach the addon to check.";
+        out.className = "note unsealed";
+      });
+  }
+
   function renderSecurityNote() {
     var note = $("sealNote"), disclaimer = $("sealDisclaimer");
     if (lastBuildSealed) {
@@ -3557,6 +3591,7 @@ function fillForm(s) {
     useDefaults.addEventListener("change", syncDefaults);
   }
   $("go").addEventListener("click", build);
+  $("test").addEventListener("click", testToken);
   $("copy").addEventListener("click", copyInstallURL);
   var forget = $("forget");
   if (forget) forget.addEventListener("click", function (e) {

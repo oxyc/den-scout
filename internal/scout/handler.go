@@ -117,6 +117,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, errBody("internal"), noStore)
 		}
 	}()
+	// /validate is the one route that is not a read: it takes a pasted token and asks the service whether
+	// it works, so it is a POST and is matched before the gate below rather than carved out of it.
+	if r.URL.Path == "/validate" {
+		h.handleValidate(w, r)
+		return
+	}
 	// Every route here is a read, so GET/HEAD is the entire vocabulary — and until this gate existed the
 	// handler dispatched on PATH ALONE, which made that an assumption rather than a rule. `/play` is the
 	// one that mattered: it resolves, and resolving an uncached release ADDS it, against an allowance of

@@ -49,6 +49,14 @@ func do(h http.Handler, path string, headers map[string]string) *httptest.Respon
 	return doMethod(h, http.MethodGet, path, headers)
 }
 
+func postJSON(h http.Handler, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "https://scout.example"+path, strings.NewReader(body))
+	req.Header.Set("content-type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
 func doMethod(h http.Handler, method, path string, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, "https://scout.example"+path, nil)
 	for k, v := range headers {
