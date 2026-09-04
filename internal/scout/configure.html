@@ -85,6 +85,16 @@
     <label class="chk"><input type="checkbox" name="res" value="480p"> 480p</label>
   </div>
 </div>
+<div class="field">
+  <label for="preferResolution">Prefer <span class="optional">(ranked first, others still shown)</span></label>
+  <select id="preferResolution">
+    <option value="">No preference</option>
+    <option value="2160p">4K</option>
+    <option value="1080p">1080p</option>
+    <option value="720p">720p</option>
+    <option value="480p">480p</option>
+  </select>
+</div>
 <div class="field"><label for="maxSizeGB">Max size (GB, blank = no cap)</label>
   <input id="maxSizeGB" type="number" min="0" placeholder="e.g. 25"></div>
 <div class="field"><label for="minSeeders">Min seeders (blank = any)</label>
@@ -3389,6 +3399,7 @@ function collectConfig() {
     config.filters = {
       excludeCam: $("excludeCam").checked,
       resolutions: checkedVals("res"),
+      preferResolution: $("preferResolution").value || undefined,
       hdrOnly: $("hdrOnly").checked,
       minSeeders: numVal("minSeeders"),
       maxSizeGB: numVal("maxSizeGB"),
@@ -3434,6 +3445,7 @@ function fillForm(s) {
   if (typeof s.cachedOnly === "boolean") $("cachedOnly").checked = s.cachedOnly;
   if ("hdrOnly" in f) $("hdrOnly").checked = !!f.hdrOnly;
   if (f.resolutions) setChecks("res", f.resolutions);
+  if (f.preferResolution) $("preferResolution").value = f.preferResolution;
   if (f.maxSizeGB != null) $("maxSizeGB").value = f.maxSizeGB;
   if (f.minSeeders != null) $("minSeeders").value = f.minSeeders;
   if (s.resultCap != null) $("resultCap").value = s.resultCap;

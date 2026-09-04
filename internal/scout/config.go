@@ -62,12 +62,17 @@ type DebridAccount struct {
 }
 
 type Filters struct {
-	ExcludeCam   bool
-	Resolutions  []string // empty → all
-	HDROnly      bool
-	MinSeeders   *int // nil → no filter
-	MaxSizeGB    *int // nil → no filter
-	ExcludeRegex string
+	ExcludeCam  bool
+	Resolutions []string // empty → all
+	// PreferResolution sinks every OTHER resolution below this one instead of dropping it — "1080p
+	// please, but show me the 4K rather than nothing". Every other knob here is a hard drop, which is
+	// the wrong shape for a taste: a viewer who filters to 1080p to save bandwidth would rather see a
+	// 4K remux than an empty list when that is all anybody has. "" → no preference.
+	PreferResolution string
+	HDROnly          bool
+	MinSeeders       *int // nil → no filter
+	MaxSizeGB        *int // nil → no filter
+	ExcludeRegex     string
 }
 
 type Config struct {
@@ -86,12 +91,13 @@ type rawConfig struct {
 	} `json:"debrid"`
 	Indexers []string `json:"indexers"`
 	Filters  *struct {
-		ExcludeCam   *bool    `json:"excludeCam"`
-		Resolutions  []string `json:"resolutions"`
-		HDROnly      *bool    `json:"hdrOnly"`
-		MinSeeders   *float64 `json:"minSeeders"`
-		MaxSizeGB    *float64 `json:"maxSizeGB"`
-		ExcludeRegex *string  `json:"excludeRegex"`
+		ExcludeCam       *bool    `json:"excludeCam"`
+		Resolutions      []string `json:"resolutions"`
+		PreferResolution *string  `json:"preferResolution"`
+		HDROnly          *bool    `json:"hdrOnly"`
+		MinSeeders       *float64 `json:"minSeeders"`
+		MaxSizeGB        *float64 `json:"maxSizeGB"`
+		ExcludeRegex     *string  `json:"excludeRegex"`
 	} `json:"filters"`
 	CachedOnly *bool    `json:"cachedOnly"`
 	ResultCap  *float64 `json:"resultCap"`
@@ -163,6 +169,11 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 			if validResolutions[r] {
 				f.Resolutions = append(f.Resolutions, r)
 			}
+		}
+		// Whitelisted like every other resolution field; an unknown value is dropped, not carried, so it
+		// becomes "no preference" rather than a preference nothing can ever satisfy.
+		if raw.Filters.PreferResolution != nil && validResolutions[*raw.Filters.PreferResolution] {
+			f.PreferResolution = *raw.Filters.PreferResolution
 		}
 		if raw.Filters.HDROnly != nil {
 			f.HDROnly = *raw.Filters.HDROnly

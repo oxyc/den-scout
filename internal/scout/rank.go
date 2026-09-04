@@ -324,10 +324,22 @@ func realDebridBlocked(title string) bool {
 	return false
 }
 
+// preferenceSink is what a soft preference costs a release that does not match it.
+//
+// Derived, not picked: it has to outweigh every QUALITY signal so the preferred bucket really does come
+// first, and it must not outweigh cachedness or junk, which are facts about playability rather than
+// taste. The quality signals span at most resolutionBase (3900) + remux (230) + HDR (30) + audio (30) +
+// size (600) = 4790, so 5000 clears them all. Cached (+8000) still wins: a cached 4K above an uncached
+// 1080p is the right answer even for someone who asked for 1080p, because the alternative is a wait.
+// Junk (-100000) is untouched — a preference must never lift a CAM.
+const preferenceSink = 5000
+
 type rankFilters struct {
-	ExcludeCam   bool
-	Resolutions  []string
-	HDROnly      bool
+	ExcludeCam  bool
+	Resolutions []string
+	// PreferResolution sinks other resolutions below this one rather than dropping them. "" → off.
+	PreferResolution string
+	HDROnly          bool
 	MinSeeders   *int
 	MaxSizeGB    *int
 	ExcludeRegex string
@@ -475,10 +487,14 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 			!titleOverlap(s.Title, f.ExpectedTitleTokens) {
 			continue
 		}
-		if len(allowed) > 0 {
-			if res := detectResolutionLower(lower); res != "" && !allowed[res] {
-				continue
-			}
+		// Computed once for both the hard filter and the soft preference, and only when one of them is
+		// actually set — an install using neither pays nothing for this.
+		res := ""
+		if len(allowed) > 0 || f.PreferResolution != "" {
+			res = detectResolutionLower(lower)
+		}
+		if len(allowed) > 0 && res != "" && !allowed[res] {
+			continue
 		}
 		if f.HDROnly && !reHDROnly.match(lower) {
 			continue
@@ -500,7 +516,14 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		if f.CachedOnly && !s.Cached && s.CacheKnown {
 			continue
 		}
-		out = append(out, scored{s, i, qualityScoreLower(lower, s, junk), intOr(s.Seeders, 0)})
+		score := qualityScoreLower(lower, s, junk)
+		// A release whose resolution could not be read is NOT sunk, matching every hard filter here: the
+		// resolution whitelist keeps untagged releases, minSeeders keeps unknown seeder counts, maxSizeGB
+		// keeps unknown sizes. Punishing an unknown would be asserting something nobody measured.
+		if f.PreferResolution != "" && res != "" && res != f.PreferResolution {
+			score -= preferenceSink
+		}
+		out = append(out, scored{s, i, score, intOr(s.Seeders, 0)})
 	}
 
 	sort.SliceStable(out, func(a, b int) bool {

@@ -407,6 +407,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	ranked := rankStreams(seeds, rankFilters{
 		ExcludeCam:          config.Filters.ExcludeCam,
 		Resolutions:         config.Filters.Resolutions,
+		PreferResolution:    config.Filters.PreferResolution,
 		HDROnly:             config.Filters.HDROnly,
 		MinSeeders:          config.Filters.MinSeeders,
 		MaxSizeGB:           config.Filters.MaxSizeGB,

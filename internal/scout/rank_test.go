@@ -253,3 +253,72 @@ func TestCapSeeds_breaksTiesOnSeeders(t *testing.T) {
 		t.Errorf("tie not broken on seeders: %+v", kept)
 	}
 }
+
+// A preference RANKS, it does not filter. Every other knob in Filters is a hard drop, which is the wrong
+// shape for a taste: someone who filters to 1080p to save bandwidth would still rather see a 4K remux
+// than an empty list when that is all anybody is seeding.
+func TestRankStreams_preferResolutionRanksWithoutDropping(t *testing.T) {
+	streams := []RawStream{
+		rs("Film.2024.2160p.BluRay.REMUX.HDR.mkv", nil),
+		rs("Film.2024.1080p.WEB-DL.mkv", nil),
+		rs("Film.2024.720p.WEB-DL.mkv", nil),
+	}
+	got := rankStreams(streams, rankFilters{PreferResolution: "1080p", ResultCap: 20})
+	if len(got) != 3 {
+		t.Fatalf("a preference dropped releases: kept %d of 3", len(got))
+	}
+	if detectResolution(got[0].Title) != "1080p" {
+		t.Errorf("preferred resolution did not rank first: %q", got[0].Title)
+	}
+	// …and below it, the normal quality order is untouched: the 4K remux still beats the 720p.
+	if detectResolution(got[1].Title) != "2160p" {
+		t.Errorf("non-preferred releases lost their own ordering: %q then %q", got[1].Title, got[2].Title)
+	}
+}
+
+// The sink must clear every quality signal — otherwise "prefer 1080p" loses to a big 4K remux and means
+// nothing — while staying under cachedness, which is a fact about whether it plays now rather than taste.
+func TestRankStreams_preferenceOutweighsQualityButNotCached(t *testing.T) {
+	best4K := rs("Film.2024.2160p.BluRay.REMUX.HDR.DDP5.1.Atmos.mkv", func(s *RawStream) {
+		s.SizeBytes = intp(80 * gib) // maximum size bonus, on top of every other quality signal
+	})
+	plain1080 := rs("Film.2024.1080p.WEB-DL.mkv", nil)
+
+	got := rankStreams([]RawStream{best4K, plain1080}, rankFilters{PreferResolution: "1080p", ResultCap: 20})
+	if detectResolution(got[0].Title) != "1080p" {
+		t.Errorf("the richest possible 4K outranked the preference: %q", got[0].Title)
+	}
+
+	// Cached still wins: waiting for a download is worse than a resolution you did not ask for.
+	cached4K := best4K
+	cached4K.Cached = true
+	got = rankStreams([]RawStream{cached4K, plain1080}, rankFilters{PreferResolution: "1080p", ResultCap: 20})
+	if detectResolution(got[0].Title) != "2160p" {
+		t.Errorf("an uncached preference outranked a cached release: %q", got[0].Title)
+	}
+}
+
+// An unreadable resolution is not sunk. Every hard filter here keeps what it cannot measure — the
+// whitelist keeps untagged releases, minSeeders keeps unknown counts, maxSizeGB keeps unknown sizes — and
+// punishing an unknown would assert something nobody measured.
+func TestRankStreams_preferenceKeepsUntaggedResolutionNeutral(t *testing.T) {
+	untagged := rs("Film.2024.WEB-DL.mkv", nil)
+	other := rs("Film.2024.720p.WEB-DL.mkv", nil)
+	got := rankStreams([]RawStream{other, untagged}, rankFilters{PreferResolution: "1080p", ResultCap: 20})
+	if len(got) != 2 {
+		t.Fatalf("kept %d of 2", len(got))
+	}
+	if got[0].Title != untagged.Title {
+		t.Errorf("an untagged release was sunk alongside the non-preferred ones: %q first", got[0].Title)
+	}
+}
+
+// A preference must never lift junk. The CAM sink is orders of magnitude larger for a reason.
+func TestRankStreams_preferenceNeverLiftsJunk(t *testing.T) {
+	cam := rs("Film.2024.1080p.HDCAM.x264.mkv", nil)
+	legit := rs("Film.2024.2160p.WEB-DL.mkv", nil)
+	got := rankStreams([]RawStream{cam, legit}, rankFilters{PreferResolution: "1080p", ResultCap: 20})
+	if got[0].Title == cam.Title {
+		t.Error("a preference lifted a CAM above a legitimate release")
+	}
+}

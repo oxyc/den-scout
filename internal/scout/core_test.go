@@ -46,6 +46,17 @@ func TestDecodeConfig(t *testing.T) {
 		t.Errorf("filters: %+v", c.Filters)
 	}
 
+	// preferResolution is whitelisted like every other resolution field. An unknown value becomes "no
+	// preference" rather than a preference nothing can satisfy — which would sink every release equally.
+	pref, _ := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"preferResolution":"1080p"}}`))
+	if pref.Filters.PreferResolution != "1080p" {
+		t.Errorf("preferResolution: %q", pref.Filters.PreferResolution)
+	}
+	bogus, _ := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"preferResolution":"8k"}}`))
+	if bogus.Filters.PreferResolution != "" {
+		t.Errorf("an unknown preferResolution was carried: %q", bogus.Filters.PreferResolution)
+	}
+
 	// A live host that needs a config PATH is not disabled. comet 403s the bare path and answers on a
 	// config path, which `configPathIndexers` already handles — disabling it stripped it before
 	// makeScrapers could mint one, leaving the install with a single real source.
