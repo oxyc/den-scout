@@ -45,6 +45,13 @@ type validateResult struct {
 // honest answer to "you are asking too fast" and costs the server nothing.
 //
 // Sized for a person, not a script: five presses of the button, then one every two seconds.
+//
+// KNOWN AND ACCEPTED: the bucket is global, not per client, so a flood at over 0.5 rps holds it empty and
+// the operator's own "Test token" click gets a 429 for as long as that runs. Keying per client IP would
+// fix it and would reintroduce the exact hole this file's sibling had — hostLimiter never evicts, so a
+// map keyed by anything the caller chooses grows until the process dies, which is a strictly worse
+// failure than a button that says "try again in a moment". The blast radius here is one convenience on
+// the configure page; nothing about playback touches this limiter.
 var validateLimiter = newHostLimiter(2*time.Second, 5)
 
 // How long the whole check may take. One upstream read; a configure page is waiting on it.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -696,8 +697,20 @@ func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
 	}
 }
 
+// unthrottleDebug gives a test its own debug allowance. debugLimiter is a package-level bucket under one
+// shared key, so without this every test that issues a ?debug=1 request spends from the same three and
+// the suite becomes order- and timing-dependent — `go test -count=2` failed unrelated tests with an
+// opaque 429.
+func unthrottleDebug(t *testing.T) {
+	t.Helper()
+	saved := debugLimiter
+	debugLimiter = newHostLimiter(time.Millisecond, 10000)
+	t.Cleanup(func() { debugLimiter = saved })
+}
+
 // "Where did this list go" answered exactly, instead of guessed from a log line.
 func TestStreamDebug_reportsWhereTheListWent(t *testing.T) {
+	unthrottleDebug(t)
 	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
 	h := NewHandler(testDeps(func(d *Deps) { d.Cache = cache }))
 	path := "/" + validBlob + "/stream/movie/tt1234567.json"
@@ -752,6 +765,7 @@ func TestStreamDebug_reportsWhereTheListWent(t *testing.T) {
 // A debug build is a diagnostic, not an entry other viewers should be served — and must not displace the
 // good one. It also must not be answered FROM the cache, which carries no accounting.
 func TestStreamDebug_isNeverCached(t *testing.T) {
+	unthrottleDebug(t)
 	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
 	h := NewHandler(testDeps(func(d *Deps) { d.Cache = cache }))
 	path := "/" + validBlob + "/stream/movie/tt1234567.json"
@@ -771,12 +785,80 @@ func TestStreamDebug_isNeverCached(t *testing.T) {
 	}
 }
 
+// The accounting reconciles: deduped minus every attributed drop equals ranked.
+//
+// The two filters that run OUTSIDE rankStreams are the ones worth a test — the seed cap and the RD
+// filename filter. Measured after them, `deduped` read as "this is all the indexers had" while both had
+// already removed releases that appeared in no drop tally, and on an RD-only install that is most of the
+// list: realDebridBlocked matches web-dl, webrip, bdrip, hdrip and dvdrip as substrings.
+func TestStreamDebug_accountingReconciles(t *testing.T) {
+	unthrottleDebug(t)
+	// An RD-only config, so realDebridBlocked runs, and enough seeds to trip the 500 cap.
+	rdBlob := blob(`{"debrid":[{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}`)
+	seeds := make([]RawStream, 0, maxSeeds+40)
+	for i := 0; i < maxSeeds+20; i++ {
+		// Blocked by RD's filename rule.
+		seeds = append(seeds, RawStream{
+			InfoHash: fmt.Sprintf("%040x", i),
+			Title:    fmt.Sprintf("Film.2024.1080p.WEB-DL.x264-G%d.mkv", i),
+		})
+	}
+	for i := 0; i < 20; i++ {
+		// Survives it.
+		seeds = append(seeds, RawStream{
+			InfoHash: fmt.Sprintf("%040x", 100000+i),
+			Title:    fmt.Sprintf("Film.2024.1080p.BluRay.REMUX-G%d.mkv", i),
+		})
+	}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				return append([]RawStream(nil), seeds...), nil
+			}}}
+		}
+		d.MakeStores = func(*Config) []Store { return []Store{fakeStore{svc: ServiceRealDebrid}} }
+	}))
+
+	rr := do(h, "/"+rdBlob+"/stream/movie/tt1234567.json?debug=1", nil)
+	if rr.Code != 200 {
+		t.Fatalf("debug: %d", rr.Code)
+	}
+	var body struct {
+		Debug struct {
+			Deduped   int            `json:"deduped"`
+			Ranked    int            `json:"ranked"`
+			DroppedBy map[string]int `json:"droppedBy"`
+		} `json:"debug"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Debug.Deduped != len(seeds) {
+		t.Errorf("deduped = %d, want the %d the indexer returned before anything trimmed them",
+			body.Debug.Deduped, len(seeds))
+	}
+	if body.Debug.DroppedBy["seedCap"] != len(seeds)-maxSeeds {
+		t.Errorf("seedCap drops = %d, want %d", body.Debug.DroppedBy["seedCap"], len(seeds)-maxSeeds)
+	}
+	if body.Debug.DroppedBy["realDebridBlocked"] == 0 {
+		t.Errorf("the RD filename filter dropped nothing it admitted to: %v", body.Debug.DroppedBy)
+	}
+	dropped := 0
+	for _, n := range body.Debug.DroppedBy {
+		dropped += n
+	}
+	if body.Debug.Deduped-dropped != body.Debug.Ranked {
+		t.Errorf("accounting does not reconcile: deduped %d - dropped %d != ranked %d (%v)",
+			body.Debug.Deduped, dropped, body.Debug.Ranked, body.Debug.DroppedBy)
+	}
+}
+
 // ?debug=1 is the only /stream path with neither the list cache nor a shared singleflight in front of the
 // debrid cache-check fan-out, and there is no host limiter anywhere on the debrid side — so without a
 // ceiling here, one sequential curl loop is an unbounded stream of scrapes and checkcached batches.
 func TestStreamDebug_isRateLimited(t *testing.T) {
 	saved := debugLimiter
-	debugLimiter = newHostLimiter(time.Hour, 2)
+	debugLimiter = newHostLimiter(time.Hour, 2) // the ceiling itself is what's under test here
 	t.Cleanup(func() { debugLimiter = saved })
 
 	scrapes := 0
@@ -814,6 +896,7 @@ func TestStreamDebug_isRateLimited(t *testing.T) {
 // The one thing this route must never emit. MediaFusion's base URL carries an encrypted config minted
 // from the debrid token, which is why scrape.go logs the indexer name and never the address.
 func TestStreamDebug_leaksNoUpstreamURLsOrTokens(t *testing.T) {
+	unthrottleDebug(t)
 	h := NewHandler(testDeps(nil))
 	body := do(h, "/"+validBlob+"/stream/movie/tt1234567.json?debug=1", nil).Body.String()
 	for _, forbidden := range []string{"tb-secret", "mediafusion.elfhosted", "torrentio.strem.fun", "https://comet"} {
@@ -870,7 +953,7 @@ func TestStreamList_servesStaleWhileRebuilding(t *testing.T) {
 	<-scraped
 
 	// Age the entry past its freshness without touching its physical expiry — exactly the state the
-	// staleServeWindow exists to hold.
+	// the stale window exists to hold.
 	key := cache.lastKey()
 	held, ok := cache.Get(key)
 	if !ok {
@@ -924,6 +1007,89 @@ func TestStreamList_staleWindowScalesWithTheTTL(t *testing.T) {
 	// The stale reply must never claim a longer freshness than the operator configured.
 	if cc := do(h, path, nil).Header().Get("cache-control"); cc != "public, max-age=30" {
 		t.Errorf("stale cache-control = %q, want max-age capped at the 30s TTL", cc)
+	}
+}
+
+// One goroutine per stale KEY, not per stale REQUEST.
+//
+// singleflight collapses the work but not the spawn, so every stale hit used to start a goroutine that
+// then parked behind the leader at ~3 KB apiece — and the request goroutine returns immediately, so the
+// flood is fire-and-forget. Roughly 60k of those is enough to push a 230 MiB heap into an OOM kill.
+func TestStreamList_staleRebuildSpawnsOneGoroutinePerKey(t *testing.T) {
+	release := make(chan struct{})
+	var builds atomic.Int32
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.Cache = cache
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				if builds.Add(1) > 1 {
+					<-release // hold the rebuild open so the flood lands while it is in flight
+				}
+				return testSeeds(), nil
+			}}}
+		}
+	}))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+	do(h, path, nil) // seed
+	key := cache.lastKey()
+	held, _ := cache.Get(key)
+	complete, _, etag, body := splitCached(held)
+	cache.Put(key, joinCached(complete, time.Now().Add(-time.Second).Unix(), etag, body), time.Minute)
+
+	before := runtime.NumGoroutine()
+	for i := 0; i < 300; i++ {
+		if rr := do(h, path, nil); rr.Code != 200 {
+			t.Fatalf("stale hit %d: %d", i, rr.Code)
+		}
+	}
+	// One rebuild is in flight and parked; the other 299 requests must not have started anything.
+	if grew := runtime.NumGoroutine() - before; grew > 5 {
+		close(release)
+		t.Fatalf("300 stale hits grew the goroutine count by %d, want ~1", grew)
+	}
+	close(release)
+}
+
+// A degraded rebuild caches nothing, so without a cool-off the entry stays stale and EVERY subsequent
+// request books another full scrape plus debrid fan-out — the same harm the partial-list caching note
+// records fixing, reappearing on the stale path.
+func TestStreamList_degradedRebuildCoolsOff(t *testing.T) {
+	var scrapes atomic.Int32
+	healthy := atomic.Bool{}
+	healthy.Store(true)
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.Cache = cache
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				scrapes.Add(1)
+				if !healthy.Load() {
+					return nil, context.Canceled // every indexer down → degraded build
+				}
+				return testSeeds(), nil
+			}}}
+		}
+	}))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+	do(h, path, nil)
+	key := cache.lastKey()
+	held, _ := cache.Get(key)
+	complete, _, etag, body := splitCached(held)
+
+	healthy.Store(false)
+	for i := 0; i < 20; i++ {
+		// Re-stale the entry before each request, as a real expired entry would be.
+		cache.Put(key, joinCached(complete, time.Now().Add(-time.Second).Unix(), etag, body), time.Minute)
+		do(h, path, nil)
+	}
+	// Let the one permitted rebuild finish and register its cool-off.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && scrapes.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := scrapes.Load(); got > 3 {
+		t.Errorf("%d scrapes for 20 stale hits during an outage — the cool-off is not holding", got)
 	}
 }
 

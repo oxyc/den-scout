@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,45 @@ const (
 	maxStaleServeWindow = 2 * time.Minute
 )
 
+// How long a key is barred from re-booking a background rebuild after one came back degraded. Long
+// enough that an indexer outage does not put a scrape and a debrid fan-out on every request for the rest
+// of the stale window; short enough that recovery is noticed within a minute, which is the same bet
+// partialListTTL makes.
+const rebuildCooloff = time.Minute
+
+// bookRebuild reserves the right to rebuild this key in the background, or reports that someone else
+// already holds it (or that a degraded attempt is still cooling off).
+func (h *handler) bookRebuild(key string, now time.Time, until time.Time) bool {
+	h.rebuildMu.Lock()
+	defer h.rebuildMu.Unlock()
+	if h.rebuilds == nil {
+		h.rebuilds = map[string]time.Time{}
+	}
+	if t, ok := h.rebuilds[key]; ok && now.Before(t) {
+		return false
+	}
+	// Swept here rather than on a timer: the map only ever holds keys with a live booking or a recent
+	// cool-off, so it stays small, and pruning on the rare stale hit costs nothing worth measuring.
+	for k, t := range h.rebuilds {
+		if !now.Before(t) {
+			delete(h.rebuilds, k)
+		}
+	}
+	h.rebuilds[key] = until
+	return true
+}
+
+// releaseRebuild ends a booking early (a healthy rebuild) or extends it into a cool-off (a degraded one).
+func (h *handler) releaseRebuild(key string, cooloffUntil time.Time) {
+	h.rebuildMu.Lock()
+	defer h.rebuildMu.Unlock()
+	if cooloffUntil.IsZero() {
+		delete(h.rebuilds, key)
+		return
+	}
+	h.rebuilds[key] = cooloffUntil
+}
+
 // staleWindowFor bounds the stale window by the freshness it follows, so shortening the TTL shortens both.
 func staleWindowFor(ttl time.Duration) time.Duration {
 	if ttl < maxStaleServeWindow {
@@ -98,6 +138,21 @@ type handler struct {
 	deps Deps
 	sf   singleflight.Group
 
+	// Which keys already have a background rebuild booked, and the earliest a fresh one may start.
+	//
+	// singleflight is the wrong primitive for this and using it alone was a real hole: it collapses the
+	// WORK, not the SPAWN, so every stale hit still started a goroutine that then parked behind the
+	// leader. Measured at ~3 KB apiece, and the request goroutine returns immediately, so the flood is
+	// fire-and-forget over keep-alive — roughly 60k parked rebuilds is enough to push a 230 MiB heap into
+	// continuous GC and then an OOM kill, and seeding a cacheable entry to aim at needs no working token.
+	//
+	// The same gate carries the cool-off after a DEGRADED rebuild. Nothing is cached when a build comes
+	// back degraded, so without one the entry stays stale for the rest of its life and every single
+	// request re-books a full scrape plus a debrid fan-out — precisely the harm the partial-list caching
+	// note further down says it fixed, reappearing on the stale path.
+	rebuildMu sync.Mutex
+	rebuilds  map[string]time.Time
+
 	// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
 	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
 	scrapeFails atomic.Int32
@@ -106,14 +161,32 @@ type handler struct {
 	manifestUnconf     string
 	manifestUnconfETag string
 	configureETag      string
+
+	// The three stream-list Cache-Control headers. Every input is fixed once ListTTL is known, so
+	// formatting them per request was three Sprintf and four allocations on a path whose own comments
+	// insist a warm hit pays nothing — measured at ~5% of the warm-hit cost, for a constant.
+	listCache        string
+	partialListCache string
+	staleListCache   string
 }
 
 // After this many consecutive builds where no indexer responded, /health reports "degraded".
 const scrapeFailThreshold = 3
 
-// debugLimiter paces ?debug=1, per stream-list cache key. A diagnostic is run by a person a handful of
-// times in a row, so three then one every ten seconds is invisible to that and puts a ceiling on the one
-// /stream path that has neither the list cache nor a shared singleflight in front of the debrid.
+// debugLimiter paces ?debug=1. A diagnostic is run by a person a handful of times in a row, so three then
+// one every ten seconds is invisible to that and puts a ceiling on the one /stream path that has neither
+// the list cache nor a shared singleflight in front of the debrid.
+//
+// ONE bucket, under a constant key — not one per cache key, which is how this was first written and was a
+// second unbounded-memory hole in the fix for the first. hostLimiter never evicts (it was built for
+// upstream HOSTS, a small operator-controlled set), so keying it on a cache key derived from the request
+// path let an anonymous caller mint a permanent bucket per distinct blob or episode number. Worse, a
+// fresh bucket starts at full burst, so the pacing never engaged on exactly that traffic.
+//
+// The cost of one shared bucket is that debugging two titles at once contends. That is the right trade
+// for a hand-run diagnostic, and it is what keeps this bounded without teaching the limiter to evict.
+const debugLimiterKey = "debug"
+
 var debugLimiter = newHostLimiter(10*time.Second, 3)
 
 // NewHandler builds the scout HTTP handler.
@@ -125,6 +198,21 @@ func NewHandler(deps Deps) http.Handler {
 		deps.ListTTL = defaultListTTL
 	}
 	h := &handler{deps: deps}
+	ttlSec := int(deps.ListTTL.Seconds())
+	h.listCache = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
+	// A short list and a stale one must never be held LONGER than a complete fresh one. Both windows are
+	// therefore capped by the configured TTL, not just written as the 60s that suits the default: at
+	// SCOUT_LIST_TTL_SECONDS=30 a knowingly-short list was being advertised as fresh for 60s and usable
+	// for 120 while a complete one got 30 — the exact inversion three comments in this file forbid, and
+	// the first attempt at this fixed it only for the stale header, one branch over from the partial one.
+	shortSec := int(partialListTTL.Seconds())
+	if ttlSec < shortSec {
+		shortSec = ttlSec
+	}
+	h.partialListCache = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d", shortSec, shortSec)
+	// No stale-if-error on a stale body: the client should come back once the rebuild this response
+	// booked has landed, not hold the old list for a day on the next error.
+	h.staleListCache = fmt.Sprintf("public, max-age=%d", shortSec)
 	b, _ := json.Marshal(buildManifest(nil))
 	h.manifestUnconf = string(b)
 	h.manifestUnconfETag = etagFor(h.manifestUnconf)
@@ -253,22 +341,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		writeJSON(w, http.StatusBadRequest, errBody("bad_id"), noStore)
 		return
 	}
-	ttlSec := int(h.deps.ListTTL.Seconds())
-	listCache := fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
-	partialSec := int(partialListTTL.Seconds())
-	partialListCache := fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d", partialSec, partialSec)
-	// A stale body carries a short freshness window and no stale-if-error: the client should come back
-	// soon, by which time the rebuild this response kicked off has landed. Holding a stale list for the
-	// full TTL — and a day on any later error — is what the server is fixing, not something to pass on.
-	//
-	// Never longer than the operator's own freshness. Pinned to partialListTTL's 60s alone, a deployment
-	// with SCOUT_LIST_TTL_SECONDS=30 told clients to hold a KNOWINGLY STALE list for twice as long as a
-	// fresh one.
-	staleSec := partialSec
-	if s := int(h.deps.ListTTL.Seconds()); s < staleSec {
-		staleSec = s
-	}
-	staleListCache := fmt.Sprintf("public, max-age=%d", staleSec)
+	listCache, partialListCache, staleListCache := h.listCache, h.partialListCache, h.staleListCache
 	origin := h.publicOrigin(r)
 	// audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
 	cacheKey := "list:" + keyHash(configBlob) + ":" + keyHash(origin) + ":" + streamCacheID(sid)
@@ -285,20 +358,29 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	//
 	// And it is PACED, because collapsing concurrent requests does nothing about sequential ones — a
 	// single-connection `while true; do curl …?debug=1; done` was still an unbounded stream of scrapes
-	// and cache-check batches. That is the cost worth naming precisely: the host limiter in scrape.go
-	// paces the INDEXERS and there is no equivalent anywhere on the debrid side, so with the list cache
-	// and the singleflight both stepped around, this was the one route that could put unpaced repeated
-	// checkcached batches on a debrid account — and a throttled debrid reads back to a viewer as "this
-	// release does not exist". Per cache key, so debugging one title never blocks debugging another.
-	if r.URL.Query().Get("debug") == "1" {
-		if !debugLimiter.allow(cacheKey) {
-			w.Header().Set("retry-after", "10")
-			writeJSON(w, http.StatusTooManyRequests, errBody("debug_rate_limited"), noStore)
-			return
-		}
+	// and cache-check batches. The host limiter in scrape.go paces the INDEXERS and there is no
+	// equivalent anywhere on the debrid side, so a debug loop puts unpaced repeated checkcached batches
+	// on a debrid account, and a throttled debrid reads back to a viewer as "this release does not exist".
+	//
+	// The limiter is consulted AFTER the config is validated, and under one shared key. Both matter: an
+	// undecodable blob must not be able to mint limiter state or spend the allowance, and a per-cache-key
+	// bucket gave an attacker a fresh full burst for every distinct blob or episode number — so the
+	// ceiling this exists to impose measured exactly zero, while the never-evicted bucket map grew for
+	// free. Sharing one bucket means debugging two titles at once contends, which is the right trade for
+	// something a person runs by hand.
+	//
+	// Not a general answer to /stream traffic with a varying config blob, which misses the list cache in
+	// the same way. That is pre-existing, is bounded by the indexer limiter, and is a separate question
+	// from this branch.
+	if isDebugRequest(r) {
 		config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 		if !ok {
 			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
+			return
+		}
+		if !debugLimiter.allow(debugLimiterKey) {
+			w.Header().Set("retry-after", "10")
+			writeJSON(w, http.StatusTooManyRequests, errBody("debug_rate_limited"), noStore)
 			return
 		}
 		buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()),
@@ -397,21 +479,38 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 // The config is decoded on this path rather than on the hit path, because a warm hit must keep paying
 // nothing for decode/validate — this runs only on the rare stale hit.
 func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamID, origin, cacheKey string) {
+	budget := h.deps.ScrapeTimeout + listBuildSlack
+	now := time.Now()
+	// Booked BEFORE the goroutine exists, and before the config is decoded, so a flood of stale hits costs
+	// one map lookup each instead of a goroutine each.
+	if !h.bookRebuild(cacheKey, now, now.Add(budget)) {
+		return
+	}
 	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
-		return // it decoded when the entry was built; if it no longer does, serving stale is all we can do
+		// It decoded when the entry was built; if it no longer does, serving stale is all we can do.
+		h.releaseRebuild(cacheKey, time.Time{})
+		return
 	}
 	parent := context.WithoutCancel(r.Context())
 	go func() {
 		// The same lesson as the probe fan-out: this is a background goroutine, so the recover() on the
 		// request goroutine cannot see a panic raised here, and an unrecovered one takes the process down.
+		// The booking is released from a defer as well, so a panic cannot strand the key permanently.
 		defer recoverBackground("stale list rebuild")
-		ctx, cancel := context.WithTimeout(parent, h.deps.ScrapeTimeout+listBuildSlack)
+		cooloff := time.Time{}
+		defer func() { h.releaseRebuild(cacheKey, cooloff) }()
+		ctx, cancel := context.WithTimeout(parent, budget)
 		defer cancel()
-		_, _, _ = h.sf.Do(cacheKey, func() (any, error) {
+		v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
 			value, degraded, complete := h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil)
 			return buildResult{value: value, degraded: degraded, complete: complete}, nil
 		})
+		// A degraded build caches nothing, so the entry is still stale and the next request would book
+		// another rebuild at once. Hold the key until there is some prospect of a different answer.
+		if res, isResult := v.(buildResult); isResult && res.degraded != "" {
+			cooloff = time.Now().Add(rebuildCooloff)
+		}
 	}()
 }
 
@@ -594,9 +693,14 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// short list it was protecting against.
 	ttl := h.deps.ListTTL
 	if !scrapeComplete {
+		// Capped by the configured freshness for the same reason the header is: a knowingly-short list
+		// must not outlive a complete one, which the flat 60s did whenever the TTL was set below it.
 		ttl = partialListTTL
+		if h.deps.ListTTL < ttl {
+			ttl = h.deps.ListTTL
+		}
 	}
-	// The entry outlives its freshness by staleServeWindow so the hit path can answer from it while a
+	// The entry outlives its freshness by staleWindowFor(ttl) so the hit path can answer from it while a
 	// rebuild runs — but only when it is COMPLETE. A partial list expires exactly when it says it does:
 	// it is already knowingly short, and the one thing it must not get is a longer life.
 	now := time.Now()
@@ -973,6 +1077,13 @@ func (h *handler) conditional(w http.ResponseWriter, r *http.Request, body, etag
 	_, _ = w.Write([]byte(body))
 }
 
+// isDebugRequest checks for ?debug=1 without parsing a query string that is almost always absent.
+// url.Values costs a map allocation, and Stremio sends no query at all — so the common path is one
+// string compare and the parse happens only when there is something to parse.
+func isDebugRequest(r *http.Request) bool {
+	return r.URL.RawQuery != "" && r.URL.Query().Get("debug") == "1"
+}
+
 func etagFor(body string) string { return `"` + etagHex(body) + `"` }
 
 func etagMatches(ifNoneMatch, etag string) bool {
@@ -990,7 +1101,7 @@ func etagMatches(ifNoneMatch, etag string) bool {
 // A cached list is "<complete>[|<fresh-until-unix>]\x00<etag>\x00<body>". Completeness is stored with the
 // entry because the cache-hit branch has to answer the same question the build did, and could not
 // otherwise know; the freshness stamp is stored beside it because the entry now OUTLIVES its freshness
-// (see staleServeWindow) and only the entry itself knows when it stopped being current.
+// (see staleWindowFor) and only the entry itself knows when it stopped being current.
 //
 // The stamp is a suffix on the existing first field rather than a fourth field, so that an entry written
 // by an older build — a disk tier surviving a redeploy is exactly when that happens — still parses here,
