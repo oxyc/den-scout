@@ -62,6 +62,31 @@ func TestRankDropsYearMistag(t *testing.T) {
 	}
 }
 
+// Series get the title half of the mistag filter and none of the year half. An episode release carries
+// no year, so the token check is exactly what judges it: the show's own releases share a token and stay,
+// while whatever a mistagged id drags in does not.
+func TestRankSeriesUsesTitleTokensWithoutAYear(t *testing.T) {
+	streams := []RawStream{
+		rs("The.Bear.S04E01.1080p.WEB-DL.mkv", func(s *RawStream) { s.InfoHash = repeat("a", 40) }),
+		rs("B-Bead.mp4", func(s *RawStream) { s.InfoHash = repeat("b", 40) }),
+		// A season pack carrying the SEASON's air year. With a year filter derived from a series span
+		// this is exactly what would have been dropped as a mistag; with no year filter it stays.
+		rs("The.Bear.S04.2025.1080p.WEB-DL", func(s *RawStream) { s.InfoHash = repeat("c", 40) }),
+	}
+	out := rankStreams(streams, rankFilters{
+		ExpectedTitleTokens: titleTokens("The Bear"), // no ExpectedYear — that is the point
+		ResultCap:           10,
+	})
+	if len(out) != 2 {
+		t.Fatalf("want 2 (the junk dropped, both Bear releases kept), got %d: %+v", len(out), out)
+	}
+	for _, s := range out {
+		if s.Title == "B-Bead.mp4" {
+			t.Error("year-less junk survived the title check")
+		}
+	}
+}
+
 func TestCinemetaMeta(t *testing.T) {
 	ok := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) {
 		return resp(200, `{"meta":{"id":"tt1","name":"Disclosure Day","year":"2026"}}`), nil
@@ -69,9 +94,27 @@ func TestCinemetaMeta(t *testing.T) {
 	if m, found := ok(context.Background(), "movie", "tt15047880"); !found || m.Year != 2026 || m.Title != "Disclosure Day" {
 		t.Errorf("movie meta: %+v found=%v", m, found)
 	}
-	// series → not year-filtered
-	if _, found := ok(context.Background(), "series", "tt1"); found {
-		t.Error("series should return found=false")
+	// A series is looked up for its TITLE and deliberately carries no year. Cinemeta gives a series a
+	// span ("2019–2023") of which only the start is readable, and the ±1 year check would then drop a
+	// correctly named Show.S04.2023 — season packs routinely carry the season's air year.
+	var askedPath string
+	series := cinemetaMeta(mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		askedPath = r.URL.Path
+		return resp(200, `{"meta":{"id":"tt1","name":"The Bear","releaseInfo":"2022–2025"}}`), nil
+	}}, "https://cinemeta.example")
+	m, found := series(context.Background(), "series", "tt1")
+	if !found || m.Title != "The Bear" {
+		t.Errorf("series meta: %+v found=%v", m, found)
+	}
+	if m.Year != 0 {
+		t.Errorf("a series carried year %d — the ±1 check would drop correctly named season packs", m.Year)
+	}
+	if askedPath != "/meta/series/tt1.json" {
+		t.Errorf("series asked %q, want the series endpoint", askedPath)
+	}
+	// Anything that is neither is not asked about at all.
+	if _, found := ok(context.Background(), "channel", "tt1"); found {
+		t.Error("an unknown type should return found=false")
 	}
 	// upstream failure → found=false (list served unfiltered)
 	bad := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(500, ""), nil }}, "x")

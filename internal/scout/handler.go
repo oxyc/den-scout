@@ -67,9 +67,10 @@ type Deps struct {
 	PublicURL     string // audit #8: fixed public origin; when empty, fall back to forwarded headers
 	MakeScrapers  func(*Config) []scraper
 	MakeStores    func(*Config) []Store
-	// Meta resolves an id → title + release year (movies only) so mistagged torrents can be dropped.
-	// Optional (nil = no year/title filter); a lookup failure returns ok=false and the list is served
-	// unfiltered.
+	// Meta resolves an id → title, plus a release year for MOVIES only, so mistagged torrents can be
+	// dropped. A series deliberately carries no year (cinemeta.go explains why), which leaves it judged
+	// by the title-token check alone. Optional (nil = no year/title filter); a lookup failure returns
+	// ok=false and the list is served unfiltered.
 	Meta func(ctx context.Context, typ, imdb string) (cineMeta, bool)
 	// SealKeyring decrypts a sealed config path segment (docs/SEALED-CONFIG.md). nil = sealed URLs
 	// disabled (legacy plaintext still works); the current key's public half is served at /config-key.
@@ -423,8 +424,8 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		seeds = kept
 	}
 
-	// Expected title + release year (movies) → drop torrents mistagged with another film's id. Best-effort:
-	// a lookup failure just means no year/title filter.
+	// Expected title, plus a release year for movies → drop torrents mistagged with another title's id.
+	// Best-effort: a lookup failure just means no year/title filter.
 	var expectedYear *int
 	var expectedTitleTokens map[string]bool
 	if h.deps.Meta != nil {
