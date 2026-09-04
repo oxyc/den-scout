@@ -68,37 +68,54 @@ const (
 // partialListTTL makes.
 const rebuildCooloff = time.Minute
 
-// bookRebuild reserves the right to rebuild this key in the background, or reports that someone else
-// already holds it (or that a degraded attempt is still cooling off).
-func (h *handler) bookRebuild(key string, now time.Time, until time.Time) bool {
+// rebuildLease is one booking. The generation is a fencing token: the booking is a wall-clock LEASE, so a
+// rebuild can outrun its own expiry — its ctx deadline and its budget are the same 28 seconds, and it
+// still has a marshal and a disk write to do after the deadline fires. Without fencing, that late
+// goroutine's release deleted whatever sat at the key by then, which could be a NEWER booking (leaking a
+// concurrent rebuild slot) or a cool-off another attempt had just installed (restoring per-request
+// scrapes during an outage). A release now only acts on the lease it was given.
+type rebuildLease struct {
+	until time.Time
+	gen   uint64
+}
+
+// bookRebuild reserves the right to rebuild this key in the background, returning the lease's generation.
+// ok=false means someone else already holds it, or a degraded attempt is still cooling off.
+func (h *handler) bookRebuild(key string, now time.Time, until time.Time) (gen uint64, ok bool) {
 	h.rebuildMu.Lock()
 	defer h.rebuildMu.Unlock()
 	if h.rebuilds == nil {
-		h.rebuilds = map[string]time.Time{}
+		h.rebuilds = map[string]rebuildLease{}
 	}
-	if t, ok := h.rebuilds[key]; ok && now.Before(t) {
-		return false
+	if l, held := h.rebuilds[key]; held && now.Before(l.until) {
+		return 0, false
 	}
 	// Swept here rather than on a timer: the map only ever holds keys with a live booking or a recent
 	// cool-off, so it stays small, and pruning on the rare stale hit costs nothing worth measuring.
-	for k, t := range h.rebuilds {
-		if !now.Before(t) {
+	for k, l := range h.rebuilds {
+		if !now.Before(l.until) {
 			delete(h.rebuilds, k)
 		}
 	}
-	h.rebuilds[key] = until
-	return true
+	h.rebuildGen++
+	h.rebuilds[key] = rebuildLease{until: until, gen: h.rebuildGen}
+	return h.rebuildGen, true
 }
 
 // releaseRebuild ends a booking early (a healthy rebuild) or extends it into a cool-off (a degraded one).
-func (h *handler) releaseRebuild(key string, cooloffUntil time.Time) {
+// A lease that has already been superseded releases nothing — see rebuildLease.
+func (h *handler) releaseRebuild(key string, gen uint64, cooloffUntil time.Time) {
 	h.rebuildMu.Lock()
 	defer h.rebuildMu.Unlock()
+	l, held := h.rebuilds[key]
+	if !held || l.gen != gen {
+		return
+	}
 	if cooloffUntil.IsZero() {
 		delete(h.rebuilds, key)
 		return
 	}
-	h.rebuilds[key] = cooloffUntil
+	h.rebuilds[key] = rebuildLease{until: cooloffUntil, gen: gen}
 }
 
 // staleWindowFor bounds the stale window by the freshness it follows, so shortening the TTL shortens both.
@@ -150,8 +167,9 @@ type handler struct {
 	// back degraded, so without one the entry stays stale for the rest of its life and every single
 	// request re-books a full scrape plus a debrid fan-out — precisely the harm the partial-list caching
 	// note further down says it fixed, reappearing on the stale path.
-	rebuildMu sync.Mutex
-	rebuilds  map[string]time.Time
+	rebuildMu  sync.Mutex
+	rebuilds   map[string]rebuildLease
+	rebuildGen uint64
 
 	// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
 	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
@@ -183,8 +201,11 @@ const scrapeFailThreshold = 3
 // path let an anonymous caller mint a permanent bucket per distinct blob or episode number. Worse, a
 // fresh bucket starts at full burst, so the pacing never engaged on exactly that traffic.
 //
-// The cost of one shared bucket is that debugging two titles at once contends. That is the right trade
-// for a hand-run diagnostic, and it is what keeps this bounded without teaching the limiter to evict.
+// KNOWN AND ACCEPTED, the same trade validate.go's limiter writes down: one shared bucket means an
+// anonymous caller can hold it empty and deny the OPERATOR ?debug=1 outright, not merely make two
+// concurrent debug runs contend. Keying per caller would fix that and would reintroduce the
+// never-evicting map this exists to close, which is a worse failure than a diagnostic that says "try
+// again in a moment". Nothing about playback touches this limiter.
 const debugLimiterKey = "debug"
 
 var debugLimiter = newHostLimiter(10*time.Second, 3)
@@ -483,13 +504,14 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 	now := time.Now()
 	// Booked BEFORE the goroutine exists, and before the config is decoded, so a flood of stale hits costs
 	// one map lookup each instead of a goroutine each.
-	if !h.bookRebuild(cacheKey, now, now.Add(budget)) {
+	gen, booked := h.bookRebuild(cacheKey, now, now.Add(budget))
+	if !booked {
 		return
 	}
 	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
 		// It decoded when the entry was built; if it no longer does, serving stale is all we can do.
-		h.releaseRebuild(cacheKey, time.Time{})
+		h.releaseRebuild(cacheKey, gen, time.Time{})
 		return
 	}
 	parent := context.WithoutCancel(r.Context())
@@ -499,7 +521,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 		// The booking is released from a defer as well, so a panic cannot strand the key permanently.
 		defer recoverBackground("stale list rebuild")
 		cooloff := time.Time{}
-		defer func() { h.releaseRebuild(cacheKey, cooloff) }()
+		defer func() { h.releaseRebuild(cacheKey, gen, cooloff) }()
 		ctx, cancel := context.WithTimeout(parent, budget)
 		defer cancel()
 		v, _, _ := h.sf.Do(cacheKey, func() (any, error) {

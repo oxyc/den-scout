@@ -1051,10 +1051,73 @@ func TestStreamList_staleRebuildSpawnsOneGoroutinePerKey(t *testing.T) {
 	close(release)
 }
 
-// A degraded rebuild caches nothing, so without a cool-off the entry stays stale and EVERY subsequent
-// request books another full scrape plus debrid fan-out — the same harm the partial-list caching note
-// records fixing, reappearing on the stale path.
-func TestStreamList_degradedRebuildCoolsOff(t *testing.T) {
+// The rebuild gate, tested directly against injected clock values.
+//
+// The end-to-end test below cannot reach the cool-off: every stale hit it makes lands inside the 28-second
+// BOOKING window, so the gate alone satisfies it and disabling the cool-off left it green. The booking
+// window is not injectable (listBuildSlack is a package constant), so the cool-off gets a unit test
+// instead of a contrived integration one.
+func TestRebuildGate(t *testing.T) {
+	h := &handler{}
+	t0 := time.Now()
+	const budget = 28 * time.Second
+
+	gen, ok := h.bookRebuild("k", t0, t0.Add(budget))
+	if !ok {
+		t.Fatal("first booking refused")
+	}
+	if _, ok := h.bookRebuild("k", t0.Add(time.Second), t0.Add(budget)); ok {
+		t.Error("a second booking was granted while the first was live")
+	}
+	// A healthy rebuild clears the key immediately, so the next expiry rebuilds at once.
+	h.releaseRebuild("k", gen, time.Time{})
+	gen2, ok := h.bookRebuild("k", t0.Add(2*time.Second), t0.Add(budget))
+	if !ok {
+		t.Fatal("a released key refused the next booking")
+	}
+
+	// A DEGRADED rebuild installs a cool-off, which outlives the booking window it replaces. Without it,
+	// an outage has every request re-book a full scrape plus debrid fan-out for the rest of the stale life.
+	h.releaseRebuild("k", gen2, t0.Add(rebuildCooloff))
+	if _, ok := h.bookRebuild("k", t0.Add(budget+time.Second), t0.Add(budget)); ok {
+		t.Error("the cool-off did not outlive the booking window — a degraded key rebuilds immediately")
+	}
+	if _, ok := h.bookRebuild("k", t0.Add(rebuildCooloff+time.Second), t0.Add(budget)); !ok {
+		t.Error("the cool-off never expired")
+	}
+}
+
+// A lease is a wall-clock reservation, so a rebuild can outrun it — its context deadline and its budget
+// are the same 28 seconds, and it still has a marshal and a disk write to do afterwards. Without a fencing
+// token that late release deleted whatever sat at the key: a NEWER booking (leaking a rebuild slot) or a
+// cool-off just installed (restoring per-request scrapes during an outage).
+func TestRebuildGate_staleLeaseReleasesNothing(t *testing.T) {
+	h := &handler{}
+	t0 := time.Now()
+
+	old, _ := h.bookRebuild("k", t0, t0.Add(time.Second))
+	// The lease expires and a second request books the key.
+	fresh, ok := h.bookRebuild("k", t0.Add(2*time.Second), t0.Add(30*time.Second))
+	if !ok || fresh == old {
+		t.Fatalf("second booking: ok=%v gen=%d (first was %d)", ok, fresh, old)
+	}
+	// The first, overrun rebuild now finishes and tries to release.
+	h.releaseRebuild("k", old, time.Time{})
+	if _, ok := h.bookRebuild("k", t0.Add(3*time.Second), t0.Add(30*time.Second)); ok {
+		t.Error("a superseded lease deleted the live booking — two rebuilds can now run for one key")
+	}
+	// And it must not be able to wipe a cool-off either.
+	h.releaseRebuild("k", fresh, t0.Add(time.Hour))
+	h.releaseRebuild("k", old, time.Time{})
+	if _, ok := h.bookRebuild("k", t0.Add(4*time.Second), t0.Add(30*time.Second)); ok {
+		t.Error("a superseded lease wiped the cool-off")
+	}
+}
+
+// End to end, an outage does not put a scrape on every stale request. Note this exercises the BOOKING
+// gate, not the cool-off — every hit here lands inside the booking window; TestRebuildGate covers the
+// cool-off directly, because the booking window cannot be shortened from a test.
+func TestStreamList_outageDoesNotScrapePerRequest(t *testing.T) {
 	var scrapes atomic.Int32
 	healthy := atomic.Bool{}
 	healthy.Store(true)

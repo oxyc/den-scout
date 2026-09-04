@@ -3,6 +3,7 @@ package scout
 import (
 	"encoding/json"
 	"math"
+	"regexp"
 )
 
 // DebridService / Indexer enums (ported from src/config.ts).
@@ -55,6 +56,10 @@ var disabledIndexers = map[Indexer]string{
 	"torz": "host no longer resolves (no DNS)",
 }
 var validResolutions = map[string]bool{"2160p": true, "1080p": true, "720p": true, "480p": true}
+
+// countedRepeat spots a `{n}` / `{n,}` / `{n,m}` quantifier in a user-supplied pattern — the one regex
+// construct whose COMPILED size is not bounded by the pattern's length. An escaped brace is not one.
+var countedRepeat = regexp.MustCompile(`(^|[^\\])\{\d+(,\d*)?\}`)
 
 type DebridAccount struct {
 	Service DebridService
@@ -185,6 +190,22 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 			s := *raw.Filters.ExcludeRegex
 			if len(s) > 256 {
 				s = s[:256]
+			}
+			// Counted repetition is dropped, and the length cap is not enough on its own.
+			//
+			// RE2 is linear at MATCH time, which is what makes this filter safe to run over a stream list
+			// (audit #9). Nothing bounded it at COMPILE time: `{n}` is expanded into the program, so 250
+			// characters of `(?:x{240}){1000}` — inside the cap, from an unauthenticated caller, because a
+			// config's debrid token is never verified — compiles to 53 MiB of live heap. Measured against
+			// 0.03 MiB for the same 250 characters without braces, inside a 230 MiB GOMEMLIMIT; sixteen
+			// concurrent requests took the container past its 256 MB limit.
+			//
+			// Dropping the whole quantifier rather than capping the count: this filter exists to exclude
+			// words a viewer does not want in a release name ("hindi|dubbed|hc"), and none of that needs
+			// counted repetition. Without `{}` the compiled program is bounded by the pattern length.
+			// Dropped, not rejected, to match the existing tolerance for a malformed pattern.
+			if countedRepeat.MatchString(s) {
+				s = ""
 			}
 			f.ExcludeRegex = s
 		}

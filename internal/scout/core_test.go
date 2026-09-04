@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -44,6 +45,32 @@ func TestDecodeConfig(t *testing.T) {
 
 	if len(c.Filters.Resolutions) != 2 || !c.Filters.HDROnly || c.Filters.MaxSizeGB == nil || *c.Filters.MaxSizeGB != 40 {
 		t.Errorf("filters: %+v", c.Filters)
+	}
+
+	// A counted repetition is dropped from a user pattern. RE2 is linear at MATCH time, which is what
+	// makes this filter safe to run over a stream list — but nothing bounded it at COMPILE time, and `{n}`
+	// is expanded into the program. 250 characters inside the existing cap compile to 53 MiB of live heap,
+	// from an unauthenticated caller, inside a 230 MiB GOMEMLIMIT.
+	for _, bad := range []string{
+		`(?:` + repeat("x", 240) + `){1000}`,
+		`a{1000}`,
+		`a{100,}`,
+		`a{2,50}`,
+	} {
+		c, ok := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"excludeRegex":`+jsonString(bad)+`}}`))
+		if !ok {
+			t.Fatalf("config carrying %q was rejected outright", bad)
+		}
+		if c.Filters.ExcludeRegex != "" {
+			t.Errorf("counted repetition survived validation: %q", c.Filters.ExcludeRegex)
+		}
+	}
+	// The patterns people actually write are untouched — including an ESCAPED brace, which expands nothing.
+	for _, good := range []string{`hindi|tamil|dubbed`, `\bhc\b`, `x\{3\}`} {
+		c, _ := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"excludeRegex":`+jsonString(good)+`}}`))
+		if c.Filters.ExcludeRegex != good {
+			t.Errorf("a legitimate pattern was dropped: %q → %q", good, c.Filters.ExcludeRegex)
+		}
 	}
 
 	// preferResolution is whitelisted like every other resolution field. An unknown value becomes "no
@@ -334,4 +361,11 @@ func repeat(s string, n int) string {
 		out = append(out, s...)
 	}
 	return string(out)
+}
+
+// jsonString quotes a value for embedding in a config fixture, so a pattern full of backslashes and
+// braces reaches the decoder exactly as a client would have sent it.
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
