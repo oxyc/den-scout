@@ -148,6 +148,14 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, status, noStore)
 		return
+	case "/metrics":
+		// Prometheus text format. Unauthenticated like /health, and safe to be, because of what it does
+		// NOT carry: no debrid service or account labels, no ids, no titles — see metrics.go's render.
+		w.Header().Set("content-type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("cache-control", noStore)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(metrics.render(cachePersistentGauge(h.deps.Cache))))
+		return
 	case "/manifest.json":
 		h.conditional(w, r, h.manifestUnconf, h.manifestUnconfETag, jsonType, staticCache)
 		return
@@ -219,10 +227,12 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		// the shortening exists to prevent, defeated one branch over.
 		complete, freshUntil, etag, body := splitCached(hit)
 		header := listCache
+		metrics.listCacheHit.Add(1)
 		switch {
 		case !complete:
 			header = partialListCache
 		case freshUntil > 0 && time.Now().Unix() >= freshUntil:
+			metrics.listCacheStale.Add(1)
 			// Stale but complete: answer now from what we have and refresh behind the reply. Only
 			// COMPLETE lists get this — serving a knowingly-short one past its own expiry is the harm
 			// the branch above exists to prevent, and a longer life is the last thing it should get.
@@ -234,6 +244,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	}
 
 	// Miss: decode now (#16 — a warm hit never pays decode/validate).
+	metrics.listCacheMiss.Add(1)
 	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
@@ -474,6 +485,14 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		hold = ttl + staleServeWindow
 	}
 	value := joinCached(scrapeComplete, freshUntil, etag, string(body))
+	switch {
+	case degraded:
+		metrics.buildDegraded.Add(1)
+	case !scrapeComplete:
+		metrics.buildPartial.Add(1)
+	default:
+		metrics.buildOK.Add(1)
+	}
 	if !degraded {
 		if !scrapeComplete {
 			log.Printf("scout: %s %s: an indexer did not answer; caching this list for %s only",

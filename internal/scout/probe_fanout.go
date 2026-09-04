@@ -68,12 +68,14 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 		}
 		key := probeCacheKey(s, sid)
 		if raw, ok := h.deps.Cache.Get(key); ok {
+			metrics.probeCacheHit.Add(1)
 			var p Probe
 			if json.Unmarshal([]byte(raw), &p) == nil {
 				s.Probe = &p
 			}
 			continue
 		}
+		metrics.probeCacheMiss.Add(1)
 		// WHICH services hold it, not just that one does. `s.Cached` is the union across accounts, so on a
 		// two-account install a release only the second holds still reads as cached here — and resolving
 		// it through the pool would reach the first account, which adds it. Carrying the holders lets the
@@ -162,6 +164,7 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 // a panic simply joins them rather than needing an answer of its own.
 func recoverProbe(what string) {
 	if rec := recover(); rec != nil {
+		metrics.probePanic.Add(1)
 		log.Printf("scout: %s panicked, skipping it: %v", what, rec)
 	}
 }

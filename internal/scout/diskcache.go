@@ -214,6 +214,11 @@ func (c *TieredCache) path(key string) string {
 	return filepath.Join(c.dir, base64.RawURLEncoding.EncodeToString(sum[:])+".ent")
 }
 
+// Persistent reports whether the durable tier is still writing. The failure it exposes is silent by
+// design — one log line and then memory keeps serving — so without a way to ask, an operator learns that
+// persistence died only by noticing probes never survive a redeploy.
+func (c *TieredCache) Persistent() bool { return !c.disabled() }
+
 func (c *TieredCache) disabled() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -402,10 +402,15 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 		g.Go(func() error {
 			cctx, cancel := context.WithTimeout(gctx, timeout)
 			defer cancel()
-			if r, err := sc.scrape(cctx, q); err == nil {
+			r, err := sc.scrape(cctx, q)
+			if err == nil {
 				results[i] = r
 				respok[i] = true
 			}
+			// Counted here because this is where the answer is already known. An unaskable scraper is
+			// counted too: "asked nobody, so nobody answered" is a state worth being able to see, and
+			// its failure ratio being exactly 1 is how it looks.
+			metrics.indexerResult(sc.id(), err == nil)
 			return nil // never fail the group — gather what responded
 		})
 	}
