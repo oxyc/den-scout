@@ -26,6 +26,10 @@ Added under `profiles: ["scout"]` so a plain `docker compose up` doesn't start i
       SCOUT_SCRAPE_TIMEOUT_MS: "${SCOUT_SCRAPE_TIMEOUT_MS:-8000}"
       SCOUT_LIST_TTL_SECONDS: "${SCOUT_LIST_TTL_SECONDS:-300}"
       SCOUT_MEDIAFUSION_URL: "${SCOUT_MEDIAFUSION_URL:-}"   # base incl. its encrypted-config segment
+      # Sealed config-in-URL (docs/SEALED-CONFIG.md). Unset = links carry the debrid token in PLAIN
+      # TEXT; the feature is built and tested but does nothing until this key exists.
+      SCOUT_CONFIG_KEY: "${SCOUT_CONFIG_KEY:-}"             # base64 32-byte X25519 private key
+      SCOUT_CONFIG_KEYS_PREV: "${SCOUT_CONFIG_KEYS_PREV:-}" # prior keys (rotation), comma-separated
     read_only: true
     volumes:
       - den-scout-cache:/cache        # durable cache tier; MUST be a volume (read_only rootfs)
@@ -84,7 +88,19 @@ not IP-bound.
 ```
 DEN_SCOUT_VERSION=latest                # ghcr.io/oxyc/den-scout (profile: scout)
 # SCOUT_MEDIAFUSION_URL=                 # optional: self-hosted MediaFusion base incl. config segment
+# SCOUT_CONFIG_KEY=                      # base64 X25519 private key → sealed (not plaintext) addon URLs
+# SCOUT_CONFIG_KEYS_PREV=                # prior keys, comma-separated, so a rotation keeps old links working
 ```
+
+Generate a config key with:
+
+```
+head -c 32 /dev/urandom | base64
+```
+
+Without it the addon URL carries the debrid token in plain text — anyone who sees the link (a log, a
+screenshot, browser history) can read it. `/config-key` 404s until it is set, and `/configure` then says
+"⚠︎ Not sealed" on the link it builds.
 
 ## 4. Bring it up + smoke test
 

@@ -25,10 +25,12 @@ resolve to a server you control, so the app just renders what comes back.
 ## How it works
 
 1. **Config in the URL** (Torrentio-style): a base64url blob — debrid service + token, indexers,
-   filters — rides in the addon path. Build it at `/configure`. It is a bearer credential; the Den
-   app stores it in the Keychain and never logs it. (A future hardening swaps it for an opaque
-   `configId`; the decode/validate seam in `internal/scout/config.go` + `internal/scout/play.go` is
-   the only thing that changes.)
+   filters — rides in the addon path. Build it at `/configure`, which **seals** it in the browser to
+   the server's X25519 public key (served at `/config-key`) when one is configured, so the link
+   carries ciphertext rather than your token; legacy plaintext blobs still resolve. See
+   [`docs/SEALED-CONFIG.md`](docs/SEALED-CONFIG.md). Sealed or not, the link remains a bearer
+   credential — whoever holds it can spend the account's quota — so the Den app keeps it in the
+   Keychain and never logs it.
 2. **Scrape** the configured indexers concurrently (Torrentio, Comet, MediaFusion, Torz), each under
    its own timeout — a slow indexer never blocks the rest. Dedupe by infohash.
 3. **Cache-check** the debrid store(s). TorBox has a real batched cache API and is the default;
@@ -43,14 +45,22 @@ resolve to a server you control, so the app just renders what comes back.
 ## Routes
 
 ```
-GET /                                   configure page
-GET /configure                          configure page
-GET /health                             { status: "ok" }
-GET /manifest.json                      unconfigured manifest (configurationRequired)
-GET /<config>/manifest.json             configured manifest
-GET /<config>/stream/<movie|series>/<id>.json   ranked, clean, cached streams
-GET /<config>/play/<token>              302 → cached debrid link
+GET  /                                   configure page
+GET  /configure                          configure page
+GET  /health                             { status: "ok" | "degraded" }
+GET  /metrics                            Prometheus text: indexer, cache, build and probe counters
+GET  /config-key                         { key } — X25519 public key for sealing (404 if unset)
+POST /validate                           { service, token } → { valid, reason } — check a debrid key
+GET  /manifest.json                      unconfigured manifest (configurationRequired)
+GET  /<config>/manifest.json             configured manifest
+GET  /<config>/stream/<movie|series>/<id>.json   ranked, clean, cached streams
+GET  /<config>/stream/…?debug=1          the same list plus per-filter drop counts and scores
+GET  /<config>/play/<token>              302 → cached debrid link
+GET  /<config>/play/<token>?probe=1      "can this play yet?" — reports, starts nothing
 ```
+
+Everything is `GET` (and `HEAD`) except `/validate`. `/play` is `GET` only: resolving is what *adds* an
+uncached release, so a prefetcher's `HEAD` is refused rather than answered.
 
 `<id>` is `tt…` (movie) or `tt…:S:E` (series episode). Scout advertises `idPrefixes: ["tt"]` because
 Den bridges TMDB → IMDb before it asks for streams.
@@ -76,11 +86,21 @@ docker run -p 8080:8080 den-scout
 ### Config (env, no secrets)
 
 den-scout holds **no** debrid secret — the token is per-install, in the addon URL, not the server.
-Env only tunes runtime behavior (see `.env.example`): `PORT`, `SCOUT_SCRAPE_TIMEOUT_MS`,
-`SCOUT_LIST_TTL_SECONDS`, `SCOUT_CACHE_BYTES` (in-memory list-cache byte budget), `SCOUT_PUBLIC_URL`
-(the external origin used to mint `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored), and
-per-indexer base-URL overrides `SCOUT_{TORRENTIO,COMET,MEDIAFUSION,TORZ}_URL` (point MediaFusion at a
-base that includes its encrypted-config segment).
+Env only tunes runtime behavior (see `.env.example`):
+
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | listen port (default `8080`) |
+| `SCOUT_SCRAPE_TIMEOUT_MS` | per-indexer scrape timeout (default `8000`) |
+| `SCOUT_LIST_TTL_SECONDS` | how long a ranked list stays fresh (default `300`) |
+| `SCOUT_CACHE_BYTES` | in-memory list-cache byte budget (default 48 MiB) |
+| `SCOUT_CACHE_DIR` | durable cache tier; **needs a writable mount** — see `DEPLOY.md` |
+| `SCOUT_PUBLIC_URL` | external origin for `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored |
+| `SCOUT_CINEMETA_URL` | metadata source for the mistag filter (default: public Cinemeta) |
+| `SCOUT_CONFIG_KEY` | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |
+| `SCOUT_CONFIG_KEYS_PREV` | prior keys, comma-separated, so a rotation doesn't break live installs |
+| `SCOUT_MINT_INDEXER_CONFIGS` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts** — off unless set |
+| `SCOUT_{TORRENTIO,COMET,MEDIAFUSION,TORZ}_URL` | per-indexer base-URL overrides (point MediaFusion at a base including its encrypted-config segment) |
 
 ## Architecture
 
