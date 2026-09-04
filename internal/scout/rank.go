@@ -355,6 +355,50 @@ type rankFilters struct {
 	// real releases, while keeping foreign-language releases (which carry the year, or a name/number
 	// token). Empty = no title filter (best-effort; a Cinemeta lookup failure serves unfiltered).
 	ExpectedTitleTokens map[string]bool
+	// Debug collects drop counts and scores when ?debug=1 asked for them. nil on every normal request.
+	Debug *rankDebug
+}
+
+// rankDebug records where a list went: how many releases each filter removed, and what the survivors
+// scored. Answering that meant reading a log line and guessing, which is why handler.go logs
+// "scraped N → ranked M" at all — this is the same question answered exactly, on demand.
+//
+// Collected only when ?debug=1 asked for it. Every method is nil-safe so the normal path pays one
+// not-taken branch per filter and allocates nothing.
+type rankDebug struct {
+	// Releases the indexers returned, after dedupe by infohash.
+	Deduped int `json:"deduped"`
+	// Releases actually served, after filtering and the result cap.
+	Ranked int `json:"ranked"`
+	// How many releases each filter removed, keyed by filter name. A filter that removed nothing is
+	// absent rather than zero — the interesting ones are the ones with a number.
+	DroppedBy map[string]int `json:"droppedBy,omitempty"`
+	// The served releases with the score that ordered them, in served order.
+	Kept []debugScore `json:"kept,omitempty"`
+	// Deliberately ABSENT: indexer base URLs. MediaFusion's carries an encrypted config minted from the
+	// debrid token, which is why scrape.go logs the indexer NAME and never the address. Per-indexer
+	// answer/failure counts live on /metrics, where they are aggregate and carry no per-install detail.
+	Note string `json:"note,omitempty"`
+}
+
+type debugScore struct {
+	Title      string `json:"title"`
+	Score      int    `json:"score"`
+	Resolution string `json:"resolution,omitempty"`
+	Cached     bool   `json:"cached"`
+}
+
+// drop records one release removed by a named filter. Nil-safe: the normal path calls this too.
+func (d *rankDebug) drop(reason string) { d.dropN(reason, 1) }
+
+func (d *rankDebug) dropN(reason string, n int) {
+	if d == nil || n <= 0 {
+		return
+	}
+	if d.DroppedBy == nil {
+		d.DroppedBy = map[string]int{}
+	}
+	d.DroppedBy[reason] += n
 }
 
 // titleTokenRe splits a release/title into alphanumeric tokens.
@@ -471,13 +515,16 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		lower := strings.ToLower(s.Title)
 		junk := junkClassOf(lower)
 		if f.ExcludeCam && junk != "" {
+			f.Debug.drop(junk)
 			continue
 		}
 		if excludeRe != nil && excludeRe.MatchString(s.Title) {
+			f.Debug.drop("excludeRegex")
 			continue
 		}
 		// Drop a mistagged torrent (another film's IMDb id) — its release year is clearly wrong.
 		if f.ExpectedYear != nil && yearMismatch(s.Title, *f.ExpectedYear) {
+			f.Debug.drop("yearMismatch")
 			continue
 		}
 		// A release with no parseable year can't be year-checked; if we know the title, require at least
@@ -485,6 +532,7 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		// releases survive on the year gate above, or on a shared name/number token.
 		if len(f.ExpectedTitleTokens) > 0 && len(releaseYears(s.Title)) == 0 &&
 			!titleOverlap(s.Title, f.ExpectedTitleTokens) {
+			f.Debug.drop("titleMismatch")
 			continue
 		}
 		// Computed once for both the hard filter and the soft preference, and only when one of them is
@@ -494,18 +542,22 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 			res = detectResolutionLower(lower)
 		}
 		if len(allowed) > 0 && res != "" && !allowed[res] {
+			f.Debug.drop("resolution")
 			continue
 		}
 		if f.HDROnly && !reHDROnly.match(lower) {
+			f.Debug.drop("hdrOnly")
 			continue
 		}
 		// Only drop when the seeder count is actually known — many indexer entries omit it, and treating
 		// missing as 0 would discard otherwise-good (even cached) results (mirrors the size filter, which
 		// keeps unknown sizes).
 		if f.MinSeeders != nil && s.Seeders != nil && *s.Seeders < *f.MinSeeders {
+			f.Debug.drop("minSeeders")
 			continue
 		}
 		if f.MaxSizeGB != nil && intOr(s.SizeBytes, 0) > *f.MaxSizeGB*gib {
+			f.Debug.drop("maxSizeGB")
 			continue
 		}
 		// "Show me only what plays now" is a filter on what we KNOW is not cached, not on what we failed
@@ -514,6 +566,7 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		// releases from the list with nothing anywhere saying so. A release nobody could check survives
 		// and ranks below the confirmed-cached ones, which is the honest ordering.
 		if f.CachedOnly && !s.Cached && s.CacheKnown {
+			f.Debug.drop("cachedOnly")
 			continue
 		}
 		score := qualityScoreLower(lower, s, junk)
@@ -536,13 +589,27 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		return out[a].idx < out[b].idx
 	})
 	if len(out) > f.ResultCap {
+		f.Debug.dropN("resultCap", len(out)-f.ResultCap)
 		out = out[:f.ResultCap]
 	}
-	res := make([]RawStream, len(out))
+	result := make([]RawStream, len(out))
 	for i := range out {
-		res[i] = out[i].s
+		result[i] = out[i].s
 	}
-	return res
+	// After the cap, so the scores recorded are the ones that actually ordered what the viewer sees.
+	if f.Debug != nil {
+		f.Debug.Ranked = len(out)
+		f.Debug.Kept = make([]debugScore, len(out))
+		for i := range out {
+			f.Debug.Kept[i] = debugScore{
+				Title:      out[i].s.Title,
+				Score:      out[i].score,
+				Resolution: detectResolution(out[i].s.Title),
+				Cached:     out[i].s.Cached,
+			}
+		}
+	}
+	return result
 }
 
 func intOr(p *int, d int) int {

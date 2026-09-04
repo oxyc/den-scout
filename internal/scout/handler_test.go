@@ -688,6 +688,93 @@ func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
 	}
 }
 
+// "Where did this list go" answered exactly, instead of guessed from a log line.
+func TestStreamDebug_reportsWhereTheListWent(t *testing.T) {
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	h := NewHandler(testDeps(func(d *Deps) { d.Cache = cache }))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+
+	rr := do(h, path+"?debug=1", nil)
+	if rr.Code != 200 {
+		t.Fatalf("debug: %d", rr.Code)
+	}
+	var body struct {
+		Streams []struct {
+			Title string `json:"title"`
+		} `json:"streams"`
+		Debug *struct {
+			Deduped   int            `json:"deduped"`
+			Ranked    int            `json:"ranked"`
+			DroppedBy map[string]int `json:"droppedBy"`
+			Kept      []struct {
+				Title      string `json:"title"`
+				Score      int    `json:"score"`
+				Resolution string `json:"resolution"`
+				Cached     bool   `json:"cached"`
+			} `json:"kept"`
+		} `json:"debug"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Debug == nil {
+		t.Fatal("?debug=1 returned no debug block")
+	}
+	// The fixture has three seeds: a CAM (dropped) and two cached releases (kept).
+	if body.Debug.Deduped != 3 || body.Debug.Ranked != 2 {
+		t.Errorf("counts: deduped=%d ranked=%d, want 3 and 2", body.Debug.Deduped, body.Debug.Ranked)
+	}
+	if body.Debug.DroppedBy["cam"] != 1 {
+		t.Errorf("the CAM drop was not attributed: %v", body.Debug.DroppedBy)
+	}
+	if len(body.Debug.Kept) != len(body.Streams) {
+		t.Fatalf("kept %d scores for %d streams", len(body.Debug.Kept), len(body.Streams))
+	}
+	// Scores are recorded in SERVED order, so they explain the ordering the viewer sees.
+	for i := range body.Streams {
+		if body.Debug.Kept[i].Title != body.Streams[i].Title {
+			t.Errorf("kept[%d]=%q but stream[%d]=%q", i, body.Debug.Kept[i].Title, i, body.Streams[i].Title)
+		}
+	}
+	if body.Debug.Kept[0].Score <= body.Debug.Kept[1].Score {
+		t.Errorf("scores do not explain the order: %d then %d", body.Debug.Kept[0].Score, body.Debug.Kept[1].Score)
+	}
+}
+
+// A debug build is a diagnostic, not an entry other viewers should be served — and must not displace the
+// good one. It also must not be answered FROM the cache, which carries no accounting.
+func TestStreamDebug_isNeverCached(t *testing.T) {
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	h := NewHandler(testDeps(func(d *Deps) { d.Cache = cache }))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+
+	if rr := do(h, path+"?debug=1", nil); rr.Code != 200 {
+		t.Fatalf("debug: %d", rr.Code)
+	}
+	if key := cache.lastKey(); key != "" {
+		if v, ok := cache.Get(key); ok && strings.Contains(v, "droppedBy") {
+			t.Error("a debug build was cached and would be served to everyone else")
+		}
+	}
+	// A normal request afterwards is unaffected and carries no debug block.
+	plain := do(h, path, nil)
+	if strings.Contains(plain.Body.String(), "\"debug\"") {
+		t.Error("a normal response carries a debug block")
+	}
+}
+
+// The one thing this route must never emit. MediaFusion's base URL carries an encrypted config minted
+// from the debrid token, which is why scrape.go logs the indexer name and never the address.
+func TestStreamDebug_leaksNoUpstreamURLsOrTokens(t *testing.T) {
+	h := NewHandler(testDeps(nil))
+	body := do(h, "/"+validBlob+"/stream/movie/tt1234567.json?debug=1", nil).Body.String()
+	for _, forbidden := range []string{"tb-secret", "mediafusion.elfhosted", "torrentio.strem.fun", "https://comet"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("?debug=1 disclosed %q", forbidden)
+		}
+	}
+}
+
 // recordingCache remembers the key a list was written under, so a test can age that entry without having
 // to rebuild the handler's cache-key formula.
 type recordingCache struct {

@@ -220,6 +220,32 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	// audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
 	cacheKey := "list:" + keyHash(configBlob) + ":" + keyHash(origin) + ":" + streamCacheID(sid)
 
+	// ?debug=1 — "where did this list go", answered exactly instead of guessed from a log line.
+	//
+	// Deliberately bypasses the cache and the singleflight: a cached entry carries no accounting, and
+	// joining an in-flight normal build would return a body with nothing in it. So this really does run
+	// a scrape, and it is not written back to the cache — a hand-run diagnostic pays for itself rather
+	// than displacing a good entry. It grants nothing new: the caller already holds the config segment,
+	// which is what /play needs, and the indexers are still paced by the host limiter.
+	if r.URL.Query().Get("debug") == "1" {
+		config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
+			return
+		}
+		buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()),
+			h.deps.ScrapeTimeout+listBuildSlack)
+		defer cancel()
+		value, degraded, _ := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey,
+			&rankDebug{})
+		if degraded != "" {
+			w.Header().Set("X-Scout-Degraded", degraded)
+		}
+		_, _, _, body := splitCached(value)
+		writeJSON(w, http.StatusOK, json.RawMessage(body), noStore)
+		return
+	}
+
 	if hit, ok := h.deps.Cache.Get(cacheKey); ok {
 		// The completeness rides WITH the entry. Shortening the header only on the build meant the very
 		// next requester — Stremio races and cancels addon requests, so that happens routinely — was told
@@ -257,7 +283,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		value, degraded, complete := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey)
+		value, degraded, complete := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil)
 		return buildResult{value: value, degraded: degraded, complete: complete}, nil
 	})
 	res := v.(buildResult)
@@ -307,7 +333,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 			h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
 		_, _, _ = h.sf.Do(cacheKey, func() (any, error) {
-			value, degraded, complete := h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey)
+			value, degraded, complete := h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil)
 			return buildResult{value: value, degraded: degraded, complete: complete}, nil
 		})
 	}()
@@ -322,8 +348,11 @@ type buildResult struct {
 	complete bool
 }
 
-// buildStreamList scrapes → cache-checks → ranks → serializes, caches "<complete>\x00<etag>\x00<body>".
-func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string) (string, string, bool) {
+// buildStreamList scrapes → cache-checks → ranks → serializes, caches the framed entry (see joinCached).
+//
+// dbg is nil on every normal request. When it is not, the accounting rides along in the response body and
+// the result is NOT cached — a debug build is a diagnostic, not an entry other viewers should be served.
+func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string, dbg *rankDebug) (string, string, bool) {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
 
@@ -416,7 +445,11 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		ResultCap:           config.ResultCap,
 		ExpectedYear:        expectedYear,
 		ExpectedTitleTokens: expectedTitleTokens,
+		Debug:               dbg,
 	})
+	if dbg != nil {
+		dbg.Deduped = len(seeds)
+	}
 
 	// Degraded is judged on what is actually SERVED, not on what was scraped.
 	//
@@ -444,28 +477,31 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 			sid.Type, sid.IMDb, unchecked, len(ranked))
 	}
 
-	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
-	// the viewer will see; before serialisation, so the answer rides along in the same response and the
 	// Where a list is lost. An empty answer has half a dozen possible authors — no indexer had it, a
 	// filter removed everything, the cache-only gate dropped an uncached set — and they are
-	// indistinguishable in the reply. Reported when the pipeline empties a list that started non-empty,
-	// which is the case worth a line and the one that had us guessing at an episode torrentio was
-	// serving 50 results for.
-	// Also when nothing was scraped at all: "no indexer had it" and "a filter removed it" are the two
-	// answers an empty reply can carry, and only this line separates them.
-	if len(ranked) == 0 || len(ranked) < len(seeds) {
+	// indistinguishable in the reply. This is the line that separates them, and the one that ended the
+	// guessing about an episode torrentio was serving 50 results for.
+	//
+	// EMPTY only. The condition used to also fire on `len(ranked) < len(seeds)`, which is true whenever
+	// the result cap trims — twenty of them, by default, on any popular title — so a line written for
+	// the case worth investigating printed on very nearly every request and buried itself. "Some were
+	// dropped" is now a counter on /metrics and an exact answer on ?debug=1; this stays for the one
+	// outcome that is genuinely worth a line in the log.
+	if len(ranked) == 0 {
 		log.Printf("scout: %s %s: scraped %d → ranked %d (cachedOnly=%t year=%v filters: res=%v minSeed=%d maxGB=%v cam=%t hdr=%t)",
 			sid.Type, sid.IMDb, len(seeds), len(ranked), effCachedOnly, expectedYear,
 			config.Filters.Resolutions, config.Filters.MinSeeders, config.Filters.MaxSizeGB,
 			config.Filters.ExcludeCam, config.Filters.HDROnly)
 	}
+	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
+	// the viewer will see; before serialisation, so a cached probe rides along in this same response.
 	h.probeTop(ctx, config, ranked, sid, truth)
 
 	out := make([]streamOut, 0, len(ranked))
 	for _, s := range ranked {
 		out = append(out, toStremioStream(s, sid, origin, configBlob))
 	}
-	body, _ := json.Marshal(streamsResponse{Streams: out})
+	body, _ := json.Marshal(streamsResponse{Streams: out, Debug: dbg})
 	etag := etagFor(string(body))
 	// A list missing one indexer's releases is worth serving and worth caching — just not for as long
 	// as a complete one. Refusing to cache it at all put the full scrape and a fresh debrid fan-out on
@@ -494,7 +530,9 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	default:
 		metrics.buildOK.Add(1)
 	}
-	if !degraded {
+	// A debug build carries accounting in its body and must not become the entry every other viewer is
+	// served — nor displace a good one.
+	if !degraded && dbg == nil {
 		if !scrapeComplete {
 			log.Printf("scout: %s %s: an indexer did not answer; caching this list for %s only",
 				sid.Type, sid.IMDb, ttl)
@@ -744,6 +782,9 @@ type streamHints struct {
 
 type streamsResponse struct {
 	Streams []streamOut `json:"streams"`
+	// Present only for ?debug=1. omitempty on a nil pointer, so a normal response is byte-identical to
+	// what it was before this existed — which matters, because the ETag is a hash of it.
+	Debug *rankDebug `json:"debug,omitempty"`
 }
 
 func toStremioStream(s RawStream, sid *StreamID, origin, configBlob string) streamOut {
