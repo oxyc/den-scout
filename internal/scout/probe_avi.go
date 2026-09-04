@@ -5,6 +5,10 @@ import (
 	"strings"
 )
 
+// maxAVIDepth bounds LIST/RIFF nesting. A real AVI reaches depth 3 (RIFF > hdrl > strl); anything past
+// this is a file built to make the parser recurse, not to be played.
+const maxAVIDepth = 16
+
 // AVI carries no language metadata at all — the format predates the idea — so this reads only what it
 // does know: the codec. That still matters, because the fourcc is how an XviD rip announces itself, and
 // those decode in software on an Apple TV: no hardware decoder, no native transport, no scrubber.
@@ -14,8 +18,16 @@ func parseAVI(head []byte) (Probe, bool) {
 	}
 	p := Probe{Container: "avi"}
 	var lastKind string
-	var walk func(buf []byte, start, end int)
-	walk = func(buf []byte, start, end int) {
+	var walk func(buf []byte, start, end, depth int)
+	walk = func(buf []byte, start, end, depth int) {
+		// A nested LIST costs 12 bytes, so a crafted megabyte head buys roughly 87,000 stack frames of
+		// recursion — the one quantity in the three container parsers that the input controls without a
+		// ceiling. It terminates and corrupts nothing, but it is stack a remote server asked for, inside
+		// a 256 MiB container, on the path where its bytes are least trustworthy. A real file nests
+		// RIFF > hdrl > strl and stops; the bound is loose enough that no honest muxer can reach it.
+		if depth > maxAVIDepth {
+			return
+		}
 		i := start
 		for i+8 <= end && i+8 <= len(buf) {
 			id := string(buf[i : i+4])
@@ -30,7 +42,7 @@ func parseAVI(head []byte) (Probe, bool) {
 				if stop > len(buf) {
 					stop = len(buf)
 				}
-				walk(buf, body+4, stop)
+				walk(buf, body+4, stop, depth+1)
 			case "strf":
 				// Follows the strh it belongs to; for audio it is a WAVEFORMATEX whose second field is
 				// the channel count.
@@ -62,7 +74,7 @@ func parseAVI(head []byte) (Probe, bool) {
 			}
 		}
 	}
-	walk(head, 12, len(head))
+	walk(head, 12, len(head), 0)
 	if p.VideoCodec == "" && p.UntaggedAudio == 0 {
 		return Probe{}, false
 	}

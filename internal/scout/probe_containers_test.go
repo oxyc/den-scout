@@ -26,6 +26,39 @@ func TestParseHead_avi(t *testing.T) {
 	}
 }
 
+// nestedAVI builds an AVI head that nests `depth` LIST chunks and puts a single audio strh at the
+// bottom. Each level costs 12 bytes, so a megabyte of head buys tens of thousands of them — the shape a
+// file would take if it were built to make the parser recurse rather than to be played.
+func nestedAVI(depth int) []byte {
+	head := []byte("RIFF\xff\xff\xff\xffAVI ")
+	for i := 0; i < depth; i++ {
+		// A size larger than the buffer, which the walker clamps to the end — so every level nests
+		// rather than running out.
+		head = append(head, "LIST\xf0\xff\xff\xffjunk"...)
+	}
+	// strh: an audio stream header. Read only if the walk actually descended this far.
+	head = append(head, "strh\x08\x00\x00\x00audsxvid"...)
+	return head
+}
+
+// The walk stops at a bounded depth. Nesting is the only quantity in the three container parsers that
+// the input controls with no ceiling, and these are bytes a remote server chose.
+func TestParseAVI_boundsNestingDepth(t *testing.T) {
+	// Just inside the bound: the strh is reached and counted, so the bound is not simply refusing files.
+	shallow, ok := parseAVI(nestedAVI(maxAVIDepth - 1))
+	if !ok || shallow.UntaggedAudio != 1 {
+		t.Fatalf("shallow nesting: ok=%v untaggedAudio=%d, want a track found", ok, shallow.UntaggedAudio)
+	}
+	// Past it: the walk returns before reaching the strh, so nothing is read and nothing is claimed.
+	if deep, ok := parseAVI(nestedAVI(maxAVIDepth + 1)); ok || deep.UntaggedAudio != 0 {
+		t.Fatalf("deep nesting: ok=%v untaggedAudio=%d, want the walk to have stopped", ok, deep.UntaggedAudio)
+	}
+	// A depth bomb the size of a real probe read returns instead of recursing tens of thousands deep.
+	if _, ok := parseAVI(nestedAVI(80_000)); ok {
+		t.Fatal("a depth bomb produced a probe result")
+	}
+}
+
 // A real MP4, so the box walking and mdhd's packed language are exercised against something a muxer
 // actually produced.
 func TestParseHead_mp4(t *testing.T) {
