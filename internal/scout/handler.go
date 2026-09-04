@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,17 @@ const (
 	// appear soon after that indexer recovers; long enough that a flaky upstream does not put the full
 	// scrape and a debrid fan-out on every single request.
 	partialListTTL = time.Minute
+	// How long past its freshness a COMPLETE list may still be served while a rebuild runs behind it.
+	//
+	// The response header has advertised stale-while-revalidate since this route existed, and the server
+	// implemented none of it: the request that arrived one second after expiry paid the whole eight-second
+	// scrape plus a debrid cache-check fan-out, with a perfectly good list sitting in memory.
+	//
+	// Two minutes, not another full TTL. The window only has to cover the moment of expiry — a rebuild
+	// finishes well inside it — and every second added here is a second every cached list occupies memory
+	// and disk. It also bounds how wrong a served list may be: torrent availability moves, and a list
+	// stale by an hour is not a kindness.
+	staleServeWindow = 2 * time.Minute
 )
 
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
@@ -192,6 +204,10 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	listCache := fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
 	partialSec := int(partialListTTL.Seconds())
 	partialListCache := fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d", partialSec, partialSec)
+	// A stale body carries a short freshness window and no stale-if-error: the client should come back
+	// soon, by which time the rebuild this response kicked off has landed. Holding a stale list for the
+	// full TTL — and a day on any later error — is what the server is fixing, not something to pass on.
+	staleListCache := fmt.Sprintf("public, max-age=%d", partialSec)
 	origin := h.publicOrigin(r)
 	// audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
 	cacheKey := "list:" + keyHash(configBlob) + ":" + keyHash(origin) + ":" + streamCacheID(sid)
@@ -201,10 +217,17 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		// next requester — Stremio races and cancels addon requests, so that happens routinely — was told
 		// to hold a knowingly-short list for five minutes and a day on stale-if-error, which is the harm
 		// the shortening exists to prevent, defeated one branch over.
-		complete, etag, body := splitCached(hit)
+		complete, freshUntil, etag, body := splitCached(hit)
 		header := listCache
-		if !complete {
+		switch {
+		case !complete:
 			header = partialListCache
+		case freshUntil > 0 && time.Now().Unix() >= freshUntil:
+			// Stale but complete: answer now from what we have and refresh behind the reply. Only
+			// COMPLETE lists get this — serving a knowingly-short one past its own expiry is the harm
+			// the branch above exists to prevent, and a longer life is the last thing it should get.
+			header = staleListCache
+			h.rebuildBehind(r, configBlob, sid, origin, cacheKey)
 		}
 		h.conditional(w, r, body, etag, jsonType, header)
 		return
@@ -232,7 +255,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	if res.degraded != "" {
 		w.Header().Set("X-Scout-Degraded", res.degraded)
 	}
-	_, etag, body := splitCached(res.value)
+	_, _, etag, body := splitCached(res.value)
 	// A degraded build is deliberately not cached server-side, "so the next request retries instead of
 	// serving the blip for the whole TTL" — and then the same body went out with `max-age=300,
 	// stale-if-error=86400`, which URLSession's shared cache honours. The guard was defeated one layer
@@ -249,6 +272,34 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		cacheHeader = partialListCache
 	}
 	h.conditional(w, r, body, etag, jsonType, cacheHeader)
+}
+
+// rebuildBehind refreshes an expired list after the stale answer has gone out.
+//
+// Deduped through the same singleflight key the foreground build uses, so a burst of viewers arriving on
+// an expired title produces one scrape — and a foreground build already in flight absorbs this one rather
+// than racing it.
+//
+// Its own context, not the request's: the reply is already written, so inheriting it would cancel the
+// rebuild immediately. The config is decoded HERE rather than on the hit path, because a warm hit must
+// keep paying nothing for decode/validate — this runs only on the rare stale hit.
+func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamID, origin, cacheKey string) {
+	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
+	if !ok {
+		return // it decoded when the entry was built; if it no longer does, serving stale is all we can do
+	}
+	go func() {
+		// The same lesson as the probe fan-out: this is a background goroutine, so the recover() on the
+		// request goroutine cannot see a panic raised here, and an unrecovered one takes the process down.
+		defer recoverProbe("stale list rebuild")
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()),
+			h.deps.ScrapeTimeout+listBuildSlack)
+		defer cancel()
+		_, _, _ = h.sf.Do(cacheKey, func() (any, error) {
+			value, degraded, complete := h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey)
+			return buildResult{value: value, degraded: degraded, complete: complete}, nil
+		})
+	}()
 }
 
 // buildResult carries the singleflight build's body plus a degraded reason ("" when healthy).
@@ -404,19 +455,31 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	}
 	body, _ := json.Marshal(streamsResponse{Streams: out})
 	etag := etagFor(string(body))
-	value := joinCached(scrapeComplete, etag, string(body))
+	// A list missing one indexer's releases is worth serving and worth caching — just not for as long
+	// as a complete one. Refusing to cache it at all put the full scrape and a fresh debrid fan-out on
+	// every single request whenever one upstream was flaky, which is a worse answer than the slightly
+	// short list it was protecting against.
+	ttl := h.deps.ListTTL
+	if !scrapeComplete {
+		ttl = partialListTTL
+	}
+	// The entry outlives its freshness by staleServeWindow so the hit path can answer from it while a
+	// rebuild runs — but only when it is COMPLETE. A partial list expires exactly when it says it does:
+	// it is already knowingly short, and the one thing it must not get is a longer life.
+	now := time.Now()
+	freshUntil := int64(0)
+	hold := ttl
+	if scrapeComplete {
+		freshUntil = now.Add(ttl).Unix()
+		hold = ttl + staleServeWindow
+	}
+	value := joinCached(scrapeComplete, freshUntil, etag, string(body))
 	if !degraded {
-		// A list missing one indexer's releases is worth serving and worth caching — just not for as long
-		// as a complete one. Refusing to cache it at all put the full scrape and a fresh debrid fan-out on
-		// every single request whenever one upstream was flaky, which is a worse answer than the slightly
-		// short list it was protecting against.
-		ttl := h.deps.ListTTL
 		if !scrapeComplete {
-			ttl = partialListTTL
 			log.Printf("scout: %s %s: an indexer did not answer; caching this list for %s only",
 				sid.Type, sid.IMDb, ttl)
 		}
-		h.deps.Cache.Put(cacheKey, value, ttl)
+		h.deps.Cache.Put(cacheKey, value, hold)
 	}
 	return value, degradedReason, scrapeComplete
 }
@@ -768,15 +831,21 @@ func etagMatches(ifNoneMatch, etag string) bool {
 	return false
 }
 
-// A cached list is "<complete>\x00<etag>\x00<body>". The completeness is stored with the entry because
-// the cache-hit branch has to answer the same question the build did, and could not otherwise know.
-func splitCached(v string) (complete bool, etag, body string) {
+// A cached list is "<complete>[|<fresh-until-unix>]\x00<etag>\x00<body>". Completeness is stored with the
+// entry because the cache-hit branch has to answer the same question the build did, and could not
+// otherwise know; the freshness stamp is stored beside it because the entry now OUTLIVES its freshness
+// (see staleServeWindow) and only the entry itself knows when it stopped being current.
+//
+// The stamp is a suffix on the existing first field rather than a fourth field, so that an entry written
+// by an older build — a disk tier surviving a redeploy is exactly when that happens — still parses here,
+// and so that the hot path stays two IndexByte calls and no allocation.
+func splitCached(v string) (complete bool, freshUntil int64, etag, body string) {
 	first := strings.IndexByte(v, '\x00')
 	if first < 0 {
 		// No separator at all: completeness unknown, so the same conservative answer as the legacy
 		// one-separator case below. Claiming completeness here while denying it three lines down would be
 		// two answers to one question.
-		return false, "", v
+		return false, 0, "", v
 	}
 	rest := v[first+1:]
 	second := strings.IndexByte(rest, '\x00')
@@ -785,15 +854,25 @@ func splitCached(v string) (complete bool, etag, body string) {
 		// exactly when short lists are in flight, and claiming completeness for one would serve it with a
 		// five-minute max-age and a day of stale-if-error — the harm this format exists to prevent. The
 		// cost of being wrong the other way is one extra scrape within the minute.
-		return false, v[:first], rest
+		return false, 0, v[:first], rest
 	}
-	return v[:first] == "1", rest[:second], rest[second+1:]
+	flag := v[:first]
+	// A stamp-less entry predates this format. It was written with its freshness AS its expiry, so the
+	// cache holding it at all is proof it is still fresh — freshUntil 0 says exactly that.
+	if bar := strings.IndexByte(flag, '|'); bar >= 0 {
+		freshUntil, _ = strconv.ParseInt(flag[bar+1:], 10, 64)
+		flag = flag[:bar]
+	}
+	return flag == "1", freshUntil, rest[:second], rest[second+1:]
 }
 
-func joinCached(complete bool, etag, body string) string {
+func joinCached(complete bool, freshUntil int64, etag, body string) string {
 	flag := "0"
 	if complete {
 		flag = "1"
+	}
+	if freshUntil > 0 {
+		flag += "|" + strconv.FormatInt(freshUntil, 10)
 	}
 	return flag + "\x00" + etag + "\x00" + body
 }

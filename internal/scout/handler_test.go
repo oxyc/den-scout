@@ -688,13 +688,117 @@ func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
 	}
 }
 
+// recordingCache remembers the key a list was written under, so a test can age that entry without having
+// to rebuild the handler's cache-key formula.
+type recordingCache struct {
+	Cache
+	mu   sync.Mutex
+	last string
+}
+
+func (c *recordingCache) Put(key, value string, ttl time.Duration) {
+	c.mu.Lock()
+	c.last = key
+	c.mu.Unlock()
+	c.Cache.Put(key, value, ttl)
+}
+
+func (c *recordingCache) lastKey() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.last
+}
+
+// An expired-but-complete list is answered from immediately, with the rebuild running behind the reply.
+//
+// The response header has advertised stale-while-revalidate since this route existed and the server
+// implemented none of it: a request one second past expiry paid the whole scrape plus a debrid
+// cache-check fan-out with a good list sitting right there.
+func TestStreamList_servesStaleWhileRebuilding(t *testing.T) {
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	scraped := make(chan struct{}, 4)
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.Cache = cache
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				scraped <- struct{}{}
+				return testSeeds(), nil
+			}}}
+		}
+	}))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+
+	cold := do(h, path, nil)
+	if cold.Code != 200 {
+		t.Fatalf("cold build: %d", cold.Code)
+	}
+	<-scraped
+
+	// Age the entry past its freshness without touching its physical expiry — exactly the state the
+	// staleServeWindow exists to hold.
+	key := cache.lastKey()
+	held, ok := cache.Get(key)
+	if !ok {
+		t.Fatal("the cold build cached nothing")
+	}
+	complete, _, etag, body := splitCached(held)
+	cache.Put(key, joinCached(complete, time.Now().Add(-time.Second).Unix(), etag, body), time.Minute)
+
+	stale := do(h, path, nil)
+	if stale.Code != 200 {
+		t.Fatalf("stale hit: %d", stale.Code)
+	}
+	if stale.Body.String() != body {
+		t.Error("the stale hit did not serve the cached body")
+	}
+	// Told to come back soon, and NOT given stale-if-error: holding a stale list for the full TTL, and a
+	// day on any later error, is the harm being fixed rather than something to pass on to the device.
+	if cc := stale.Header().Get("cache-control"); cc != "public, max-age=60" {
+		t.Errorf("stale cache-control = %q", cc)
+	}
+	select {
+	case <-scraped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no rebuild ran behind the stale answer — the entry would just expire")
+	}
+}
+
+// A partial list must never be served stale. It is already knowingly short, and a longer life is the one
+// thing it must not get — the same harm the shortened header exists to prevent, one branch over.
+func TestStreamList_partialListGetsNoStaleWindow(t *testing.T) {
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.Cache = cache
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{
+				fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) { return testSeeds(), nil }},
+				fakeScraper{"comet", func(context.Context) ([]RawStream, error) { return nil, context.Canceled }},
+			}
+		}
+	}))
+	if rr := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil); rr.Code != 200 {
+		t.Fatalf("partial build: %d", rr.Code)
+	}
+	held, ok := cache.Get(cache.lastKey())
+	if !ok {
+		t.Fatal("the partial build cached nothing")
+	}
+	complete, freshUntil, _, _ := splitCached(held)
+	if complete {
+		t.Fatal("a scrape with a failed indexer was recorded as complete")
+	}
+	if freshUntil != 0 {
+		t.Errorf("a partial list carries a freshness stamp (%d) — it would outlive its own expiry", freshUntil)
+	}
+}
+
 // A cached entry written by an older build has no completeness recorded, and must be read as INCOMPLETE.
 //
 // A redeploy is exactly when short lists are in flight. Claiming completeness for one served it with a
 // five-minute max-age and a day of stale-if-error — the harm the three-part format exists to prevent,
 // reached through the one branch that handles entries surviving a deploy.
 func TestSplitCached_readsAnOlderEntryConservatively(t *testing.T) {
-	complete, etag, body := splitCached("W/\"abc\"\x00{\"streams\":[]}")
+	complete, _, etag, body := splitCached("W/\"abc\"\x00{\"streams\":[]}")
 	if complete {
 		t.Error("an entry with no completeness recorded must not be assumed complete")
 	}
@@ -704,15 +808,25 @@ func TestSplitCached_readsAnOlderEntryConservatively(t *testing.T) {
 
 	// And the round trip of the current format.
 	for _, want := range []bool{true, false} {
-		got, e, b := splitCached(joinCached(want, "E", "B"))
+		got, _, e, b := splitCached(joinCached(want, 0, "E", "B"))
 		if got != want || e != "E" || b != "B" {
 			t.Errorf("round trip complete=%v: got %v %q %q", want, got, e, b)
 		}
 	}
 	// A body containing the separator must not be truncated.
-	_, _, weird := splitCached(joinCached(true, "E", "a\x00b"))
+	_, _, _, weird := splitCached(joinCached(true, 0, "E", "a\x00b"))
 	if weird != "a\x00b" {
 		t.Errorf("body with a separator was truncated: %q", weird)
+	}
+	// The freshness stamp round-trips beside completeness.
+	if c, f, e, b := splitCached(joinCached(true, 1757000000, "E", "B")); !c || f != 1757000000 || e != "E" || b != "B" {
+		t.Errorf("stamped round trip: complete=%v fresh=%d etag=%q body=%q", c, f, e, b)
+	}
+	// A three-field entry from a build that predates the stamp reports freshUntil 0 — "no stamp", which
+	// the hit path reads as fresh. It has to: such an entry was written with its freshness AS its expiry,
+	// so the cache still holding it is proof it has not passed.
+	if c, f, _, _ := splitCached("1\x00E\x00B"); !c || f != 0 {
+		t.Errorf("pre-stamp entry: complete=%v freshUntil=%d, want complete with no stamp", c, f)
 	}
 }
 
@@ -721,8 +835,8 @@ func TestSplitCached_readsAnOlderEntryConservatively(t *testing.T) {
 // into trouble in the first place.
 func TestSplitCached_treatsEveryUnknownFormTheSameWay(t *testing.T) {
 	bare, oneSep := "just-a-body", "etag\x00body"
-	bareComplete, _, bareBody := splitCached(bare)
-	sepComplete, _, _ := splitCached(oneSep)
+	bareComplete, _, _, bareBody := splitCached(bare)
+	sepComplete, _, _, _ := splitCached(oneSep)
 	if bareComplete != sepComplete {
 		t.Errorf("unknown completeness answered %v with no separator and %v with one", bareComplete, sepComplete)
 	}
