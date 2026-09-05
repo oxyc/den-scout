@@ -1271,6 +1271,35 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		}
 	}
 
+	// Every place a body can be cut off is transient, and each has its own completeness check to get past.
+	// The decoder ends a loop for a read error exactly as it does for a closed bracket, so asking "was
+	// anything usable?" or "was the envelope good?" before reading that bracket classifies a blip as
+	// permanent — and a memoised blip suppresses the one retry that rediscovers a queued torrent.
+	//
+	// The array case is the subtle one: it needs an entry that PARSED and was then filtered, so the
+	// question "entries seen, none usable" is reachable before the array is known to have closed.
+	for _, cut := range []struct{ name, body string }{
+		{"inside data, after an unusable entry", `{"success":true,"data":[{"id":1,"hash":"tooshort"}`},
+		{"data closed, outer object not", `{"success":true,"data":[]`},
+	} {
+		n := 0
+		s := &torBoxStore{token: "cut-" + cut.name, api: torboxAPI, cache: NewMemoryCache(1 << 20),
+			client: mockDoer{func(*http.Request) (*http.Response, error) {
+				n++
+				return resp(200, cut.body), nil
+			}}}
+		for i := 0; i < 3; i++ {
+			if ids, ok := s.accountListing(context.Background()); ok || ids != nil {
+				t.Fatalf("%s: a truncated listing must not read as an answer", cut.name)
+			}
+		}
+		if n != 3 {
+			t.Errorf("%s: pulled %d times for three attempts — a truncated body was remembered as a "+
+				"permanent fault, and that retry is the only thing that rediscovers a queued torrent",
+				cut.name, n)
+		}
+	}
+
 	// But a body CUT OFF in the OUTER object reaches the same place and is transient — the decoder reports
 	// "no more" for a read error exactly as it does for a closed object, and only reading the closing token
 	// tells them apart. The fixture has to be cut where the envelope ends, not inside `data`: a truncated

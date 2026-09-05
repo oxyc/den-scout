@@ -1887,11 +1887,17 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 				// The filter above made this reachable at any size, not just past the entry cap: if TorBox
 				// renames `hash` — a v2 API, or `infohash` — every entry filters out at once. An account
 				// that genuinely holds nothing sends no entries at all, so it still answers authoritatively.
-				if seen > 0 && len(ids) == 0 {
-					return nil, false, listingNoUsableEntries
-				}
+				// The closing bracket FIRST: "no usable entries" is a statement about a complete array, and
+				// dec.More() ends the loop for a read error exactly as it does for a closed one. Asking the
+				// question before the array is known complete classified a body cut off after an unusable
+				// entry as a persistent fault, memoising a blip for fifteen seconds and suppressing the one
+				// retry that rediscovers a queued torrent — the same ordering mistake as the envelope check
+				// below, one level in.
 				if _, err := dec.Token(); err != nil { // closing ]
 					return nil, false, listingFaultNone
+				}
+				if seen > 0 && len(ids) == 0 {
+					return nil, false, listingNoUsableEntries
 				}
 			}
 		default:
