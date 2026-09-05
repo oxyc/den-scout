@@ -137,6 +137,28 @@ being generous rather than the tests being isolated.
   (raw passthrough only when there's no list — single-file fast path / list failure).
 - RD + Premiumize now prefer the episode name-match over the positional `fileIdx`.
 
+**Residual: an absolute-numbered pack gets a confidently wrong episode.** `largestEpisodeCandidate`
+only excludes files that *rule themselves out* by naming a different episode, and `labelledEpisodeRe`
+does not recognise bare absolute numbering (`Show - 24.mkv`), which is the normal shape for anime on
+public indexers. So no file in such a pack rules itself out, the last-resort "largest video" fires, and
+the answer tracks SIZE rather than the episode asked for. Measured on a two-file pack:
+
+```
+Show - 24.mkv (1 GiB) + Show - 25.mkv (3 GiB), asked S02E01 → Show - 25.mkv
+Show - 24.mkv (3 GiB) + Show - 25.mkv (1 GiB), asked S02E01 → Show - 24.mkv
+Show - 24.mkv (3 GiB) + Show - 25.mkv (1 GiB), asked S01E01 → Show - 24.mkv
+```
+
+The third is the sharp one: episode 1 is plainly not in a pack of episodes 24 and 25, and it is served
+with a 302 and no error. A *labelled* pack missing the episode refuses correctly
+(`torrent holds no file for that episode`), so the two spellings of the same situation behave opposite
+ways — and the wrong-episode-with-a-302 symptom is the one `unlabelledCandidates` was written to remove.
+
+Not fixed here because the fallback is load-bearing for the shape it was built for — a single feature
+plus a sample, where the largest video IS the episode — and narrowing it means teaching the matcher
+absolute numbering, which needs the season's episode count to map E01 of season 2 onto absolute 25.
+That is a real feature, not a guard. Revisit with #13's other residual.
+
 **Residual (minor):** the *precedence* when a `fileIdx` is present WITHOUT an episode selector for a
 movie delivered inside a multi-file pack is still best-effort (raw/positional). Rare; revisit only if a
 concrete miss shows up. RD/PM still identify files positionally into their own listing, which holds for

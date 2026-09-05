@@ -201,8 +201,15 @@ func TestAttributes_titleAndProbeAgreeOnCodecSpelling(t *testing.T) {
 				t.Errorf("matroska %q → %q, but the title path says %q — one codec, two spellings, so "+
 					"the value flips when the probe lands", tc.matroskaID, s, tc.codec)
 			}
+			// AVI and MP4 share codecFromFourCC but hand it different spellings — an AVI fourCC and an
+			// MP4 sample-entry type. Both are asserted, because "avc1" and "h264" landing on the same
+			// answer is the agreement being claimed, not an incidental one.
 			if s := codecFromFourCC(tc.fourCC); s != tc.codec {
-				t.Errorf("fourCC %q → %q, but the title path says %q", tc.fourCC, s, tc.codec)
+				t.Errorf("avi fourCC %q → %q, but the title path says %q", tc.fourCC, s, tc.codec)
+			}
+			if s := codecFromFourCC(tc.mp4SampleEntry); s != tc.codec {
+				t.Errorf("mp4 sample entry %q → %q, but the title path says %q",
+					tc.mp4SampleEntry, s, tc.codec)
 			}
 		})
 	}
