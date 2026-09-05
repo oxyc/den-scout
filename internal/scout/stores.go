@@ -2756,9 +2756,15 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 		// debrid is refusing and stops the client trying other sources — for a release RD demonstrably
 		// holds. Because this path runs on every poll and each one re-stamps the record, it never lapsed
 		// while the blip lasted. The same narrowing TorBox's read path already makes.
+		//
+		// recordRefusalFor, not recordRefusal: this chain is now reachable by a NoAdd caller (the probe
+		// route asks any store holding an id), and the per-release key is an add-path guard a read-only
+		// resolve is exempt from READING — so it must not write one either, or a probe poll gates the
+		// next /play behind a minute of backoff with no upstream call. TorBox already honours that
+		// contract; RD's read path predates the probe ever reaching it.
 		var refusedUs *StoreUnavailableError
 		if errors.As(err, &refusedUs) {
-			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+			recordRefusalFor(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err, t.NoAdd)
 		}
 		// Only a definitive "no such torrent" forgets the id. An empty file list, a throttle or a timeout
 		// all describe this attempt, not what the account holds — forgetting on those re-bought the
@@ -2803,7 +2809,7 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 		if storeRefusedUs(sel.StatusCode) {
 			refused := &StoreUnavailableError{Service: ServiceRealDebrid, Status: sel.StatusCode,
 				Reason: fmt.Sprintf("selectFiles http %d", sel.StatusCode)}
-			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, refused)
+			recordRefusalFor(s.cache, ServiceRealDebrid, s.token, t.InfoHash, refused, t.NoAdd)
 			return "", refused
 		}
 		return "", &DeadLinkError{fmt.Sprintf("realdebrid selectFiles http %d", sel.StatusCode)}
@@ -2814,7 +2820,7 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 		// one extra walk of the whole chain before the first `info` caught it on the next poll.
 		var refusedUs *StoreUnavailableError
 		if errors.As(err, &refusedUs) {
-			recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+			recordRefusalFor(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err, t.NoAdd)
 		}
 		return "", err
 	}
@@ -2831,7 +2837,7 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 	// whole chain again to reach the same throttled endpoint.
 	var refusedUs *StoreUnavailableError
 	if errors.As(err, &refusedUs) {
-		recordRefusal(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err)
+		recordRefusalFor(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err, t.NoAdd)
 	}
 	return got, err
 }
@@ -3064,8 +3070,18 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// it this way for the same reason — a read-only caller cannot have caused a backoff and must not be
 	// blocked by one.
 	//
-	// directdl queues a transfer for anything the account does not already hold, so it is an add.
-	if t.NoAdd {
+	// directdl queues a transfer for anything the account does not already hold, so it is an add — EXCEPT
+	// for a transfer we already queued, where it is the read that discovers the transfer finished. The
+	// charge below is skipped in exactly that case (`if !queued`), so letting a read-only caller through
+	// here buys nothing and costs nothing.
+	//
+	// Refusing it unconditionally is what left the probe route unable to see a Premiumize release become
+	// READY. Nothing on that path can clear pmQueuedKey — settleQueuedTransfer is reached only from the
+	// content branch below, which this return made unreachable for a NoAdd caller — so once scout queued
+	// a transfer the probe answered 202 "downloading" until the marker aged past pendingGiveUp and then
+	// 404, never 200, while /play answered 302 with a playable link. Measured on a completed transfer:
+	// probe 202, /play 302, on the one URL that exists to tell a client its download landed.
+	if t.NoAdd && !alreadyQueued(s.cache, s.token, t.InfoHash) {
 		return "", errWouldAdd
 	}
 	// The account gate the other two have. It was genuinely redundant here — `backedOff` consults the

@@ -666,6 +666,13 @@ func TestProbe_aTorrentRealDebridAlreadyHoldsReadsAsReady(t *testing.T) {
 	}
 }
 
+// NOTE ON THIS TEST'S SCOPE: it pins premiumizeStore.AddInFlight at three marker ages and nothing else.
+// It does NOT observe the agreement between the two routes, despite what an earlier version of this
+// comment claimed — and that overclaim is why two real disagreements passed it: a queued transfer that
+// directdl had since REFUSED, and one that had since COMPLETED. Its fixture answers
+// success-with-no-content for every call, which is the one case where the marker alone is right. The
+// route-level agreements are pinned by the two tests below it.
+//
 // Premiumize has a second way to be mid-fetch, and the probe could not see it either.
 //
 // directdl answering success with empty content means the transfer was queued: the store stamps
@@ -702,6 +709,37 @@ func TestProbeAndPlay_agreeAboutAPremiumizeTransferAtBothEndsOfTheWindow(t *test
 					"/play does", got, tc.wantQueued)
 			}
 		})
+	}
+}
+
+// HoldingServices asks EVERY store, and builds Real-Debrid's key the way /play writes it.
+//
+// Two gaps in one: the loop had no multi-store fixture, so stopping after the first store passed the
+// whole suite; and the only test used a movie target, so dropping season/episode from the RD key — which
+// would make the fix silently do nothing for series, most of the traffic — also passed.
+func TestHoldingServices_asksEveryStoreAndKeysEpisodesCorrectly(t *testing.T) {
+	token, hash := "holding", repeat("3", 40)
+	cache := NewMemoryCache(1 << 20)
+	season, episode := 2, 5
+	target := ResolveTarget{InfoHash: hash, Season: &season, Episode: &episode}
+	// Written the way /play writes it, episode selector and all, on the store asked LAST.
+	cache.Put(rdTorrentKey(token, hash, target), "RDID-S2E5", time.Hour)
+
+	pool := &StorePool{stores: []Store{
+		&torBoxStore{token: token, cache: cache, api: torboxAPI},
+		&realDebridStore{token: token, cache: cache, api: realDebridAPI},
+	}}
+
+	held := pool.HoldingServices(target)
+	if len(held) != 1 || held[0] != ServiceRealDebrid {
+		t.Errorf("HoldingServices = %v, want [realdebrid] — either the loop stopped at the first store, "+
+			"or the episode selector is missing from the key, which makes the whole enquiry a no-op for "+
+			"series", held)
+	}
+	// A different episode of the same pack is a different entry, so it must NOT match.
+	other := 6
+	if got := pool.HoldingServices(ResolveTarget{InfoHash: hash, Season: &season, Episode: &other}); len(got) != 0 {
+		t.Errorf("episode 6 matched episode 5's entry: %v", got)
 	}
 }
 
@@ -751,6 +789,55 @@ func TestProbeAndPlay_agreeWhenAQueuedPremiumizeTransferIsRefused(t *testing.T) 
 		t.Errorf("?probe=1 = %d (%s), /play = %d (%s) — one vocabulary, two answers",
 			probe.Code, strings.TrimSpace(probe.Body.String()),
 			play.Code, strings.TrimSpace(play.Body.String()))
+	}
+}
+
+// A Premiumize transfer that has COMPLETED must read as ready, not as still downloading.
+//
+// Nothing on the probe path could clear pmQueuedKey: settleQueuedTransfer is reached only from
+// directdl's content branch, and Premiumize refused a NoAdd target before consulting anything, so the
+// probe never called directdl and the marker went on saying "coming". The probe therefore never
+// transitioned to ready for Premiumize at all — 202 until the marker aged past pendingGiveUp, then 404,
+// while /play answered 302 with a playable link. Measured before the fix: probe 202, /play 302.
+//
+// For an already-queued transfer directdl is a READ — the charge is suppressed in exactly that case —
+// so letting a read-only caller through buys nothing and is the only way to discover completion.
+func TestProbeAndPlay_agreeWhenAPremiumizeTransferCompletes(t *testing.T) {
+	token, hash := "pm-complete", repeat("2", 40)
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+
+	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "cache/check") {
+			return resp(200, `{"status":"success","response":[true]}`), nil
+		}
+		return resp(200, `{"status":"success","content":[`+
+			`{"path":"Movie.mkv","link":"https://pm.example/final.mkv","size":100}]}`), nil
+	}}
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&premiumizeStore{token: token, cache: cache, api: premiumizeAPI, client: client}}
+		},
+	})
+	pmBlob := blob(`{"debrid":[{"service":"premiumize","token":"` + token + `"}],` +
+		`"indexers":["torrentio"],"resultCap":20}`)
+	tok := encodePlayToken(PlayTarget{InfoHash: hash})
+
+	probe := httptest.NewRecorder()
+	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
+	play := httptest.NewRecorder()
+	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok, nil))
+
+	if play.Code != http.StatusFound {
+		t.Fatalf("/play = %d, want 302 — the fixture is not serving a completed transfer", play.Code)
+	}
+	if probe.Code == http.StatusAccepted {
+		t.Errorf("?probe=1 still says downloading (%s) while /play serves a 302 — the client polling to "+
+			"learn its download landed never finds out", strings.TrimSpace(probe.Body.String()))
+	}
+	if probe.Code != http.StatusOK {
+		t.Errorf("?probe=1 = %d (%s), want 200 ready", probe.Code, strings.TrimSpace(probe.Body.String()))
 	}
 }
 

@@ -1039,7 +1039,17 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// polls it on a two-second cadence — so it belongs under the ceiling statusBudget's own comment
 		// describes ("far under the resolve budget so a wait answers promptly instead of hanging the
 		// poll"), rather than pinning a goroutine and a connection for forty-five seconds against a slow
-		// debrid. It makes up to three upstream calls, all reads.
+		// debrid.
+		//
+		// It is NOT free, and an earlier note here saying "up to three upstream calls, all reads" is no
+		// longer true of either half. Since the readiness enquiry started asking any store that holds an
+		// id — the fix for a probe that answered 404 for a release /play served — a poll against a
+		// Real-Debrid holding walks that store's whole read chain: measured 4 calls when the release is
+		// ready (info, selectFiles, info, unrestrict/link) and 3 while it is still downloading, at a
+		// two-second cadence, with a state-changing selectFiles among them and a fresh unrestricted link
+		// minted and discarded on every ready poll. /play walks the same chain on the same cadence, so
+		// this is the cost of the two routes agreeing rather than a new class of work — but it is real,
+		// and it is recorded in FOLLOWUP.md rather than left as a comment claiming otherwise.
 		//
 		// The three SHARE this budget rather than each getting a slice, and the honest consequence is that
 		// a status read slow enough to spend all eight seconds leaves the cache check a dead context, so

@@ -94,6 +94,25 @@ Three ways out for the huge-scalar case, none free:
 Left alone deliberately. If TorBox ever legitimately returns listings near the cap, revisit — at that
 point the first option stops being a regression and starts being correct.
 
+## `?probe=1` now walks a store's read chain on every poll
+
+Not a defect — it is what makes the probe and `/play` agree — but it is a real cost, and the comment on
+the route understated it for a while, so it is recorded rather than left to be rediscovered.
+
+The readiness enquiry asks any store holding a torrent id, which was the fix for a probe answering 404
+`not_queued` for a release `/play` served a 302 for. For Real-Debrid that means the whole read chain per
+poll. Measured on an RD-held release:
+
+- **ready:** 4 calls — `GET info`, `POST selectFiles`, `GET info`, `POST unrestrict/link`
+- **still downloading:** 3 calls — `GET info`, `POST selectFiles`, `GET info`
+
+At the client's ~2s cadence that is roughly 90 RD calls a minute for the length of a download, including
+a state-changing `selectFiles` on every poll and a fresh unrestricted link minted and discarded on every
+ready poll. `/play` walks the same chain on the same cadence, so this is the price of the two routes
+agreeing rather than a new class of work — but if a real account is ever seen hitting an RD rate limit
+while polling, this is the first thing to look at. The obvious mitigation is a short-lived memo of the
+read chain's verdict, keyed per hash, which nothing needs yet.
+
 ## The test suite shares process-global state between tests
 
 Not a regression — both cases below reproduce at every commit tried, including before the audit branch.
