@@ -1740,6 +1740,7 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 	}
 	success := true
 	sawData := false
+	seen := 0
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
@@ -1791,14 +1792,30 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 					if dec.Decode(&e) != nil {
 						return nil, false, false
 					}
-					ids[strings.ToLower(e.Hash)] = e.ID
-					// The map is what this function retains, and its size is the ENTRY COUNT — which the
-					// byte cap does not bound: 60 MiB of minimal entries is ~1M of them and peaked at
-					// 346 MiB against a 230 MiB GOMEMLIMIT. No real account is near this; a body that is
-					// says something is wrong with the upstream, not with the account.
-					if len(ids) > maxListingEntries {
+					// A hash that could never be asked about is dropped BEFORE it is lowercased and
+					// retained. Entry count and byte count both miss this: the key is whatever the upstream
+					// sent, so one entry carrying a 60 MiB "hash" is one entry and 60 MiB — under both caps
+					// — and it decoded as a valid listing, retained the 60 MiB for the TTL, and allocated
+					// 248 MiB doing it, against a 230 MiB GOMEMLIMIT. ToLower is half of that, since it
+					// copies whenever the string is not already lower-case.
+					//
+					// Nothing is lost by dropping them: /play validates an infohash to 32-40 hex or base32
+					// before it ever reaches a lookup, so a key outside that range cannot match anything.
+					// The cap counts entries SEEN, and is checked BEFORE the length filter can skip past it.
+					// The byte cap does not bound the entry count: 60 MiB of minimal entries is ~1M of them
+					// and peaked at 346 MiB against a 230 MiB GOMEMLIMIT. Counting only what survived the
+					// filter — or leaving the check below a `continue` — would let a body of a million
+					// unusable hashes fall through to an empty map and be reported as an authoritative
+					// "this account holds nothing", which costs a duplicate add: worse than the retention
+					// the filter was added to prevent.
+					seen++
+					if seen > maxListingEntries {
 						return nil, false, true
 					}
+					if len(e.Hash) < 32 || len(e.Hash) > 40 {
+						continue
+					}
+					ids[strings.ToLower(e.Hash)] = e.ID
 				}
 				if _, err := dec.Token(); err != nil { // closing ]
 					return nil, false, false

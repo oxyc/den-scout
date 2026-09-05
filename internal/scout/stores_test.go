@@ -717,10 +717,15 @@ var listingFlightTestSeq atomic.Int64
 // measured inheriting a leader's 120 ms failure.
 func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// A token unique to this invocation, because listingFlight is process-wide and keyed on the token
-	// alone. With a fixed one, a -count rerun joins the PREVIOUS iteration's fetch — which is still live,
-	// because the leader's fetch is detached and outlives the test function that started it — takes that
-	// iteration's result, and never calls its own transport, so the leader blocks at <-arrivals forever
-	// and a legible failure becomes a package-wide timeout.
+	// alone. It matters on the FAILING paths: a t.Fatal runs the deferred release and returns without
+	// waiting for the detached fetch, so that fetch is still holding the flight when the next -count
+	// iteration starts — the rerun joins it, takes the previous iteration's result, never calls its own
+	// transport, and blocks at <-arrivals forever. A legible failure becomes a package-wide timeout,
+	// exactly when the message mattered.
+	//
+	// On the passing path there is no such window: singleflight deletes the key before it sends results,
+	// under one lock, so a caller either joins a live flight or starts a fresh one, and this test's last
+	// step waits for the joiner's result.
 	token := fmt.Sprintf("shared-%d", listingFlightTestSeq.Add(1))
 	release := make(chan struct{})
 	// Released on EVERY exit, including a t.Fatal, so a failing assertion never strands an in-flight fetch
@@ -766,19 +771,24 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// The leader: a long budget, and it goes away before the fetch completes. A DEADLINE, not a bare
 	// cancel — the leader's context is only carved into a detached one when it has a deadline to copy, so
 	// a cancel-only fixture leaves that whole branch unexecuted and the detachment untested.
+	// An ODD budget, not a round 30s: the assertion below has to distinguish "inherited the leader's
+	// deadline" from "was given some deadline of its own". Against a round number, replacing the copy with
+	// a hardcoded 29s ceiling passed — which is exactly the change someone would make while "fixing" the
+	// documented wart that a follower inherits a shorter leader's budget.
+	const leaderBudget = 31337 * time.Millisecond
 	leader := newStore(token)
-	leaderCtx, cancelLeader := context.WithTimeout(context.Background(), 30*time.Second)
+	leaderCtx, cancelLeader := context.WithTimeout(context.Background(), leaderBudget)
 	leaderDone := make(chan struct{})
 	go func() {
 		defer close(leaderDone)
 		_, _ = leader.accountListing(leaderCtx)
 	}()
 	<-arrivals // the fetch is in flight
-	// It runs detached from the leader's CANCELLATION but on the leader's CLOCK. Anything much under the
-	// 30 s given above means the deadline was not copied across.
-	if left := <-fetchDeadline; left < 25*time.Second {
-		t.Errorf("the detached fetch carried a %v deadline, want about the leader's 30s — the deadline "+
-			"was not copied onto the detached context", left)
+	// It runs detached from the leader's CANCELLATION but on the leader's CLOCK. Measured overhead between
+	// building the context and the transport call is under a millisecond, so a second is ample slack.
+	if left := <-fetchDeadline; left < leaderBudget-time.Second || left > leaderBudget {
+		t.Errorf("the detached fetch carried a %v deadline, want the leader's %v — it did not inherit the "+
+			"caller's clock", left, leaderBudget)
 	}
 
 	// A follower on the same account with a SHORT budget must not wait for the leader. Run in a goroutine
@@ -1348,6 +1358,52 @@ func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 
 // The listing map is bounded by ENTRY COUNT as well as by bytes: the byte cap admits ~1M minimal entries,
 // which measured 346 MiB of retained map against a 230 MiB GOMEMLIMIT.
+// A hash nothing could ever ask about is dropped before it is retained — and a body full of them is
+// still "could not read this", never "the account holds nothing".
+//
+// The key is whatever the upstream sent, so neither cap sees it: one entry carrying a 60 MiB hash is one
+// entry (under the entry cap) and 60 MiB (under the byte cap). It decoded as a VALID listing, retained
+// the 60 MiB for the memo TTL, and allocated 248 MiB doing so against a 230 MiB GOMEMLIMIT.
+//
+// The second half is the trap in the first half's fix: if the cap counted only entries KEPT, a listing of
+// a million unusable hashes would drop to an empty map and be reported as an authoritative empty account
+// — a miss marker and a duplicate add, which is worse than the retention being fixed.
+func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *testing.T) {
+	good := repeat("a", 40)
+
+	// One usable entry beside a huge one: the huge key is not retained, the usable one still is.
+	giant := `{"success":true,"data":[{"id":1,"hash":"` + repeat("A", 8<<20) + `"},` +
+		`{"id":2,"hash":"` + good + `"}]}`
+	ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(giant)))
+	if !ok {
+		t.Fatal("one unusable entry must not make the whole listing unreadable")
+	}
+	if ids[good] != 2 {
+		t.Errorf("the usable entry was lost: %v", ids)
+	}
+	for k := range ids {
+		if len(k) > 40 {
+			t.Errorf("retained a %d-byte hash — neither cap bounds this, it is the key itself", len(k))
+		}
+	}
+
+	// A body of nothing but unusable hashes reaches the cap on entries SEEN, so it stays indeterminate.
+	var junk strings.Builder
+	junk.WriteString(`{"success":true,"data":[`)
+	for i := 0; i <= maxListingEntries; i++ {
+		if i > 0 {
+			junk.WriteString(",")
+		}
+		junk.WriteString(`{"id":1,"hash":"tooshort"}`)
+	}
+	junk.WriteString(`]}`)
+	ids, ok, tooMany := decodeListing(json.NewDecoder(strings.NewReader(junk.String())))
+	if ok || !tooMany {
+		t.Errorf("a listing of unusable hashes reported ok=%v tooMany=%v with %d entries — an empty map "+
+			"here reads as an authoritative 'holds nothing' and costs a duplicate add", ok, tooMany, len(ids))
+	}
+}
+
 func TestDecodeListing_boundsEntryCount(t *testing.T) {
 	var body strings.Builder
 	body.WriteString(`{"success":true,"data":[`)
