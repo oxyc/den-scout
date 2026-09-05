@@ -494,6 +494,39 @@ func TestDecodeConfig_boundsWhatOneRequestCanRetain(t *testing.T) {
 	}
 }
 
+// The account cap is a ceiling, not a target: a config naming several services keeps all of them.
+//
+// Only the upper bound was pinned, so narrowing the cap to a single account left the whole suite green
+// — and dropping an account is not a cosmetic loss. Every debrid account is asked whether it holds a
+// release, and a release only the second account has becomes a resolve against the first, which is an
+// add: the exact cost the 50/hour budget exists to ration.
+//
+// The blind spot was in the fixtures rather than the assertions. Every config blob in the suite names
+// exactly ONE debrid service, and the two multi-account fixtures are 8 and 100 identical torbox
+// entries, so nothing anywhere decoded a config with two different services in it.
+func TestDecodeConfig_keepsEveryAccountUpToTheCeiling(t *testing.T) {
+	cfg, ok := decodeConfig(nil, blob(`{"debrid":[`+
+		`{"service":"torbox","token":"tb"},`+
+		`{"service":"premiumize","token":"pm"},`+
+		`{"service":"realdebrid","token":"rd"}],`+
+		`"indexers":["torrentio"]}`))
+	if !ok {
+		t.Fatal("a three-service config was refused outright")
+	}
+	want := []DebridService{ServiceTorBox, ServicePremiumize, ServiceRealDebrid}
+	if len(cfg.Debrid) != len(want) {
+		t.Fatalf("kept %d debrid accounts, want %d — an account that is dropped is never asked whether "+
+			"it holds a release, so every play of a release only it has costs an add against another "+
+			"account", len(cfg.Debrid), len(want))
+	}
+	for i, svc := range want {
+		if cfg.Debrid[i].Service != svc {
+			t.Errorf("account %d is %q, want %q — order is the preference order the pool asks in",
+				i, cfg.Debrid[i].Service, svc)
+		}
+	}
+}
+
 // maxCompiledInsts bounds the compiled PROGRAM of a pattern that survives validation.
 //
 // Instructions, not megabytes, because megabytes could not be measured honestly here. Two earlier

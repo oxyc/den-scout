@@ -85,6 +85,14 @@ func detectSourceAttr(t string) string {
 	return ""
 }
 
+// detectCodec reads the codec off the release title. Its spellings must match the ones the probe
+// produces, because withProbe overwrites this field rather than merging with it.
+//
+// This is the "eng"/"en" problem cleanLang exists to fix, one field over, and it was live: the title
+// path answered "avc" where all three container parsers answer "h264" for the same codec. Probing is
+// asynchronous, so a viewer got "avc" in the first /stream response for a release and "h264" in the
+// next — one codec, two spellings, which no client can badge or group on. h264 is the spelling that
+// wins because three parsers already produce it and this was the only place that did not.
 func detectCodec(t string) string {
 	switch {
 	case reAV1.match(t):
@@ -92,7 +100,7 @@ func detectCodec(t string) string {
 	case reHEVC.match(t):
 		return "hevc"
 	case reAVC.match(t):
-		return "avc"
+		return "h264"
 	}
 	return ""
 }

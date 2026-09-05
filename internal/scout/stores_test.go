@@ -1672,7 +1672,7 @@ func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 	// allocates 1.06x the body here; buffering the same field into a json.RawMessage allocates 3.7x.
 	//
 	// 1.06x is this FIXTURE, not the walk. Token allocates once per token, so the ratio tracks token
-	// density: the same 24 MiB written as small tokens measures 13x to 37x depending on how tightly they
+	// density: the same 24 MiB written as small tokens measures 13x to 52x depending on how tightly they
 	// are packed. The 6 KB strings below keep the walk's own cost near the body size, which is what makes
 	// a 2x ceiling meaningful against the 3.7x buffering form rather than a number that happens to pass.
 	var skipped strings.Builder

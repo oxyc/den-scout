@@ -59,8 +59,21 @@ func TestBuildDeps(t *testing.T) {
 	if _, err := sc[1].scrape(context.Background(), scrapeQuery{}); err == nil {
 		t.Error("an unaskable indexer must fail, so it counts as a source that did not answer")
 	}
-	if _, ok := sc[1].(unaskableScraper); !ok {
+	un, ok := sc[1].(unaskableScraper)
+	if !ok {
 		t.Errorf("comet should be unaskable without a config URL, got %T", sc[1])
+	}
+	// NOT transient. The distinction decides whether the operator is told to configure something or
+	// told an upstream is down, and it is read one level up to decide whether an empty list is an
+	// outage. Inverting it on this, the shipped default, reported every genuinely empty title as an
+	// indexer outage: X-Scout-Degraded on every response, no-store so negative caching never runs, and
+	// three in a row flipping /health to degraded on a service that is perfectly healthy.
+	//
+	// Only the CONSUMPTION of this flag was covered, never its production, so the inversion was green.
+	if un.transient {
+		t.Error("an indexer with no config URL and no minting is a misconfiguration, not an outage — " +
+			"marking it transient suppresses the operator's log line and reports healthy empty lists " +
+			"as a degraded scrape")
 	}
 	// Given the URL, it is asked.
 	withComet := BuildDeps(SettingsFromEnv(func(k string) string {

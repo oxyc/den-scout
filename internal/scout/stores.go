@@ -2011,8 +2011,8 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 			// look like 50x rather than the 2.9x it is. Nor is 67 MiB free: Token materialises every
 			// string it steps over, so the walk allocates once per TOKEN and that ratio is a property of
 			// the body's token density, not of the walk. 1.06x holds for the 6 KB strings measured here;
-			// the same 24 MiB written as small tokens measures 13x to 37x depending on how tightly they
-			// are packed, the top of that range being `"a":0` pairs. It is all garbage rather
+			// the same 24 MiB written as small tokens measures 13x to 52x depending on how tightly they
+			// are packed, the top of that range being a bare `[0,0,0,…]` array. It is all garbage rather
 			// than live heap, so it costs GC time and not GOMEMLIMIT headroom — which is the actual win
 			// over holding the body twice at once, not a small constant.
 			//

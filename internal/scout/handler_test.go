@@ -1069,6 +1069,71 @@ func TestStreamList_servesStaleWhileRebuilding(t *testing.T) {
 	}
 }
 
+// The rebuild behind a stale answer outlives the request that triggered it.
+//
+// This is the same WithoutCancel detachment as the foreground build, at a second site, and it is the
+// worse of the two: r.Context() is cancelled the moment ServeHTTP returns, so a rebuild riding it dies
+// instantly, every time, for every key. Nothing is ever refreshed, and the stale body is served for its
+// whole stale-if-error life.
+//
+// TestStreamList_servesStaleWhileRebuilding cannot see it, because httptest.NewRequest carries a
+// context that is never cancelled — so the rebuild survives there whichever context it is given. The
+// cancel below is what a real server does.
+func TestStreamList_aDisconnectDoesNotKillTheStaleRebuild(t *testing.T) {
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	scraped := make(chan error, 4)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.Cache = cache
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(ctx context.Context) ([]RawStream, error) {
+				// The rebuild waits, so the cancel below has certainly happened before it reads ctx.
+				// Without that the test would race the goroutine and pass at random.
+				if calls.Add(1) > 1 {
+					<-release
+				}
+				scraped <- ctx.Err()
+				return testSeeds(), nil
+			}}}
+		}
+	}))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+
+	if rr := do(h, path, nil); rr.Code != 200 {
+		t.Fatalf("cold build: %d", rr.Code)
+	}
+	if err := <-scraped; err != nil {
+		t.Fatalf("the cold build's scrape saw %v", err)
+	}
+
+	// Age the entry into the stale window without touching its physical expiry.
+	key := cache.lastKey()
+	held, ok := cache.Get(key)
+	if !ok {
+		t.Fatal("the cold build cached nothing")
+	}
+	complete, _, etag, body := splitCached(held)
+	cache.Put(key, joinCached(complete, time.Now().Add(-time.Second).Unix(), etag, body), time.Minute)
+
+	// A stale hit from a client that goes away the instant it has its answer.
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "https://scout.example"+path, nil).WithContext(ctx)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	cancel()
+	close(release)
+
+	select {
+	case err := <-scraped:
+		if err != nil {
+			t.Errorf("the rebuild saw %v — it is riding the request context, so it dies as soon as the "+
+				"stale answer is written and the entry is never refreshed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no rebuild ran behind the stale answer")
+	}
+}
+
 // The stale window is a ceiling scaled by the configured TTL, not an absolute. Pinned at two minutes, an
 // operator running SCOUT_LIST_TTL_SECONDS=30 got 30 seconds of freshness followed by two minutes of
 // staleness — an entry spending 80% of its life stale — and was told to hold the stale body for 60s,

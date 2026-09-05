@@ -81,6 +81,63 @@ func TestScraperURL(t *testing.T) {
 	}
 }
 
+// A shed request is retried, and a refusal is not.
+//
+// The whole retry mechanism had no coverage: retryableScrapeStatus, both backoff durations and the
+// attempt counter all survived mutation, and making scrape() never retry left the package green. The
+// only test touching a 502 asserts `err != nil`, which is true whether or not the retry happened.
+//
+// The cost of losing it is not one release. Opening a season asks for every episode at once, an indexer
+// sheds part of that burst, and each shed request becomes "no source found" for an episode the same
+// indexer serves 50 releases of a second later — and per the quorum an episode that lost its only
+// answering indexer is a degraded, uncacheable response rather than a list.
+func TestScrape_retriesAShedRequestButNotARefusal(t *testing.T) {
+	body := `{"streams":[{"name":"x","infoHash":"` + repeat("a", 40) + `","title":"Movie 1080p"}]}`
+
+	for _, tc := range []struct {
+		name       string
+		status     int
+		wantCalls  int
+		wantStream bool
+	}{
+		// Shedding: the indexer is declining to answer right now, so ask again.
+		{"429 too many requests", http.StatusTooManyRequests, 2, true},
+		{"408 request timeout", http.StatusRequestTimeout, 2, true},
+		{"502 bad gateway", http.StatusBadGateway, 2, true},
+		// A refusal is an answer. Retrying it spends someone else's share of the 8s budget to be told
+		// the same thing, and 403 is what an unconfigured indexer returns for every request it gets.
+		{"403 forbidden", http.StatusForbidden, 1, false},
+		{"404 not found", http.StatusNotFound, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			sc := &stremioScraper{indexer: "torrentio", baseURL: "https://tor.example",
+				client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+					calls++
+					if calls == 1 {
+						return resp(tc.status, "{}"), nil
+					}
+					return resp(200, body), nil
+				}}}
+
+			streams, err := sc.scrape(context.Background(), scrapeQuery{Type: "movie", IMDb: "tt1"})
+			if calls != tc.wantCalls {
+				t.Errorf("made %d request(s), want %d", calls, tc.wantCalls)
+			}
+			if tc.wantStream {
+				if err != nil || len(streams) != 1 {
+					t.Errorf("a shed request should be retried and then succeed: %d streams err=%v",
+						len(streams), err)
+				}
+				return
+			}
+			if err == nil {
+				t.Error("a refusal is an answer and must be reported, not retried into a success")
+			}
+		})
+	}
+}
+
 // Torrentio is asked on its BARE path, whatever the filters say.
 //
 // The options segment was free to add and expensive to keep: with torrentio's origin down, Cloudflare

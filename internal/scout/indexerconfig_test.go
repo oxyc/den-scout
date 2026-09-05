@@ -171,6 +171,24 @@ func TestUnaskableScraper_transientStillCountsInTheQuorum(t *testing.T) {
 	if _, ok, _ := scrapeAll(context.Background(), outage, scrapeQuery{}, budget); ok {
 		t.Error("an indexer that could not be reached must leave the empty result non-authoritative")
 	}
+
+	// Asking NOBODY is not an answer either, and this is the case the excuse above can reach on its own.
+	// Every unaskable indexer is excused from the quorum, so a list of nothing but unaskable indexers
+	// excuses everyone and the empty result comes back authoritative — a confident "nobody has this",
+	// cached for five minutes on the device and up to a day on any later error, from an install that
+	// made no request at all.
+	//
+	// Reachable without editing anything: /configure offers comet and mediafusion as tick boxes, so a
+	// user can untick torrentio, and with minting off (the default) and no URLs set, every scraper in
+	// the list is unaskable.
+	nobody := []scraper{
+		unaskableScraper{indexer: "comet"},
+		unaskableScraper{indexer: "mediafusion"},
+	}
+	if _, ok, _ := scrapeAll(context.Background(), nobody, scrapeQuery{}, budget); ok {
+		t.Error("every indexer unaskable: an empty result must not be authoritative — nothing was " +
+			"asked, so nothing answered, and caching that states a release does not exist")
+	}
 }
 
 // Off unless the operator says otherwise: this decides whether the debrid token leaves the homelab.

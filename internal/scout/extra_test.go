@@ -153,7 +153,10 @@ func TestDetectAudioCodecBranches(t *testing.T) {
 			t.Errorf("audio(%q)=%v want %q", title, a, want)
 		}
 	}
-	codec := map[string]string{"x AV1": "av1", "x x265": "hevc", "x HEVC": "hevc", "x x264": "avc", "x h264": "avc"}
+	// The spellings here must be the ones the container parsers produce, since withProbe overwrites
+	// Codec outright — see detectCodec. TestAttributes_titleAndProbeAgreeOnCodecSpelling holds the two
+	// paths together; this table only pins the title half.
+	codec := map[string]string{"x AV1": "av1", "x x265": "hevc", "x HEVC": "hevc", "x x264": "h264", "x h264": "h264"}
 	for title, want := range codec {
 		if c := streamAttributes(RawStream{Title: title}).Codec; c == nil || *c != want {
 			t.Errorf("codec(%q)=%v want %q", title, c, want)
@@ -161,6 +164,47 @@ func TestDetectAudioCodecBranches(t *testing.T) {
 	}
 	if streamAttributes(RawStream{Title: "x mystery"}).Codec != nil {
 		t.Error("no codec → nil")
+	}
+}
+
+// The title path and the probe paths must spell each codec the same way.
+//
+// withProbe OVERWRITES Codec rather than merging, and probing is asynchronous, so any disagreement
+// shows up as the value changing between a viewer's first /stream response for a release and the next.
+// That was live: the title path said "avc" where all three container parsers say "h264".
+//
+// Asserted across the three producers at once, because a table that pins each one separately is what
+// let them drift — TestWithProbe_overridesTitleGuesses seeds Codec with "h264", a value the title path
+// could not then produce, so it agreed with the probe by construction and saw nothing.
+func TestAttributes_titleAndProbeAgreeOnCodecSpelling(t *testing.T) {
+	for _, tc := range []struct {
+		codec          string
+		title          string
+		matroskaID     string
+		fourCC         string
+		mp4SampleEntry string
+	}{
+		{"h264", "Movie 1080p x264", "V_MPEG4/ISO/AVC", "h264", "avc1"},
+		{"hevc", "Movie 2160p x265", "V_MPEGH/ISO/HEVC", "hevc", "hvc1"},
+		{"av1", "Movie 2160p AV1", "V_AV1", "av01", "av01"},
+	} {
+		t.Run(tc.codec, func(t *testing.T) {
+			got := streamAttributes(RawStream{Title: tc.title}).Codec
+			if got == nil {
+				t.Fatalf("title %q → nil, want %q", tc.title, tc.codec)
+			}
+			if *got != tc.codec {
+				t.Fatalf("title %q → %q, want %q — the title path and the container parsers disagree, "+
+					"so the codec flips when the probe lands", tc.title, *got, tc.codec)
+			}
+			if s := codecFromMatroskaID(tc.matroskaID); s != tc.codec {
+				t.Errorf("matroska %q → %q, but the title path says %q — one codec, two spellings, so "+
+					"the value flips when the probe lands", tc.matroskaID, s, tc.codec)
+			}
+			if s := codecFromFourCC(tc.fourCC); s != tc.codec {
+				t.Errorf("fourCC %q → %q, but the title path says %q", tc.fourCC, s, tc.codec)
+			}
+		})
 	}
 }
 
