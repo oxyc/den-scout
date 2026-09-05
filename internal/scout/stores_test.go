@@ -806,6 +806,46 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	}
 }
 
+// A panic inside the listing fetch is abandoned, not fatal.
+//
+// Moving the fetch to DoChan made this urgent and silent: singleflight re-raises a panic from the flight
+// with `go panic(e)` on a fresh goroutine whenever anyone is waiting on a channel, and nothing can recover
+// it there. Under the blocking Do the panic unwound into the caller and the handler's own recover turned
+// it into a 500. So a change made for context handling quietly converted a recoverable panic into a dead
+// container — every viewer losing playback because one account listing tripped a parser.
+func TestAccountListing_aPanicInTheFetchIsAbandonedNotFatal(t *testing.T) {
+	before := metrics.backgroundPanic.Load()
+	s := &torBoxStore{token: "panics", api: torboxAPI, cache: NewMemoryCache(1 << 20),
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			panic("a parser went off the end")
+		}}}
+
+	// Two callers, because the second is what makes singleflight register a channel — which is the exact
+	// condition under which it re-raises the panic instead of returning it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan bool, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			ids, ok := s.accountListing(ctx)
+			done <- ok || ids != nil
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case answered := <-done:
+			if answered {
+				t.Error("a panicking fetch reported an answer")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a caller never returned from a panicking fetch")
+		}
+	}
+	if got := metrics.backgroundPanic.Load(); got <= before {
+		t.Errorf("the panic was not counted (%d → %d) — an operator has nothing to alert on", before, got)
+	}
+}
+
 // StatusAnswer's doubt comes from the lookup it already did, not from a second one.
 //
 // The three-valued answer was first built by re-running findTorrentByHash purely to learn whether the

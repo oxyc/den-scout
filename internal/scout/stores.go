@@ -1610,6 +1610,13 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	// rather than a false "nobody is fetching it" — and the flight is per token, so it needs a second
 	// concurrent request against the same account in the window between the two reads.
 	ch := listingFlight.DoChan(key, func() (any, error) {
+		// This closure is a BACKGROUND goroutine now, and DoChan makes a panic in it fatal to the process:
+		// singleflight re-raises it with `go panic(e)` on a fresh goroutine whenever anyone is waiting on a
+		// channel, where nothing can recover it. Under the blocking Do it unwound into the caller's stack
+		// and the handler's own recover turned it into a 500. Moving to DoChan quietly converted a
+		// recoverable panic into a dead container, which is the rule probe_fanout.go's recoverBackground
+		// was written for; abandoning the fetch is already a first-class outcome here, so a panic joins it.
+		defer recoverBackground("account listing fetch")
 		// Built INSIDE the closure, so its cancel is tied to the lifetime of the fetch rather than to the
 		// leader's own call. Constructing it outside and deferring the cancel there undid the detachment
 		// completely: the deferred cancel fires when the leader's caller returns, which on the abandonment
@@ -1631,6 +1638,16 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 		putCachedListing(s.cache, key, ids)
 		return ids, nil
 	})
+	// An answer already in hand wins, before the budget is even consulted. A plain two-way select picks at
+	// random when both are ready, so a listing that arrived in the same instant the budget expired was
+	// thrown away about half the time — on the path that decides whether to spend an add, and for nothing,
+	// since the fetch had already been paid for.
+	select {
+	case res := <-ch:
+		ids, _ := res.Val.(map[string]int)
+		return ids, ids != nil
+	default:
+	}
 	select {
 	case <-ctx.Done():
 		// Our own budget, not the leader's. Nothing is concluded from this: ok=false is indeterminate, so
