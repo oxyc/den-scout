@@ -1576,15 +1576,16 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	if ids, hit := cachedListing(s.cache, key); hit {
 		return ids, true
 	}
-	// A listing too LARGE to read is memoised, briefly. Nothing else about a failure is.
+	// A listing this account will keep failing to produce is memoised, briefly. A transient failure is not.
 	//
-	// The distinction is the whole point. A transient failure — a timeout, a 5xx — must be retried at
-	// once, because that retry is the only thing able to rediscover a queued torrent; suppressing it is a
-	// bug this package has already had and has a test for. Oversize is not transient: the body was too big
-	// a moment ago and will be too big again, so re-pulling it is guaranteed waste. Without this an
-	// oversized account re-pulled the whole body on every attempt, and a single /play makes up to three
-	// status reads while a client polls it every two seconds — tens of megabytes of egress per request,
-	// sustained for the length of a wait, to reach the same answer each time.
+	// The distinction is the whole point, and it is the FAULT that draws it, not the size: too big to
+	// read, too many entries, or no usable entry among them. A transient failure — a timeout, a 5xx —
+	// must be retried at once, because that retry is the only thing able to rediscover a queued torrent;
+	// suppressing it is a bug this package has already had and has a test for. None of the three faults is
+	// transient: the body was that shape a moment ago and will be again, so re-pulling it is guaranteed
+	// waste. Without this an oversized account re-pulled the whole body on every attempt, and a single
+	// /play makes up to three status reads while a client polls it every two seconds — tens of megabytes
+	// of egress per request, sustained for the length of a wait, to reach the same answer each time.
 	//
 	// Still not the same thing as torrentMissKey, which the code below deliberately refuses to write here:
 	// this says "do not re-pull the listing yet", not "the account does not hold it". Callers get ok=false,
@@ -1630,9 +1631,9 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 			leaderCtx, cancel = context.WithDeadline(leaderCtx, deadline)
 			defer cancel()
 		}
-		ids, ok, oversized := s.fetchAccountListing(leaderCtx)
+		ids, ok, persistent := s.fetchAccountListing(leaderCtx)
 		if !ok {
-			if oversized && s.cache != nil {
+			if persistent && s.cache != nil {
 				s.cache.Put(key+":oversized", "1", listingTTL)
 			}
 			return nil, nil
@@ -1670,10 +1671,10 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	}
 }
 
-// The third result separates "this account's listing is too big to read" from every other failure. Only
-// the first is worth remembering: it is a property of the account rather than a blip, so retrying it
-// immediately is guaranteed waste — where retrying a timeout is the only way a queued torrent is ever
-// rediscovered.
+// The third result says whether this failure is worth REMEMBERING: too big to read, too many entries, or
+// no usable entry among them. Each is a property of the listing rather than a blip, so each will fail the
+// same way on the next poll and retrying it immediately is guaranteed waste — where retrying a timeout is
+// the only way a queued torrent is ever rediscovered.
 func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, bool, bool) {
 	resp, err := s.get(ctx, s.api+"/torrents/mylist?bypass_cache=true")
 	if err != nil {
@@ -1704,7 +1705,7 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	// for the listing TTL.
 	limited := &truncationDetector{r: io.LimitReader(resp.Body, maxListingBytes+1), limit: maxListingBytes}
 	ids, ok, fault := decodeListing(json.NewDecoder(limited))
-	if fault != listingOK {
+	if fault != listingFaultNone {
 		// Both faults take the same road as the byte cap: each is a property of this listing rather than a
 		// blip, so each will fail the same way on the next poll, and each is therefore remembered. Only
 		// the byte one was at first, and tripping the entry cap re-pulled the whole body every poll —
@@ -1721,6 +1722,9 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 			log.Printf("scout: torbox account listing had entries but no usable infohash among them — " +
 				"treating it as no answer rather than as an empty account; the upstream may have renamed " +
 				"the field")
+		case listingBadEnvelope:
+			log.Printf("scout: torbox account listing came back without a usable data array — treating it " +
+				"as no answer rather than as an empty account; the upstream envelope may have changed")
 		}
 		return nil, false, true
 	}
@@ -1736,13 +1740,6 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	return ids, ok, false
 }
 
-// decodeListing walks `{"success":…,"data":[{id,hash},…]}` and keeps only the hash→id map.
-//
-// Returns ok=false for anything it cannot read as a list. No list, no verdict: a 200 carrying no `data`
-// key at all, or an explicit success:false, is not the account saying it holds nothing — it is TorBox's
-// envelope missing, and listFiles reads exactly the same body as silence ("not a claim about the
-// account"). Calling that authoritative wrote a 15s miss marker that then suppressed the only lookup able
-// to rediscover a queued torrent.
 // listingFault says WHY a listing could not be read, for the two reasons that are properties of the
 // listing rather than blips. Both must be remembered: re-pulling a body that will fail the same way is
 // the egress the oversized memo exists to stop. Only a transient failure — a timeout, a 5xx — is worth
@@ -1750,18 +1747,35 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 type listingFault int
 
 const (
-	listingOK listingFault = iota
+	// No PERSISTENT fault. Most returns carrying this are still failures — a decode error, a truncated
+	// body — they are simply the retryable kind. Named for the absence of a fault rather than for success,
+	// because reading it as "the listing parsed" is a trap: the parse result is the separate ok value.
+	listingFaultNone listingFault = iota
 	// More entries than the map may hold.
 	listingTooManyEntries
 	// Entries arrived and not one was usable. An upstream that renamed `hash` looks exactly like this,
 	// and it will look like it again on the next poll, so it is remembered rather than re-fetched.
 	listingNoUsableEntries
+	// A complete envelope with no usable `data` array: the key renamed, `data` holding an object, or an
+	// explicit success:false. Same deterministic class as the two above — and separated from a truncated
+	// body, which reaches the same place and is not.
+	listingBadEnvelope
 )
 
+// decodeListing walks `{"success":…,"data":[{id,hash},…]}` and keeps only the hash→id map.
+//
+// Returns ok=false for anything it cannot read as a list. No list, no verdict: a 200 carrying no `data`
+// key at all, or an explicit success:false, is not the account saying it holds nothing — it is TorBox's
+// envelope missing, and listFiles reads exactly the same body as silence ("not a claim about the
+// account"). Calling that authoritative wrote a 15s miss marker that then suppressed the only lookup able
+// to rediscover a queued torrent.
+//
+// The fault says whether ok=false is worth REMEMBERING; listingFaultNone there means "no persistent fault", so
+// an ordinary parse failure stays retryable.
 func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listingFault) {
 	tok, err := dec.Token()
 	if err != nil || tok != json.Delim('{') {
-		return nil, false, listingOK
+		return nil, false, listingFaultNone
 	}
 	success := true
 	sawData := false
@@ -1769,13 +1783,13 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
-			return nil, false, listingOK
+			return nil, false, listingFaultNone
 		}
 		switch key {
 		case "success":
 			var v *bool
 			if dec.Decode(&v) != nil {
-				return nil, false, listingOK
+				return nil, false, listingFaultNone
 			}
 			if v != nil {
 				success = *v
@@ -1793,20 +1807,23 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 			// nothing. TorBox does not emit duplicate keys, so this costs nothing in practice; what it
 			// buys is that a body which does is never mistaken for a fact about the account.
 			if sawData {
-				return nil, false, listingOK
+				return nil, false, listingFaultNone
 			}
 			sawData = true
 			// A null `data` is the envelope-missing case and must stay distinct from an empty array.
 			if dec.More() {
 				open, err := dec.Token()
 				if err != nil {
-					return nil, false, listingOK
+					return nil, false, listingFaultNone
 				}
 				if open == nil {
 					continue // explicit null
 				}
 				if open != json.Delim('[') {
-					return nil, false, listingOK
+					// `data` present and not an array — an object, a string, a number. Deterministic in the
+					// same way a renamed key is, and distinguishable from truncation, which errors on the
+					// token read above rather than yielding a well-formed one of the wrong kind.
+					return nil, false, listingBadEnvelope
 				}
 				ids = map[string]int{}
 				for dec.More() {
@@ -1815,7 +1832,7 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 						Hash string `json:"hash"`
 					}
 					if dec.Decode(&e) != nil {
-						return nil, false, listingOK
+						return nil, false, listingFaultNone
 					}
 					// The cap counts entries SEEN, and is checked BEFORE the filter below can skip past it.
 					// The byte cap does not bound the entry count: 60 MiB of minimal entries is ~1M of them
@@ -1874,7 +1891,7 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 					return nil, false, listingNoUsableEntries
 				}
 				if _, err := dec.Token(); err != nil { // closing ]
-					return nil, false, listingOK
+					return nil, false, listingFaultNone
 				}
 			}
 		default:
@@ -1904,14 +1921,28 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 			// real large accounts and would turn them oversized. Recorded in FOLLOWUP.md with the options
 			// rather than traded for a functional regression on a threat this package already accepts.
 			if !skipValue(dec) {
-				return nil, false, listingOK
+				return nil, false, listingFaultNone
 			}
 		}
 	}
-	if ids == nil || !success {
-		return nil, false, listingOK
+	// The loop ends either because the object closed or because the body ran out — dec.More() reports both
+	// as "no more", so the closing token is what tells them apart. Reading it is the ONLY way to know the
+	// envelope was complete, and that is what makes the difference between a persistent fault and a blip.
+	if _, err := dec.Token(); err != nil {
+		return nil, false, listingFaultNone // cut off mid-body: transient, retry at once
 	}
-	return ids, true, listingOK
+	if ids == nil || !success {
+		// A complete, well-formed envelope that simply has no usable `data` array — the key renamed, or an
+		// explicit success:false. Deterministic: the same body arrives next poll and fails the same way.
+		//
+		// This sat on the transient road while its sibling (entries present, none usable) was taken off
+		// it, which is the same defect one level out: measured at 45 listing fetches over a 15-poll wait
+		// and 539 MiB pulled on a 12 MiB account, for each of a renamed `data` key, a `data` object, and a
+		// success:false. Not a blanket rule — a body cut off mid-stream reaches here too and IS transient,
+		// which is what the token read above separates.
+		return nil, false, listingBadEnvelope
+	}
+	return ids, true, listingFaultNone
 }
 
 // truncationDetector reports whether a LimitReader was consumed all the way to its limit, which is the

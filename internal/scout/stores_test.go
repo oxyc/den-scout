@@ -1245,6 +1245,55 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 			"so every poll re-pulls the whole account", unusableFetches)
 	}
 
+	// The whole DETERMINISTIC family takes that road, not just the one that was noticed first. A renamed
+	// envelope key, a `data` that is an object, and an explicit success:false are each exactly as
+	// repeatable as a renamed `hash`, and each sat on the transient road costing 45 listing fetches over a
+	// 15-poll wait — 539 MiB on a 12 MiB account, three times over.
+	for _, tc := range []struct{ name, body string }{
+		{"the data key renamed", `{"success":true,"items":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`},
+		{"data is an object", `{"success":true,"data":{"1":"` + repeat("a", 40) + `"}}`},
+		{"success is false", `{"success":false,"data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`},
+	} {
+		fetches := 0
+		s := &torBoxStore{token: "envelope-" + tc.name, api: torboxAPI, cache: NewMemoryCache(1 << 20),
+			client: mockDoer{func(*http.Request) (*http.Response, error) {
+				fetches++
+				return resp(200, tc.body), nil
+			}}}
+		for i := 0; i < 3; i++ {
+			if ids, ok := s.accountListing(context.Background()); ok || ids != nil {
+				t.Fatalf("%s: must not read as an answer", tc.name)
+			}
+		}
+		if fetches != 1 {
+			t.Errorf("%s: pulled the listing %d times for three attempts — a deterministic envelope fault "+
+				"is not being remembered, so every poll re-pulls the whole account", tc.name, fetches)
+		}
+	}
+
+	// But a body CUT OFF in the OUTER object reaches the same place and is transient — the decoder reports
+	// "no more" for a read error exactly as it does for a closed object, and only reading the closing token
+	// tells them apart. The fixture has to be cut where the envelope ends, not inside `data`: a truncated
+	// array trips the closing-`]` check long before this, so it cannot exercise the discriminator at all.
+	//
+	// `{"success":false` complete is a persistent bad envelope; the same bytes without the brace are a
+	// blip. That one character is the whole difference, which is what makes this worth pinning.
+	cutFetches := 0
+	cut := &torBoxStore{token: "cut", api: torboxAPI, cache: NewMemoryCache(1 << 20),
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			cutFetches++
+			return resp(200, `{"success":false`), nil
+		}}}
+	for i := 0; i < 3; i++ {
+		if ids, ok := cut.accountListing(context.Background()); ok || ids != nil {
+			t.Fatal("a truncated listing must not read as an answer")
+		}
+	}
+	if cutFetches != 3 {
+		t.Errorf("a body cut off mid-stream was pulled %d times for three attempts — it was remembered as "+
+			"persistent, and that retry is the only thing that rediscovers a queued torrent", cutFetches)
+	}
+
 	// A transient failure must NOT be remembered: suppressing that retry is how a queued torrent stops
 	// being rediscoverable, which this package has a separate test for.
 	transientFetches := 0
@@ -1417,10 +1466,13 @@ func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *test
 		junk.WriteString(`{"id":1,"hash":"tooshort"}`)
 	}
 	junk.WriteString(`]}`)
+	// The EXACT fault, not merely "not OK": the two faults log different lines, and the renamed-field one
+	// is otherwise invisible from outside. Asserting only `!= listingFaultNone` let this return the too-many
+	// -entries fault instead, which tells an operator the account holds fifty thousand torrents.
 	ids, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(junk.String())))
-	if ok || fault == listingOK {
-		t.Errorf("a listing of unusable hashes reported ok=%v fault=%v with %d entries — an empty map "+
-			"here reads as an authoritative 'holds nothing' and costs a duplicate add", ok, fault, len(ids))
+	if ok || fault != listingTooManyEntries {
+		t.Errorf("a listing of more than %d unusable hashes reported ok=%v fault=%v with %d entries — "+
+			"want the entry-cap fault, since that is what it trips first", maxListingEntries, ok, fault, len(ids))
 	}
 
 	// Entries arrived and NONE survived: that is unreadable, not empty. This is the half the filter made
@@ -1431,9 +1483,9 @@ func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *test
 	// The scenario needs no attacker. TorBox renaming `hash` — a v2 API, or `infohash` — empties every
 	// entry at once.
 	renamed := `{"success":true,"data":[{"id":1,"infohash":"` + good + `"},{"id":2,"infohash":"x"}]}`
-	if ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(renamed))); ok {
-		t.Errorf("a listing whose entries all filtered out answered ok=true (ids=%v) — that is an "+
-			"authoritative 'the account holds nothing', and it costs an add on every poll", ids)
+	if ids, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(renamed))); ok || fault != listingNoUsableEntries {
+		t.Errorf("a listing whose entries all filtered out answered ok=%v fault=%v (ids=%v) — want the "+
+			"no-usable-entries fault, which is the one that names a renamed field in the log", ok, fault, ids)
 	}
 	// But an account that genuinely holds nothing sends no entries, and still answers authoritatively.
 	if ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(
@@ -1459,6 +1511,15 @@ func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *test
 		if !hashNorm.MatchString(repeat("b", n)) {
 			t.Errorf("scrape.go's hashNorm rejects a %d-char hash that the listing filter keeps — the "+
 				"probe path and the listing disagree about what an infohash is", n)
+		}
+	}
+	// And BOTH directions: accepting more than the filter keeps is the costly one, because a probe-path
+	// hash the listing drops reads as an authoritative miss. Asserting only acceptance let hashNorm widen
+	// to {32,64} with the whole suite green.
+	for _, n := range []int{31, 33, 39, 41, 64} {
+		if hashNorm.MatchString(repeat("b", n)) {
+			t.Errorf("scrape.go's hashNorm accepts a %d-char hash that the listing filter drops — that "+
+				"reads back as 'the account does not hold this'", n)
 		}
 	}
 
@@ -1541,8 +1602,8 @@ func TestDecodeListing_boundsEntryCount(t *testing.T) {
 	}
 	atCap.WriteString(`]}`)
 	ids, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(atCap.String())))
-	if !ok || fault != listingOK || len(ids) != maxListingEntries {
-		t.Errorf("a listing of exactly %d entries: ok=%v fault=%v n=%d (want true, listingOK, %d)",
+	if !ok || fault != listingFaultNone || len(ids) != maxListingEntries {
+		t.Errorf("a listing of exactly %d entries: ok=%v fault=%v n=%d (want true, listingFaultNone, %d)",
 			maxListingEntries, ok, fault, len(ids), maxListingEntries)
 	}
 }
