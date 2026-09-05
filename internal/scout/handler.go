@@ -101,9 +101,10 @@ func deadlinePassed(ctx context.Context) bool {
 // no status read may take the RESOLVE budget, and exactly one — this one, on the path about to spend an
 // add — may take double.
 //
-// Worst-case status time on a /play is FOUR status budgets, 32 seconds: this read, the escalation, and
-// the post-failure read below, which is a fresh budget on a detached context and so outside the resolve
-// clock entirely. Measured end to end at 53 seconds all in, against a 60-second write timeout.
+// Worst-case status time on a /play is FOUR status budgets, 32 seconds — three reads, because this one
+// counts twice: the ordinary poll read (8 s), this escalation (16 s), and the post-failure read below
+// (8 s), which is a fresh budget on a detached context and so outside the resolve clock entirely.
+// Measured end to end at 53 seconds all in, against a 60-second write timeout.
 func escalatedStatusCtx(parent context.Context) (context.Context, context.CancelFunc, bool) {
 	deadline, ok := parent.Deadline()
 	if !ok {
@@ -993,6 +994,13 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// describes ("far under the resolve budget so a wait answers promptly instead of hanging the
 		// poll"), rather than pinning a goroutine and a connection for forty-five seconds against a slow
 		// debrid. It makes up to three upstream calls, all reads.
+		//
+		// The three SHARE this budget rather than each getting a slice, and the honest consequence is that
+		// a status read slow enough to spend all eight seconds leaves the cache check a dead context, so
+		// the probe answers 503 "could not ask" for the length of that wait. That is the safe direction —
+		// it never claims an absence — and slicing here is not obviously better: the pool already slices
+		// per store, and stacking a second division on top is how an earlier fix left every store a budget
+		// too short to answer in. Left alone deliberately; revisit if a real account is seen hitting it.
 		probeCtx, probeCancel := context.WithTimeout(r.Context(), statusBudget)
 		defer probeCancel()
 		h.handleProbe(w, probeCtx, config, pool, target.InfoHash, rt)
@@ -1010,7 +1018,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// three siblings already agreed; this was the third.
 	statusCtx, statusCancel := context.WithTimeout(r.Context(), statusBudget)
 	defer statusCancel()
-	status, ok, unknown := pool.Status(statusCtx, rt)
+	status, ok, unknown := pool.StatusDetail(statusCtx, rt)
 	if ok {
 		writeQueued(w, target.InfoHash, status)
 		return
@@ -1045,10 +1053,14 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// budget, so a store can time out while the pool still returns long before the caller's deadline —
 	// "did my whole budget elapse" was false exactly when a store had failed to answer, which is the case
 	// this branch exists for. The pool knows which store ran out of time, so it is the one that says.
-	if unknown {
+	//
+	// Only the stores that could not answer are re-asked. Going back through the whole pool re-ran a
+	// question the other stores had already answered definitively — three store reads instead of one on a
+	// three-account install, per poll, on a path that is already struggling.
+	if len(unknown) > 0 {
 		if slowCtx, slowCancel, ok := escalatedStatusCtx(ctx); ok {
 			defer slowCancel()
-			if status, ok, _ := pool.Status(slowCtx, rt); ok {
+			if status, ok, _ := (&StorePool{stores: unknown}).StatusDetail(slowCtx, rt); ok {
 				log.Printf("scout: play %s → 202, status needed longer than %s to answer",
 					shortHash(target.InfoHash), statusBudget)
 				writeQueued(w, target.InfoHash, status)

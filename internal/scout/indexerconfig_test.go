@@ -367,23 +367,45 @@ func TestMintedCache_reclaimsIdleEntries(t *testing.T) {
 // through indexerBaseWithConfig. The rationale used to be a caller-side room check that gated the insert;
 // that guard is gone, because under plain LRU the prune always makes room and the answer was always yes.
 func TestIndexerBaseWithConfig_mapStaysBoundedUnderAFlood(t *testing.T) {
-	resetMinted()
-	t.Cleanup(resetMinted)
+	// BOTH sites get their own flood. Only the success one was driven, so deleting the prune from the
+	// failure site left the whole suite green while 1,024 invented tokens sat in the map — the site that
+	// is easier to reach of the two, since it needs no working indexer, only an unhealthy one.
+	for _, tc := range []struct {
+		name    string
+		indexer Indexer
+		doer    *stubDoer
+		// A failed mint yields no URL, which is the point of that path rather than a problem with it.
+		wantURL bool
+	}{
+		// comet mints locally, so a flood costs no round trips — which is why it is the cheap attack.
+		{"a successful mint", "comet", &stubDoer{status: 200, body: `{"encrypted_str":"E","status":"success"}`}, true},
+		// mediafusion mints over the network; while it is down every distinct token remembers a failure.
+		{"a remembered failure", "mediafusion", &stubDoer{err: fmt.Errorf("dial tcp: i/o timeout")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetMinted()
+			t.Cleanup(resetMinted)
 
-	// comet mints locally, so a flood costs no round trips — which is exactly why it is the cheap attack.
-	d := &stubDoer{status: 200, body: `{"encrypted_str":"E","status":"success"}`}
-	for i := 0; i < maxMintedEntries*4; i++ {
-		cfg := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: fmt.Sprintf("invented-%d", i)}}}
-		if got, _ := indexerBaseWithConfig(context.Background(), "comet", cfg, d); got == "" {
-			t.Fatalf("mint %d produced no URL", i)
-		}
-	}
+			for i := 0; i < maxMintedEntries*4; i++ {
+				cfg := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: fmt.Sprintf("invented-%d", i)}}}
+				got, _ := indexerBaseWithConfig(context.Background(), tc.indexer, cfg, tc.doer)
+				if (got != "") != tc.wantURL {
+					t.Fatalf("mint %d returned %q, wantURL=%v", i, got, tc.wantURL)
+				}
+			}
 
-	mintedMu.Lock()
-	total := len(minted)
-	mintedMu.Unlock()
-	if total > maxMintedEntries {
-		t.Errorf("the map holds %d entries after a flood of distinct tokens, ceiling is %d",
-			total, maxMintedEntries)
+			mintedMu.Lock()
+			total := len(minted)
+			mintedMu.Unlock()
+			if total > maxMintedEntries {
+				t.Errorf("the map holds %d entries after a flood of distinct tokens, ceiling is %d",
+					total, maxMintedEntries)
+			}
+			// And it is actually full, or the flood never reached the ceiling and the bound is untested.
+			if total < maxMintedEntries {
+				t.Errorf("the flood left only %d entries — it never reached the %d ceiling, so this "+
+					"asserts nothing about eviction", total, maxMintedEntries)
+			}
+		})
 	}
 }

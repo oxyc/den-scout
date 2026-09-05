@@ -1401,12 +1401,19 @@ func TestHandlePlay_pollReadsUseTheStatusBudget(t *testing.T) {
 				// forbidding the escalation; cutting the escalation to fit made it a guard that could
 				// not succeed, because the retry is sliced from the same budget as the read that just
 				// timed out.
+				//
+				// The ceiling is 2*statusBudget SPELLED OUT, not escalatedStatusBudget(). Taking it from
+				// the same function the handler derives the deadline from made the multiplier the one
+				// thing this test could not see: changing it to 2.75x left the whole suite green, and at
+				// anything up to 2.8125x — the point where escalatedStatusCtx's own guard starts
+				// declining — the single poll-blocking read grows with nothing objecting.
+				ceiling := 2 * statusBudget
 				doubled := 0
 				for i, left := range store.statusAt {
-					if left > escalatedStatusBudget() {
+					if left > ceiling {
 						t.Errorf("status read %d carried a %v deadline, want no more than %v — a poll "+
 							"read must not be able to hold the poll for the whole resolve budget",
-							i, left, escalatedStatusBudget())
+							i, left, ceiling)
 					}
 					if left > statusBudget {
 						doubled++
@@ -1456,8 +1463,15 @@ func TestEscalatedStatusCtx_cannotOutliveTheResolveBudget(t *testing.T) {
 	if !has {
 		t.Fatal("the escalated context carries no deadline")
 	}
-	if left := time.Until(got); left > escalatedStatusBudget() {
-		t.Errorf("escalated read got %v, want no more than the %v ceiling", left, escalatedStatusBudget())
+	// Spelled out rather than taken from escalatedStatusBudget(), which is what the code under test
+	// derives the deadline from — asserting a value against its own source pins nothing. The multiplier
+	// is the number that matters: it decides how long a single poll can block, and how much of the
+	// resolve clock is left for the add afterwards.
+	if left := time.Until(got); left > 2*statusBudget {
+		t.Errorf("escalated read got %v, want no more than the %v ceiling", left, 2*statusBudget)
+	}
+	if got := escalatedStatusBudget(); got != 2*statusBudget {
+		t.Errorf("the escalation is %v, want exactly twice the %v status budget", got, statusBudget)
 	}
 	parentDeadline, _ := parent.Deadline()
 	if got.After(parentDeadline) {

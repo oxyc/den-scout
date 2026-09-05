@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -24,7 +25,9 @@ const maxStoreBytes = 4 << 20
 // maxListingBytes is the ONE exception: the account listing is the whole account, and 4 MiB truncates a
 // real large one (~13 MB at 2,000 torrents), which reads back as "this account holds nothing" and costs a
 // duplicate add. It can be this large safely because the listing decode streams and keeps only hash→id —
-// see fetchAccountListing. Every other store read keeps the small cap.
+// see fetchAccountListing. Measured at the cap rather than argued, since that is what the size rests on:
+// a 60 MiB listing allocates 2.7 MiB in total and peaks 20 MiB above baseline, against 128.9 MiB for the
+// buffering decode this replaced. Every other store read keeps the small cap.
 const maxListingBytes = 64 << 20
 
 // statusAnswer is what a status read can say. Three values, because "it is not being fetched" and "I
@@ -1391,6 +1394,84 @@ func torrentListKey(token string) string { return "torbox:list:" + keyHash(token
 // releases at once — is anything but sequential.
 var listingFlight singleflight.Group
 
+// listingMemo holds the PARSED listing, in process, rather than JSON in the shared cache.
+//
+// The shared Cache is string-valued, so every hit re-ran json.Unmarshal and handed each caller a private
+// copy of the map: measured at 14 ms and 9.1 MB per hit on a 50,000-entry account, and 26.5 MB held
+// simultaneously across the eight concurrent probes a poster grid makes — 11% of GOMEMLIMIT to answer
+// one grid, for a listing that had already been fetched once. maxListingEntries reads as if it bounded
+// this, and it does not: the real bound was entries times concurrent callers, and nothing capped the
+// second factor. It also went through the TIERED cache, so the whole listing was written to disk every
+// listingTTL, on a container whose only writable storage is that volume.
+//
+// The map is published READ-ONLY and shared by every caller. Nothing may write to it after it lands
+// here; the one consumer, findTorrentByHash, only looks entries up.
+//
+// Scoped to the CACHE as well as the account, which is where this memo lived before and therefore the
+// isolation everything already assumes: two handlers built with different caches do not share an
+// account, and neither do two tests. Keyed on the interface value, so every Cache implementation must
+// stay comparable — all three are pointers.
+var (
+	listingMemoMu sync.Mutex
+	listingMemo   = map[listingMemoKey]listingMemoEntry{}
+)
+
+type listingMemoKey struct {
+	cache Cache
+	key   string
+}
+
+type listingMemoEntry struct {
+	ids map[string]int
+	at  time.Time
+}
+
+// maxListingMemoEntries bounds the memo by ACCOUNT, because its key derives from a token the config
+// supplies and nobody here verifies. A legitimate install has at most maxDebridAccounts of them. Only a
+// token TorBox actually answered a listing for can reach this map, so this is a backstop rather than the
+// front line — but a caller-keyed map in this package gets a ceiling regardless.
+const maxListingMemoEntries = 32
+
+func cachedListing(cache Cache, key string) (map[string]int, bool) {
+	if cache == nil {
+		return nil, false
+	}
+	listingMemoMu.Lock()
+	defer listingMemoMu.Unlock()
+	e, ok := listingMemo[listingMemoKey{cache, key}]
+	if !ok || time.Since(e.at) >= listingTTL {
+		return nil, false
+	}
+	return e.ids, true
+}
+
+func putCachedListing(cache Cache, key string, ids map[string]int) {
+	if cache == nil {
+		return
+	}
+	listingMemoMu.Lock()
+	defer listingMemoMu.Unlock()
+	for k, e := range listingMemo {
+		if time.Since(e.at) >= listingTTL {
+			delete(listingMemo, k)
+		}
+	}
+	// Expiry alone cannot bound a caller-keyed map — the same reasoning as pruneMintedLocked, which this
+	// deliberately mirrors. Oldest first, since every entry lives the same fifteen seconds and there is
+	// no separate last-used clock to prefer.
+	for len(listingMemo) >= maxListingMemoEntries {
+		var oldest listingMemoKey
+		at := time.Time{}
+		for k, e := range listingMemo {
+			if at.IsZero() || e.at.Before(at) {
+				oldest, at = k, e.at
+			}
+		}
+		delete(listingMemo, oldest)
+	}
+	listingMemo[listingMemoKey{cache, key}] = listingMemoEntry{ids: ids, at: time.Now()}
+}
+
 // accountListing returns the account's hash → torrent-id map, fetching it at most once per listingTTL.
 //
 // The listing is the whole account and it was pulled once per INFOHASH, because the only memo was the
@@ -1403,13 +1484,8 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 		return nil, false
 	}
 	key := torrentListKey(s.token)
-	if s.cache != nil {
-		if raw, hit := s.cache.Get(key); hit && raw != "" {
-			var ids map[string]int
-			if json.Unmarshal([]byte(raw), &ids) == nil {
-				return ids, true
-			}
-		}
+	if ids, hit := cachedListing(s.cache, key); hit {
+		return ids, true
 	}
 	// A listing too LARGE to read is memoised, briefly. Nothing else about a failure is.
 	//
@@ -1437,11 +1513,7 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 			}
 			return nil, nil
 		}
-		if s.cache != nil {
-			if b, err := json.Marshal(ids); err == nil {
-				s.cache.Put(key, string(b), listingTTL)
-			}
-		}
+		putCachedListing(s.cache, key, ids)
 		return ids, nil
 	})
 	ids, _ := out.(map[string]int)
@@ -1517,6 +1589,7 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 		return nil, false, false
 	}
 	success := true
+	sawData := false
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
@@ -1532,17 +1605,21 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 				success = *v
 			}
 		case "data":
-			// First non-null `data` wins — the guard is on ids, so `{"data":null,"data":[…]}` still reads
-			// the list. A duplicate key is not something TorBox produces, but letting a later null
-			// overwrite a list already read turns an answer into "no answer", and the reverse (an empty
-			// first array winning over a later populated one) is the unsafe direction: an authoritative
-			// "this account holds nothing", a miss marker, and a duplicate add.
-			if ids != nil {
-				if !skipValue(dec) {
-					return nil, false, false
-				}
-				continue
+			// A REPEATED `data` key makes the body unreadable, rather than picking one of them.
+			//
+			// Two rules were tried here and each was unsafe in one direction. "Last wins" lets a trailing
+			// null erase a list already read, turning an answer into "no answer". "First non-null wins"
+			// lets `{"data":[],"data":[…]}` settle on the empty one — an authoritative "this account
+			// holds nothing", which writes a 15 s miss marker and costs a duplicate add. There is no
+			// third rule that is safe for both, because the safe direction is opposite in each case.
+			//
+			// So neither: ok=false is indeterminate, which is the answer that concludes nothing and adds
+			// nothing. TorBox does not emit duplicate keys, so this costs nothing in practice; what it
+			// buys is that a body which does is never mistaken for a fact about the account.
+			if sawData {
+				return nil, false, false
 			}
+			sawData = true
 			// A null `data` is the envelope-missing case and must stay distinct from an empty array.
 			if dec.More() {
 				open, err := dec.Token()
@@ -1580,7 +1657,13 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 		default:
 			// Walked token by token, NOT decoded into a json.RawMessage. RawMessage keeps a full copy of
 			// the field's raw bytes on top of the decoder's own buffer, so a large unknown top-level field
-			// was retained twice: measured on a 63 MiB array field, 196 MiB before and 3.9 MiB now.
+			// was retained twice: on a 63 MiB array field, 191 MiB allocated before against 67 MiB now.
+			//
+			// Both numbers are TotalAlloc, because mixing a peak against a residency is how this comment
+			// was wrong before — it quoted 3.9 MiB "now", which is the post-GC figure and made the saving
+			// look like 50x rather than the 2.9x it is. Nor is 67 MiB free: it is a bit over one body's
+			// worth, because Token materialises every string it steps over. The win is that it is
+			// transient and shallow rather than the body held twice at once.
 			//
 			// Nothing STRUCTURED is retained — a scalar is not helped, and saying otherwise would be the
 			// kind of comment this file keeps having to correct. A single 63 MiB string still costs
@@ -2925,15 +3008,28 @@ func (p *StorePool) ResolveCachedOnly(ctx context.Context, t ResolveTarget,
 // prevent, reintroduced for every multi-account install by the fix for a different one. The pool knows
 // which store ran out of time; it now says so instead of leaving it to be guessed.
 func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool, bool) {
-	unknown := false
+	status, ok, unknown := p.StatusDetail(ctx, t)
+	return status, ok, len(unknown) > 0
+}
+
+// StatusDetail is Status, plus WHICH stores could not answer — so a retry asks only those.
+//
+// The escalated read went back through the whole pool, and a store that answered definitively has
+// nothing new to say a moment later: measured on a three-account pool, one unknown store cost nine store
+// reads per /play where six would do, and each TorBox read is up to two upstream calls. On a two-second
+// poll cadence for the length of a download, that is a wasted upstream read per extra account per poll,
+// on the path the escalation exists for — which is by definition a path where something is already
+// struggling.
+func (p *StorePool) StatusDetail(ctx context.Context, t ResolveTarget) (StoreStatus, bool, []Store) {
+	var unknown []Store
 	for i, st := range p.stores {
 		share := ctx
 		var cancel context.CancelFunc
 		if deadline, ok := ctx.Deadline(); ok {
 			if deadlinePassed(ctx) || ctx.Err() != nil {
 				// Out of time, or the caller went away. Either way the stores still unasked have not
-				// answered — which is not the same as answering no.
-				return StoreStatus{}, false, true
+				// answered — which is not the same as answering no, so they are the ones to retry.
+				return StoreStatus{}, false, p.stores[i:]
 			}
 			share, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(p.stores)-i))
 		}
@@ -2948,13 +3044,13 @@ func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, b
 		// unreadable listing), or it was cut short by its own slice or by the caller going away. Only
 		// deadlines were counted before, so a 503 read as a definitive "not downloading".
 		if answer == statusUnknown || (answer != statusDownloading && (share.Err() != nil || ctx.Err() != nil)) {
-			unknown = true
+			unknown = append(unknown, st)
 		}
 		if cancel != nil {
 			cancel()
 		}
 		if answer == statusDownloading {
-			return status, true, false
+			return status, true, nil
 		}
 	}
 	return StoreStatus{}, false, unknown

@@ -513,6 +513,39 @@ func TestStorePoolStatus_reportsWhenAStoreCouldNotAnswer(t *testing.T) {
 	}
 }
 
+// StatusDetail names the stores that could not answer, so the escalated retry asks only those.
+//
+// The retry used to go back through the whole pool, re-asking stores that had just answered
+// definitively — one unknown store in a three-account pool cost nine store reads per /play instead of
+// six, and each TorBox read is up to two upstream calls, on a two-second poll cadence.
+func TestStorePoolStatusDetail_namesOnlyTheStoresThatCouldNotAnswer(t *testing.T) {
+	var uncertainAsks, definiteAsks int
+	uncertain := answeringStore{fakeStore: fakeStore{svc: ServiceTorBox}, answer: statusUnknown, asked: &uncertainAsks}
+	definite := answeringStore{fakeStore: fakeStore{svc: ServiceRealDebrid}, answer: statusNo, asked: &definiteAsks}
+
+	pool := &StorePool{stores: []Store{definite, uncertain, definite}}
+	_, ok, unknown := pool.StatusDetail(context.Background(), ResolveTarget{InfoHash: H})
+	if ok {
+		t.Fatal("nothing was downloading")
+	}
+	if len(unknown) != 1 {
+		t.Fatalf("reported %d stores as unable to answer, want 1", len(unknown))
+	}
+	if unknown[0].Service() != ServiceTorBox {
+		t.Errorf("named %s as the store that could not answer, want torbox", unknown[0].Service())
+	}
+
+	// The retry, as handlePlay performs it: only the named store is asked again.
+	before := definiteAsks
+	if _, _, _ = (&StorePool{stores: unknown}).StatusDetail(context.Background(), ResolveTarget{InfoHash: H}); definiteAsks != before {
+		t.Errorf("the retry asked a store that had already answered definitively (%d extra reads)",
+			definiteAsks-before)
+	}
+	if uncertainAsks != 2 {
+		t.Errorf("the store that could not answer was asked %d times, want 2 (once, then the retry)", uncertainAsks)
+	}
+}
+
 // The account listing is decoded element by element, so its size bounds time and not memory — which is
 // what makes the larger cap safe. A body past the cap must read as "no answer", never as "the account
 // holds nothing", because the second costs a duplicate add.
@@ -553,6 +586,20 @@ func TestFetchAccountListing_streamsAndDetectsTruncation(t *testing.T) {
 	// An envelope with no data key is not a claim about the account either.
 	if _, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true}`))); ok {
 		t.Error("a listing with no data key was treated as authoritative")
+	}
+	// A REPEATED data key is unreadable, whichever order it comes in. Every rule for picking one of them
+	// is unsafe in one direction — a trailing null erases a list that was read, and an empty first array
+	// beats a populated second one into an authoritative "holds nothing" that costs a duplicate add —
+	// and the two safe directions are opposites, so no pick is safe. All four shapes must be ok=false.
+	for _, body := range []string{
+		`{"success":true,"data":null,"data":[{"id":7,"hash":"` + H + `"}]}`,
+		`{"success":true,"data":[{"id":7,"hash":"` + H + `"}],"data":null}`,
+		`{"success":true,"data":[],"data":[{"id":7,"hash":"` + H + `"}]}`,
+		`{"success":true,"data":[{"id":7,"hash":"` + H + `"}],"data":[]}`,
+	} {
+		if ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(body))); ok {
+			t.Errorf("a duplicate data key was treated as an answer (%v): %s", ids, body)
+		}
 	}
 	if _, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(`{"success":false,"data":[]}`))); ok {
 		t.Error("success:false was treated as authoritative")
@@ -646,6 +693,82 @@ func TestTorBoxStatusAnswer_takesItsDoubtFromTheLookupItAlreadyDid(t *testing.T)
 			}
 		})
 	}
+}
+
+// A memo HIT hands every caller the same parsed map, rather than re-parsing the listing per caller.
+//
+// The memo used to be JSON in the shared Cache, so each hit re-ran json.Unmarshal and produced a private
+// copy: 14 ms and 9.1 MB per hit on an account near maxListingEntries, and 26.5 MB alive at once across
+// the eight concurrent probes a poster grid makes. maxListingEntries reads as though it bounded what the
+// listing costs, and it did not — the real quantity was entries times concurrent callers.
+func TestAccountListing_memoHitsShareOneParsedMap(t *testing.T) {
+	const entries = 2000
+	var body strings.Builder
+	body.WriteString(`{"success":true,"data":[`)
+	for i := 0; i < entries; i++ {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		fmt.Fprintf(&body, `{"id":%d,"hash":"%040x"}`, i, i)
+	}
+	body.WriteString(`]}`)
+
+	fetches := 0
+	s := &torBoxStore{token: "memo", api: torboxAPI, cache: NewMemoryCache(1 << 20),
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			fetches++
+			return resp(200, body.String()), nil
+		}}}
+
+	first, ok := s.accountListing(context.Background())
+	if !ok || len(first) != entries {
+		t.Fatalf("first read: ok=%v entries=%d", ok, len(first))
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	const hits = 8
+	got := make([]map[string]int, hits)
+	for i := range got {
+		ids, ok := s.accountListing(context.Background())
+		if !ok {
+			t.Fatalf("memo hit %d missed", i)
+		}
+		got[i] = ids
+	}
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(got)
+
+	if fetches != 1 {
+		t.Errorf("fetched the listing %d times for nine reads", fetches)
+	}
+	// Same map, not an equal one: a private copy per caller is the cost this exists to remove, and two
+	// maps with the same contents would satisfy any assertion phrased on contents.
+	for i, ids := range got {
+		if len(ids) != len(first) {
+			t.Fatalf("memo hit %d returned %d entries, want %d", i, len(ids), len(first))
+		}
+		if !mapsAreSame(ids, first) {
+			t.Errorf("memo hit %d returned a private copy of the listing, not the shared map", i)
+		}
+	}
+	// Eight hits on a 2,000-entry account allocated ~445 KB each through the old path, so anything in
+	// that range means the parse is back. A shared map costs a handful of words per hit.
+	if allocated := int64(after.TotalAlloc) - int64(before.TotalAlloc); allocated > 64<<10 {
+		t.Errorf("%d memo hits allocated %d bytes — the listing is being re-parsed per caller",
+			hits, allocated)
+	}
+}
+
+// mapsAreSame reports whether two maps are the SAME map, which is what distinguishes a shared memo from
+// a per-caller copy. Go has no pointer equality for maps, so it is done by observation: write a key into
+// one and see whether the other sees it.
+func mapsAreSame(a, b map[string]int) bool {
+	const probe = "\x00same-map-probe"
+	a[probe] = 1
+	_, seen := b[probe]
+	delete(a, probe)
+	return seen
 }
 
 // An account whose listing is too big to read is not re-pulled on every attempt — but a TRANSIENT
@@ -770,46 +893,73 @@ func TestTruncationDetector_aBodyOfExactlyTheCapIsWhole(t *testing.T) {
 // The listing decode must not RETAIN the body — that property, not just "it parses", is what keeps a
 // 64 MiB cap safe inside a 230 MiB budget.
 //
-// Nothing asserted it: replacing the element-by-element walk with the old Decode-into-slice left the
-// whole suite green, and that buffering version is what peaked at 2.1x the body. The margin here is
-// enormous (measured ~1 MiB against ~129 MiB on 40 MiB of JSON), so a coarse ceiling is plenty and there
-// is no need to measure precisely enough to be flaky.
+// TWO fixtures, because the decode has two places it could buffer and each one needs the bulk to be
+// somewhere the other does not look. Bulk inside `data[]` is discarded by the element decode, so it
+// cannot see a skipped top-level field being materialised; bulk in a top-level field never enters the
+// element walk, so it cannot see that walk replaced by a single Decode into a slice. A previous version
+// of this test had only the second fixture and went green while `data[]` was buffered whole.
+//
+// Each shape gets its own ceiling, from measurement rather than a shared round number: the numbers are
+// far enough apart that a coarse ceiling is plenty and there is no need to measure precisely enough to
+// be flaky.
 func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
-	// The bulk sits in a TOP-LEVEL key that is neither success nor data, so it goes through skipValue's
-	// default branch — which is the code under test. An earlier fixture put the bulk inside each array
-	// element, where it is discarded by the element decode instead, so the skip branch never ran at all
-	// and the test could not tell the streaming walk from the buffering decode it replaced.
-	var body strings.Builder
-	body.WriteString(`{"success":true,"unknown_field":[`)
-	for i := 0; body.Len() < 24<<20; i++ {
+	// A top-level key that is neither success nor data goes through skipValue's default branch. Its walk
+	// allocates about one body's worth, because Token materialises each string it steps over; buffering
+	// the same field into a json.RawMessage allocates 3.7x.
+	var skipped strings.Builder
+	skipped.WriteString(`{"success":true,"unknown_field":[`)
+	for i := 0; skipped.Len() < 24<<20; i++ {
 		if i > 0 {
-			body.WriteString(",")
+			skipped.WriteString(",")
 		}
-		fmt.Fprintf(&body, `{"noise":"%s"}`, repeat("f", 6000))
+		fmt.Fprintf(&skipped, `{"noise":"%s"}`, repeat("f", 6000))
 	}
-	body.WriteString(`],"data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`)
+	skipped.WriteString(`],"data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`)
 
-	// TotalAlloc, not HeapAlloc: the buffering decode's cost is a transient PEAK, and it is unreachable
-	// by the time a post-GC HeapAlloc reading is taken — an earlier version of this test measured
-	// residency and passed against every implementation it forbids, including the RawMessage skip. What
-	// GOMEMLIMIT actually sees is the volume allocated while the decode runs.
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(body.String())))
-	runtime.ReadMemStats(&after)
-	if !ok {
-		t.Fatal("the fixture did not decode")
+	// The `data[]` walk keeps only hash→id, so its bulk costs almost nothing — 0.05x — while decoding the
+	// array into one []struct allocates 3.7x. The gap is wide enough that the ceiling can sit well under
+	// the body size, which is what makes this shape the sharper of the two.
+	var inData strings.Builder
+	inData.WriteString(`{"success":true,"data":[`)
+	for i := 0; inData.Len() < 24<<20; i++ {
+		if i > 0 {
+			inData.WriteString(",")
+		}
+		fmt.Fprintf(&inData, `{"id":%d,"hash":"%040x","files":"%s"}`, i, i, repeat("f", 6000))
 	}
-	runtime.KeepAlive(ids)
+	inData.WriteString(`]}`)
 
-	allocated := int64(after.TotalAlloc) - int64(before.TotalAlloc)
-	// Measured on this fixture: the streaming walk allocates 1.06x the body (the decoder's own read
-	// buffer, which it grows geometrically and reuses), buffering the skipped field into a
-	// json.RawMessage allocates 3.7x. Two is the only number between them that is not a coincidence.
-	if allocated > 2*int64(body.Len()) {
-		t.Errorf("decoding a %d-byte listing allocated %d bytes — the body is being buffered, not streamed",
-			body.Len(), allocated)
+	for _, tc := range []struct {
+		name string
+		body string
+		// Ceiling as a fraction of the body, x1000 to stay in integers.
+		ceilingPerMille int64
+	}{
+		{"bulk in a skipped top-level field", skipped.String(), 2000},
+		{"bulk inside the data array", inData.String(), 500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// TotalAlloc, not HeapAlloc: the buffering decode's cost is a transient PEAK, and it is
+			// unreachable by the time a post-GC HeapAlloc reading is taken — an earlier version of this
+			// test measured residency and passed against every implementation it forbids, including the
+			// RawMessage skip. What GOMEMLIMIT actually sees is the volume allocated while it runs.
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(tc.body)))
+			runtime.ReadMemStats(&after)
+			if !ok {
+				t.Fatal("the fixture did not decode")
+			}
+			runtime.KeepAlive(ids)
+
+			allocated := int64(after.TotalAlloc) - int64(before.TotalAlloc)
+			ceiling := int64(len(tc.body)) * tc.ceilingPerMille / 1000
+			if allocated > ceiling {
+				t.Errorf("decoding a %d-byte listing allocated %d bytes, ceiling %d — the body is being "+
+					"buffered, not streamed", len(tc.body), allocated, ceiling)
+			}
+		})
 	}
 }
 
