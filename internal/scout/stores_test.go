@@ -712,18 +712,22 @@ func TestFetchAccountListing_largeAccountIsNotTruncated(t *testing.T) {
 // measured inheriting a leader's 120 ms failure.
 func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	release := make(chan struct{})
-	arrived := make(chan struct{}, 1)
-	fetches := 0
+	// One send per fetch STARTED, so "did anyone start a second fetch" is answerable without reading a
+	// counter across goroutines.
+	arrivals := make(chan struct{}, 4)
 	newStore := func(token string) *torBoxStore {
 		return &torBoxStore{token: token, api: torboxAPI, cache: NewMemoryCache(1 << 20),
 			client: mockDoer{func(r *http.Request) (*http.Response, error) {
-				fetches++
+				arrivals <- struct{}{}
+				// Honours the request context, like a real transport — otherwise cancelling the leader
+				// changes nothing and the detachment half of this test asserts nothing. Cancellation is
+				// checked FIRST and on its own: once both it and release are ready a plain two-way select
+				// picks at random, which would make the detachment assertion a coin flip.
 				select {
-				case arrived <- struct{}{}:
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
 				default:
 				}
-				// Honours the request context, like a real transport — otherwise cancelling the leader
-				// changes nothing and the detachment half of this test asserts nothing.
 				select {
 				case <-release: // held until the test lets the leader finish
 				case <-r.Context().Done():
@@ -733,15 +737,17 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 			}}}
 	}
 
-	// The leader: a long budget, and it goes away before the fetch completes.
+	// The leader: a long budget, and it goes away before the fetch completes. A DEADLINE, not a bare
+	// cancel — the leader's context is only carved into a detached one when it has a deadline to copy, so
+	// a cancel-only fixture leaves that whole branch unexecuted and the detachment untested.
 	leader := newStore("shared")
-	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderCtx, cancelLeader := context.WithTimeout(context.Background(), 30*time.Second)
 	leaderDone := make(chan struct{})
 	go func() {
 		defer close(leaderDone)
 		_, _ = leader.accountListing(leaderCtx)
 	}()
-	<-arrived // the fetch is in flight
+	<-arrivals // the fetch is in flight
 
 	// A follower on the same account with a SHORT budget must not wait for the leader. Run in a goroutine
 	// with its own ceiling: blocked on the leader's WaitGroup this never returns at all, and a test that
@@ -764,26 +770,40 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 			"leader's clock, not its own")
 	}
 
-	// The leader's caller hangs up. The fetch must survive it, because other callers are waiting on it.
-	cancelLeader()
-	patient := newStore("shared")
-	patientCtx, cancelPatient := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelPatient()
-	got := make(chan bool, 1)
+	// A joiner with a long budget attaches to the SAME in-flight fetch — asserted, not assumed, by the
+	// fetch count. An earlier version of this simply called accountListing after cancelling the leader,
+	// which lets the caller start a NEW flight of its own and so passes whether or not the leader's fetch
+	// survived. It has to be attached before the leader goes away, or it proves nothing.
+	joiner := newStore("shared")
+	joinerCtx, cancelJoiner := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelJoiner()
+	joined := make(chan bool, 1)
 	go func() {
-		_, ok := patient.accountListing(patientCtx)
-		got <- ok
+		_, ok := joiner.accountListing(joinerCtx)
+		joined <- ok
 	}()
+	select {
+	case <-arrivals:
+		t.Fatal("the joiner started a second fetch instead of attaching to the one in flight, so " +
+			"cancelling the leader would prove nothing about whether its fetch survives")
+	case <-time.After(250 * time.Millisecond):
+		// No second fetch started: the joiner is attached to the leader's.
+	}
+
+	// Now the leader's caller hangs up. The fetch must survive it, because the joiner is waiting on it.
+	// Release only once the leader's call has fully RETURNED, so anything it cancels on the way out has
+	// already happened — otherwise the fetch can finish first and the assertion never gets to fire.
+	cancelLeader()
+	<-leaderDone
 	close(release)
 	select {
-	case ok := <-got:
+	case ok := <-joined:
 		if !ok {
 			t.Error("a caller with ten seconds left inherited the departed leader's cancellation")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("the patient caller never returned")
+		t.Fatal("the joining caller never returned")
 	}
-	<-leaderDone
 }
 
 // StatusAnswer's doubt comes from the lookup it already did, not from a second one.

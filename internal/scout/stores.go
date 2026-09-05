@@ -1609,13 +1609,18 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	// "could not find out" while it still had time. That answer is indeterminate, so it costs a retry
 	// rather than a false "nobody is fetching it" — and the flight is per token, so it needs a second
 	// concurrent request against the same account in the window between the two reads.
-	leaderCtx := context.WithoutCancel(ctx)
-	if deadline, ok := ctx.Deadline(); ok {
-		var cancel context.CancelFunc
-		leaderCtx, cancel = context.WithDeadline(leaderCtx, deadline)
-		defer cancel()
-	}
 	ch := listingFlight.DoChan(key, func() (any, error) {
+		// Built INSIDE the closure, so its cancel is tied to the lifetime of the fetch rather than to the
+		// leader's own call. Constructing it outside and deferring the cancel there undid the detachment
+		// completely: the deferred cancel fires when the leader's caller returns, which on the abandonment
+		// path is exactly when the fetch still needs to be running for everyone else — measured as the
+		// joiner inheriting "context canceled", the very failure this is here to prevent.
+		leaderCtx := context.WithoutCancel(ctx)
+		if deadline, ok := ctx.Deadline(); ok {
+			var cancel context.CancelFunc
+			leaderCtx, cancel = context.WithDeadline(leaderCtx, deadline)
+			defer cancel()
+		}
 		ids, ok, oversized := s.fetchAccountListing(leaderCtx)
 		if !ok {
 			if oversized && s.cache != nil {
