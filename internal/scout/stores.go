@@ -801,6 +801,25 @@ func (p *StorePool) AddInFlight(infoHash string) bool {
 	return false
 }
 
+// addStillBelievable mirrors addInFlight's ORDER, and the order is the point.
+//
+// addInFlight — which /play's resolve consults — checks unknownTooLong FIRST and converts to a dead
+// link past addGiveUp. Reading addOutcomeUnknown on its own skipped that, and the two markers have
+// different lifetimes (the attempt marker 90s, the unknown-outcome stamp 30 minutes), so they overlap:
+// the last add before the give-up leaves an attempt marker live for up to ninety seconds past it.
+// Measured in that window: ?probe=1 answered 202 downloading while /play answered 404 dead_link, for
+// the same release at the same instant.
+//
+// That is the defect this reporter was added to fix, pointing the other way, and it defeats what
+// addGiveUp is for — "past this the release is reported dead so the client can fall through" — on the
+// one URL the client polls to decide whether to keep waiting.
+func addStillBelievable(cache Cache, svc DebridService, token, infoHash string) bool {
+	if unknownTooLong(cache, svc, token, infoHash) {
+		return false
+	}
+	return addOutcomeUnknown(cache, svc, token, infoHash)
+}
+
 // addWouldMissTheClock refuses to CHARGE an add the caller's deadline can no longer carry.
 //
 // The charge and the in-flight marker are both written before the request is built, and a dead context
@@ -814,19 +833,32 @@ func (p *StorePool) AddInFlight(infoHash string) bool {
 // the free cache reads ahead of the charge — addInFlight and the two backoff gates — and so turned a
 // 202 "downloading" into a 503 naming the viewer's debrid as refusing, for a release scout had queued
 // moments earlier. Placed here, the free answers still surface and only the pointless purchase stops.
+// Wrapped in errScoutSide, and that wrap is load-bearing rather than cosmetic. recordRefusal excludes
+// errScoutSide by name, and without it this error was filed as a REFUSAL BY THE STORE: it wraps neither
+// a cancellation nor errScoutSide, and it returns before noteAddAttempt, so both of recordRefusal's
+// guards missed it and TorBox's add-error handler wrote a one-minute refusedKey naming TorBox for a
+// release TorBox had never been asked about. One spent clock then made a healthy release answer 503 on
+// /play AND on ?probe=1 for the next sixty seconds, on a fresh clock, with the store skipped as
+// "backing off". Measured: control 302, treatment 503 twice over.
+//
+// That is the laundering this file warns about twice — at recordRefusal itself and at the RD site that
+// once built a StoreUnavailableError here and hid the cause from isCancellation. It came back because
+// the guard was placed one line ABOVE noteAddAttempt, and it was the marker that used to route this
+// error away from recordRefusal.
 func addWouldMissTheClock(ctx context.Context, svc DebridService) error {
 	if ctx.Err() == nil {
 		return nil
 	}
-	return &StoreUnavailableError{Service: svc, Reason: "the resolve budget was spent before the add could be sent"}
+	return fmt.Errorf("%w: %w", errScoutSide, &StoreUnavailableError{
+		Service: svc, Reason: "the resolve budget was spent before the add could be sent"})
 }
 
 func (s *torBoxStore) AddInFlight(infoHash string) bool {
-	return addOutcomeUnknown(s.cache, ServiceTorBox, s.token, infoHash)
+	return addStillBelievable(s.cache, ServiceTorBox, s.token, infoHash)
 }
 
 func (s *realDebridStore) AddInFlight(infoHash string) bool {
-	return addOutcomeUnknown(s.cache, ServiceRealDebrid, s.token, infoHash)
+	return addStillBelievable(s.cache, ServiceRealDebrid, s.token, infoHash)
 }
 
 // Premiumize has a SECOND way to be mid-fetch, and it is the usual one.
@@ -842,7 +874,7 @@ func (s *realDebridStore) AddInFlight(infoHash string) bool {
 // agreeing at the same moment rather than swapping sides — past the give-up /play reports the release
 // dead, and a probe still claiming 202 would be the same defect pointing the other way.
 func (s *premiumizeStore) AddInFlight(infoHash string) bool {
-	if addOutcomeUnknown(s.cache, ServicePremiumize, s.token, infoHash) {
+	if addStillBelievable(s.cache, ServicePremiumize, s.token, infoHash) {
 		return true
 	}
 	return alreadyQueued(s.cache, s.token, infoHash) &&

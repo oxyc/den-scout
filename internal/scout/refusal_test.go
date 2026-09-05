@@ -524,6 +524,100 @@ func TestHandlePlay_anInFlightAddIsQueuedNotRefused(t *testing.T) {
 	}
 }
 
+// A spent clock must not be remembered as the STORE refusing.
+//
+// The guard that stops an add being charged on a dead context returns a StoreUnavailableError, and
+// recordRefusal files anything that is not a cancellation, not errScoutSide, not errAddInFlight and not
+// errTorrentGone. So the refusal memory learned that TorBox had declined a release TorBox was never
+// asked about: one cancelled poll — a viewer changing focus is enough — made a healthy release answer
+// 503 on BOTH routes for the next sixty seconds, on a fresh clock, with the store skipped as "backing
+// off". The clock is scout's, so the error says so, and errScoutSide is what keeps it out of the memory.
+//
+// All three stores, because only TorBox's guard had a test and the other two were free to drift.
+func TestResolve_aSpentClockIsNotRememberedAsTheStoreRefusing(t *testing.T) {
+	for _, svc := range []DebridService{ServiceTorBox, ServiceRealDebrid, ServicePremiumize} {
+		t.Run(string(svc), func(t *testing.T) {
+			token, hash := "clock-"+string(svc), repeat("7", 40)
+			cache := NewMemoryCache(1 << 20)
+			quiet := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				return resp(200, `{"data":{}}`), nil
+			}}
+			var store Store
+			switch svc {
+			case ServiceRealDebrid:
+				store = &realDebridStore{token: token, cache: cache, api: realDebridAPI, client: quiet}
+			case ServicePremiumize:
+				store = &premiumizeStore{token: token, cache: cache, api: premiumizeAPI, client: quiet}
+			default:
+				store = &torBoxStore{token: token, cache: cache, api: torboxAPI, client: quiet}
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err := store.Resolve(ctx, ResolveTarget{InfoHash: hash})
+			if err == nil {
+				t.Fatal("a resolve on a spent clock should not succeed")
+			}
+			if !errors.Is(err, errScoutSide) {
+				t.Errorf("a spent clock reported %v — not marked as scout's own, so recordRefusal files "+
+					"it and the store is blamed for a request it never saw", err)
+			}
+			if reason, backed := backedOff(cache, svc, token, hash); backed {
+				t.Errorf("a spent clock left a refusal against %s: %q — the next poll skips a healthy "+
+					"store for a minute, on both /play and ?probe=1", svc, reason)
+			}
+		})
+	}
+}
+
+// The probe stops believing an add at the same moment /play does.
+//
+// addInFlight, which /play's resolve consults, checks unknownTooLong FIRST and calls the release dead
+// past addGiveUp. The pool's reporter read the attempt marker alone, and the two markers have different
+// lifetimes — the attempt marker 90s, the unknown-outcome stamp 30 minutes — so they overlap: the last
+// add before the give-up leaves an attempt marker live for up to ninety seconds past it. In that window
+// ?probe=1 said 202 downloading while /play said 404 dead_link, which is the disagreement the reporter
+// was added to remove, pointing the other way.
+func TestAddInFlight_stopsBelievingAnAddAtTheGiveUp(t *testing.T) {
+	token, hash := "giveup", repeat("8", 40)
+	cache := NewMemoryCache(1 << 20)
+	s := &realDebridStore{token: token, cache: cache, api: realDebridAPI}
+
+	noteAddAttempt(cache, ServiceRealDebrid, token, hash)
+	if !s.AddInFlight(hash) {
+		t.Fatal("a fresh add attempt should read as in flight")
+	}
+
+	// Age the unknown-outcome stamp past the give-up, leaving the 90s attempt marker live beneath it.
+	cache.Put(unknownOutcomeKey(ServiceRealDebrid, token, hash),
+		strconv.FormatInt(time.Now().Add(-addGiveUp-time.Minute).Unix(), 10), unknownOutcomeTTL)
+
+	if s.AddInFlight(hash) {
+		t.Error("past the give-up the probe still called the add live, while /play calls the release " +
+			"dead — the client is told to keep waiting for something /play has stopped waiting for")
+	}
+}
+
+// The pool asks EVERY store, not just the first.
+//
+// Every fixture for this reporter built a single-store pool, so the loop was never exercised: a version
+// that answered false for any pool with more than one store passed the whole suite, and would have made
+// the probe blind to in-flight adds on exactly the multi-account installs it matters for.
+func TestStorePoolAddInFlight_asksEveryStore(t *testing.T) {
+	token, hash := "pool-loop", repeat("6", 40)
+	cache := NewMemoryCache(1 << 20)
+	noteAddAttempt(cache, ServicePremiumize, token, hash) // the marker is on the LAST store
+
+	pool := &StorePool{stores: []Store{
+		&torBoxStore{token: token, cache: cache, api: torboxAPI},
+		&realDebridStore{token: token, cache: cache, api: realDebridAPI},
+		&premiumizeStore{token: token, cache: cache, api: premiumizeAPI},
+	}}
+	if !pool.AddInFlight(hash) {
+		t.Error("the pool missed an add in flight on a store that was not the first one asked")
+	}
+}
+
 // A release Real-Debrid already holds is READY on the probe route, not "not queued".
 //
 // The probe's readiness branch was gated on the cache check alone, and RD publishes no cache API — it
