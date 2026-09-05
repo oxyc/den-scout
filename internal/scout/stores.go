@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1408,9 +1409,19 @@ var listingFlight singleflight.Group
 // here; the one consumer, findTorrentByHash, only looks entries up.
 //
 // Scoped to the CACHE as well as the account, which is where this memo lived before and therefore the
-// isolation everything already assumes: two handlers built with different caches do not share an
-// account, and neither do two tests. Keyed on the interface value, so every Cache implementation must
-// stay comparable — all three are pointers.
+// isolation everything already assumes: two handlers built with different caches do not read each
+// other's memo, and neither do two tests. Keyed on the interface value, so every Cache implementation
+// must stay comparable — all three are pointers.
+//
+// Not a claim that two such handlers share nothing: listingFlight is keyed on the token alone, so
+// concurrent fetches for one account still collapse into one round trip across caches. That is correct —
+// the token IS the account, and the answer does not depend on who asked — and it is only the memo that
+// is scoped, so it is worth saying rather than implying otherwise.
+//
+// Comparability is CHECKED rather than assumed. Cache is exported and Deps.Cache takes any
+// implementation, so a value-typed one with a map or slice field would panic on the map insert — inside a
+// request handler, with nothing at compile time to catch it. An implementation that cannot be a key
+// simply gets no memo.
 var (
 	listingMemoMu sync.Mutex
 	listingMemo   = map[listingMemoKey]listingMemoEntry{}
@@ -1426,40 +1437,64 @@ type listingMemoEntry struct {
 	at  time.Time
 }
 
-// maxListingMemoEntries bounds the memo by ACCOUNT, because its key derives from a token the config
-// supplies and nobody here verifies. A legitimate install has at most maxDebridAccounts of them. Only a
-// token TorBox actually answered a listing for can reach this map, so this is a backstop rather than the
-// front line — but a caller-keyed map in this package gets a ceiling regardless.
-const maxListingMemoEntries = 32
+// maxListingMemoEntries bounds the memo by TORRENT, summed across accounts — not by account.
+//
+// A per-account ceiling is the mistake byte budgets exist to correct, and cache.go's own header records
+// it: an entry count says nothing about size when the entries differ by four orders of magnitude. Each
+// account may hold up to maxListingEntries, measured at 4.0 MiB live for 50,000, so a 32-ACCOUNT ceiling
+// admits 127 MiB — 55% of GOMEMLIMIT, and held outside the 48 MiB cache budget that used to bound this
+// when it was a string in the LRU.
+//
+// 100,000 torrents is about 8 MiB by that measurement. It admits two accounts at the absolute per-account
+// cap, or fifty at the largest size this package has actually measured (2,000), which is far past any
+// real install: maxDebridAccounts is 8 per config, and only a token TorBox answered a listing for can
+// reach this map at all.
+const maxListingMemoEntries = 100_000
+
+// memoisable reports whether a Cache can be a map key at all — see listingMemo's comment.
+func memoisable(cache Cache) bool {
+	return cache != nil && reflect.TypeOf(cache).Comparable()
+}
 
 func cachedListing(cache Cache, key string) (map[string]int, bool) {
-	if cache == nil {
+	if !memoisable(cache) {
 		return nil, false
 	}
 	listingMemoMu.Lock()
 	defer listingMemoMu.Unlock()
-	e, ok := listingMemo[listingMemoKey{cache, key}]
-	if !ok || time.Since(e.at) >= listingTTL {
+	memoKey := listingMemoKey{cache, key}
+	e, ok := listingMemo[memoKey]
+	if !ok {
+		return nil, false
+	}
+	if time.Since(e.at) >= listingTTL {
+		// Dropped here rather than left for the next put. An account nobody asks about again otherwise
+		// stays resident until some OTHER account is fetched, which for a single-account install is never.
+		delete(listingMemo, memoKey)
 		return nil, false
 	}
 	return e.ids, true
 }
 
 func putCachedListing(cache Cache, key string, ids map[string]int) {
-	if cache == nil {
+	if !memoisable(cache) {
 		return
 	}
 	listingMemoMu.Lock()
 	defer listingMemoMu.Unlock()
+	delete(listingMemo, listingMemoKey{cache, key}) // replaced, so it must not count toward the total
+	held := 0
 	for k, e := range listingMemo {
 		if time.Since(e.at) >= listingTTL {
 			delete(listingMemo, k)
+			continue
 		}
+		held += len(e.ids)
 	}
 	// Expiry alone cannot bound a caller-keyed map — the same reasoning as pruneMintedLocked, which this
-	// deliberately mirrors. Oldest first, since every entry lives the same fifteen seconds and there is
-	// no separate last-used clock to prefer.
-	for len(listingMemo) >= maxListingMemoEntries {
+	// deliberately mirrors. Oldest first, since every entry lives the same fifteen seconds and there is no
+	// separate last-used clock to prefer.
+	for held+len(ids) > maxListingMemoEntries && len(listingMemo) > 0 {
 		var oldest listingMemoKey
 		at := time.Time{}
 		for k, e := range listingMemo {
@@ -1467,6 +1502,7 @@ func putCachedListing(cache Cache, key string, ids map[string]int) {
 				oldest, at = k, e.at
 			}
 		}
+		held -= len(listingMemo[oldest].ids)
 		delete(listingMemo, oldest)
 	}
 	listingMemo[listingMemoKey{cache, key}] = listingMemoEntry{ids: ids, at: time.Now()}
@@ -2987,26 +3023,18 @@ func (p *StorePool) ResolveCachedOnly(ctx context.Context, t ResolveTarget,
 
 // Status — the first store that can say a queued release is still downloading. Only meaningful right
 // after a failed Resolve; ok=false means nobody is fetching it, i.e. genuinely dead.
-// Each store gets its own SLICE of the budget, rather than all of them sharing one deadline.
 //
-// Sharing it meant the first store could spend the lot: TorBox's Status walks an account listing this
-// package measures at ~13 MB on a large account, so with TorBox configured first, every later store was
-// called with an already-expired context and its request failed instantly. A Real-Debrid account that
-// was actively downloading the release was asked twice and answered neither time — the pool reported
-// "nobody is fetching it", and the caller queued a second copy. The store that knew the answer was in
-// the list the whole time.
-//
-// Split evenly across the stores still to be asked, so an early store that answers quickly hands its
-// unused time to the rest rather than the first one taking it all.
 // The third result is the one that matters to a caller deciding whether to ADD: it reports that at least
-// one store could not answer, as opposed to answering "no".
+// one store could not answer, as opposed to answering "no". Callers that will RETRY want StatusDetail
+// instead, which says which stores those were; this is the same question collapsed to a bool.
 //
-// Returning only (status, ok) forced handlePlay to infer that from its own clock, and the slicing above
-// made the two questions different: store 0 can burn its slice and time out while the pool still returns
-// well before the caller's deadline, so "did the whole budget elapse" was false and the caller queued a
-// second copy of a torrent store 0 was already fetching. That is the exact bug the escalation exists to
-// prevent, reintroduced for every multi-account install by the fix for a different one. The pool knows
-// which store ran out of time; it now says so instead of leaving it to be guessed.
+// Returning only (status, ok) forced handlePlay to infer doubt from its own clock, and the per-store
+// budget slicing below made the two questions different: store 0 can burn its slice and time out while
+// the pool still returns well before the caller's deadline, so "did the whole budget elapse" was false
+// exactly when a store had failed to answer. The caller then queued a second copy of a torrent store 0
+// was already fetching — the bug the escalation exists to prevent, reintroduced for every multi-account
+// install by the fix for a different one. The pool knows; it says so rather than leaving it to be
+// guessed.
 func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool, bool) {
 	status, ok, unknown := p.StatusDetail(ctx, t)
 	return status, ok, len(unknown) > 0
@@ -3020,6 +3048,15 @@ func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, b
 // poll cadence for the length of a download, that is a wasted upstream read per extra account per poll,
 // on the path the escalation exists for — which is by definition a path where something is already
 // struggling.
+//
+// Each store gets its own SLICE of the budget, rather than all of them sharing one deadline. Sharing it
+// meant the first store could spend the lot: TorBox's status walks an account listing this package
+// measures at ~13 MB on a large account, so with TorBox configured first, every later store was called
+// with an already-expired context and failed instantly. A Real-Debrid account that was actively
+// downloading the release was asked twice and answered neither time — the pool reported "nobody is
+// fetching it", and the caller queued a second copy. The store that knew the answer was in the list the
+// whole time. Split evenly across the stores STILL TO BE ASKED, so an early store that answers quickly
+// hands its unused time to the rest rather than the first one taking it all.
 func (p *StorePool) StatusDetail(ctx context.Context, t ResolveTarget) (StoreStatus, bool, []Store) {
 	var unknown []Store
 	for i, st := range p.stores {
@@ -3029,7 +3066,14 @@ func (p *StorePool) StatusDetail(ctx context.Context, t ResolveTarget) (StoreSta
 			if deadlinePassed(ctx) || ctx.Err() != nil {
 				// Out of time, or the caller went away. Either way the stores still unasked have not
 				// answered — which is not the same as answering no, so they are the ones to retry.
-				return StoreStatus{}, false, p.stores[i:]
+				//
+				// Together with the stores that ALREADY said they could not answer. Returning only the
+				// unasked tail dropped them, so the escalation re-asked stores that had never been asked
+				// (which answer "no" promptly) while never re-asking the one store that was uncertain —
+				// and then /play concluded nobody was fetching the torrent and spent an add on it. That
+				// is the failure the escalation exists to prevent, reintroduced by the change that made
+				// the retry cheaper.
+				return StoreStatus{}, false, append(unknown, p.stores[i:]...)
 			}
 			share, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(p.stores)-i))
 		}

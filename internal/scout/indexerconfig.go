@@ -214,6 +214,11 @@ func pruneMintedLocked() {
 	// about to insert exactly one — and sorting 256 entries to drop one of them cost 31 µs and 15 KB per
 	// insert against 4 µs under the ceiling, all of it holding mintedMu, which serialises every mint in
 	// the process. That is 7.5x the wall clock precisely under the flood this ceiling exists to absorb.
+	//
+	// The loop is O((n-ceiling)·n), which only matters if the map can ever be far OVER the ceiling — and it
+	// cannot: both insert sites prune first, so it is only ever one entry past. Measured at 4x the ceiling
+	// it is 4.6 ms and at 16x it is 86 ms, all under the mutex, so anything that preloads or restores this
+	// map has to trim before it publishes it.
 	for len(minted) >= maxMintedEntries {
 		var oldest string
 		used := time.Time{}

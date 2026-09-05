@@ -1435,6 +1435,40 @@ func TestHandlePlay_pollReadsUseTheStatusBudget(t *testing.T) {
 	}
 }
 
+// The narrowed escalation, asserted where handlePlay actually performs it.
+//
+// The pool-level property had a test and the CALL SITE did not: reverting handlePlay to escalate through
+// the whole pool left the entire suite green, so the fix that saves the upstream calls was unpinned while
+// the mechanism it uses was covered. Counted in store reads because that is the quantity that matters —
+// each TorBox read is up to two upstream calls, on a two-second poll cadence.
+func TestHandlePlay_theEscalationReAsksOnlyTheStoreThatCouldNotAnswer(t *testing.T) {
+	dead := func() (string, error) { return "", &DeadLinkError{"nothing here"} }
+	var uncertainAsks, firstAsks, lastAsks int
+	stores := []Store{
+		answeringStore{fakeStore: fakeStore{svc: ServiceRealDebrid, resolve: dead}, answer: statusNo, asked: &firstAsks},
+		answeringStore{fakeStore: fakeStore{svc: ServiceTorBox, resolve: dead}, answer: statusUnknown, asked: &uncertainAsks},
+		answeringStore{fakeStore: fakeStore{svc: ServicePremiumize, resolve: dead}, answer: statusNo, asked: &lastAsks},
+	}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store { return stores }
+	}))
+	tok := encodePlayToken(PlayTarget{InfoHash: repeat("a", 40)})
+	do(h, "/"+validBlob+"/play/"+tok, nil)
+
+	// Three reads happen on this path: the poll read, the escalation, and the post-failure read after the
+	// resolve. Only the escalation is narrowed — the post-failure one runs after an add may have landed,
+	// so every store's answer can have changed and all of them are asked again.
+	if uncertainAsks != 3 {
+		t.Errorf("the store that could not answer was read %d times, want 3 (poll, escalation, post-failure)",
+			uncertainAsks)
+	}
+	if firstAsks != 2 || lastAsks != 2 {
+		t.Errorf("stores that answered definitively were read %d and %d times, want 2 each — the "+
+			"escalation is re-asking stores that already gave a definitive answer",
+			firstAsks, lastAsks)
+	}
+}
+
 // The same rule, on the ONE path that is allowed an exception: a first read that timed out earns a
 // second, longer one, because the alternative is queueing a torrent already downloading.
 //

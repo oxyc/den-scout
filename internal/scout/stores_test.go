@@ -265,11 +265,22 @@ type answeringStore struct {
 	fakeStore
 	answer statusAnswer
 	asked  *int
+	// onAsk runs after the answer is recorded, so a test can make the world change mid-loop — the caller
+	// hanging up being the one that drives the pool's out-of-time branch.
+	onAsk func()
 }
 
-func (a answeringStore) StatusAnswer(context.Context, ResolveTarget) (StoreStatus, statusAnswer) {
+func (a answeringStore) StatusAnswer(ctx context.Context, _ ResolveTarget) (StoreStatus, statusAnswer) {
 	if a.asked != nil {
 		*a.asked++
+	}
+	// Honours the embedded fakeStore's statusBlocks, so a store can both take too long AND report that it
+	// could not tell — which is the combination the pool's out-of-time branch has to get right.
+	if a.statusBlocks {
+		<-ctx.Done()
+	}
+	if a.onAsk != nil {
+		a.onAsk()
 	}
 	return StoreStatus{Progress: 0.5}, a.answer
 }
@@ -547,6 +558,40 @@ func TestStorePoolStatusDetail_namesOnlyTheStoresThatCouldNotAnswer(t *testing.T
 	}
 }
 
+// Running out of time mid-loop keeps the stores that ALREADY said they could not answer, as well as the
+// ones never reached.
+//
+// That branch had no coverage at all: returning nil from it — "every store answered no" — left the whole
+// suite green. And returning only the unasked tail is worse than useless, because the escalation then
+// re-asks stores that were never asked (which answer promptly, and say no) while never re-asking the one
+// store that was uncertain. /play reads that as nobody fetching the torrent and spends an add on it.
+func TestStorePoolStatusDetail_keepsUncertainStoresWhenTimeRunsOut(t *testing.T) {
+	// Store 0 says it cannot tell; the caller then hangs up, so store 1 is never reached. A store's own
+	// slice expiring does not get here — the pool simply moves on with time left — so the branch is
+	// driven the way production reaches it, by the request context ending.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	uncertain := answeringStore{fakeStore: fakeStore{svc: ServiceTorBox}, answer: statusUnknown, onAsk: cancel}
+	unreached := fakeStore{svc: ServiceRealDebrid}
+
+	pool := &StorePool{stores: []Store{uncertain, unreached}}
+	_, ok, unknown := pool.StatusDetail(ctx, ResolveTarget{InfoHash: H})
+	if ok {
+		t.Fatal("nothing was downloading")
+	}
+	var named []DebridService
+	for _, st := range unknown {
+		named = append(named, st.Service())
+	}
+	if len(unknown) != 2 {
+		t.Fatalf("named %v as unable to answer, want both stores", named)
+	}
+	// The uncertain one specifically — the tail alone would name only realdebrid.
+	if named[0] != ServiceTorBox {
+		t.Errorf("named %v; the store that said it could not tell must be in the retry set", named)
+	}
+}
+
 // The account listing is decoded element by element, so its size bounds time and not memory — which is
 // what makes the larger cap safe. A body past the cap must read as "no answer", never as "the account
 // holds nothing", because the second costs a duplicate add.
@@ -693,6 +738,106 @@ func TestTorBoxStatusAnswer_takesItsDoubtFromTheLookupItAlreadyDid(t *testing.T)
 				t.Errorf("listed the account %d times over two polls, want %d", fetches, tc.wantFetches)
 			}
 		})
+	}
+}
+
+// The memo is bounded by TORRENTS held, not by accounts, and an expired entry stops being resident.
+//
+// Both shipped with no coverage. An account ceiling is what byte budgets exist to replace — 32 accounts
+// times maxListingEntries admits 127 MiB, over half of GOMEMLIMIT and outside the cache budget that used
+// to bound this — and expiry that only ran inside a put left a single-account install holding a stale
+// listing forever, because nothing else was ever fetched to trigger the sweep.
+func TestListingMemo_isBoundedByTorrentsAndDropsExpiredEntries(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	t.Cleanup(func() {
+		listingMemoMu.Lock()
+		listingMemo = map[listingMemoKey]listingMemoEntry{}
+		listingMemoMu.Unlock()
+	})
+
+	// Each account holds a tenth of the ceiling, so fifteen of them cannot all fit.
+	const per = maxListingMemoEntries / 10
+	ids := func(n int) map[string]int {
+		m := make(map[string]int, n)
+		for i := 0; i < n; i++ {
+			m[fmt.Sprintf("%040x", i)] = i
+		}
+		return m
+	}
+	for i := 0; i < 15; i++ {
+		putCachedListing(cache, fmt.Sprintf("acct-%d", i), ids(per))
+	}
+
+	listingMemoMu.Lock()
+	total, accounts := 0, len(listingMemo)
+	for _, e := range listingMemo {
+		total += len(e.ids)
+	}
+	listingMemoMu.Unlock()
+	if total > maxListingMemoEntries {
+		t.Errorf("the memo holds %d torrents across %d accounts, ceiling is %d",
+			total, accounts, maxListingMemoEntries)
+	}
+	// And it is actually full, or the flood never reached the ceiling and this asserts nothing.
+	if total < maxListingMemoEntries-per {
+		t.Errorf("the memo holds only %d torrents — the flood never reached the %d ceiling",
+			total, maxListingMemoEntries)
+	}
+
+	// An expired entry is dropped on LOOKUP, not left for the next account's put.
+	listingMemoMu.Lock()
+	listingMemo = map[listingMemoKey]listingMemoEntry{
+		{cache, "stale"}: {ids: ids(3), at: time.Now().Add(-listingTTL - time.Second)},
+	}
+	listingMemoMu.Unlock()
+	if _, hit := cachedListing(cache, "stale"); hit {
+		t.Error("an expired listing was served")
+	}
+	listingMemoMu.Lock()
+	left := len(listingMemo)
+	listingMemoMu.Unlock()
+	if left != 0 {
+		t.Errorf("the expired entry is still resident (%d left) — on a single-account install nothing "+
+			"else is ever fetched to sweep it", left)
+	}
+}
+
+// uncomparableCache is a Cache that cannot be a map key. Cache is exported and Deps.Cache takes any
+// implementation, so this is a shape a caller outside this package can genuinely supply.
+type uncomparableCache struct {
+	Cache
+	_ []int // a slice field makes the struct uncomparable; a value receiver puts it in the interface
+}
+
+func (c uncomparableCache) Get(string) (string, bool)         { return "", false }
+func (c uncomparableCache) Put(string, string, time.Duration) {}
+
+// A Cache that cannot be a map key gets no memo, rather than panicking inside a request handler.
+func TestListingMemo_survivesAnUncomparableCache(t *testing.T) {
+	var cache Cache = uncomparableCache{}
+	if memoisable(cache) {
+		t.Fatal("the fixture is comparable, so this asserts nothing")
+	}
+	// Both halves, because either one panics on its own.
+	if _, hit := cachedListing(cache, "k"); hit {
+		t.Error("an unmemoisable cache reported a hit")
+	}
+	putCachedListing(cache, "k", map[string]int{H: 1})
+
+	// And the store built on it still works, just without the memo.
+	fetches := 0
+	s := &torBoxStore{token: "uncomparable", api: torboxAPI, cache: cache,
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			fetches++
+			return resp(200, `{"success":true,"data":[{"id":4,"hash":"`+H+`"}]}`), nil
+		}}}
+	for i := 0; i < 2; i++ {
+		if ids, ok := s.accountListing(context.Background()); !ok || ids[H] != 4 {
+			t.Fatalf("read %d: ok=%v ids=%v", i, ok, ids)
+		}
+	}
+	if fetches != 2 {
+		t.Errorf("fetched %d times; without a memo every read is its own fetch", fetches)
 	}
 }
 
@@ -908,9 +1053,14 @@ func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 	}
 	skipped.WriteString(`],"data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`)
 
-	// The `data[]` walk keeps only hash→id, so its bulk costs almost nothing — 0.05x — while decoding the
+	// The `data[]` walk keeps only hash→id, so its bulk costs almost nothing — 0.03x — while decoding the
 	// array into one []struct allocates 3.7x. The gap is wide enough that the ceiling can sit well under
 	// the body size, which is what makes this shape the sharper of the two.
+	//
+	// 0.5x rather than something nearer the measured 0.03x, because the cheapest way to reintroduce the
+	// buffering is a []json.RawMessage over the array, which measures 1.09x — an order of magnitude below
+	// the 3.7x of a full slice decode. The ceiling has to sit under the CHEAPEST regression, not the
+	// worst, and 0.5 is the midpoint of that pair rather than of the loud one.
 	var inData strings.Builder
 	inData.WriteString(`{"success":true,"data":[`)
 	for i := 0; inData.Len() < 24<<20; i++ {
