@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -487,7 +488,9 @@ func TestFetchAccountListing_streamsAndDetectsTruncation(t *testing.T) {
 	}
 
 	// Truncation is detectable, and must not look like an empty account.
-	td := &truncationDetector{r: io.LimitReader(strings.NewReader(big.String()), 1<<10), limit: 1 << 10}
+	// Constructed exactly as production does: the reader is given limit+1 so that "read the cap exactly"
+	// and "cut off at the cap" are distinguishable.
+	td := &truncationDetector{r: io.LimitReader(strings.NewReader(big.String()), (1<<10)+1), limit: 1 << 10}
 	if _, ok := decodeListing(json.NewDecoder(td)); ok {
 		t.Error("a truncated listing decoded as a valid answer")
 	}
@@ -590,5 +593,62 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 	if transientFetches != 3 {
 		t.Errorf("a transient listing failure was memoised (%d fetches for three attempts) — a queued "+
 			"torrent would stop being rediscoverable", transientFetches)
+	}
+}
+
+// The listing decode must not RETAIN the body — that property, not just "it parses", is what keeps a
+// 64 MiB cap safe inside a 230 MiB budget.
+//
+// Nothing asserted it: replacing the element-by-element walk with the old Decode-into-slice left the
+// whole suite green, and that buffering version is what peaked at 2.1x the body. The margin here is
+// enormous (measured ~1 MiB against ~129 MiB on 40 MiB of JSON), so a coarse ceiling is plenty and there
+// is no need to measure precisely enough to be flaky.
+func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(`{"success":true,"data":[`)
+	for i := 0; body.Len() < 24<<20; i++ {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		// The bulk is in a field the walk skips, which is where a RawMessage or a full unmarshal shows up.
+		fmt.Fprintf(&body, `{"id":%d,"hash":"%040x","files":"%s"}`, i, i, repeat("f", 6000))
+	}
+	body.WriteString(`]}`)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	ids, ok := decodeListing(json.NewDecoder(strings.NewReader(body.String())))
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if !ok {
+		t.Fatal("the fixture did not decode")
+	}
+	runtime.KeepAlive(ids)
+
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	// The map itself is a few hundred KB at this size; the body is 24 MiB. Anything near the body means
+	// the decode is buffering it again.
+	if retained > 8<<20 {
+		t.Errorf("decoding a %d-byte listing retained %d bytes — the body is being held, not streamed",
+			body.Len(), retained)
+	}
+}
+
+// The listing map is bounded by ENTRY COUNT as well as by bytes: the byte cap admits ~1M minimal entries,
+// which measured 346 MiB of retained map against a 230 MiB GOMEMLIMIT.
+func TestDecodeListing_boundsEntryCount(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(`{"success":true,"data":[`)
+	for i := 0; i <= maxListingEntries; i++ {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		fmt.Fprintf(&body, `{"id":%d,"hash":"%040x"}`, i, i)
+	}
+	body.WriteString(`]}`)
+
+	if _, ok := decodeListing(json.NewDecoder(strings.NewReader(body.String()))); ok {
+		t.Errorf("a listing with more than %d entries was accepted", maxListingEntries)
 	}
 }

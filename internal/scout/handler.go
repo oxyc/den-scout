@@ -87,22 +87,37 @@ func deadlinePassed(ctx context.Context) bool {
 // the resolve a dead context, and made the add impossible. It declines unless twice the budget remains,
 // so the resolve keeps at least as long as the escalation costs.
 //
-// One statusBudget, not two. The rule in handler_test.go is that a read on the poll route carries no more
-// than statusBudget, and giving this one double quietly broke that rule while the test that asserts it
-// looked away — its fixture answers instantly, so the escalation never fired under it. Worst-case poll
-// latency is therefore two short reads rather than one, and every individual read still obeys the rule.
-// The large-account case this was really for is fixed where it belongs, in the listing decode.
+// TWICE the ordinary budget, and that number has now been wrong in both directions, so it is worth
+// recording why it settled here.
+//
+// It was two, then cut to one because a 16-second read on the polled /play route breaks the rule
+// TestHandlePlay_pollReadsUseTheStatusBudget states. Cutting it made the escalation useless: the retry is
+// sliced from the same budget as the read that just failed, so a store persistently slower than its slice
+// gets a bit-for-bit repeat of a read already known to time out. Measured on a listing 1.4x the budget,
+// five runs out of five: at one budget the play 302s and queues a duplicate add; at two it 202s and
+// queues nothing. A guard that cannot succeed is not a guard.
+//
+// So the rule is the thing that needed amending, not the number, and the test now states the real one:
+// no status read may take the RESOLVE budget, and exactly one — this one, on the path about to spend an
+// add — may take double. Worst-case poll latency is 3x statusBudget, 24 seconds, against a 45-second
+// resolve budget it is carved out of and a 60-second write timeout.
 func escalatedStatusCtx(parent context.Context) (context.Context, context.CancelFunc, bool) {
 	deadline, ok := parent.Deadline()
 	if !ok {
 		return nil, nil, false
 	}
-	if time.Until(deadline) < 2*statusBudget {
+	budget := escalatedStatusBudget()
+	// Leave the resolve at least as long as the escalation costs, so the add remains possible.
+	if time.Until(deadline) < 2*budget {
 		return nil, nil, false
 	}
-	ctx, cancel := context.WithTimeout(parent, statusBudget)
+	ctx, cancel := context.WithTimeout(parent, budget)
 	return ctx, cancel, true
 }
+
+// A function, not a var: derived once at init it did not track a statusBudget a test had shortened, and
+// the ratio silently became 107x rather than 2x.
+func escalatedStatusBudget() time.Duration { return 2 * statusBudget }
 
 // How long a key is barred from re-booking a background rebuild after one came back degraded. Long
 // enough that an indexer outage does not put a scrape and a debrid fan-out on every request for the rest
@@ -868,7 +883,8 @@ func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 // is true — which here means "nothing has been queued", not "this release is dead".
 func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config *Config, pool *StorePool,
 	infoHash string, rt ResolveTarget) {
-	if status, ok, _ := pool.Status(ctx, rt); ok {
+	status, ok, statusUnknown := pool.Status(ctx, rt)
+	if ok {
 		writeQueued(w, infoHash, status)
 		return
 	}
@@ -918,6 +934,14 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	if !truthOK && hasCacheTruth(config) {
 		log.Printf("scout: probe %s → 503, cache check unavailable", shortHash(infoHash))
 		writeJSON(w, http.StatusServiceUnavailable, errBody("cache_check_unavailable"), noStore)
+		return
+	}
+	// Same rule one step further out: a store that could not answer is not a store saying nothing is
+	// queued. 404 here is what makes a client blacklist a release, which is the single failure this route
+	// exists to prevent, so an indeterminate read gets the "ask again" answer rather than the claim.
+	if statusUnknown {
+		log.Printf("scout: probe %s → 503, a store could not answer", shortHash(infoHash))
+		writeJSON(w, http.StatusServiceUnavailable, errBody("status_unavailable"), noStore)
 		return
 	}
 	log.Printf("scout: probe %s → 404 not queued", shortHash(infoHash))

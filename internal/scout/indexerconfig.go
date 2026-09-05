@@ -180,11 +180,6 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 // ~298 KB in total — trivial against a 230 MiB heap, and the point is the bound rather than the size.
 const maxMintedEntries = 256
 
-// How long an entry is protected from eviction after it was last handed out. A real install serves a
-// stream every few minutes; five is long enough that an idle household keeps its configs and short enough
-// that a genuinely disused entry is reclaimable well inside the 12-hour TTL.
-const mintedProtectWindow = 5 * time.Minute
-
 // pruneMintedLocked drops entries past their own TTL, then enforces the count ceiling. It reports whether
 // there is now room for one more — the caller holds mintedMu and is about to insert, and must not when
 // this says no. Expiry was only ever consulted on READ, so an entry nobody asked for again stayed
@@ -198,29 +193,31 @@ func pruneMintedLocked() bool {
 	if len(minted) < maxMintedEntries {
 		return true
 	}
-	// Least-recently-USED first, and IDLE ones only. Sorting by mint time evicted the operator's own
-	// entries preferentially (they are the oldest by construction); plain LRU then only narrowed that,
-	// because 256 slots against a sustained flood is a sliding window over the attacker's mint rate, and
-	// any real entry idle longer than that window is still the least-recently-used thing in the map.
-	// Measured: legitimate entries idle five seconds, a flood at ~100 mints a second, none survived.
+	// Least-recently-USED first. Sorting by mint time instead evicted the operator's own entries
+	// preferentially, since a legitimate install's are the oldest in the map by construction — minted once
+	// and good for twelve hours.
 	//
-	// So an entry touched inside mintedProtectWindow is not a candidate at all. When nothing is idle
-	// enough, prune reports no room and the caller simply does not cache the new mint — the flood gets
-	// no entries rather than the install losing its own. That is the right way round: an uncached mint
-	// costs the flood a recomputation, where an evicted one costs a real request a round trip to
-	// mediafusion in front of its scrape.
+	// Protecting recently-used entries from eviction was tried here and REVERTED, because it protects the
+	// flood's resident entries exactly as well as the operator's, and the flood's are the ones already in
+	// the map. Once 256 slots were full the operator was refused a slot permanently rather than merely
+	// evicted from one: measured at 0 of 5 requests served from the cache, against 4 of 5 under plain LRU,
+	// and the lockout got ~150x cheaper to mount because holding a slot only needs a touch every five
+	// minutes instead of out-minting the operator. Plain LRU is the better of the two.
+	//
+	// What remains true, and is the honest limit of this ceiling: a sustained flood of caller-invented
+	// tokens degrades the minted cache to re-minting, which for mediafusion is a POST in front of the
+	// scrape. That is a latency cost, not a memory one — the bound this exists for still holds — and the
+	// whole feature is off unless SCOUT_MINT_INDEXER_CONFIGS is set.
 	type aged struct {
 		key  string
 		used time.Time
 	}
-	idle := make([]aged, 0, len(minted))
+	all := make([]aged, 0, len(minted))
 	for k, m := range minted {
-		if time.Since(m.used) >= mintedProtectWindow {
-			idle = append(idle, aged{k, m.used})
-		}
+		all = append(all, aged{k, m.used})
 	}
-	sort.Slice(idle, func(i, j int) bool { return idle[i].used.Before(idle[j].used) })
-	for _, e := range idle {
+	sort.Slice(all, func(i, j int) bool { return all[i].used.Before(all[j].used) })
+	for _, e := range all {
 		if len(minted) < maxMintedEntries {
 			break
 		}
@@ -231,8 +228,8 @@ func pruneMintedLocked() bool {
 	// memory, written while holding the mint mutex. Once a minute is enough to notice.
 	if time.Since(lastMintEvictionLog) > time.Minute {
 		lastMintEvictionLog = time.Now()
-		log.Printf("scout: minted-config cache is at its %d-entry ceiling; evicting entries idle over %s",
-			maxMintedEntries, mintedProtectWindow)
+		log.Printf("scout: minted-config cache is at its %d-entry ceiling; evicting least-recently-used",
+			maxMintedEntries)
 	}
 	return len(minted) < maxMintedEntries
 }

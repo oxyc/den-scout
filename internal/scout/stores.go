@@ -27,6 +27,45 @@ const maxStoreBytes = 4 << 20
 // see fetchAccountListing. Every other store read keeps the small cap.
 const maxListingBytes = 64 << 20
 
+// statusAnswer is what a status read can say. Three values, because "it is not being fetched" and "I
+// could not find out" are different facts and only the first may lead to an add — collapsing them into a
+// bool is what let a throttled account's 503 read as a definitive no.
+type statusAnswer int
+
+const (
+	// statusNo — the store answered, and it is not fetching this release. Includes a store with no status
+	// API at all (Real-Debrid, Premiumize): they can never say more, so treating them as "unknown" would
+	// escalate on every request and never learn anything.
+	statusNo statusAnswer = iota
+	statusDownloading
+	statusUnknown
+)
+
+// maxListingEntries bounds what the listing RETAINS, which the byte cap does not: the map holds one
+// entry per torrent, and 60 MiB of minimal entries is roughly a million of them. Fifty thousand is an
+// order of magnitude past the largest account this package has ever measured.
+const maxListingEntries = 50_000
+
+// skipValue walks one JSON value without materialising it, so an unknown field costs no retention.
+func skipValue(dec *json.Decoder) bool {
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		switch tok {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+		if depth == 0 {
+			return true
+		}
+	}
+}
+
 // Debrid stores (ported from src/stores/*). Two ops: CacheCheck (which hashes are cached?) and Resolve
 // (infohash → playable https link). Scout resolves server-side; the token never leaves the server.
 
@@ -79,8 +118,24 @@ type Store interface {
 	Resolve(ctx context.Context, t ResolveTarget) (string, error)
 	// Status reports on a release the store has been ASKED for but could not deliver yet: it is
 	// downloading, not dead. Without this the two are the same 404 to the client, which then blacklists
-	// a perfectly good release. `ok` is false when this store knows nothing about the target.
+	// a perfectly good release.
+	//
+	// `ok` is false when this store knows nothing about the target — which deliberately conflates "it is
+	// not being fetched" with "I could not find out". A store that CAN tell those apart implements
+	// statusAnswerer as well, and the pool prefers that; the two stores with no status API at all cannot,
+	// and for them false really is all there is to say.
 	Status(ctx context.Context, t ResolveTarget) (status StoreStatus, ok bool)
+}
+
+// statusAnswerer is the optional, three-valued half of Status.
+//
+// Only TorBox has a status API, so only TorBox can be UNCERTAIN: a throttled 503, an unreadable account
+// listing, a body that will not decode. As a plain bool every one of those read as a definitive "nobody
+// is fetching it", so /play queued a duplicate — more load on an account already refusing, which is the
+// one failure mode that feeds itself. Real-Debrid and Premiumize answer false always and mean it, so
+// leaving them on the bool keeps "unknown" meaning something a caller can act on.
+type statusAnswerer interface {
+	StatusAnswer(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer)
 }
 
 // StoreStatus — how far along a queued release is. Progress is 0…1; ETASeconds is nil unless the store
@@ -1113,30 +1168,45 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 // `success:false` body, a `data:null` for a torrent the user deleted, a payload with neither progress nor
 // a finished flag — must read as "no wait to promise", or a genuinely dead release would answer
 // "downloading, 0%" forever.
+// The second result is three-valued, not a bool: "it is downloading", "it is not", and "I could not find
+// out" are three different facts and only the middle one may lead to an add. A throttled TorBox answering
+// 503 used to read back as "nobody is fetching it", so /play queued a duplicate — more load on an account
+// that was already refusing, which is the one failure mode that feeds itself.
+// Status is the two-valued half of the interface, for callers that only need "is it downloading".
 func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool) {
+	status, answer := s.StatusAnswer(ctx, t)
+	return status, answer == statusDownloading
+}
+
+func (s *torBoxStore) StatusAnswer(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer) {
 	torrentID, ok := s.torrentID(ctx, t.InfoHash)
 	if !ok {
-		return StoreStatus{}, false
+		// A miss here is only trustworthy when the listing was actually read. torrentID declines to
+		// remember one otherwise, and the same doubt has to reach the caller.
+		if _, _, authoritative := s.findTorrentByHash(ctx, t.InfoHash); !authoritative {
+			return StoreStatus{}, statusUnknown
+		}
+		return StoreStatus{}, statusNo
 	}
 	resp, err := s.get(ctx, fmt.Sprintf("%s/torrents/mylist?id=%d&bypass_cache=true", s.api, torrentID))
 	if err != nil {
-		return StoreStatus{}, false
+		return StoreStatus{}, statusUnknown
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return StoreStatus{}, false
+		return StoreStatus{}, statusUnknown
 	}
 	var body struct {
 		Success *bool           `json:"success"`
 		Data    json.RawMessage `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
-		return StoreStatus{}, false
+		return StoreStatus{}, statusUnknown // a body we could not read is not the account saying no
 	}
 	// TorBox answers 200 with success:false / data:null for an id it no longer holds, and unmarshalling
 	// null into a struct succeeds silently — so both have to be rejected explicitly.
 	if body.Success != nil && !*body.Success {
-		return StoreStatus{}, false
+		return StoreStatus{}, statusNo
 	}
 	// The ID is what makes an answer about OUR torrent. mylist is asked by id and should reply with one
 	// entry, but it can reply with the account list — that is why the array fallback below exists at all
@@ -1159,7 +1229,7 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 	if len(body.Data) == 0 || json.Unmarshal(body.Data, &st) != nil {
 		var arr []entryState
 		if json.Unmarshal(body.Data, &arr) != nil || len(arr) == 0 {
-			return StoreStatus{}, false
+			return StoreStatus{}, statusNo
 		}
 		// An EXACT id wins; an id-less entry is only a fallback — the rule listFiles uses on this very
 		// payload. First-of-either let an unlabelled entry ahead of ours answer for it, and here that is
@@ -1182,19 +1252,19 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 			st, found = arr[fallback], true
 		}
 		if !found {
-			return StoreStatus{}, false
+			return StoreStatus{}, statusNo
 		}
 	}
 	if !describesOurs(st) {
-		return StoreStatus{}, false
+		return StoreStatus{}, statusNo
 	}
 	// Finished but Resolve still failed → not a wait we can promise anything about; reads as dead.
 	if st.DownloadFinished != nil && *st.DownloadFinished {
-		return StoreStatus{}, false
+		return StoreStatus{}, statusNo
 	}
 	// Nothing said about the download at all (an empty object, a deleted torrent) — not a wait either.
 	if st.Progress == nil && st.DownloadFinished == nil {
-		return StoreStatus{}, false
+		return StoreStatus{}, statusNo
 	}
 	out := StoreStatus{}
 	if st.Progress != nil {
@@ -1207,7 +1277,7 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 	if st.DownloadSpeed != nil && *st.DownloadSpeed >= 0 {
 		out.BytesPerSecond = st.DownloadSpeed
 	}
-	return out, true
+	return out, statusDownloading
 }
 
 // knownTorrentID answers "does this account already have this torrent?" from cache alone.
@@ -1397,7 +1467,10 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	// keeps only the hash→id map, which is sized by the torrent count (~100 KB at 2,000) and not by the
 	// body. The read is singleflighted and memoised for listingTTL, but per TOKEN — two accounts do not
 	// collapse into one — so the per-call ceiling is what has to be small.
-	limited := &truncationDetector{r: io.LimitReader(resp.Body, maxListingBytes), limit: maxListingBytes}
+	// limit+1 so "read exactly the cap" and "cut off at the cap" stop being the same observation: a body
+	// of exactly maxListingBytes parsed perfectly would otherwise be discarded AND remembered as oversized
+	// for the listing TTL.
+	limited := &truncationDetector{r: io.LimitReader(resp.Body, maxListingBytes+1), limit: maxListingBytes}
 	ids, ok := decodeListing(json.NewDecoder(limited))
 	if limited.truncated() {
 		// Silent truncation is the failure this whole comment is about: it reads back as "the account
@@ -1440,6 +1513,14 @@ func decodeListing(dec *json.Decoder) (map[string]int, bool) {
 				success = *v
 			}
 		case "data":
+			// First `data` wins. A duplicate key is not something TorBox produces, but letting a later
+			// null overwrite a list already read turns "no answer" into an answer — the unsafe direction.
+			if ids != nil {
+				if !skipValue(dec) {
+					return nil, false
+				}
+				continue
+			}
 			// A null `data` is the envelope-missing case and must stay distinct from an empty array.
 			if dec.More() {
 				open, err := dec.Token()
@@ -1462,16 +1543,24 @@ func decodeListing(dec *json.Decoder) (map[string]int, bool) {
 						return nil, false
 					}
 					ids[strings.ToLower(e.Hash)] = e.ID
+					// The map is what this function retains, and its size is the ENTRY COUNT — which the
+					// byte cap does not bound: 60 MiB of minimal entries is ~1M of them and peaked at
+					// 346 MiB against a 230 MiB GOMEMLIMIT. No real account is near this; a body that is
+					// says something is wrong with the upstream, not with the account.
+					if len(ids) > maxListingEntries {
+						return nil, false
+					}
 				}
 				if _, err := dec.Token(); err != nil { // closing ]
 					return nil, false
 				}
 			}
 		default:
-			// Every other field — including the per-torrent file lists that make this body large — is
-			// skipped without being retained.
-			var skip json.RawMessage
-			if dec.Decode(&skip) != nil {
+			// Walked token by token, NOT decoded into a json.RawMessage. RawMessage keeps a full copy of
+			// the field's raw bytes on top of the decoder's own buffer, so a large unknown top-level field
+			// was retained twice — measured at +47 MiB for one 63 MiB field, which is the opposite of what
+			// this branch is for. Nothing here is retained now.
+			if !skipValue(dec) {
 				return nil, false
 			}
 		}
@@ -1485,8 +1574,8 @@ func decodeListing(dec *json.Decoder) (map[string]int, bool) {
 // truncationDetector reports whether a LimitReader was consumed all the way to its limit, which is the
 // only way to tell "the body ended" from "the cap cut it off" — and those two must not look alike.
 type truncationDetector struct {
-	r    io.Reader
-	n    int64
+	r     io.Reader
+	n     int64
 	limit int64
 }
 
@@ -1496,7 +1585,7 @@ func (t *truncationDetector) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (t *truncationDetector) truncated() bool { return t.n >= t.limit }
+func (t *truncationDetector) truncated() bool { return t.n > t.limit }
 
 // errNoFileList — mylist gave no usable answer. Distinct from errTorrentGone, which is mylist ANSWERING
 // that the account no longer holds this id. Collapsing the two is what wedged a stale id: the refusal to
@@ -2821,15 +2910,23 @@ func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, b
 			}
 			share, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(p.stores)-i))
 		}
-		status, ok := st.Status(share, t)
-		// Cut short rather than answered: its own slice ran out, or the whole call was cancelled.
-		if !ok && (share.Err() != nil || ctx.Err() != nil) {
+		// Prefer the three-valued answer where the store can give one.
+		status, answer := StoreStatus{}, statusNo
+		if a, canTell := st.(statusAnswerer); canTell {
+			status, answer = a.StatusAnswer(share, t)
+		} else if s, ok := st.Status(share, t); ok {
+			status, answer = s, statusDownloading
+		}
+		// Two ways a store fails to answer, and both count: it said so itself (a throttled account, an
+		// unreadable listing), or it was cut short by its own slice or by the caller going away. Only
+		// deadlines were counted before, so a 503 read as a definitive "not downloading".
+		if answer == statusUnknown || (answer != statusDownloading && (share.Err() != nil || ctx.Err() != nil)) {
 			unknown = true
 		}
 		if cancel != nil {
 			cancel()
 		}
-		if ok {
+		if answer == statusDownloading {
 			return status, true, false
 		}
 	}

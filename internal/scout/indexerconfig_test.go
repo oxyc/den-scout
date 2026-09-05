@@ -238,7 +238,7 @@ func TestMintedCache_isBoundedByCount(t *testing.T) {
 	// Far more distinct, unexpired entries than the ceiling — all well inside mintedTTL so nothing expires
 	// out, and all IDLE past the protect window so all of them are eviction candidates.
 	now := time.Now()
-	idleBase := now.Add(-mintedProtectWindow - time.Hour)
+	idleBase := now.Add(-time.Hour)
 	mintedMu.Lock()
 	for i := 0; i < maxMintedEntries*3; i++ {
 		// Staggered so "least recently used first" is a defined order.
@@ -305,17 +305,15 @@ func TestMintedCache_keepsTheEntriesActuallyInUse(t *testing.T) {
 
 	now := time.Now()
 	mintedMu.Lock()
-	// The operator's own: minted an hour ago, and served a couple of minutes ago — idle, but well inside
-	// the protect window. Plain LRU loses exactly these, because 256 slots against a sustained flood is a
-	// sliding window over the attacker's mint rate and any real entry idle longer than it is the
-	// least-recently-used thing in the map.
+	// The operator's own: minted an hour ago and served just now. Sorting by MINT time evicts exactly
+	// these, because a legitimate install's entries are the oldest in the map by construction.
 	legit := []string{"comet:real", "mediafusion:real"}
 	for _, k := range legit {
-		minted[k] = mintedConfig{url: "https://real.example/x", at: now.Add(-time.Hour), used: now.Add(-2 * time.Minute)}
+		minted[k] = mintedConfig{url: "https://real.example/x", at: now.Add(-time.Hour), used: now}
 	}
-	// A flood, every entry minted and last used moments ago.
+	// Freshly minted entries that nobody has come back for.
 	for i := 0; i < maxMintedEntries*2; i++ {
-		stamp := now.Add(-time.Duration(i) * time.Millisecond)
+		stamp := now.Add(-time.Duration(i+1) * time.Second)
 		minted[fmt.Sprintf("comet:flood%d", i)] = mintedConfig{url: "https://flood.example/x", at: stamp, used: stamp}
 	}
 	room := pruneMintedLocked()
@@ -325,17 +323,14 @@ func TestMintedCache_keepsTheEntriesActuallyInUse(t *testing.T) {
 			survived++
 		}
 	}
+	total := len(minted)
 	mintedMu.Unlock()
 
 	if survived != len(legit) {
-		t.Errorf("%d of %d in-use entries survived a flood — the ceiling evicts the operator's own first",
-			survived, len(legit))
+		t.Errorf("%d of %d in-use entries survived — eviction is not ordered by last use", survived, len(legit))
 	}
-	// Nothing was idle enough to evict, so the honest answer is "no room" — the flood simply goes
-	// uncached. An uncached mint costs the flood a recomputation; an evicted one costs a real request a
-	// round trip to mediafusion in front of its scrape, so this is the right way round.
-	if room {
-		t.Error("prune claimed room while every entry was inside the protect window")
+	if !room || total >= maxMintedEntries {
+		t.Errorf("ceiling not enforced: room=%v total=%d, want room and under %d", room, total, maxMintedEntries)
 	}
 }
 
@@ -355,7 +350,7 @@ func TestMintedCache_reclaimsIdleEntries(t *testing.T) {
 	now := time.Now()
 	mintedMu.Lock()
 	for i := 0; i < maxMintedEntries+10; i++ {
-		stamp := now.Add(-mintedProtectWindow - time.Duration(i)*time.Second)
+		stamp := now.Add(-time.Duration(i) * time.Second)
 		minted[fmt.Sprintf("comet:idle%d", i)] = mintedConfig{url: "https://x.example/x", at: now, used: stamp}
 	}
 	room := pruneMintedLocked()
@@ -365,5 +360,32 @@ func TestMintedCache_reclaimsIdleEntries(t *testing.T) {
 	if !room || total >= maxMintedEntries {
 		t.Errorf("idle entries were not reclaimed: room=%v total=%d, want room and under %d",
 			room, total, maxMintedEntries)
+	}
+}
+
+// The ceiling holds through the REAL caller, not just through pruneMintedLocked.
+//
+// Under a flood the prune may evict nothing, and then the caller-side check is the only thing bounding
+// the map — so it has to be exercised where the caller lives. Making both call sites insert
+// unconditionally left the whole suite green while 1,000 caller-invented tokens sat in the map.
+func TestIndexerBaseWithConfig_mapStaysBoundedUnderAFlood(t *testing.T) {
+	resetMinted()
+	t.Cleanup(resetMinted)
+
+	// comet mints locally, so a flood costs no round trips — which is exactly why it is the cheap attack.
+	d := &stubDoer{status: 200, body: `{"encrypted_str":"E","status":"success"}`}
+	for i := 0; i < maxMintedEntries*4; i++ {
+		cfg := &Config{Debrid: []DebridAccount{{Service: ServiceTorBox, Token: fmt.Sprintf("invented-%d", i)}}}
+		if got, _ := indexerBaseWithConfig(context.Background(), "comet", cfg, d); got == "" {
+			t.Fatalf("mint %d produced no URL", i)
+		}
+	}
+
+	mintedMu.Lock()
+	total := len(minted)
+	mintedMu.Unlock()
+	if total > maxMintedEntries {
+		t.Errorf("the map holds %d entries after a flood of distinct tokens, ceiling is %d",
+			total, maxMintedEntries)
 	}
 }

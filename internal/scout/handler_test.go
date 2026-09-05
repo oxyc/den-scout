@@ -1373,11 +1373,24 @@ func TestHandlePlay_pollReadsUseTheStatusBudget(t *testing.T) {
 			if len(store.statusAt) == 0 {
 				t.Fatal("the status read never happened, so this asserts nothing")
 			}
+			// The rule, stated exactly: a read on the poll route never takes the RESOLVE budget, and at
+			// most one — the escalation, on the path about to spend an add — may take double the status
+			// budget. An earlier version asserted a flat statusBudget, which read as forbidding the
+			// escalation; cutting the escalation to fit made it a guard that could not succeed, because
+			// the retry is sliced from the same budget as the read that just timed out.
+			doubled := 0
 			for i, left := range store.statusAt {
-				if left > statusBudget {
+				if left > escalatedStatusBudget() {
 					t.Errorf("status read %d carried a %v deadline, want no more than %v — a poll read "+
-						"must not be able to hold the poll for the whole resolve budget", i, left, statusBudget)
+						"must not be able to hold the poll for the whole resolve budget",
+						i, left, escalatedStatusBudget())
 				}
+				if left > statusBudget {
+					doubled++
+				}
+			}
+			if doubled > 1 {
+				t.Errorf("%d reads exceeded the ordinary status budget; only the single escalation may", doubled)
 			}
 		})
 	}
@@ -1411,8 +1424,8 @@ func TestEscalatedStatusCtx_cannotOutliveTheResolveBudget(t *testing.T) {
 	if !has {
 		t.Fatal("the escalated context carries no deadline")
 	}
-	if left := time.Until(got); left > statusBudget {
-		t.Errorf("escalated read got %v, want no more than the %v ceiling", left, statusBudget)
+	if left := time.Until(got); left > escalatedStatusBudget() {
+		t.Errorf("escalated read got %v, want no more than the %v ceiling", left, escalatedStatusBudget())
 	}
 	parentDeadline, _ := parent.Deadline()
 	if got.After(parentDeadline) {
@@ -1420,7 +1433,7 @@ func TestEscalatedStatusCtx_cannotOutliveTheResolveBudget(t *testing.T) {
 	}
 
 	// Too little left to do the add afterwards: declined, so the resolve keeps what remains.
-	tight, tightCancel := context.WithTimeout(context.Background(), statusBudget)
+	tight, tightCancel := context.WithTimeout(context.Background(), escalatedStatusBudget())
 	defer tightCancel()
 	if _, c, ok := escalatedStatusCtx(tight); ok {
 		if c != nil {
