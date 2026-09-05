@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1131,6 +1132,74 @@ func TestTorBox_anAddInFlightOutranksARefusalRecordedMeanwhile(t *testing.T) {
 	if !errors.Is(err, errAddInFlight) {
 		t.Errorf("torbox answered %v, want errAddInFlight — it is blaming the store for a release scout "+
 			"has an add out for, which is the one answer this file says never to give", err)
+	}
+}
+
+// /play must not buy a release another configured account already holds.
+//
+// Its resolve ordering came only from the cache check, and Real-Debrid can never appear there: its
+// CacheCheck answers all-false by design, so HeldBy never names it. A release RD already held was
+// therefore invisible to the ordering, configured order won, and TorBox — first in the list — was asked
+// to resolve, which means createtorrent: one of the fifty per hour spent, a duplicate torrent left on
+// TorBox, and the probe (which consults Status first) then reporting a download the viewer never needed
+// for a file the other account could have served instantly.
+//
+// HoldingServices is the free cache read that answers this, added for the probe and not applied to the
+// route that pays for being wrong.
+func TestPlay_doesNotBuyAReleaseAnotherAccountAlreadyHolds(t *testing.T) {
+	token, hash := "prefer-held", repeat("d", 40)
+	cache := NewMemoryCache(1 << 20)
+	rt := ResolveTarget{InfoHash: hash}
+	cache.Put(rdTorrentKey(token, hash, rt), "RDID-HELD", time.Hour) // RD bought it earlier
+
+	var creates int32
+	tb := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "createtorrent") {
+			atomic.AddInt32(&creates, 1)
+			return resp(200, `{"data":{"torrent_id":9}}`), nil
+		}
+		return resp(200, `{"success":true,"data":[]}`), nil
+	}}
+	rd := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "/torrents/info/"):
+			return resp(200, `{"id":"RDID-HELD","status":"downloaded",`+
+				`"files":[{"id":1,"path":"/Movie.mkv","bytes":100,"selected":1}],`+
+				`"links":["https://rd.example/link"]}`), nil
+		case strings.Contains(r.URL.Path, "/unrestrict/link"):
+			return resp(200, `{"download":"https://rd.example/final.mkv"}`), nil
+		}
+		return resp(200, `{}`), nil
+	}}
+
+	before := globalAddBudget.remaining(budgetAccount(ServiceTorBox, token))
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			// TorBox first, as the config orders it — the whole point is that order must not decide this.
+			return []Store{
+				&torBoxStore{token: token, cache: cache, api: torboxAPI, client: tb},
+				&realDebridStore{token: token, cache: cache, api: realDebridAPI, client: rd},
+			}
+		},
+	})
+	twoBlob := blob(`{"debrid":[{"service":"torbox","token":"` + token + `"},` +
+		`{"service":"realdebrid","token":"` + token + `"}],"indexers":["torrentio"],"resultCap":20}`)
+
+	play := httptest.NewRecorder()
+	h.ServeHTTP(play, httptest.NewRequest("GET",
+		"/"+twoBlob+"/play/"+encodePlayToken(PlayTarget{InfoHash: hash}), nil))
+
+	if play.Code != http.StatusFound {
+		t.Fatalf("/play = %d (%s), want 302 from the account that already holds it",
+			play.Code, strings.TrimSpace(play.Body.String()))
+	}
+	if got := atomic.LoadInt32(&creates); got != 0 {
+		t.Errorf("TorBox was asked to create %d torrent(s) for a release Real-Debrid already held — "+
+			"that is one of the fifty per hour, and a duplicate torrent on the account", got)
+	}
+	if after := globalAddBudget.remaining(budgetAccount(ServiceTorBox, token)); after != before {
+		t.Errorf("TorBox's hourly allowance went %d → %d for a release another account held", before, after)
 	}
 }
 

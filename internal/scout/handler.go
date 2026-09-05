@@ -1178,12 +1178,31 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// order correctly and now does not. Under 8s both behave the same; over ~21s the old code produced
 	// the 404 this cap exists to remove.
 	//
-	var preferred []DebridService
+	// The FREE half first, and unconditionally: a store that already has an id for this release can serve
+	// it with no add at all, and finding that out is a cache read per store.
+	//
+	// It is also better evidence than the cache check. TorBox's checkcached reports what TORBOX has, not
+	// what this account has; Real-Debrid contributes no cache truth whatsoever — its CacheCheck answers
+	// all-false by design, so HeldBy can never name it; and Premiumize drops out whenever its own check
+	// is throttled or times out. Ordering on the cache check alone therefore made a release the SECOND
+	// account already held invisible, so configured order won and TorBox — always first — was asked to
+	// resolve, which means createtorrent.
+	//
+	// Measured on a TorBox + Real-Debrid install with RD already holding the torrent: /play posted
+	// createtorrent to TorBox, spent one of the fifty, and left a duplicate torrent there — then the
+	// probe, which consults Status first, found TorBox fetching and told a client that had been answering
+	// "ready" for three polls to keep waiting for a download it never needed. With this line the same
+	// play resolves from RD in four upstream calls instead of six, spends nothing, and the probe stays
+	// ready throughout.
+	//
+	// This is the enquiry handleProbe was given for exactly this reason; it was never applied to the
+	// route that pays for being wrong.
+	preferred := pool.HoldingServices(rt)
 	if len(config.Debrid) > 1 {
 		checkCtx, checkCancel := context.WithTimeout(ctx, statusBudget)
 		playTruth, _ := pool.CacheCheck(checkCtx, []string{target.InfoHash})
 		checkCancel()
-		preferred = playTruth.HeldBy(target.InfoHash)
+		preferred = append(preferred, playTruth.HeldBy(target.InfoHash)...)
 	}
 	link, err := pool.ResolvePreferring(ctx, rt, preferred)
 	if err != nil {
