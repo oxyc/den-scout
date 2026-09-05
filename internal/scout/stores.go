@@ -892,8 +892,30 @@ func (s *premiumizeStore) HoldsTorrent(t ResolveTarget) bool {
 // resolve; the probe route had no way to ask, because it never resolves — NoAdd is refused with
 // errWouldAdd before any store consults the marker — so it fell through to 404 "not queued" for a
 // release /play was reporting as downloading at the same instant.
+// AddInFlight — some store with a USABLE key has an add out for this release.
+//
+// Two rules meet here and they point different ways, which is what made an earlier version wrong:
+//
+//   - Per store, a rejected key outranks that store's own add in flight. Every store's Resolve says so:
+//     a dead key is not a wait, and accountBackedOff sits above addInFlight in all three.
+//   - Across stores, an add in flight ANYWHERE outranks a refusal elsewhere. ResolvePreferring returns
+//     `coming` before `refused`, and the comment there explains why store order must not decide it.
+//
+// Applying only the first rule at pool level — an account-refusal gate above this one — made a dead key
+// on account A outrank a live add on account B. Measured on a two-account install with TorBox's key
+// expired and Real-Debrid fetching: probe 503 store_unavailable naming torbox, /play 202 downloading.
+// The probe named a store that was not the one fetching, on the URL the client polls for its progress
+// bar, which this file says makes a client stop trying other sources.
+//
+// So the per-store rule is applied per store — a store whose key is rejected cannot be fetching anything,
+// whatever its marker says — and the cross-store rule falls out of the loop.
 func (p *StorePool) AddInFlight(infoHash string) bool {
 	for _, st := range p.stores {
+		if reporter, ok := st.(accountRefusalReporter); ok {
+			if _, refused := reporter.AccountRefused(); refused {
+				continue
+			}
+		}
 		if reporter, ok := st.(addInFlightReporter); ok && reporter.AddInFlight(infoHash) {
 			return true
 		}
@@ -1133,7 +1155,22 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// Not for a NoAdd caller, which the guards below also let past: a read-only resolve cannot have
 	// caused a backoff and must not be blocked by one — the probe route depends on that, and a test
 	// pins it.
-	if !t.NoAdd {
+	//
+	// Nor when an add of OURS is out and still believable. That is the order the gate further down
+	// states — "scout's own bookkeeping first, the store's verdict second… asking backedOff ahead of it
+	// let any refusal recorded in the meantime answer 503 instead, naming a store that had said nothing"
+	// — and hoisting this gate for the warm-path reason above quietly reversed it for TorBox alone. Real-
+	// Debrid and Premiumize both order it as documented.
+	//
+	// Reachable without planting anything: /play has no singleflight and Stremio races requests, so two
+	// concurrent polls for one hash can leave both markers live — one poll's createtorrent answered 429
+	// (settles its attempt, records the refusal), the other's connection reset (its attempt marker
+	// stays). Measured on 4 of 20 racing pairs: /play answered 503 blaming TorBox for a release scout had
+	// an add out for, while ?probe=1 correctly said downloading.
+	//
+	// addStillBelievable rather than the bare marker, so past addGiveUp the refusal is heard again
+	// instead of being suppressed by a marker nothing will ever settle.
+	if !t.NoAdd && !addStillBelievable(s.cache, ServiceTorBox, s.token, t.InfoHash) {
 		if reason, ok := backedOff(s.cache, ServiceTorBox, s.token, t.InfoHash); ok {
 			return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 		}

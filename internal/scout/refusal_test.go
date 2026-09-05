@@ -1003,6 +1003,82 @@ func TestProbeAndPlay_agreeWhenTheAccountKeyIsRejected(t *testing.T) {
 	}
 }
 
+// A dead key on ONE account must not outrank a live add on ANOTHER.
+//
+// Two rules meet here. Per store, a rejected key beats that store's own add in flight — every Resolve
+// says so. Across stores, an add in flight anywhere beats a refusal elsewhere — ResolvePreferring
+// returns `coming` before `refused` precisely so store order cannot decide the verdict. Applying the
+// first rule at POOL level broke the second: with TorBox's key expired and Real-Debrid fetching, the
+// probe answered 503 naming torbox while /play answered 202 downloading — naming a store that was not
+// the one fetching, on the URL the client polls for its progress bar.
+//
+// The sibling single-account case is pinned by TestProbeAndPlay_agreeWhenTheAccountKeyIsRejected, which
+// configures one store and so cannot see this. Both are needed.
+func TestProbeAndPlay_agreeWhenOneAccountsKeyIsDeadAndAnotherIsFetching(t *testing.T) {
+	token, hash := "two-accounts", repeat("b", 40)
+	cache := NewMemoryCache(1 << 20)
+	// TorBox's key is rejected...
+	cache.Put(accountRefusedKey(ServiceTorBox, token), "createtorrent http 401", refusalBackoff)
+	// ...while Real-Debrid has an add out for the release being watched.
+	noteAddAttempt(cache, ServiceRealDebrid, token, hash)
+
+	quiet := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		return resp(200, `{"success":true,"data":[]}`), nil
+	}}
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{
+				&torBoxStore{token: token, cache: cache, api: torboxAPI, client: quiet},
+				&realDebridStore{token: token, cache: cache, api: realDebridAPI, client: quiet},
+			}
+		},
+	})
+	twoBlob := blob(`{"debrid":[{"service":"torbox","token":"` + token + `"},` +
+		`{"service":"realdebrid","token":"` + token + `"}],"indexers":["torrentio"],"resultCap":20}`)
+	tok := encodePlayToken(PlayTarget{InfoHash: hash})
+
+	probe := httptest.NewRecorder()
+	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+twoBlob+"/play/"+tok+"?probe=1", nil))
+	play := httptest.NewRecorder()
+	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+twoBlob+"/play/"+tok, nil))
+
+	if probe.Code != play.Code {
+		t.Errorf("?probe=1 = %d (%s), /play = %d (%s) — a dead key on one account is outranking a live "+
+			"add on another, so the probe names a store that is not the one fetching",
+			probe.Code, strings.TrimSpace(probe.Body.String()),
+			play.Code, strings.TrimSpace(play.Body.String()))
+	}
+	if probe.Code != http.StatusAccepted {
+		t.Errorf("?probe=1 = %d, want 202 — Real-Debrid is fetching it", probe.Code)
+	}
+}
+
+// TorBox must rank its own add in flight above a refusal recorded in the meantime, as RD and PM do.
+//
+// The per-release backoff was hoisted above the warm fast path so a binge could not bypass it, and that
+// hoist put it above the in-flight marker for TorBox alone — reversing the order the gate further down
+// states in as many words. Both markers can be live at once without planting anything: /play has no
+// singleflight and Stremio races requests, so one poll's createtorrent can be answered 429 (settling its
+// attempt and recording the refusal) while another's connection resets, leaving its attempt marker.
+func TestTorBox_anAddInFlightOutranksARefusalRecordedMeanwhile(t *testing.T) {
+	token, hash := "tb-order", repeat("a", 40)
+	cache := NewMemoryCache(1 << 20)
+	noteAddAttempt(cache, ServiceTorBox, token, hash)
+	cache.Put(refusedKey(ServiceTorBox, token, hash), "createtorrent http 429", refusalBackoff)
+
+	s := &torBoxStore{token: token, cache: cache, api: torboxAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `{"success":true,"data":[]}`), nil
+		}}}
+
+	_, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: hash})
+	if !errors.Is(err, errAddInFlight) {
+		t.Errorf("torbox answered %v, want errAddInFlight — it is blaming the store for a release scout "+
+			"has an add out for, which is the one answer this file says never to give", err)
+	}
+}
+
 // A refusal SCOUT made must not read as "nothing is queued".
 //
 // recordRefusal excludes errScoutSide on purpose — scout's own ceiling is not the debrid declining, and

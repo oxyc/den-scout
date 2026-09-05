@@ -943,22 +943,27 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// URL the client polls to draw its progress bar. TorBox self-heals once its 15s miss marker lapses
 	// AND the add landed; Real-Debrid and Premiumize have no Status at all, so nothing clears it and the
 	// disagreement stands the full 90s addAttemptTTL.
-	// A rejected KEY outranks an add of ours being in flight, which is the order all three stores use and
-	// state: a dead key is not a wait. Consulted below AddInFlight, a live marker pre-empted it and the
-	// probe answered 202 "downloading" where /play answered 503 naming the debrid — for the same release
-	// at the same instant, for up to the marker's ninety seconds per outstanding add.
+	// An add of ours in flight outranks a rejected key, ACROSS stores — the order ResolvePreferring uses,
+	// where `coming` is returned before `refused` so store order cannot decide the verdict.
 	//
-	// Account-level only, deliberately. The per-release backoff belongs below the in-flight branch, where
-	// RecentRefusal reads it, because that one is an add-path guard a read-only caller is exempt from.
+	// The per-store rule points the other way (a dead key is not a wait, and every store's Resolve puts
+	// accountBackedOff above its own addInFlight), and an earlier version of this route applied that rule
+	// at pool level. That made a dead key on one account outrank a live add on another: with TorBox's key
+	// expired and Real-Debrid fetching, the probe answered 503 naming torbox while /play answered 202
+	// downloading. AddInFlight now applies the per-store rule per store, so both hold at once.
+	if pool.AddInFlight(infoHash) {
+		log.Printf("scout: probe %s → 202, an add is already in flight", shortHash(infoHash))
+		writeQueued(w, infoHash, StoreStatus{})
+		return
+	}
+	// No store with a usable key is fetching it, so a rejected key is now the best explanation there is.
+	//
+	// Account-level only, deliberately. The per-release backoff belongs below, where RecentRefusal reads
+	// it, because that one is an add-path guard a read-only caller is exempt from.
 	if svc, reason, refused := pool.AccountRefusal(); refused {
 		log.Printf("scout: probe %s → 503, %s refused the account (%s)", shortHash(infoHash), svc, reason)
 		writeJSON(w, http.StatusServiceUnavailable,
 			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
-		return
-	}
-	if pool.AddInFlight(infoHash) {
-		log.Printf("scout: probe %s → 202, an add is already in flight", shortHash(infoHash))
-		writeQueued(w, infoHash, StoreStatus{})
 		return
 	}
 	// A refusal SCOUT made, above the store refusals below because it is ours rather than a service's.
