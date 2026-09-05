@@ -50,22 +50,28 @@ const (
 // order of magnitude past the largest account this package has ever measured.
 const maxListingEntries = 50_000
 
-// skipValue walks one JSON value without materialising it, so an unknown field costs no retention.
-// maxSkipDepth bounds how deeply an unknown field may nest before it is refused.
+// maxSkipDepth bounds how deeply an unknown field may nest before skipValue refuses it.
 //
-// This walk allocates nothing itself, but Decoder.Token pushes onto its own token stack for every open
+// That walk allocates nothing itself, but Decoder.Token pushes onto its own token stack for every open
 // bracket, and that stack is LIVE rather than garbage, so GOMEMLIMIT cannot reclaim it. Measured on
 // `{"x":[[[[…`: 1 MiB of brackets peaks at 21 MiB, 4 MiB at 98 MiB, and 10 MiB at 239.8 MiB — past the
-// 230 MiB limit, on a body a quarter the size of the byte cap. It is also on the TRANSIENT road, so
-// every one of the 45 reads in a wait repeats it, where the huge-scalar case recorded in FOLLOWUP.md at
-// least decodes once and is memoised.
+// 230 MiB limit, on a body a SIXTH of the byte cap. It is also on the TRANSIENT road, so every one of
+// the 45 reads in a wait repeats it, where the huge-scalar case recorded in FOLLOWUP.md at least decodes
+// once and is memoised.
 //
-// A real listing does not nest: `data` is an array of flat objects, and an unknown sibling field would
-// have to be pathological to pass this. Sixty-four is far past anything TorBox could reasonably send and
-// takes the 64 MiB worst case from 1.4 GiB to a rounding error. Refusing reads as an unreadable body,
-// which is transient and retried — the same answer the walk already gives for a truncated field.
+// A real listing does not nest: skipValue is reached only for an unknown TOP-LEVEL key, since `data` is
+// opened by token and decoded element by element, so nothing in a real entry is measured against this at
+// all. Sixty-four is far past anything TorBox could reasonably send and takes the 64 MiB worst case from
+// 1.4 GiB to a rounding error.
+//
+// Refusing reads as an unreadable body, which is transient and retried. That is deliberate even though a
+// nested body — unlike a truncated one — would fail identically next poll: the bound is a limit this
+// package imposes rather than evidence the upstream is broken, so if 64 ever proved too tight for a
+// legitimate body, memoising would lock that account out for the whole TTL on every poll. Retrying costs
+// almost nothing here, because the walk stops at the 65th bracket instead of consuming the body.
 const maxSkipDepth = 64
 
+// skipValue walks one JSON value without materialising it, so an unknown field costs no retention.
 func skipValue(dec *json.Decoder) bool {
 	depth := 0
 	for {
@@ -1995,12 +2001,12 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 			// kind of comment this file keeps having to correct. A single huge string costs the same
 			// either way, because Token must buffer the whole token and allocate the string.
 			//
-			// That cost was understated here as ~159 MiB. Measured against the actual cap: one value just
-			// under maxListingBytes peaks at 256.7 MiB of LIVE heap — the decoder's buffer has doubled to
-			// 128 MiB and the materialised string is live at the same time, so the GC cannot reclaim
-			// either. That is above the 230 MiB GOMEMLIMIT and above the container, i.e. an OOM kill, and
-			// it is not reduced by the length filter on `hash` above, which runs only after the token has
-			// been materialised.
+			// That cost was understated here twice — first as ~159 MiB, then as 256.7 MiB. Re-measured
+			// against the actual cap: one value just under maxListingBytes peaks at 304 MiB of LIVE heap,
+			// the decoder's buffer having doubled to 128 MiB while the materialised string is live beside
+			// it, so the GC can reclaim neither. That is above the 230 MiB GOMEMLIMIT and above the
+			// container, i.e. an OOM kill, and it is not reduced by the length filter on `hash` above,
+			// which runs only after the token has been materialised.
 			//
 			// Left as it is, deliberately: it needs a hostile or broken api.torbox.app rather than a caller
 			// (the base URL is a constant), and the alternative is lowering maxListingBytes, which governs

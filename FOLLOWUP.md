@@ -59,7 +59,7 @@ body still decodes as a valid listing, it is memoised and the spike repeats ever
 
 A second, unrelated mechanism in the same function was found and FIXED rather than recorded: deeply
 nested brackets grow `Decoder`'s own token stack, which is live rather than garbage, so 10 MiB of `[`
-peaked at 239.8 MiB — a quarter of the byte cap, and on the transient road so every poll repeated it.
+peaked at 239.8 MiB — a sixth of the byte cap, and on the transient road so every poll repeated it.
 `maxSkipDepth` now refuses past 64 levels and takes that to 20.4 MiB. It is called out here because the
 first mitigation below was written as if it covered this shape and does not: at a 32 MiB cap the nesting
 case still peaked at 732 MiB.

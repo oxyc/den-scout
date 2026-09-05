@@ -1409,18 +1409,6 @@ func TestTruncationDetector_aBodyOfExactlyTheCapIsWhole(t *testing.T) {
 	}
 }
 
-// The listing decode must not RETAIN the body — that property, not just "it parses", is what keeps a
-// 64 MiB cap safe inside a 230 MiB budget.
-//
-// TWO fixtures, because the decode has two places it could buffer and each one needs the bulk to be
-// somewhere the other does not look. Bulk inside `data[]` is discarded by the element decode, so it
-// cannot see a skipped top-level field being materialised; bulk in a top-level field never enters the
-// element walk, so it cannot see that walk replaced by a single Decode into a slice. A previous version
-// of this test had only the second fixture and went green while `data[]` was buffered whole.
-//
-// Each shape gets its own ceiling, from measurement rather than a shared round number: the numbers are
-// far enough apart that a coarse ceiling is plenty and there is no need to measure precisely enough to
-// be flaky.
 // Entries do not carry fields over from the entry before them.
 //
 // What makes each element independent is that the struct is declared INSIDE the loop, and nothing said
@@ -1450,7 +1438,7 @@ func TestDecodeListing_entriesDoNotInheritFromTheEntryBefore(t *testing.T) {
 //
 // The walk allocates nothing itself, but Decoder.Token keeps a token stack that grows with every open
 // bracket, and it is live rather than garbage — GOMEMLIMIT cannot reclaim it. Unbounded, 10 MiB of `[`
-// peaked at 239.8 MiB against a 230 MiB limit, on a body a quarter of the byte cap, and on the transient
+// peaked at 239.8 MiB against a 230 MiB limit, on a body a sixth of the byte cap, and on the transient
 // road so every poll in a wait repeated it. This is a different mechanism from the huge-scalar case in
 // FOLLOWUP.md, and lowering the byte cap does not fix it.
 func TestSkipValue_refusesRunawayNesting(t *testing.T) {
@@ -1474,6 +1462,18 @@ func TestSkipValue_refusesRunawayNesting(t *testing.T) {
 	}
 }
 
+// The listing decode must not RETAIN the body — that property, not just "it parses", is what keeps a
+// 64 MiB cap safe inside a 230 MiB budget.
+//
+// TWO fixtures, because the decode has two places it could buffer and each one needs the bulk to be
+// somewhere the other does not look. Bulk inside `data[]` is discarded by the element decode, so it
+// cannot see a skipped top-level field being materialised; bulk in a top-level field never enters the
+// element walk, so it cannot see that walk replaced by a single Decode into a slice. A previous version
+// of this test had only the second fixture and went green while `data[]` was buffered whole.
+//
+// Each shape gets its own ceiling, from measurement rather than a shared round number: the numbers are
+// far enough apart that a coarse ceiling is plenty and there is no need to measure precisely enough to
+// be flaky.
 func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 	// A top-level key that is neither success nor data goes through skipValue's default branch. Its walk
 	// allocates about one body's worth, because Token materialises each string it steps over; buffering
