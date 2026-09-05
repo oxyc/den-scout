@@ -743,6 +743,39 @@ func (p *StorePool) RecentRefusal(infoHash string) (DebridService, string, bool)
 	return "", "", false
 }
 
+// addInFlightReporter — a store that can say whether an add of OURS is out and unanswered for a hash.
+type addInFlightReporter interface {
+	AddInFlight(infoHash string) bool
+}
+
+// AddInFlight reports that some store has an add out for this release whose outcome we never saw.
+//
+// It is the one fact in this package that is about US rather than about a service, and both read-only
+// routes must give the same answer to it. /play already does, via errAddInFlight raised from inside the
+// resolve; the probe route had no way to ask, because it never resolves — NoAdd is refused with
+// errWouldAdd before any store consults the marker — so it fell through to 404 "not queued" for a
+// release /play was reporting as downloading at the same instant.
+func (p *StorePool) AddInFlight(infoHash string) bool {
+	for _, st := range p.stores {
+		if reporter, ok := st.(addInFlightReporter); ok && reporter.AddInFlight(infoHash) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *torBoxStore) AddInFlight(infoHash string) bool {
+	return addOutcomeUnknown(s.cache, ServiceTorBox, s.token, infoHash)
+}
+
+func (s *realDebridStore) AddInFlight(infoHash string) bool {
+	return addOutcomeUnknown(s.cache, ServiceRealDebrid, s.token, infoHash)
+}
+
+func (s *premiumizeStore) AddInFlight(infoHash string) bool {
+	return addOutcomeUnknown(s.cache, ServicePremiumize, s.token, infoHash)
+}
+
 func (s *torBoxStore) RecentRefusal(infoHash string) (string, bool) {
 	return backedOff(s.cache, ServiceTorBox, s.token, infoHash)
 }
@@ -3279,18 +3312,6 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	// accounts couldn't serve this" into "you cannot play this" — a release that used to play. Adds are
 	// bounded by `spendAdd`, which is a ceiling rather than a coin flip on which store gets to try.
 	for _, st := range p.ordered(preferred) {
-		// Out of clock: stop rather than charge every remaining store for an add it cannot send. TorBox
-		// spends the hourly budget and writes the in-flight marker BEFORE the request goes out (see
-		// addMagnet), and a dead context fails at client.Do, which returns without refunding because a
-		// request that may have reached the wire must not be re-sent. Measured on an expired context:
-		// zero upstream requests issued, one add spent per configured service, and a 90-second marker
-		// left behind that makes the next poll answer 202 "downloading" for a torrent nobody queued.
-		// Out of clock: stop rather than charge every remaining store for an add it cannot send. TorBox
-		// spends the hourly budget and writes the in-flight marker BEFORE the request goes out (see
-		// addMagnet), and a dead context fails at client.Do, which returns without refunding because a
-		// request that may have reached the wire must not be re-sent. Measured on an expired context:
-		// zero upstream requests issued, one add spent per configured service, and a 90-second marker
-		// left behind that makes the next poll answer 202 "downloading" for a torrent nobody queued.
 		// Out of clock: stop rather than charge every remaining store for an add it cannot send. TorBox
 		// spends the hourly budget and writes the in-flight marker BEFORE the request goes out (see
 		// addMagnet), and a dead context fails at client.Do, which returns without refunding because a

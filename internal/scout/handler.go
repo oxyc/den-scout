@@ -917,6 +917,23 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 		// refusing. Reading the error we already have needs no cache to have been written first.
 		_ = errors.As(err, &refusedUs)
 	}
+	// An add of OURS that is out and unanswered means the release is being fetched right now, and it
+	// outranks every refusal below — the same precedence /play gives errAddInFlight, and for the same
+	// reason: it is a fact about us, not about a service.
+	//
+	// The probe route could not learn it any other way. It never resolves, and all three stores answer a
+	// NoAdd target with errWouldAdd BEFORE they consult the marker, so the state /play reports as 202
+	// reached this route as nothing at all and fell through to the 404 below. Measured on the same
+	// release at the same instant: /play → 202 {"state":"downloading"} while ?probe=1 → 404
+	// {"error":"not_queued"}. That 404 is the single failure this route exists to prevent, and it is the
+	// URL the client polls to draw its progress bar. TorBox self-heals once its 15s miss marker lapses
+	// AND the add landed; Real-Debrid and Premiumize have no Status at all, so nothing clears it and the
+	// disagreement stands the full 90s addAttemptTTL.
+	if pool.AddInFlight(infoHash) {
+		log.Printf("scout: probe %s → 202, an add is already in flight", shortHash(infoHash))
+		writeQueued(w, infoHash, StoreStatus{})
+		return
+	}
 	if refusedUs != nil {
 		log.Printf("scout: probe %s → 503, %s %s", shortHash(infoHash), refusedUs.Service, refusedUs.Reason)
 		writeJSON(w, http.StatusServiceUnavailable,

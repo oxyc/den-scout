@@ -522,3 +522,78 @@ func TestHandlePlay_anInFlightAddIsQueuedNotRefused(t *testing.T) {
 		t.Errorf("a release scout itself queued was reported as the debrid refusing: %s", rec.Body.String())
 	}
 }
+
+// ?probe=1 and /play must give the SAME answer about an add scout has out.
+//
+// They are one vocabulary by design — the doc on handleProbe says so — and this is the one fact in the
+// package that is about us rather than about a service. /play reads it through errAddInFlight, raised
+// from inside the resolve. The probe route never resolves, and all three stores answer a NoAdd target
+// with errWouldAdd BEFORE they consult the marker, so it had no way to learn the state at all and fell
+// through to 404 "not_queued" — for the same release, at the same instant, that /play was answering 202
+// "downloading".
+//
+// A 404 there is the single failure that route exists to prevent: it is the URL the client polls to
+// draw its progress bar, and it reads a 404 as a release nobody has. The window is not brief for two of
+// the three services — Real-Debrid and Premiumize have no Status API to rediscover the torrent with, so
+// nothing clears the marker before addAttemptTTL expires 90 seconds later.
+//
+// Asserted as an agreement between the two routes rather than as a status code, because the defect was
+// the DISAGREEMENT; pinning one route's number invites the other to drift again.
+//
+// This fixture reaches the disagreement one branch earlier than the reported 404: with every upstream
+// answering an empty body the probe stops at 503 (`status_unavailable` for TorBox, which has a Status
+// API, `cache_check_unavailable` for the two that do not) while /play answers 202. Removing the guard
+// reproduces that, which is the same defect at a different exit — the route not knowing a fact it
+// holds. Reaching the literal 404 needs a healthy cache check AND a store that answers "not queued",
+// which is a fuller fixture than this invariant needs.
+func TestProbeAndPlay_agreeThatAnInFlightAddIsDownloading(t *testing.T) {
+	for _, svc := range []DebridService{ServiceTorBox, ServiceRealDebrid, ServicePremiumize} {
+		t.Run(string(svc), func(t *testing.T) {
+			cache := NewMemoryCache(1 << 20)
+			noteAddAttempt(cache, svc, "tok", H) // an add went out and nothing came back
+
+			// Every upstream answers a well-formed "nothing here", so the marker is the only evidence
+			// either route has. `{"data":{}}` rather than `{"data":[]}`: the cache check decodes data as
+			// an object, so an array fails the decode and the probe stops at "cache check unavailable"
+			// before it ever reaches the branch under test.
+			quiet := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+				return resp(200, `{"data":{}}`), nil
+			}}
+			h := NewHandler(Deps{
+				Cache: cache,
+				MakeStores: func(*Config) []Store {
+					switch svc {
+					case ServiceRealDebrid:
+						return []Store{&realDebridStore{token: "tok", cache: cache, api: realDebridAPI, client: quiet}}
+					case ServicePremiumize:
+						return []Store{&premiumizeStore{token: "tok", cache: cache, api: premiumizeAPI, client: quiet}}
+					}
+					return []Store{&torBoxStore{token: "tok", cache: cache, api: torboxAPI, client: quiet}}
+				},
+			})
+			tok := encodePlayToken(PlayTarget{InfoHash: H})
+
+			probe := httptest.NewRecorder()
+			h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+validBlob+"/play/"+tok+"?probe=1", nil))
+			play := httptest.NewRecorder()
+			h.ServeHTTP(play, httptest.NewRequest("GET", "/"+validBlob+"/play/"+tok, nil))
+
+			// The agreement is the invariant. Comparing the two routes rather than asserting one number
+			// keeps this pinned to the defect — a disagreement — instead of to whichever status a
+			// fixture happens to produce.
+			if probe.Code != play.Code {
+				t.Errorf("?probe=1 answered %d (%s) while /play answered %d (%s) for the same release at "+
+					"the same instant — the two routes are one vocabulary, and the client polls the probe "+
+					"to draw its progress bar", probe.Code, strings.TrimSpace(probe.Body.String()),
+					play.Code, strings.TrimSpace(play.Body.String()))
+			}
+			if probe.Code == http.StatusNotFound {
+				t.Errorf("?probe=1 answered 404 for a release scout has an add out for: %s — the client "+
+					"reads that as a release nobody has and blacklists it", probe.Body.String())
+			}
+			if probe.Code != http.StatusAccepted {
+				t.Errorf("?probe=1 = %d, want 202 downloading: %s", probe.Code, probe.Body.String())
+			}
+		})
+	}
+}
