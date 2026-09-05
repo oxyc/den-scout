@@ -528,7 +528,10 @@ func TestStorePoolStatus_reportsWhenAStoreCouldNotAnswer(t *testing.T) {
 //
 // The retry used to go back through the whole pool, re-asking stores that had just answered
 // definitively — one unknown store in a three-account pool cost nine store reads per /play instead of
-// six, and each TorBox read is up to two upstream calls, on a two-second poll cadence.
+// seven, and each TorBox read is up to two upstream calls, on a two-second poll cadence. Seven, not six:
+// the post-failure read runs after an add may have landed and deliberately asks everyone again. Saying
+// six here would read as an instruction to narrow that one too, which is the reversal this exists to
+// forbid — see TestHandlePlay_theEscalationReAsksOnlyTheStoreThatCouldNotAnswer, which counts all three.
 func TestStorePoolStatusDetail_namesOnlyTheStoresThatCouldNotAnswer(t *testing.T) {
 	var uncertainAsks, definiteAsks int
 	uncertain := answeringStore{fakeStore: fakeStore{svc: ServiceTorBox}, answer: statusUnknown, asked: &uncertainAsks}

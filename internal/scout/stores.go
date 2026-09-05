@@ -1451,7 +1451,7 @@ type listingMemoEntry struct {
 // account here — not the eight maxDebridAccounts allows — and only a token TorBox answered a listing for
 // can reach this map at all.
 //
-// Two limits of the torrent count as the bound, both measured and both out of reach:
+// Two limits of the torrent count as the bound, both measured:
 //
 // A torrent count does not price the per-entry overhead, ~440 bytes of map header and key. At the extreme
 // — 100,000 accounts of one torrent each — the same ceiling admits 42 MiB rather than 8. That needs
@@ -1459,10 +1459,21 @@ type listingMemoEntry struct {
 //
 // Eviction is oldest-first, which is the worst possible policy for a cyclic access pattern: past the
 // ceiling, the entry evicted is always the one asked for next, so the hit rate does not degrade — it goes
-// straight from 100% to 0% and every poll re-pulls every listing. Measured at 8 accounts, the cliff is
-// 0.8% over capacity. Reaching it needs three or more distinct TorBox tokens on one instance averaging
-// over 33,000 torrents each, which is why the policy is left simple; anything that raises the account
-// count per instance should revisit it.
+// straight from 100% to 0%. The cliff is at ONE torrent over the ceiling, measured, not at any percentage
+// of it; a coarse sweep makes it look like a margin and there is none.
+//
+// The condition is total torrents across every TorBox account the process has seen, not a few large ones:
+// the memo is keyed on (cache, token) and the cache is process-wide, so fifty-one ordinary users at the
+// 2,000 this package has actually measured trips it just as well as three 33,000-torrent accounts. That is
+// still past what a self-hosted install is, which is why the policy stays simple — but the thing to watch
+// is the account COUNT, and oldest-first is the policy to replace when it moves. Random eviction degrades
+// to roughly capacity-over-working-set instead of to nothing; LRU does not, because a round-robin scan
+// evicts the next entry needed under LRU too.
+//
+// What "0%" costs is not "every poll re-pulls every listing": torrentID answers most polls from
+// torrentIDKey or the 15 s torrentMissKey without reaching the listing at all, and listingFlight collapses
+// concurrent misses. It is about one full pull per account per TTL window, plus one per sequential
+// distinct-infohash probe — measured at 1 fetch becoming 9 on the eight-release poster grid.
 const maxListingMemoEntries = 100_000
 
 // memoisable reports whether a Cache can be a map key at all — see listingMemo's comment.
