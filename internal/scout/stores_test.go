@@ -1421,6 +1421,59 @@ func TestTruncationDetector_aBodyOfExactlyTheCapIsWhole(t *testing.T) {
 // Each shape gets its own ceiling, from measurement rather than a shared round number: the numbers are
 // far enough apart that a coarse ceiling is plenty and there is no need to measure precisely enough to
 // be flaky.
+// Entries do not carry fields over from the entry before them.
+//
+// What makes each element independent is that the struct is declared INSIDE the loop, and nothing said
+// so: hoisting it above the loop — the obvious way to remove one heap allocation per entry, and half the
+// allocations this decode makes — compiles and passes everything, while an entry missing `hash` silently
+// inherits the previous one's. That maps a hash the account holds to a DIFFERENT torrent's id, which the
+// status read then follows.
+func TestDecodeListing_entriesDoNotInheritFromTheEntryBefore(t *testing.T) {
+	a, b := repeat("a", 40), repeat("b", 40)
+	ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(
+		`{"success":true,"data":[{"id":1,"hash":"` + a + `"},{"id":2},{"hash":"` + b + `"}]}`)))
+	if !ok {
+		t.Fatal("a listing with sparse entries is still readable")
+	}
+	if ids[a] != 1 {
+		t.Errorf("the complete entry was rewritten: %s → %d, want 1", a[:8], ids[a])
+	}
+	if ids[b] != 0 {
+		t.Errorf("an entry with no id took the previous entry's: %s → %d, want 0", b[:8], ids[b])
+	}
+	if len(ids) != 2 {
+		t.Errorf("expected exactly the two hashed entries, got %v", ids)
+	}
+}
+
+// A deeply nested unknown field is refused rather than walked.
+//
+// The walk allocates nothing itself, but Decoder.Token keeps a token stack that grows with every open
+// bracket, and it is live rather than garbage — GOMEMLIMIT cannot reclaim it. Unbounded, 10 MiB of `[`
+// peaked at 239.8 MiB against a 230 MiB limit, on a body a quarter of the byte cap, and on the transient
+// road so every poll in a wait repeated it. This is a different mechanism from the huge-scalar case in
+// FOLLOWUP.md, and lowering the byte cap does not fix it.
+func TestSkipValue_refusesRunawayNesting(t *testing.T) {
+	deep := `{"success":true,"x":` + strings.Repeat("[", 1<<20)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(deep)))
+	runtime.ReadMemStats(&after)
+
+	// Refused, and refused as a BLIP: an unreadable body is retried, exactly as a truncated field is.
+	if ok || fault != listingFaultNone {
+		t.Errorf("runaway nesting: ok=%v fault=%v, want false and no persistent fault", ok, fault)
+	}
+	// The bound is what keeps this proportional to the depth limit rather than to the body. Unbounded,
+	// this fixture allocates tens of MiB of token stack; bounded, it stops after 64 brackets.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(len(deep)) {
+		t.Errorf("walking %d bytes of nesting allocated %d bytes — the depth bound is not stopping the "+
+			"decoder's token stack from growing with the body", len(deep), allocated)
+	}
+}
+
 func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 	// A top-level key that is neither success nor data goes through skipValue's default branch. Its walk
 	// allocates about one body's worth, because Token materialises each string it steps over; buffering

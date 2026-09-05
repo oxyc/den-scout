@@ -52,16 +52,24 @@ several rounds and is worse than the tolerance that was written against it.
 
 `encoding/json`'s `Token` must buffer a whole token before it can hand it over, so a single value just
 under `maxListingBytes` is live twice at once: the decoder's own buffer, doubled to 128 MiB, plus the
-materialised string. Measured peak **256.7 MiB of live heap**, against `GOMEMLIMIT=230MiB` in a 256 MB
-container — an OOM kill. The length filter on `hash` does not help; it can only run once the token
-already exists. And because the body still decodes as a valid listing, it is memoised and the spike
-repeats every `listingTTL`.
+materialised string. Measured peak **304 MiB of live heap** — an earlier note here said 256.7 MiB, which
+a re-measurement put ~19% low — against `GOMEMLIMIT=230MiB` in a 256 MB container, i.e. an OOM kill. The
+length filter on `hash` does not help; it can only run once the token already exists. And because the
+body still decodes as a valid listing, it is memoised and the spike repeats every `listingTTL`.
 
-Three ways out, none free:
+A second, unrelated mechanism in the same function was found and FIXED rather than recorded: deeply
+nested brackets grow `Decoder`'s own token stack, which is live rather than garbage, so 10 MiB of `[`
+peaked at 239.8 MiB — a quarter of the byte cap, and on the transient road so every poll repeated it.
+`maxSkipDepth` now refuses past 64 levels and takes that to 20.4 MiB. It is called out here because the
+first mitigation below was written as if it covered this shape and does not: at a 32 MiB cap the nesting
+case still peaked at 732 MiB.
+
+Three ways out for the huge-scalar case, none free:
 
 - Lower `maxListingBytes`. The peak steps at the decoder's buffer doublings, so ~32 MiB would cap the
-  peak near 128 MiB. But this cap governs real large accounts, and lowering it makes them read as
-  oversized — indeterminate, then escalation. A functional regression traded for a hostile-upstream case.
+  peak near 160 MiB — measured, not the 128 MiB an earlier note claimed. But this cap governs real large
+  accounts, and lowering it makes them read as oversized — indeterminate, then escalation. A functional
+  regression traded for a hostile-upstream case.
 - Bound a single token. `encoding/json` offers no hook; it would mean a hand-written scanner for the
   listing, which is a lot of surface for this.
 - Leave it and alert on it. `scout_background_panics_total` will not see an OOM, but the container
