@@ -21,18 +21,28 @@ add a 45-second budget did not make.
 
 Fixed by giving the two questions two budgets rather than moving the number back — the budget was
 shortened deliberately, because this read answers a poll on a two-second cadence. The poll-answering
-read keeps `statusBudget`; only a read that actually TIMED OUT, which is the one path about to spend an
-add, escalates to `resolveBudget` for a definitive answer. That path was going to block on the add
-anyway, and it is self-limiting: once anything is queued the torrent id is cached and later reads are
-fast. See `TestPlay_statusTimeoutDoesNotAdd` and its control.
+read keeps `statusBudget`; only a read that could not FIND OUT, which is the one path about to spend an
+add, escalates for a definitive answer. That path was going to block on the add anyway, and it is
+self-limiting: once anything is queued the torrent id is cached and later reads are fast. See
+`TestPlay_statusTimeoutDoesNotAdd` and its control.
+
+Two details of that escalation were each got wrong once, so they are recorded in the code rather than
+here — see `escalatedStatusCtx` and `escalatedStatusBudget` in `handler.go`. In short: it takes double
+the status budget **carved out of what remains of the resolve clock**, not a fresh `resolveBudget`, which
+outlived the clock it was gating and made the add impossible; and it fires on the store reporting that it
+could not find out, not on the caller's own deadline, which the pool's per-store budget slicing had made
+a different question.
 
 ### `indexerconfig.go`'s `minted` map now has a count ceiling — fixed
 
 `pruneMintedLocked` dropped entries past their own TTL, which cannot bound a map whose keys the caller
 chooses: the key derives from a token nobody verifies, and comet's mint is local base64 with no round
 trip, so every distinct token minted successfully and was held for 12 hours (~500 B each). It now
-enforces `maxMintedEntries` (256) oldest-first as well. A legitimate install has one entry per
-(indexer, account) — under twenty.
+enforces `maxMintedEntries` (256) as well, least-recently-USED first. Not oldest-first: a legitimate
+install's entries are the oldest in the map by construction — minted once, good for twelve hours — so
+sorting by mint time evicts exactly the operator's own. Protecting recently-used entries from eviction
+was tried on top of that and reverted; the reasoning is in `pruneMintedLocked`. A legitimate install has
+one entry per (indexer, account) — under twenty.
 
 ## #13 — debrid file selection for multi-file packs
 
