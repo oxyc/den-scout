@@ -1263,6 +1263,14 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		{"the data key renamed", `{"success":true,"items":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`},
 		{"data is an object", `{"success":true,"data":{"1":"` + repeat("a", 40) + `"}}`},
 		{"success is false", `{"success":false,"data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`},
+		// A field of the WRONG TYPE is the same class: well-formed, and identical on the next poll. One
+		// odd entry among two thousand cost 45 fetches and up to 538 MiB per wait, because the decode
+		// error was read as a blip — the distinction encoding/json already draws between a type error and
+		// a body that stopped early.
+		{"an entry id is a string", `{"success":true,"data":[{"id":"1","hash":"` + repeat("a", 40) + `"}]}`},
+		{"an entry hash is a number", `{"success":true,"data":[{"id":1,"hash":7}]}`},
+		{"an entry is a scalar", `{"success":true,"data":[42]}`},
+		{"success is a string", `{"success":"yes","data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`},
 	} {
 		fetches := 0
 		s := &torBoxStore{token: "envelope-" + tc.name, api: torboxAPI, cache: NewMemoryCache(1 << 20),
@@ -1291,6 +1299,10 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 	for _, cut := range []struct{ name, body string }{
 		{"inside data, after an unusable entry", `{"success":true,"data":[{"id":1,"hash":"tooshort"}`},
 		{"data closed, outer object not", `{"success":true,"data":[]`},
+		// Cut at the two decode sites that now split type errors from blips: the same call that must
+		// memoise a wrong-typed field must still retry a body that simply stopped.
+		{"mid-entry", `{"success":true,"data":[{"id":1,"ha`},
+		{"mid-success", `{"suc`},
 	} {
 		n := 0
 		s := &torBoxStore{token: "cut-" + cut.name, api: torboxAPI, cache: NewMemoryCache(1 << 20),

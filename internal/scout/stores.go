@@ -1724,8 +1724,9 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 				"treating it as no answer rather than as an empty account; the upstream may have renamed " +
 				"the field")
 		case listingBadEnvelope:
-			log.Printf("scout: torbox account listing came back without a usable data array — treating it " +
-				"as no answer rather than as an empty account; the upstream envelope may have changed")
+			log.Printf("scout: torbox account listing was not a shape we can read — no usable data array, " +
+				"or a field of an unexpected type — treating it as no answer rather than as an empty " +
+				"account; the upstream schema may have changed")
 		}
 		return nil, false, true
 	}
@@ -1757,9 +1758,11 @@ const (
 	// Entries arrived and not one was usable. An upstream that renamed `hash` looks exactly like this,
 	// and it will look like it again on the next poll, so it is remembered rather than re-fetched.
 	listingNoUsableEntries
-	// A complete envelope with no usable `data` array: the key renamed, `data` holding an object, an
-	// explicit `data:null`, or an explicit success:false. Same deterministic class as the two above — and
-	// separated from a truncated body, which reaches the same place and is not.
+	// The body was well-formed and the wrong SHAPE. Two families reach it: an envelope with no usable
+	// `data` array — the key renamed, `data` holding an object, an explicit `data:null`, an explicit
+	// success:false — and a field of the wrong type, `id` as a string or `success` as one. Same
+	// deterministic class as the two above, and separated in both families from a truncated body, which
+	// reaches the same places and is not.
 	//
 	// success:false is the arguable member, and it is arguable in one direction only. TorBox signals state
 	// in band at HTTP 200 — this file records elsewhere that a torrent still downloading answers exactly
@@ -1770,6 +1773,20 @@ const (
 	// instead reinstates the 45 fetches and 539 MiB per wait this fault was added to remove.
 	listingBadEnvelope
 )
+
+// listingFaultFor splits a decode error into the kind worth remembering and the kind worth retrying.
+//
+// A type error means the body was well-formed and the wrong SHAPE: that arrives identically on the next
+// poll, so re-fetching it is the guaranteed waste every other deterministic fault here is memoised to
+// avoid. Anything else — an unexpected EOF above all — is a body that stopped early, and suppressing that
+// retry is how a queued torrent stops being rediscoverable.
+func listingFaultFor(err error) listingFault {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		return listingBadEnvelope
+	}
+	return listingFaultNone
+}
 
 // decodeListing walks `{"success":…,"data":[{id,hash},…]}` and keeps only the hash→id map.
 //
@@ -1797,8 +1814,10 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 		switch key {
 		case "success":
 			var v *bool
-			if dec.Decode(&v) != nil {
-				return nil, false, listingFaultNone
+			if err := dec.Decode(&v); err != nil {
+				// Same split as the entry decode below: `success` arriving as a string is a schema change,
+				// a body cut off here is a blip.
+				return nil, false, listingFaultFor(err)
 			}
 			if v != nil {
 				success = *v
@@ -1840,8 +1859,18 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 						ID   int    `json:"id"`
 						Hash string `json:"hash"`
 					}
-					if dec.Decode(&e) != nil {
-						return nil, false, listingFaultNone
+					if err := dec.Decode(&e); err != nil {
+						// Decode fails for two unrelated reasons and they must not be collapsed. A body cut
+						// off mid-entry is a blip. An entry whose fields are the WRONG TYPE — `id` arriving
+						// as a string, `hash` as a number, an element that is a scalar — is a schema
+						// change, exactly as deterministic as the renamed `hash` this function already
+						// memoises, and exactly the v2-API shape that comment invokes.
+						//
+						// Collapsing them put a single odd entry back on the re-fetch road: measured at 45
+						// listing fetches and up to 538 MiB per wait, on a two-second cadence, forever —
+						// the same number this function was driven to 1 for every other deterministic
+						// shape. encoding/json hands the distinction over for free.
+						return nil, false, listingFaultFor(err)
 					}
 					// The cap counts entries SEEN, and is checked BEFORE the filter below can skip past it.
 					// The byte cap does not bound the entry count: 60 MiB of minimal entries is ~1M of them
