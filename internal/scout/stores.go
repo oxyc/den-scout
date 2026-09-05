@@ -588,6 +588,17 @@ func noteHeld(cache Cache, token, infoHash string) {
 	}
 }
 
+// forgetHeld drops the claim, which directdl answering with no content has just disproved.
+//
+// Every remembered-holding claim in this package needs one of these. TorBox and Real-Debrid forget their
+// ids on errTorrentGone for the same reason: the claim has a life measured in hours and the account can
+// change under it at any moment.
+func forgetHeld(cache Cache, token, infoHash string) {
+	if cache != nil {
+		cache.Put(pmHeldKey(token, infoHash), "", time.Nanosecond)
+	}
+}
+
 func heldRecently(cache Cache, token, infoHash string) bool {
 	if cache == nil {
 		return false
@@ -3233,12 +3244,22 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// the transfer finished, so blocking it made a release that completed in two minutes unresolvable for
 	// the remaining eighteen. What the marker suppresses is the CHARGE: the transfer is already paid for,
 	// so asking about it again must not spend another add.
-	// "held recently" counts as queued for the CHARGE too: both mean this call needs no new transfer, so
-	// neither should spend an add. Without that a read-only poll of a release the account already served
-	// would pass through spendAdd — refunded below, but able to be refused by a spent allowance, and
-	// charging at all for a read is what this flag exists to prevent.
-	queued := alreadyQueued(s.cache, s.token, t.InfoHash) ||
-		heldRecently(s.cache, s.token, t.InfoHash)
+	// ONLY the queue marker suppresses the charge. The held mark must not, whatever it costs in tidiness:
+	// it is a six-hour CLAIM about the account, and a claim can be wrong, whereas a pending transfer is
+	// something scout itself queued and already paid for.
+	//
+	// Letting the held mark in here was measured and it is the expensive failure this function already
+	// records once, arriving through a different door. Once Premiumize evicts the release — or the user
+	// removes it — the mark still reads "held" for the rest of its six hours, so the NoAdd gate lets a
+	// read-only poll through to directdl, which IS the purchase; the charge is skipped, so the fifty an
+	// hour never sees it; and success-with-no-content skips noteQueued too, so nothing bounds the claim:
+	//
+	//   parent commit: 30 polls -> 2 directdl, allowance 50->49, queue marker set (10-min give-up)
+	//   with the mark: 30 polls -> 32 directdl, allowance 50->50, NO marker, no give-up at all
+	//
+	// Sixty polls is two minutes of a viewer sitting there. The comment on pmHeldKey said this outright —
+	// "must NOT suppress a later charge the way a pending transfer does" — and the code did the opposite.
+	queued := alreadyQueued(s.cache, s.token, t.InfoHash)
 	// Charged BEFORE the call, because the budget has to be able to gate it — directdl queues a transfer
 	// for anything the account lacks, so a spent allowance must stop the request, not merely record it.
 	// But directdl is a READ for anything Premiumize already holds, and charging every one of those billed
@@ -3397,6 +3418,12 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if len(body.Content) == 0 {
 		// A successful answer with nothing in it: this call really did queue a transfer, so the charge
 		// stands.
+		//
+		// It also PROVES the account does not hold this release — a held one comes back with content —
+		// so the held mark goes, and that is the only way it can go. Written with a six-hour life and no
+		// clearing path, it outlived every eviction: TorBox and Real-Debrid forget a remembered id the
+		// moment the service says the torrent is gone, and this had no such twin.
+		forgetHeld(s.cache, s.token, t.InfoHash)
 		if !queued {
 			noteQueued(s.cache, s.token, t.InfoHash)
 		}

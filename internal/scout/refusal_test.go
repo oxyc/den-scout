@@ -1255,9 +1255,12 @@ func TestProbeAndPlay_agreeOnALaterEpisodeAfterPremiumizeServedTheFirst(t *testi
 	cache := NewMemoryCache(1 << 20)
 	cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
 
+	// The cache check answers NOT cached, so HeldBy names nobody and the held mark is the only thing
+	// that can. With it answering `true` the holder came from the cache truth instead, and reverting
+	// HoldsTorrent's held-mark arm left the whole suite green.
 	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 		if strings.Contains(r.URL.Path, "cache/check") {
-			return resp(200, `{"status":"success","response":[true]}`), nil
+			return resp(200, `{"status":"success","response":[false]}`), nil
 		}
 		return resp(200, `{"status":"success","content":[`+
 			`{"path":"Show.S01E01.mkv","link":"https://pm.example/e1.mkv","size":100},`+
@@ -1295,6 +1298,55 @@ func TestProbeAndPlay_agreeOnALaterEpisodeAfterPremiumizeServedTheFirst(t *testi
 	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+ep(2), nil))
 	if play.Code != http.StatusFound {
 		t.Fatalf("playing episode 2 = %d, want 302", play.Code)
+	}
+}
+
+// A Premiumize release that has been EVICTED must not let read-only polls buy it back, uncharged.
+//
+// The held mark is a six-hour claim about the account, and a claim can be wrong. Once Premiumize evicts
+// the release the mark still reads "held", which lets a read-only poll through the NoAdd gate to
+// directdl — and directdl IS the purchase. Letting that mark also suppress the charge made every poll a
+// real, unbilled add with no queue marker to bound it:
+//
+//	before: 30 polls -> 2 directdl, allowance 50->49, marker set (10-minute give-up)
+//	after:  30 polls -> 32 directdl, allowance 50->50, no marker, no give-up
+//
+// Two guards are asserted: the charge is taken (so the fifty an hour sees it), and the mark is dropped
+// (so the next poll does not walk the same path again).
+func TestPremiumize_anEvictedReleaseIsNotBoughtBackByReadOnlyPolls(t *testing.T) {
+	token, hash := "pm-evicted", repeat("7", 40)
+	cache := NewMemoryCache(1 << 20)
+	noteHeld(cache, token, hash) // the account held it when /play last served it
+
+	var calls int32
+	s := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			atomic.AddInt32(&calls, 1)
+			// Evicted: directdl succeeds by QUEUEING a fresh transfer, and returns nothing to serve.
+			return resp(200, `{"status":"success","content":[]}`), nil
+		}}}
+
+	before := globalAddBudget.remaining(budgetAccount(ServicePremiumize, token))
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: hash, NoAdd: true})
+
+	if after := globalAddBudget.remaining(budgetAccount(ServicePremiumize, token)); after == before {
+		t.Errorf("a directdl that queued a transfer was not charged (allowance %d → %d) — the held mark "+
+			"is suppressing the charge, so the hourly ceiling never sees these and a polling client "+
+			"makes one real add every couple of seconds", before, after)
+	}
+	if heldRecently(cache, token, hash) {
+		t.Error("the held mark survived a directdl that returned no content — that answer proves the " +
+			"account does not hold it, and nothing else can ever clear the mark")
+	}
+	if !alreadyQueued(cache, token, hash) {
+		t.Error("no queue marker was written for a transfer this call queued — nothing bounds the " +
+			"'coming' claim, so /play answers 202 downloading with no give-up")
+	}
+
+	// And the next poll must not walk the same path again.
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: hash, NoAdd: true})
+	if got := atomic.LoadInt32(&calls); got > 2 {
+		t.Errorf("%d directdl calls across two polls — the read-only path is re-queueing on every poll", got)
 	}
 }
 
