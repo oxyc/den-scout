@@ -1438,9 +1438,9 @@ func TestDecodeListing_entriesDoNotInheritFromTheEntryBefore(t *testing.T) {
 //
 // The walk allocates nothing itself, but Decoder.Token keeps a token stack that grows with every open
 // bracket, and it is live rather than garbage — GOMEMLIMIT cannot reclaim it. Unbounded, 10 MiB of `[`
-// peaked at 239.8 MiB against a 230 MiB limit, on a body a sixth of the byte cap, and on the transient
-// road so every poll in a wait repeated it. This is a different mechanism from the huge-scalar case in
-// FOLLOWUP.md, and lowering the byte cap does not fix it.
+// peaked at ~231 MiB against a 230 MiB limit, on a body a sixth of the byte cap. This is a different
+// mechanism from the huge-scalar case in FOLLOWUP.md, and lowering the byte cap does not fix it: at a
+// 32 MiB cap the same shape still peaks at 701 MiB.
 func TestSkipValue_refusesRunawayNesting(t *testing.T) {
 	deep := `{"success":true,"x":` + strings.Repeat("[", 1<<20)
 
@@ -1450,15 +1450,64 @@ func TestSkipValue_refusesRunawayNesting(t *testing.T) {
 	_, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(deep)))
 	runtime.ReadMemStats(&after)
 
-	// Refused, and refused as a BLIP: an unreadable body is retried, exactly as a truncated field is.
-	if ok || fault != listingFaultNone {
-		t.Errorf("runaway nesting: ok=%v fault=%v, want false and no persistent fault", ok, fault)
+	// Refused, and REMEMBERED: the same body refuses at the same bracket next poll, so retrying only
+	// pays the cost again — and that cost is the whole body whenever the deep field follows `data`,
+	// which is the ordering a real listing has. It also keeps this consistent with the same shape one
+	// level in, where encoding/json's own 10,000-level ceiling raises a SyntaxError that is already
+	// memoised.
+	if ok || fault != listingBadEnvelope {
+		t.Errorf("runaway nesting: ok=%v fault=%v, want false and listingBadEnvelope", ok, fault)
 	}
 	// The bound is what keeps this proportional to the depth limit rather than to the body. Unbounded,
 	// this fixture allocates tens of MiB of token stack; bounded, it stops after 64 brackets.
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > uint64(len(deep)) {
 		t.Errorf("walking %d bytes of nesting allocated %d bytes — the depth bound is not stopping the "+
 			"decoder's token stack from growing with the body", len(deep), allocated)
+	}
+}
+
+// maxSkipDepth is pinned from BELOW as well as above.
+//
+// Only the refusal was tested, and a refusal-only test is satisfied by any bound at all: the constant
+// could be lowered to 2 with the whole suite green. That matters more here than it usually would,
+// because a depth refusal is now memoised — a bound tightened until a legitimate body trips it would
+// lock that account out for the whole listingTTL, on every poll, silently.
+//
+// The depths are LITERAL, not maxSkipDepth±1. Written against the constant, the table moves with it and
+// a tightening stays green, which is the hole this test exists to close.
+func TestSkipValue_acceptsDepthJustUnderTheBound(t *testing.T) {
+	hash := repeat("a", 40)
+	for _, tc := range []struct {
+		name   string
+		depth  int
+		wantOK bool
+	}{
+		{"under the bound", 63, true},
+		{"exactly at the bound", 64, true},
+		{"past the bound", 65, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The nested field precedes `data` so the refusal, when it comes, is the depth bound rather
+			// than anything downstream; a body that decodes must still yield the entry after it.
+			body := `{"success":true,"x":` +
+				strings.Repeat("[", tc.depth) + strings.Repeat("]", tc.depth) +
+				`,"data":[{"id":1,"hash":"` + hash + `"}]}`
+
+			ids, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(body)))
+			if ok != tc.wantOK {
+				t.Fatalf("depth %d: ok=%v fault=%v, want ok=%v", tc.depth, ok, fault, tc.wantOK)
+			}
+			if !tc.wantOK {
+				if fault != listingBadEnvelope {
+					t.Errorf("depth %d: fault=%v, want listingBadEnvelope", tc.depth, fault)
+				}
+				return
+			}
+			if ids[hash] != 1 {
+				t.Errorf("depth %d decoded, but the entry after the nested field was lost: %v",
+					tc.depth, ids)
+			}
+		})
 	}
 }
 
@@ -1476,8 +1525,12 @@ func TestSkipValue_refusesRunawayNesting(t *testing.T) {
 // be flaky.
 func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 	// A top-level key that is neither success nor data goes through skipValue's default branch. Its walk
-	// allocates about one body's worth, because Token materialises each string it steps over; buffering
-	// the same field into a json.RawMessage allocates 3.7x.
+	// allocates 1.06x the body here; buffering the same field into a json.RawMessage allocates 3.7x.
+	//
+	// 1.06x is this FIXTURE, not the walk. Token allocates once per token, so the ratio tracks token
+	// density: the same 24 MiB written as a flat object of small fields measures 20.75x. The 6 KB strings
+	// below keep the walk's own cost near the body size, which is what makes a 2x ceiling meaningful
+	// against the 3.7x buffering form rather than a number that happens to pass.
 	var skipped strings.Builder
 	skipped.WriteString(`{"success":true,"unknown_field":[`)
 	for i := 0; skipped.Len() < 24<<20; i++ {

@@ -54,42 +54,57 @@ const maxListingEntries = 50_000
 //
 // That walk allocates nothing itself, but Decoder.Token pushes onto its own token stack for every open
 // bracket, and that stack is LIVE rather than garbage, so GOMEMLIMIT cannot reclaim it. Measured on
-// `{"x":[[[[…`: 1 MiB of brackets peaks at 21 MiB, 4 MiB at 98 MiB, and 10 MiB at 239.8 MiB — past the
-// 230 MiB limit, on a body a SIXTH of the byte cap. It is also on the TRANSIENT road, so every one of
-// the 45 reads in a wait repeats it, where the huge-scalar case recorded in FOLLOWUP.md at least decodes
-// once and is memoised.
+// `{"x":[[[[…` STREAMED off a socket, which is how production reads it: 1 MiB of brackets peaks at
+// 25 MiB, 4 MiB at 95 MiB, and 10 MiB at ~231 MiB — past the 230 MiB limit, on a body a SIXTH of the
+// byte cap.
 //
 // A real listing does not nest: skipValue is reached only for an unknown TOP-LEVEL key, since `data` is
 // opened by token and decoded element by element, so nothing in a real entry is measured against this at
 // all. Sixty-four is far past anything TorBox could reasonably send and takes the 64 MiB worst case from
 // 1.4 GiB to a rounding error.
 //
-// Refusing reads as an unreadable body, which is transient and retried. That is deliberate even though a
-// nested body — unlike a truncated one — would fail identically next poll: the bound is a limit this
-// package imposes rather than evidence the upstream is broken, so if 64 ever proved too tight for a
-// legitimate body, memoising would lock that account out for the whole TTL on every poll. Retrying costs
-// almost nothing here, because the walk stops at the 65th bracket instead of consuming the body.
+// Refusing reads as listingBadEnvelope — remembered for the TTL, not retried. Two reasons, and the
+// earlier note here got both backwards:
+//
+// It is deterministic. The same body arrives next poll and refuses at the same bracket, so retrying only
+// repeats the cost. That cost is NOT the "walk stops at the 65th bracket" this comment used to claim:
+// keys are consumed in stream order, so the walk stops early only when the deep field PRECEDES `data`.
+// With it after `data` — the ordering any real body has, since `data` is what the listing is for — the
+// whole body has already been read by the time skipValue sees a bracket at all. Measured on a
+// 2,000-entry fixture: the full 0.58 MiB read, every poll, silently.
+//
+// And the same shape one level in is memoised already. Nesting inside `data[]` is decoded rather than
+// skipped, so it meets encoding/json's own 10,000-level ceiling and comes back a *json.SyntaxError,
+// which listingFaultFor maps to listingBadEnvelope. Leaving the top-level bound on the transient road
+// made two spellings of one hostile body behave oppositely.
+//
+// The risk memoising carries — a bound too tight for a legitimate body locks the account out for the
+// whole TTL — is pinned from below by TestSkipValue_acceptsDepthJustUnderTheBound rather than argued
+// about: maxSkipDepth cannot be lowered without a red test.
 const maxSkipDepth = 64
 
 // skipValue walks one JSON value without materialising it, so an unknown field costs no retention.
-func skipValue(dec *json.Decoder) bool {
+//
+// tooDeep separates the two failures for the caller: past maxSkipDepth is a deterministic property of
+// the body, while a token error is the truncated read that must be retried.
+func skipValue(dec *json.Decoder) (ok bool, tooDeep bool) {
 	depth := 0
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			return false
+			return false, false
 		}
 		switch tok {
 		case json.Delim('{'), json.Delim('['):
 			depth++
 			if depth > maxSkipDepth {
-				return false
+				return false, true
 			}
 		case json.Delim('}'), json.Delim(']'):
 			depth--
 		}
 		if depth == 0 {
-			return true
+			return true, false
 		}
 	}
 }
@@ -1993,26 +2008,41 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 			//
 			// Both numbers are TotalAlloc, because mixing a peak against a residency is how this comment
 			// was wrong before — it quoted 3.9 MiB "now", which is the post-GC figure and made the saving
-			// look like 50x rather than the 2.9x it is. Nor is 67 MiB free: it is a bit over one body's
-			// worth, because Token materialises every string it steps over. The win is that it is
-			// transient and shallow rather than the body held twice at once.
+			// look like 50x rather than the 2.9x it is. Nor is 67 MiB free: Token materialises every
+			// string it steps over, so the walk allocates once per TOKEN and that ratio is a property of
+			// the body's token density, not of the walk. 1.06x holds for the 6 KB strings measured here;
+			// the same 24 MiB as a flat object of small fields measures 20.75x. It is all garbage rather
+			// than live heap, so it costs GC time and not GOMEMLIMIT headroom — which is the actual win
+			// over holding the body twice at once, not a small constant.
 			//
 			// Nothing STRUCTURED is retained — a scalar is not helped, and saying otherwise would be the
 			// kind of comment this file keeps having to correct. A single huge string costs the same
 			// either way, because Token must buffer the whole token and allocate the string.
 			//
-			// That cost was understated here twice — first as ~159 MiB, then as 256.7 MiB. Re-measured
-			// against the actual cap: one value just under maxListingBytes peaks at 304 MiB of LIVE heap,
-			// the decoder's buffer having doubled to 128 MiB while the materialised string is live beside
-			// it, so the GC can reclaim neither. That is above the 230 MiB GOMEMLIMIT and above the
-			// container, i.e. an OOM kill, and it is not reduced by the length filter on `hash` above,
-			// which runs only after the token has been materialised.
+			// That cost is 256.7 MiB: one value just under maxListingBytes, the decoder's buffer having
+			// doubled to 128 MiB while the materialised string is live beside it, so the GC can reclaim
+			// neither. That is above the 230 MiB GOMEMLIMIT and above the container, i.e. an OOM kill,
+			// and it is not reduced by the length filter on `hash` above, which runs only after the token
+			// has been materialised.
+			//
+			// This figure has now been wrong in BOTH directions, so how it is measured matters more than
+			// the number. It was understated at ~159 MiB, corrected to 256.7, then "corrected" again to
+			// 304 — and 304 was the mistake: that probe fed the decoder a strings.Reader, so the fixture
+			// held the whole body live in the heap for the duration and the peak counted the body twice.
+			// Production reads off a socket and never materialises the body. Measure it streamed, or the
+			// number comes out high by exactly one body.
 			//
 			// Left as it is, deliberately: it needs a hostile or broken api.torbox.app rather than a caller
 			// (the base URL is a constant), and the alternative is lowering maxListingBytes, which governs
 			// real large accounts and would turn them oversized. Recorded in FOLLOWUP.md with the options
 			// rather than traded for a functional regression on a threat this package already accepts.
-			if !skipValue(dec) {
+			//
+			// The NESTED shape is a different mechanism with a different answer — bounded by maxSkipDepth
+			// and remembered rather than retried. See that constant.
+			if ok, tooDeep := skipValue(dec); !ok {
+				if tooDeep {
+					return nil, false, listingBadEnvelope
+				}
 				return nil, false, listingFaultNone
 			}
 		}

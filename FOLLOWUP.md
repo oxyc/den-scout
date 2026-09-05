@@ -51,23 +51,38 @@ Not a regression, and not reachable from a caller — `torboxAPI` is a constant,
 several rounds and is worse than the tolerance that was written against it.
 
 `encoding/json`'s `Token` must buffer a whole token before it can hand it over, so a single value just
-under `maxListingBytes` is live twice at once: the decoder's own buffer, doubled to 128 MiB, plus the
-materialised string. Measured peak **304 MiB of live heap** — an earlier note here said 256.7 MiB, which
-a re-measurement put ~19% low — against `GOMEMLIMIT=230MiB` in a 256 MB container, i.e. an OOM kill. The
-length filter on `hash` does not help; it can only run once the token already exists. And because the
-body still decodes as a valid listing, it is memoised and the spike repeats every `listingTTL`.
+under `maxListingBytes` is live twice at once: the decoder's own buffer, growing through 64 MiB to
+128 MiB with both halves live during the copy, plus the materialised string. Measured peak **~257 MiB of
+live heap** against `GOMEMLIMIT=230MiB` in a 256 MB container, i.e. an OOM kill. The length filter on
+`hash` does not help; it can only run once the token already exists. And because the body still decodes
+as a valid listing, it is memoised and the spike repeats every `listingTTL`.
+
+**How this is measured matters more than the number, because the number has now been wrong in both
+directions.** It was understated at ~159 MiB, corrected to 256.7 MiB, then "corrected" again to 304 MiB
+— and that last one was the regression, not the fix. The probe behind it fed the decoder a
+`strings.Reader`, so the fixture held the whole body live in the heap for the duration and the peak
+counted the body twice. Production reads off a socket and never materialises the body. Re-measured with
+the body streamed a chunk at a time, the original figures reproduce: **257.3 MiB** at the 64 MiB cap and
+**129.3 MiB** at a 32 MiB one. Measure it streamed, or every figure here comes out high by exactly one
+body.
+
+The peak is also sharply sensitive to where the body falls between the decoder's buffer doublings — a
+63 MiB value peaks at 160 MiB, a value just under 64 MiB at 257 MiB — so the worst case has to be built
+just under the cap rather than at a round number near it.
 
 A second, unrelated mechanism in the same function was found and FIXED rather than recorded: deeply
 nested brackets grow `Decoder`'s own token stack, which is live rather than garbage, so 10 MiB of `[`
-peaked at 239.8 MiB — a sixth of the byte cap, and on the transient road so every poll repeated it.
-`maxSkipDepth` now refuses past 64 levels and takes that to 20.4 MiB. It is called out here because the
-first mitigation below was written as if it covered this shape and does not: at a 32 MiB cap the nesting
-case still peaked at 732 MiB.
+peaked at ~231 MiB — a sixth of the byte cap. `maxSkipDepth` now refuses past 64 levels, which takes it
+to a rounding error, and the refusal is remembered rather than retried — see the constant for why, and
+note that the same shape nested inside `data[]` already lands on `listingBadEnvelope` through
+`encoding/json`'s own 10,000-level ceiling. It is called out here because the first mitigation below was
+written as if it covered this shape and does not: at a 32 MiB cap the nesting case still peaks at
+701 MiB.
 
 Three ways out for the huge-scalar case, none free:
 
 - Lower `maxListingBytes`. The peak steps at the decoder's buffer doublings, so ~32 MiB would cap the
-  peak near 160 MiB — measured, not the 128 MiB an earlier note claimed. But this cap governs real large
+  peak near 128 MiB — 129.3 MiB measured streamed. But this cap governs real large
   accounts, and lowering it makes them read as oversized — indeterminate, then escalation. A functional
   regression traded for a hostile-upstream case.
 - Bound a single token. `encoding/json` offers no hook; it would mean a hand-written scanner for the
