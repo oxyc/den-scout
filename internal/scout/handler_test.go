@@ -1087,6 +1087,60 @@ func TestRebuildGate(t *testing.T) {
 	}
 }
 
+// A global ceiling as well as the per-key one. bookRebuild dedupes per KEY, which stopped one goroutine
+// per stale REQUEST but left one per distinct stale key — and a caller picks the keys. Measured before
+// this: 400 stale keys from a single sequential caller produced 801 goroutines, each holding a finished
+// list body.
+func TestRebuildGate_boundsConcurrentRebuilds(t *testing.T) {
+	h := &handler{}
+	t0 := time.Now()
+	gens := map[string]uint64{}
+	for i := 0; i < maxConcurrentRebuilds; i++ {
+		key := fmt.Sprintf("k%d", i)
+		gen, ok := h.bookRebuild(key, t0, t0.Add(time.Minute))
+		if !ok {
+			t.Fatalf("booking %d refused below the ceiling", i)
+		}
+		gens[key] = gen
+	}
+	if _, ok := h.bookRebuild("one-too-many", t0, t0.Add(time.Minute)); ok {
+		t.Errorf("booked %d concurrent rebuilds, want a ceiling of %d",
+			maxConcurrentRebuilds+1, maxConcurrentRebuilds)
+	}
+	// Finishing one frees exactly one slot.
+	h.releaseRebuild("k0", gens["k0"], time.Time{})
+	if _, ok := h.bookRebuild("after-release", t0, t0.Add(time.Minute)); !ok {
+		t.Error("a freed slot was not reusable")
+	}
+}
+
+// The slot must come back even when the lease is already gone. A rebuild that overruns its lease has it
+// swept by a later booking, so releasing only a lease we still own leaked a slot every time that
+// happened — and eight of those means no title ever refreshes in the background again.
+func TestRebuildGate_sweptLeaseStillReturnsItsSlot(t *testing.T) {
+	h := &handler{}
+	t0 := time.Now()
+
+	// Book and overrun: a short lease, then a later booking elsewhere sweeps it.
+	gen, _ := h.bookRebuild("overrun", t0, t0.Add(time.Second))
+	later := t0.Add(10 * time.Second)
+	sweeper, _ := h.bookRebuild("sweeper", later, later.Add(time.Minute))
+	if _, held := h.rebuilds["overrun"]; held {
+		t.Fatal("the expired lease was not swept, so this test proves nothing")
+	}
+	// The overrun rebuild finally finishes and releases a lease that is no longer in the map.
+	h.releaseRebuild("overrun", gen, time.Time{})
+	h.releaseRebuild("sweeper", sweeper, time.Time{})
+
+	// Every slot must be free again.
+	for i := 0; i < maxConcurrentRebuilds; i++ {
+		if _, ok := h.bookRebuild(fmt.Sprintf("fresh%d", i), later, later.Add(time.Minute)); !ok {
+			t.Fatalf("only %d of %d slots came back — a swept lease leaked one",
+				i, maxConcurrentRebuilds)
+		}
+	}
+}
+
 // A lease is a wall-clock reservation, so a rebuild can outrun it — its context deadline and its budget
 // are the same 28 seconds, and it still has a marshal and a disk write to do afterwards. Without a fencing
 // token that late release deleted whatever sat at the key: a NEWER booking (leaking a rebuild slot) or a

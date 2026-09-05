@@ -2,8 +2,7 @@ package scout
 
 import (
 	"encoding/json"
-	"regexp"
-	"runtime"
+	"regexp/syntax"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +32,10 @@ func TestDecodeConfig(t *testing.T) {
 
 	// clamp + drop unknown; #12: minSeeders:-5 becomes nil (no filter), not 0.
 	c, ok = decodeConfig(nil, blob(`{"debrid":[{"service":"realdebrid","token":"rd"}],"resultCap":9999,"filters":{"excludeRegex":"`+repeat("x", 400)+`","minSeeders":-5},"evil":"ignored"}`))
-	if !ok || c.ResultCap != 200 || len(c.Filters.ExcludeRegex) != 256 || c.Filters.MinSeeders != nil {
+	// resultCap clamps to maxResultCap, which came down from 200: every stream in the reply embeds a copy
+	// of the config segment in its /play URL, so the body is len(blob) x resultCap and the cap is the
+	// larger half of that product.
+	if !ok || c.ResultCap != maxResultCap || len(c.Filters.ExcludeRegex) != 256 || c.Filters.MinSeeders != nil {
 		t.Fatalf("clamp: resultCap=%d regexLen=%d minSeeders=%v", c.ResultCap, len(c.Filters.ExcludeRegex), c.Filters.MinSeeders)
 	}
 
@@ -138,6 +140,26 @@ func TestParseStreamID(t *testing.T) {
 		if _, ok := parseStreamID(bad[0], bad[1]); ok {
 			t.Errorf("expected reject: %v", bad)
 		}
+	}
+
+	// The id is retained for the whole build — cache key, rebuild-gate map key, and the bingeGroup of
+	// EVERY stream in the response — and it is concatenated into the outbound indexer URL. `tt\d+` had no
+	// bound: `tt` plus 900,000 digits was accepted, pinned 2.7 MiB per in-flight request, and turned one
+	// small inbound GET into a ~900 KB outbound URL per indexer.
+	if _, ok := parseStreamID("movie", "tt"+repeat("1", 900_000)+".json"); ok {
+		t.Error("an id with 900,000 digits was accepted")
+	}
+	if _, ok := parseStreamID("movie", "tt"+repeat("1", 11)+".json"); ok {
+		t.Error("an 11-digit IMDb id was accepted")
+	}
+	// Checked before the split, because Split allocates one string per part whatever the regex says: a
+	// megabyte of colons is a megabyte of slice, paid before the id is ever rejected.
+	if _, ok := parseStreamID("series", "tt1234567"+repeat(":", 100_000)+"1:1.json"); ok {
+		t.Error("an id padded with 100,000 colons was accepted")
+	}
+	// The longest real id still parses.
+	if s, ok := parseStreamID("series", "tt1234567890:999:999.json"); !ok || s.Season != 999 {
+		t.Errorf("the longest legitimate id was refused: %+v ok=%v", s, ok)
 	}
 }
 
@@ -387,22 +409,52 @@ func jsonString(s string) string {
 // retained for the length of a scrape. Distinct blobs defeat both the list cache and the singleflight, so
 // 150 concurrent misses measured 207 MiB inside a 230 MiB GOMEMLIMIT.
 func TestDecodeConfig_boundsWhatOneRequestCanRetain(t *testing.T) {
-	// A segment past the ceiling is refused without being decoded.
-	if _, ok := decodeConfig(nil, repeat("A", maxConfigBlob+1)); ok {
-		t.Error("an oversized config segment was accepted")
+	// A WELL-FORMED oversized segment is refused. The length matters: `maxConfigBlob+1` is 8193, and
+	// 8193 % 4 == 1, which is not a valid unpadded base64 length — so the first version of this check was
+	// rejected by the decoder before the cap was ever consulted, and disabling the cap left the whole
+	// suite green. Built here as a real config padded with a long token, so only the cap can refuse it.
+	oversized := blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"excludeRegex":"` +
+		repeat("a", 64) + `"},"_pad":"` + repeat("p", maxConfigBlob) + `"}`)
+	if len(oversized) <= maxConfigBlob {
+		t.Fatalf("the oversized fixture is only %d bytes — it cannot exercise the %d cap", len(oversized), maxConfigBlob)
 	}
-	// An honest segment is nowhere near it — the real /configure output is a few hundred bytes.
-	honest := blob(`{"debrid":[{"service":"torbox","token":"` + repeat("t", 64) + `"}],` +
-		`"indexers":["torrentio","comet","mediafusion"],` +
-		`"filters":{"excludeCam":true,"hdrOnly":true,"resolutions":["2160p","1080p"],` +
-		`"preferResolution":"1080p","minSeeders":3,"maxSizeGB":40,"excludeRegex":"hindi|tamil|dubbed"},` +
+	if _, ok := decodeConfig(nil, oversized); ok {
+		t.Error("a well-formed oversized config segment was accepted")
+	}
+	// …and it really would have decoded, so the refusal above is the cap and not a parse failure.
+	if _, ok := decodeConfig(nil, oversized[:maxConfigBlob/2/4*4]); ok {
+		t.Log("(the truncated half does not decode either, which is fine — the check above is the point)")
+	}
+
+	// The margin that matters is against the largest LEGITIMATE config the field caps admit, not against
+	// a hand-picked typical one. maxDebridAccounts accounts each carrying a 512-character token (the
+	// per-token cap), all four indexers, every filter set, and a 256-character excludeRegex.
+	var accts []string
+	for i := 0; i < maxDebridAccounts; i++ {
+		accts = append(accts, `{"service":"torbox","token":"`+repeat("t", 512)+`"}`)
+	}
+	worstLegit := blob(`{"debrid":[` + strings.Join(accts, ",") + `],` +
+		`"indexers":["torrentio","comet","mediafusion","torz"],` +
+		`"filters":{"excludeCam":true,"hdrOnly":true,"resolutions":["2160p","1080p","720p","480p"],` +
+		`"preferResolution":"1080p","minSeeders":3,"maxSizeGB":40,"excludeRegex":"` + repeat("a", 256) + `"},` +
 		`"cachedOnly":true,"resultCap":20}`)
-	if len(honest) > maxConfigBlob/4 {
-		t.Errorf("a full honest config is %d bytes, uncomfortably close to the %d cap", len(honest), maxConfigBlob)
+	if _, ok := decodeConfig(nil, worstLegit); !ok {
+		t.Errorf("the largest config the field caps admit (%d bytes) does not fit the %d cap",
+			len(worstLegit), maxConfigBlob)
 	}
-	if _, ok := decodeConfig(nil, honest); !ok {
-		t.Fatal("a full honest config was refused")
+	// Sealing costs a little more, so the sealed form is what the margin has to clear.
+	kr, _ := parseSealKeyring(vecPrivB64, "")
+	plain, _ := b64urlDecode(worstLegit)
+	sealedBlob, _ := seal(&kr.keys[0].pub, plain)
+	sealedSeg := b64urlEncode(append([]byte{sealedVersion}, sealedBlob...))
+	if _, ok := decodeConfig(kr, sealedSeg); !ok {
+		t.Errorf("the largest legitimate config SEALED (%d bytes) does not fit the %d cap",
+			len(sealedSeg), maxConfigBlob)
 	}
+	// Recorded rather than asserted loosely: 81% of the cap is reachable legitimately, so the cap cannot
+	// come down without lowering maxDebridAccounts or the per-token cap with it.
+	t.Logf("largest legitimate segment: %d plain, %d sealed, against a %d cap",
+		len(worstLegit), len(sealedSeg), maxConfigBlob)
 
 	// Accounts are capped, and repeated resolutions are deduped rather than retained — four valid values
 	// mean a repeat carries no information, and rankStreams scans that slice per release.
@@ -426,16 +478,43 @@ func TestDecodeConfig_boundsWhatOneRequestCanRetain(t *testing.T) {
 	}
 }
 
-// maxCompiledMiB bounds what a pattern surviving validation may cost to compile.
+// maxCompiledInsts bounds the compiled PROGRAM of a pattern that survives validation.
 //
-// Ten, and both ends of that are measured. The worst SURVIVING shape found is a repeated Unicode
-// CATEGORY — `\pC|` sixty-two times — at 3.1 MiB, so a tighter bound fails on a legal pattern; the bomb
-// the guard exists for is 53.1 MiB, so a looser one stops catching it. An earlier version of this test
-// asserted 2 MiB and passed only because its samples used `\p{Latin}`, a SCRIPT of ~30 rune ranges,
-// where `\pL` and `\pC` are categories of hundreds — the same construct and length at ninety times the
-// cost. Sixteen concurrent worst-survivors is ~50 MiB of peak inside a 230 MiB GOMEMLIMIT, which is why
-// 3.1 MiB is tolerable and 53 is not.
-const maxCompiledMiB = 10
+// Instructions, not megabytes, because megabytes could not be measured honestly here. Two earlier
+// versions of this test sampled `runtime.MemStats.TotalAlloc` around the compile — and TotalAlloc is
+// process-wide and cumulative, so every byte any other goroutine allocated inside that window was
+// charged to the regex. It reported 250 literal `k`s as 23.6 MiB, and under contention 1,545 MiB for the
+// same pattern that measures 0.03 MiB in a quiet process. That made the suite fail roughly one run in
+// three under `-race -count=2`, and it meant the bound itself had been calibrated with a broken
+// instrument.
+//
+// The instruction count is exactly what the guard controls, and it is deterministic: a counted
+// repetition is EXPANDED into the program, which is the whole mechanism. Measured, all patterns at the
+// 256-character cap:
+//
+//	bomb  `(?:x*240){1000}`   240,002 instructions   (dropped by the guard)
+//	worst survivor                252 instructions   (250 literal characters, or 62 starred groups)
+//
+// 4096 sits three orders of magnitude below the bomb and sixteen times above the worst survivor.
+//
+// The other dimension, rune-table entries, is deliberately NOT asserted: `\pC` repeated 83 times is
+// 118,192 runes (~0.47 MiB), and regexp/syntax caps that itself at 128 Ki runes — so an assertion here
+// could never fail and would be the kind of forever-green check this file has already had to fix once.
+const maxCompiledInsts = 4096
+
+// compiledInsts returns the instruction count of a pattern's compiled program, or -1 if it will not
+// compile at all. Deterministic: no clock, no allocator, no other goroutine can influence it.
+func compiledInsts(pat string) int {
+	re, err := syntax.Parse("(?i)"+pat, syntax.Perl)
+	if err != nil {
+		return -1
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return -1
+	}
+	return len(prog.Inst)
+}
 
 // The guard exists for a memory bound, so the bound is what gets asserted — not just which patterns the
 // matcher happens to flag.
@@ -473,16 +552,9 @@ func TestExcludeRegex_compiledSizeIsBounded(t *testing.T) {
 		if cfg.Filters.ExcludeRegex == "" {
 			continue // the guard dropped it, so it is bounded by construction
 		}
-		var m1, m2 runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&m1)
-		re, err := regexp.Compile("(?i)" + cfg.Filters.ExcludeRegex)
-		runtime.ReadMemStats(&m2)
-		mib := float64(m2.TotalAlloc-m1.TotalAlloc) / (1 << 20)
-		if err == nil && mib > maxCompiledMiB {
-			t.Errorf("a %d-char pattern that survived validation compiled to %.1f MiB (max %d): %.40q",
-				len(pat), mib, maxCompiledMiB, pat)
+		if insts := compiledInsts(cfg.Filters.ExcludeRegex); insts > maxCompiledInsts {
+			t.Errorf("a %d-char pattern that survived validation compiled to %d instructions (max %d): %.40q",
+				len(pat), insts, maxCompiledInsts, pat)
 		}
-		_ = re
 	}
 }

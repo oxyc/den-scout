@@ -68,6 +68,15 @@ const (
 // partialListTTL makes.
 const rebuildCooloff = time.Minute
 
+// How many background rebuilds may be in flight across the whole process.
+//
+// bookRebuild dedupes per KEY, which was the fix for one goroutine per stale request — but it leaves one
+// per distinct stale key, and a caller picks the keys. Measured: 400 stale keys hit by a single
+// sequential caller produced 801 goroutines, each holding a finished list body. A household refreshes a
+// handful of titles at once; anything beyond that is not a viewer, and a rebuild skipped now is simply
+// rebuilt by the next request for that title, which is the same outcome as never having booked it.
+const maxConcurrentRebuilds = 8
+
 // rebuildLease is one booking. The generation is a fencing token: the booking is a wall-clock LEASE, so a
 // rebuild can outrun its own expiry — its ctx deadline and its budget are the same 28 seconds, and it
 // still has a marshal and a disk write to do after the deadline fires. Without fencing, that late
@@ -90,6 +99,11 @@ func (h *handler) bookRebuild(key string, now time.Time, until time.Time) (gen u
 	if l, held := h.rebuilds[key]; held && now.Before(l.until) {
 		return 0, false
 	}
+	// A global ceiling as well as the per-key one. The entry stays stale and the next request for this
+	// title books it, which is the same outcome as never having asked.
+	if h.rebuildsLive >= maxConcurrentRebuilds {
+		return 0, false
+	}
 	// Swept here rather than on a timer: the map only ever holds keys with a live booking or a recent
 	// cool-off, so it stays small, and pruning on the rare stale hit costs nothing worth measuring.
 	for k, l := range h.rebuilds {
@@ -99,6 +113,7 @@ func (h *handler) bookRebuild(key string, now time.Time, until time.Time) (gen u
 	}
 	h.rebuildGen++
 	h.rebuilds[key] = rebuildLease{until: until, gen: h.rebuildGen}
+	h.rebuildsLive++
 	return h.rebuildGen, true
 }
 
@@ -107,6 +122,17 @@ func (h *handler) bookRebuild(key string, now time.Time, until time.Time) (gen u
 func (h *handler) releaseRebuild(key string, gen uint64, cooloffUntil time.Time) {
 	h.rebuildMu.Lock()
 	defer h.rebuildMu.Unlock()
+	// The slot goes back FIRST, and unconditionally — before the fencing check below can return early.
+	// This is called exactly once per granted booking, so the count stays right even when the lease is
+	// already gone: a rebuild that overruns its lease has it swept by some later booking, and decrementing
+	// only on a lease we still own leaked a slot every time that happened. Eight of those and no title
+	// ever refreshes in the background again.
+	//
+	// A cool-off is also why this cannot be derived from the map: it keeps the KEY reserved with no
+	// goroutine behind it.
+	if h.rebuildsLive > 0 {
+		h.rebuildsLive--
+	}
 	l, held := h.rebuilds[key]
 	if !held || l.gen != gen {
 		return
@@ -170,6 +196,9 @@ type handler struct {
 	rebuildMu  sync.Mutex
 	rebuilds   map[string]rebuildLease
 	rebuildGen uint64
+	// In-flight background rebuilds, against maxConcurrentRebuilds. Counted rather than derived from
+	// len(rebuilds), because that map also holds cool-off entries with no goroutine behind them.
+	rebuildsLive int
 
 	// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
 	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.

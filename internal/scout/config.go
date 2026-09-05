@@ -63,6 +63,19 @@ const (
 	// Ceiling on accounts in one config. There are three services; more than a handful of accounts is
 	// not a configuration, it is a way to make one request retain a large slice for a whole scrape.
 	maxDebridAccounts = 8
+	// Ceiling on results in one response, down from 200.
+	//
+	// This is the OTHER half of what one request can retain, and the larger half. Every stream in the
+	// reply embeds a full copy of the config segment in its /play URL, so the response body is
+	// len(blob) x resultCap — measured at 1,602,743 bytes for an 8 KiB blob and a 200 cap, 214 times the
+	// blob itself. Capping the blob alone left 150 concurrent requests, every value inside its own
+	// limit, pinning 311 MiB against a 230 MiB GOMEMLIMIT.
+	//
+	// The blob ceiling cannot come down to fix it: the largest config the field caps admit measures 6,600
+	// bytes sealed, i.e. 81% of the 8 KiB already. So the multiplier is what gives. Fifty is well past
+	// what anybody scrolls — the default is twenty, and the ranking exists precisely so the answer is
+	// near the top — and it cuts the worst body fourfold.
+	maxResultCap = 50
 )
 
 // countedRepeatAt matches a `{n}` / `{n,}` / `{n,m}` quantifier at the start of what it is given.
@@ -163,9 +176,14 @@ func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
 	// in-flight request, with distinct blobs defeating both the cache and the singleflight: 150 concurrent
 	// misses measured 207 MiB inside a 230 MiB GOMEMLIMIT.
 	//
-	// 8 KiB is roughly ten times the largest honest segment. A sealed config carrying a debrid token and a
-	// full set of filters is a few hundred bytes before base64; the cap exists to stop the absurd, not to
-	// be tight.
+	// 8 KiB, and the margin is thinner than it looks: the largest config the FIELD caps admit —
+	// maxDebridAccounts accounts each with a 512-character token, all four indexers, every filter, a
+	// 256-character regex — measures 6,535 bytes plain and 6,600 sealed, so 81% of this is legitimately
+	// reachable. It cannot come down without lowering those caps too, which is why the response-side
+	// multiplier is bounded by maxResultCap instead. A config from /configure is ~1 KB.
+	//
+	// This bounds the segment, NOT what a request retains: the reply embeds a copy of the segment per
+	// stream, so see maxResultCap for the other half.
 	if len(blob) > maxConfigBlob {
 		return nil, false
 	}
@@ -232,8 +250,10 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 			f.ExcludeCam = *raw.Filters.ExcludeCam
 		}
 		// Deduped as well as whitelisted. There are four valid values, so a repeated one carries no
-		// information — and a config naming "1080p" ten thousand times was ten thousand retained strings
-		// and a linear scan per release in rankStreams.
+		// information, and a config naming "1080p" ten thousand times retained ten thousand strings for
+		// the length of the build. (Not a per-release scan: rankStreams turns this into a set once per
+		// call, so the cost was ten thousand map inserts per build plus the retention — the retention is
+		// the reason.)
 		for _, r := range raw.Filters.Resolutions {
 			if validResolutions[r] && !containsString(f.Resolutions, r) {
 				f.Resolutions = append(f.Resolutions, r)
@@ -285,7 +305,7 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 	}
 	resultCap := 20
 	if raw.ResultCap != nil && isFinite(*raw.ResultCap) {
-		resultCap = clampInt(int(math.Round(*raw.ResultCap)), 1, 200)
+		resultCap = clampInt(int(math.Round(*raw.ResultCap)), 1, maxResultCap)
 	}
 
 	return &Config{Debrid: debrid, Indexers: idx, Filters: f, CachedOnly: cachedOnly, ResultCap: resultCap}, true

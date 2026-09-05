@@ -15,11 +15,30 @@ type StreamID struct {
 	HasEp   bool
 }
 
-var imdbRe = regexp.MustCompile(`^tt\d+$`)
+// A real IMDb id is `tt` plus seven or eight digits; ten leaves room for a couple of decades of growth.
+//
+// The bound matters because `\d+` did not have one. This segment is retained for the whole build — it
+// goes into the cache key, into the rebuild gate's map key, and into the bingeGroup of EVERY stream in
+// the response — and it is also concatenated into the outbound indexer URL. Measured: `tt` followed by
+// 900,000 digits was accepted, pinned 2.7 MiB per in-flight request (150 concurrent parked at the scrape
+// reached 408 MiB, against a 230 MiB GOMEMLIMIT), and turned one small inbound GET into a ~900 KB
+// outbound URL per configured indexer — which is the "ban risk" hostlimit.go was written to prevent,
+// paced by the limiter but not sized by it. The requests queueing inside that limiter are what hold the
+// memory, so pacing made it worse rather than better.
+var imdbRe = regexp.MustCompile(`^tt\d{1,10}$`)
+
+// maxStreamIDLen bounds the whole id segment. The longest real one is `tt1234567890:999:999.json`, at 25
+// characters. Checked BEFORE the split, because Split allocates one string per part whatever the regex
+// below would later say: an id of a megabyte of colons is a megabyte of slice, and the id never reaches
+// imdbRe to be rejected until after that is paid.
+const maxStreamIDLen = 64
 
 // parseStreamID parses the <type> + <id>.json route segments, or ok=false (→ 400).
 func parseStreamID(typ, rawID string) (*StreamID, bool) {
 	if typ != "movie" && typ != "series" {
+		return nil, false
+	}
+	if len(rawID) > maxStreamIDLen {
 		return nil, false
 	}
 	id := strings.TrimSuffix(rawID, ".json")

@@ -201,7 +201,7 @@ fires on year-less titles and needs one significant-token overlap.
   `TestTitleTokens_wouldEmptyRealSeries` pins the four counter-examples so this cannot be re-proposed
   on the strength of an ASCII, English-titled show.
 
-- **Per-indexer circuit breaker.** `torz` is stripped by `validateConfig` (`config.go:147-152`) and
+- **Per-indexer circuit breaker.** `torz` is stripped by `validateConfig` (the `disabledIndexers` loop) and
   never reaches `makeScrapers`, so it costs nothing today; NXDOMAIN plus retries is ~1.3s, not 8s.
   And there is no safe value for `unaskableScraper.transient`: `true` forces `complete=false` and puts
   a full scrape plus debrid fan-out on every minute — "a worse answer than the one it was fixing"

@@ -45,6 +45,14 @@ func main() {
 		Addr:              ":" + settings.Port,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bounds the request line and headers. net/http defaults to 1 MiB, and every cap inside the
+		// handler is a PARSE-time cap — by the time decodeConfig refuses an 8 KiB-plus config segment,
+		// net/http has already read and buffered the whole megabyte, so the 400 costs the sender nothing
+		// and reclaims nothing. Measured: 150 connections sending a 1 MiB request line and withholding
+		// the terminating blank line pinned 153 MiB with the handler never invoked, re-established every
+		// ReadHeaderTimeout. 16 KiB is twice the config-segment ceiling, which is the largest thing that
+		// legitimately appears in a URL here.
+		MaxHeaderBytes: 16 << 10,
 		// Bounds the whole request read, body included. ReadHeaderTimeout alone covers only the headers:
 		// net/http clears the read deadline once they are parsed, so a body arriving one byte per minute
 		// held a goroutine and a connection indefinitely. That cost nothing while every route was a GET
