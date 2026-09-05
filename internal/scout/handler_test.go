@@ -1155,16 +1155,54 @@ func TestRebuildGate_staleLeaseReleasesNothing(t *testing.T) {
 	if !ok || fresh == old {
 		t.Fatalf("second booking: ok=%v gen=%d (first was %d)", ok, fresh, old)
 	}
-	// The first, overrun rebuild now finishes and tries to release.
+	// The first, overrun rebuild now finishes and tries to release. Released ONCE — releaseRebuild is
+	// called exactly once per granted booking, and an earlier version of this test released `old` twice,
+	// which drove the live count below what production can reach and was absorbed silently by the floor
+	// in releaseRebuild. A test that breaks the invariant is a test that cannot check it.
 	h.releaseRebuild("k", old, time.Time{})
 	if _, ok := h.bookRebuild("k", t0.Add(3*time.Second), t0.Add(30*time.Second)); ok {
 		t.Error("a superseded lease deleted the live booking — two rebuilds can now run for one key")
 	}
-	// And it must not be able to wipe a cool-off either.
+	// And a superseded lease must not wipe a cool-off either. `fresh` installs one and is thereby spent;
+	// a THIRD booking stands in for the overrun rebuild that arrives afterwards.
 	h.releaseRebuild("k", fresh, t0.Add(time.Hour))
-	h.releaseRebuild("k", old, time.Time{})
-	if _, ok := h.bookRebuild("k", t0.Add(4*time.Second), t0.Add(30*time.Second)); ok {
+	late, ok := h.bookRebuild("other", t0.Add(4*time.Second), t0.Add(30*time.Second))
+	if !ok {
+		t.Fatal("could not book a second key")
+	}
+	h.releaseRebuild("k", late, time.Time{}) // right gen, wrong key — must not touch k's cool-off
+	if _, ok := h.bookRebuild("k", t0.Add(5*time.Second), t0.Add(30*time.Second)); ok {
 		t.Error("a superseded lease wiped the cool-off")
+	}
+	h.releaseRebuild("other", late, time.Time{})
+}
+
+// Every granted booking returns its slot exactly once, so the ceiling neither seizes up nor loosens.
+//
+// The counter is the thing maxConcurrentRebuilds is enforced on, and nothing was checking that it comes
+// back to rest: a release that never happens stops background refreshes forever, and one that happens
+// twice quietly raises the ceiling — which is the harm the ceiling exists to prevent.
+func TestRebuildGate_slotAccountingBalances(t *testing.T) {
+	h := &handler{}
+	t0 := time.Now()
+	for round := 0; round < 5; round++ {
+		var gens []uint64
+		for i := 0; i < maxConcurrentRebuilds; i++ {
+			gen, ok := h.bookRebuild(fmt.Sprintf("r%d-k%d", round, i), t0, t0.Add(time.Minute))
+			if !ok {
+				t.Fatalf("round %d: booking %d refused — slots did not come back", round, i)
+			}
+			gens = append(gens, gen)
+		}
+		for i, gen := range gens {
+			h.releaseRebuild(fmt.Sprintf("r%d-k%d", round, i), gen, time.Time{})
+		}
+	}
+	h.rebuildMu.Lock()
+	live := h.rebuildsLive
+	h.rebuildMu.Unlock()
+	if live != 0 {
+		t.Errorf("after 40 balanced book/release pairs the live count is %d, want 0", live)
 	}
 }
 

@@ -537,11 +537,20 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 	if !booked {
 		return
 	}
+	// Until the goroutine exists and owns the release, THIS function owns it — including if something
+	// between here and the `go` statement panics. serve() recovers such a panic into a 500 and the
+	// process carries on, so a slot lost here is lost for the life of the process, reported by nothing;
+	// eight of those and no title ever refreshes in the background again. No panic is reachable in this
+	// window today, which is exactly why it is worth closing before one becomes reachable.
+	spawned := false
+	defer func() {
+		if !spawned {
+			h.releaseRebuild(cacheKey, gen, time.Time{})
+		}
+	}()
 	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
-		// It decoded when the entry was built; if it no longer does, serving stale is all we can do.
-		h.releaseRebuild(cacheKey, gen, time.Time{})
-		return
+		return // it decoded when the entry was built; if it no longer does, serving stale is all we can do
 	}
 	parent := context.WithoutCancel(r.Context())
 	go func() {
@@ -563,6 +572,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 			cooloff = time.Now().Add(rebuildCooloff)
 		}
 	}()
+	spawned = true // the goroutine's defer owns the release from here
 }
 
 // buildResult carries the singleflight build's body plus a degraded reason ("" when healthy).

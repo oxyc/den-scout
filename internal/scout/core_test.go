@@ -157,6 +157,22 @@ func TestParseStreamID(t *testing.T) {
 	if _, ok := parseStreamID("series", "tt1234567"+repeat(":", 100_000)+"1:1.json"); ok {
 		t.Error("an id padded with 100,000 colons was accepted")
 	}
+	// An id that is OVERLONG and nothing else: a valid imdb id, and a season padded with leading zeros
+	// that Atoi reads as 1. Every other check here passes it, so only the length cap can refuse it —
+	// which is the point. Without this, deleting maxStreamIDLen outright left the whole suite green,
+	// because each assertion above is really held by the regex or by Atoi.
+	overlong := "tt1234567:" + repeat("0", 60) + "1:1"
+	if len(overlong) <= maxStreamIDLen {
+		t.Fatalf("the fixture is %d chars, not longer than the %d cap", len(overlong), maxStreamIDLen)
+	}
+	if _, ok := parseStreamID("series", overlong+".json"); ok {
+		t.Error("an otherwise-valid id past the length cap was accepted")
+	}
+	// …and the same shape just under the cap still parses, so the cap is not simply refusing everything.
+	shortEnough := "tt1234567:" + repeat("0", 8) + "1:1"
+	if s, ok := parseStreamID("series", shortEnough+".json"); !ok || s.Season != 1 {
+		t.Errorf("a padded but in-length id was refused: %+v ok=%v", s, ok)
+	}
 	// The longest real id still parses.
 	if s, ok := parseStreamID("series", "tt1234567890:999:999.json"); !ok || s.Season != 999 {
 		t.Errorf("the longest legitimate id was refused: %+v ok=%v", s, ok)

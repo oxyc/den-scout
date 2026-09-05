@@ -3387,6 +3387,22 @@ function checkedVals(name) {
 }
 function numVal(id) { var v = parseInt($(id).value, 10); return isNaN(v) ? undefined : v; }
 
+// Clamp to the field's own min/max before the value goes into a link.
+//
+// There is no <form> on this page — the buttons are click listeners — so the browser's native constraint
+// validation never runs and `max="50"` is decoration. Without this, a saved install from before the cap
+// came down restored resultCap:200 into the field, showed 200, and shipped a link the server clamped to
+// 50: the page said one thing and the addon did another, with nothing anywhere saying so.
+function clampedNumVal(id) {
+  var v = numVal(id);
+  if (v === undefined) return undefined;
+  var el = $(id), lo = parseInt(el.min, 10), hi = parseInt(el.max, 10);
+  if (!isNaN(lo) && v < lo) v = lo;
+  if (!isNaN(hi) && v > hi) v = hi;
+  el.value = String(v); // show what the link will actually carry
+  return v;
+}
+
 function collectConfig() {
   var err = $("err");
   var token = $("token").value.trim();
@@ -3399,7 +3415,7 @@ function collectConfig() {
   var config = { debrid: [{ service: $("service").value, token: token }] };
   if (!$("useDefaults").checked) {
     config.indexers = checkedVals("indexer");
-    config.resultCap = numVal("resultCap") || 20;
+    config.resultCap = clampedNumVal("resultCap") || 20;
     config.filters = {
       excludeCam: $("excludeCam").checked,
       resolutions: checkedVals("res"),

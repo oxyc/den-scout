@@ -71,8 +71,8 @@ const (
 	// blob itself. Capping the blob alone left 150 concurrent requests, every value inside its own
 	// limit, pinning 311 MiB against a 230 MiB GOMEMLIMIT.
 	//
-	// The blob ceiling cannot come down to fix it: the largest config the field caps admit measures 6,600
-	// bytes sealed, i.e. 81% of the 8 KiB already. So the multiplier is what gives. Fifty is well past
+	// The blob ceiling cannot come down to fix it: the largest config the field caps admit measures 6,563
+	// bytes sealed, i.e. 80% of the 8 KiB already. So the multiplier is what gives. Fifty is well past
 	// what anybody scrolls — the default is twenty, and the ranking exists precisely so the answer is
 	// near the top — and it cuts the worst body fourfold.
 	maxResultCap = 50
@@ -178,8 +178,8 @@ func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
 	//
 	// 8 KiB, and the margin is thinner than it looks: the largest config the FIELD caps admit —
 	// maxDebridAccounts accounts each with a 512-character token, all four indexers, every filter, a
-	// 256-character regex — measures 6,535 bytes plain and 6,600 sealed, so 81% of this is legitimately
-	// reachable. It cannot come down without lowering those caps too, which is why the response-side
+	// 256-character regex — measures 6,498 bytes plain and 6,563 sealed, so 80% of this is legitimately
+	// reachable. Those two numbers are computed by the test rather than trusted here. It cannot come down without lowering those caps too, which is why the response-side
 	// multiplier is bounded by maxResultCap instead. A config from /configure is ~1 KB.
 	//
 	// This bounds the segment, NOT what a request retains: the reply embeds a copy of the segment per
