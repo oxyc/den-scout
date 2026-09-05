@@ -1,13 +1,24 @@
 # Tasks
 
-**Status: all 11 done** (branch `audit-fixes`). Nothing was skipped; two items were implemented
-differently from the sketch below, and both are recorded in their commit messages:
+**Status: 10 of 11 shipped** (branch `audit-fixes`). Three implemented differently from the sketch
+below, and one reverted — all recorded in their commit messages:
 
+- **#10 REVERTED, and moved to "Verified dead".** The claim it rested on — "the year half is unsafe
+  for series but the title-token half transfers" — was wrong. The token check is safe for movies only
+  because it judges a release solely when that release carries no parseable year, and a movie release
+  almost always carries one; a series episode release carries `S04E01` and no year, so the check
+  judges nearly everything. Measured against real shows, five of six returned an EMPTY list: Shōgun
+  and Pokémon (`[a-z0-9]+` cannot match `ō`/`é`), Attack on Titan (romaji releases), Money Heist and
+  Squid Game (original titles). The test that shipped with it used The Bear, the one case that works.
 - **#5** stamps freshness inside the cached entry instead of adding a `Cache` method — one lookup on
   the hot path instead of two, and neither backend changes.
 - **#1** fixes the deployment with a named volume, not a tmpfs: a tmpfs survives a restart but not the
   container recreate an image push performs, which is the case `diskcache.go` was written for. The
   "make it louder" half became the `scout_cache_persistent` gauge in #6.
+- **#6** ended up behind a bearer token (`SCOUT_METRICS_TOKEN`, route 404s without one) rather than
+  relying on aggregation discipline: withholding debrid labels answered the credential-oracle question
+  but not the two the counters raise on their own — a cache-miss counter is a timeline of when the
+  household is watching, and per-indexer counters disclose per-install configuration.
 
 Audited work list. Every item was checked against the source before it was written down — the
 "Verified dead" section at the bottom records the ones that did **not** survive, so they don't get
@@ -184,6 +195,11 @@ fires on year-less titles and needs one significant-token overlap.
 ---
 
 ## Verified dead — do not implement
+
+- **The series mistag filter (was #10).** Tried, measured, reverted — see the status note at the top
+  and the reasoning recorded at the head of `internal/scout/cinemeta.go`.
+  `TestTitleTokens_wouldEmptyRealSeries` pins the four counter-examples so this cannot be re-proposed
+  on the strength of an ASCII, English-titled show.
 
 - **Per-indexer circuit breaker.** `torz` is stripped by `validateConfig` (`config.go:147-152`) and
   never reaches `makeScrapers`, so it costs nothing today; NXDOMAIN plus retries is ~1.3s, not 8s.
