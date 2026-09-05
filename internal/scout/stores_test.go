@@ -1225,6 +1225,26 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 			entryFetches)
 	}
 
+	// An UNUSABLE listing takes the same road, for the same reason: an upstream that renamed `hash` will
+	// rename it again on the next poll, so re-pulling is guaranteed waste. It shipped once as
+	// "not persistent", which cost 15 listing fetches over a 15-poll wait against 1 — and two per /play
+	// rather than none, because an indeterminate answer also makes every poll escalate.
+	unusableFetches := 0
+	unusable := &torBoxStore{token: "t4", api: torboxAPI, cache: NewMemoryCache(1 << 20),
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			unusableFetches++
+			return resp(200, `{"success":true,"data":[{"id":1,"infohash":"`+repeat("a", 40)+`"}]}`), nil
+		}}}
+	for i := 0; i < 3; i++ {
+		if ids, ok := unusable.accountListing(context.Background()); ok || ids != nil {
+			t.Fatal("a listing with no usable entry must not read as an answer")
+		}
+	}
+	if unusableFetches != 1 {
+		t.Errorf("pulled the unusable listing %d times for three attempts — it is not being remembered, "+
+			"so every poll re-pulls the whole account", unusableFetches)
+	}
+
 	// A transient failure must NOT be remembered: suppressing that retry is how a queued torrent stops
 	// being rediscoverable, which this package has a separate test for.
 	transientFetches := 0
@@ -1397,10 +1417,10 @@ func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *test
 		junk.WriteString(`{"id":1,"hash":"tooshort"}`)
 	}
 	junk.WriteString(`]}`)
-	ids, ok, tooMany := decodeListing(json.NewDecoder(strings.NewReader(junk.String())))
-	if ok || !tooMany {
-		t.Errorf("a listing of unusable hashes reported ok=%v tooMany=%v with %d entries — an empty map "+
-			"here reads as an authoritative 'holds nothing' and costs a duplicate add", ok, tooMany, len(ids))
+	ids, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(junk.String())))
+	if ok || fault == listingOK {
+		t.Errorf("a listing of unusable hashes reported ok=%v fault=%v with %d entries — an empty map "+
+			"here reads as an authoritative 'holds nothing' and costs a duplicate add", ok, fault, len(ids))
 	}
 
 	// Entries arrived and NONE survived: that is unreadable, not empty. This is the half the filter made
@@ -1422,10 +1442,29 @@ func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *test
 			ok, len(ids))
 	}
 
+	// The two lengths are LITERALS here, deliberately. Deriving the fixture from the constant under test
+	// asserts only that the filter agrees with the regex — true by construction, since one is built from
+	// the other — and the first version of this did exactly that: narrowing the constant to 33 moved the
+	// fixture with it and passed the entire suite. 32 is base32, 40 is hex; those are the facts, and they
+	// belong in the test rather than being read back out of the code.
+	if minInfoHashLen != 32 || maxInfoHashLen != 40 {
+		t.Fatalf("infohash bounds are %d..%d, want 32 (base32) .. 40 (hex) — a listing filtered narrower "+
+			"than the lookups accept turns a torrent the account holds into an authoritative miss",
+			minInfoHashLen, maxInfoHashLen)
+	}
+	// hashNorm is the THIRD copy of these lengths, and the one the probe path uses — it never passes
+	// through infoHashRe, so a hash it admits can reach findTorrentByHash without the constants above ever
+	// being consulted. Pinned here because nothing else ties it to them.
+	for _, n := range []int{32, 40} {
+		if !hashNorm.MatchString(repeat("b", n)) {
+			t.Errorf("scrape.go's hashNorm rejects a %d-char hash that the listing filter keeps — the "+
+				"probe path and the listing disagree about what an infohash is", n)
+		}
+	}
+
 	// EVERY length /play accepts must survive the filter, or the listing is narrower than the lookup and a
-	// torrent the account holds becomes an authoritative miss. Nothing pinned the lower end: raising it to
-	// 33 — which drops base32 — passed the whole suite.
-	for _, n := range []int{minInfoHashLen, maxInfoHashLen} {
+	// torrent the account holds becomes an authoritative miss.
+	for _, n := range []int{32, 40} {
 		h := repeat("b", n)
 		if !infoHashRe.MatchString(h) {
 			t.Fatalf("the fixture is %d chars, which /play itself rejects — this asserts nothing", n)
@@ -1438,9 +1477,27 @@ func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *test
 		}
 	}
 
+	// The cheap pre-guard is the MEMORY bound, and it needs its own assertion: it is what stops ToLower
+	// copying a giant value, and widening it costs nothing that any correctness check would notice. A
+	// listing whose one entry carries a huge hash must decode without allocating anything like it.
+	var huge strings.Builder
+	huge.WriteString(`{"success":true,"data":[{"id":1,"hash":"` + repeat("A", 24<<20) + `"}]}`)
+	var beforeGuard, afterGuard runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&beforeGuard)
+	_, _, _ = decodeListing(json.NewDecoder(strings.NewReader(huge.String())))
+	runtime.ReadMemStats(&afterGuard)
+	// Materialising the token is unavoidable and is the documented hostile-upstream cost — the decoder
+	// buffer plus the string is 3.7x the body on this fixture. What the guard removes is the ToLower COPY
+	// on top of that, one further body's worth, so the ceiling sits between the two at 4x.
+	if allocated := afterGuard.TotalAlloc - beforeGuard.TotalAlloc; allocated > 4*uint64(huge.Len()) {
+		t.Errorf("decoding a listing with a %d-byte hash allocated %d bytes — the pre-guard is not "+
+			"stopping ToLower from copying it", huge.Len(), allocated)
+	}
+
 	// The length that decides is the LOWERED one. A hash of 32 upper-case Kelvin signs is 96 raw bytes and
 	// 32 after lowering, which /play would accept — judging it on the raw length drops an askable key.
-	kelvin := repeat("K", minInfoHashLen)
+	kelvin := repeat("K", 32)
 	lowered := strings.ToLower(kelvin)
 	if !infoHashRe.MatchString(lowered) {
 		t.Fatalf("the fixture does not lower into an askable hash (%q) — this asserts nothing", lowered)
@@ -1463,10 +1520,11 @@ func TestDecodeListing_boundsEntryCount(t *testing.T) {
 	}
 	body.WriteString(`]}`)
 
-	// tooMany must be reported separately, because that is what makes the caller remember the account as
+	// The fault must be reported separately, because that is what makes the caller remember the account as
 	// oversized instead of re-pulling and re-discarding the whole listing on every poll.
-	if _, ok, tooMany := decodeListing(json.NewDecoder(strings.NewReader(body.String()))); ok || !tooMany {
-		t.Errorf("a listing with more than %d entries: ok=%v tooMany=%v (want false,true)", maxListingEntries, ok, tooMany)
+	if _, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(body.String()))); ok || fault != listingTooManyEntries {
+		t.Errorf("a listing with more than %d entries: ok=%v fault=%v (want false, listingTooManyEntries)",
+			maxListingEntries, ok, fault)
 	}
 
 	// And EXACTLY the cap still succeeds. Only the "one too many fails" side was pinned, so tightening the
@@ -1482,9 +1540,9 @@ func TestDecodeListing_boundsEntryCount(t *testing.T) {
 		fmt.Fprintf(&atCap, `{"id":%d,"hash":"%040x"}`, i, i)
 	}
 	atCap.WriteString(`]}`)
-	ids, ok, tooMany := decodeListing(json.NewDecoder(strings.NewReader(atCap.String())))
-	if !ok || tooMany || len(ids) != maxListingEntries {
-		t.Errorf("a listing of exactly %d entries: ok=%v tooMany=%v n=%d (want true,false,%d)",
-			maxListingEntries, ok, tooMany, len(ids), maxListingEntries)
+	ids, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(atCap.String())))
+	if !ok || fault != listingOK || len(ids) != maxListingEntries {
+		t.Errorf("a listing of exactly %d entries: ok=%v fault=%v n=%d (want true, listingOK, %d)",
+			maxListingEntries, ok, fault, len(ids), maxListingEntries)
 	}
 }

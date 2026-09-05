@@ -1703,15 +1703,25 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	// of exactly maxListingBytes parsed perfectly would otherwise be discarded AND remembered as oversized
 	// for the listing TTL.
 	limited := &truncationDetector{r: io.LimitReader(resp.Body, maxListingBytes+1), limit: maxListingBytes}
-	ids, ok, tooManyEntries := decodeListing(json.NewDecoder(limited))
-	if tooManyEntries {
-		// The ENTRY cap, and it takes the same road as the byte cap: both mean "this account's listing is
-		// bigger than we will read", both are properties of the account rather than blips, and both are
-		// therefore worth remembering. Only the byte one was, so tripping the entry cap re-pulled the
-		// whole body on every poll — 14.9 MiB per /play on a two-second cadence, which is the egress the
-		// oversized memo exists to stop.
-		log.Printf("scout: torbox account listing holds more than %d torrents — treating it as no answer "+
-			"rather than as an empty account", maxListingEntries)
+	ids, ok, fault := decodeListing(json.NewDecoder(limited))
+	if fault != listingOK {
+		// Both faults take the same road as the byte cap: each is a property of this listing rather than a
+		// blip, so each will fail the same way on the next poll, and each is therefore remembered. Only
+		// the byte one was at first, and tripping the entry cap re-pulled the whole body every poll —
+		// 14.9 MiB per /play on a two-second cadence, which is the egress this memo exists to stop.
+		//
+		// The unusable-entries fault was added later returning "not persistent", which put it straight
+		// back on that road: measured at 15 listing fetches over a 15-poll wait against 1, and two per
+		// /play rather than none, because an indeterminate answer also makes every poll escalate.
+		switch fault {
+		case listingTooManyEntries:
+			log.Printf("scout: torbox account listing holds more than %d torrents — treating it as no "+
+				"answer rather than as an empty account", maxListingEntries)
+		case listingNoUsableEntries:
+			log.Printf("scout: torbox account listing had entries but no usable infohash among them — " +
+				"treating it as no answer rather than as an empty account; the upstream may have renamed " +
+				"the field")
+		}
 		return nil, false, true
 	}
 	if limited.truncated() {
@@ -1733,10 +1743,25 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 // envelope missing, and listFiles reads exactly the same body as silence ("not a claim about the
 // account"). Calling that authoritative wrote a 15s miss marker that then suppressed the only lookup able
 // to rediscover a queued torrent.
-func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntries bool) {
+// listingFault says WHY a listing could not be read, for the two reasons that are properties of the
+// listing rather than blips. Both must be remembered: re-pulling a body that will fail the same way is
+// the egress the oversized memo exists to stop. Only a transient failure — a timeout, a 5xx — is worth
+// retrying at once, because that retry is the only thing that rediscovers a queued torrent.
+type listingFault int
+
+const (
+	listingOK listingFault = iota
+	// More entries than the map may hold.
+	listingTooManyEntries
+	// Entries arrived and not one was usable. An upstream that renamed `hash` looks exactly like this,
+	// and it will look like it again on the next poll, so it is remembered rather than re-fetched.
+	listingNoUsableEntries
+)
+
+func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listingFault) {
 	tok, err := dec.Token()
 	if err != nil || tok != json.Delim('{') {
-		return nil, false, false
+		return nil, false, listingOK
 	}
 	success := true
 	sawData := false
@@ -1744,13 +1769,13 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
-			return nil, false, false
+			return nil, false, listingOK
 		}
 		switch key {
 		case "success":
 			var v *bool
 			if dec.Decode(&v) != nil {
-				return nil, false, false
+				return nil, false, listingOK
 			}
 			if v != nil {
 				success = *v
@@ -1768,20 +1793,20 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 			// nothing. TorBox does not emit duplicate keys, so this costs nothing in practice; what it
 			// buys is that a body which does is never mistaken for a fact about the account.
 			if sawData {
-				return nil, false, false
+				return nil, false, listingOK
 			}
 			sawData = true
 			// A null `data` is the envelope-missing case and must stay distinct from an empty array.
 			if dec.More() {
 				open, err := dec.Token()
 				if err != nil {
-					return nil, false, false
+					return nil, false, listingOK
 				}
 				if open == nil {
 					continue // explicit null
 				}
 				if open != json.Delim('[') {
-					return nil, false, false
+					return nil, false, listingOK
 				}
 				ids = map[string]int{}
 				for dec.More() {
@@ -1790,7 +1815,7 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 						Hash string `json:"hash"`
 					}
 					if dec.Decode(&e) != nil {
-						return nil, false, false
+						return nil, false, listingOK
 					}
 					// The cap counts entries SEEN, and is checked BEFORE the filter below can skip past it.
 					// The byte cap does not bound the entry count: 60 MiB of minimal entries is ~1M of them
@@ -1801,17 +1826,20 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 					// the filter was added to prevent.
 					seen++
 					if seen > maxListingEntries {
-						return nil, false, true
+						return nil, false, listingTooManyEntries
 					}
 					// A hash that could never be asked about is dropped rather than retained. Both caps miss
 					// this, because the key is whatever the upstream sent: one entry carrying a 60 MiB
 					// "hash" is one entry and 60 MiB, under each of them, and it decoded as a valid listing,
 					// retained the 60 MiB for the memo TTL, and allocated 248 MiB doing it.
 					//
-					// Nothing real is lost: play.go admits only minInfoHashLen..maxInfoHashLen, and these
-					// bounds are shared with it so the two cannot drift. A listing filtered NARROWER than
-					// /play accepts would turn a torrent the account holds into an authoritative miss, a
-					// fifteen-second marker, and a duplicate add.
+					// Nothing real is lost: every hash that can reach a lookup is 32 or 40 characters —
+					// play.go's infoHashRe on the /play path, scrape.go's hashNorm on the probe path, which
+					// does NOT go through infoHashRe. The bounds are shared with play.go so those two
+					// cannot drift; hashNorm is a third copy and is only kept honest by the test.
+					//
+					// Filtering NARROWER than the lookups accept is the direction that costs: a torrent the
+					// account holds becomes an authoritative miss and a fifteen-second marker.
 					//
 					// Two steps, because the length that decides is the LOWERED one: a non-ASCII hash can be
 					// 96 raw bytes and 32 after lowering, and judging it on the raw length would drop a key
@@ -1828,19 +1856,25 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 					ids[hash] = e.ID
 				}
 				// Entries arrived and NONE of them were usable: that is a listing we could not read, not an
-				// account holding nothing. The difference is an add — an empty map answers ok=true, which
-				// findTorrentByHash reports as an authoritative miss, which writes a fifteen-second marker
-				// and sends /play to queue a torrent the account may well already have.
+				// account holding nothing. An empty map answers ok=true, which findTorrentByHash reports as
+				// an authoritative miss and which writes a fifteen-second marker against a torrent the
+				// account may well already hold.
+				//
+				// It does NOT save the add, and saying so here was wrong twice. Measured end to end: with
+				// the listing unreadable, /play escalates once, the escalated read is indeterminate too,
+				// and handler.go then resolves anyway — deliberately, because never starting the download
+				// is worse than a duplicate. Both shapes spend the same one add. What this buys is the
+				// marker: nothing records a false "the account does not hold this" for the next fifteen
+				// seconds, and the answer stops claiming knowledge it does not have.
 				//
 				// The filter above made this reachable at any size, not just past the entry cap: if TorBox
-				// renames `hash` — a v2 API, or `infohash` — every entry filters out, the map is empty, and
-				// a poll every two seconds spends an add for the whole memo TTL. An account that genuinely
-				// holds nothing sends no entries at all, so it still answers authoritatively.
+				// renames `hash` — a v2 API, or `infohash` — every entry filters out at once. An account
+				// that genuinely holds nothing sends no entries at all, so it still answers authoritatively.
 				if seen > 0 && len(ids) == 0 {
-					return nil, false, false
+					return nil, false, listingNoUsableEntries
 				}
 				if _, err := dec.Token(); err != nil { // closing ]
-					return nil, false, false
+					return nil, false, listingOK
 				}
 			}
 		default:
@@ -1870,14 +1904,14 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 			// real large accounts and would turn them oversized. Recorded in FOLLOWUP.md with the options
 			// rather than traded for a functional regression on a threat this package already accepts.
 			if !skipValue(dec) {
-				return nil, false, false
+				return nil, false, listingOK
 			}
 		}
 	}
 	if ids == nil || !success {
-		return nil, false, false
+		return nil, false, listingOK
 	}
-	return ids, true, false
+	return ids, true, listingOK
 }
 
 // truncationDetector reports whether a LimitReader was consumed all the way to its limit, which is the
