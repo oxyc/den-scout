@@ -2,6 +2,9 @@ package scout
 
 import (
 	"encoding/json"
+	"regexp"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -56,6 +59,12 @@ func TestDecodeConfig(t *testing.T) {
 		`a{1000}`,
 		`a{100,}`,
 		`a{2,50}`,
+		// The escape-state cases. The first version of this guard asked "is the character before the
+		// brace a backslash", which is a different question: here the `\\` is an ESCAPED BACKSLASH and
+		// the quantifier after it is live, so the lookbehind called it escaped and let it through.
+		`\\{1000}`,
+		`a\\{1000}`,
+		`{1000}`, // at the very start, where there is no preceding character at all
 	} {
 		c, ok := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"excludeRegex":`+jsonString(bad)+`}}`))
 		if !ok {
@@ -65,8 +74,9 @@ func TestDecodeConfig(t *testing.T) {
 			t.Errorf("counted repetition survived validation: %q", c.Filters.ExcludeRegex)
 		}
 	}
-	// The patterns people actually write are untouched — including an ESCAPED brace, which expands nothing.
-	for _, good := range []string{`hindi|tamil|dubbed`, `\bhc\b`, `x\{3\}`} {
+	// The patterns people actually write are untouched — including a genuinely escaped brace, a unicode
+	// class (whose braces carry no digits), and a brace inside a character class.
+	for _, good := range []string{`hindi|tamil|dubbed`, `\bhc\b`, `x\{3\}`, `\p{Latin}`, `[{]1000}`} {
 		c, _ := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"excludeRegex":`+jsonString(good)+`}}`))
 		if c.Filters.ExcludeRegex != good {
 			t.Errorf("a legitimate pattern was dropped: %q → %q", good, c.Filters.ExcludeRegex)
@@ -368,4 +378,46 @@ func repeat(s string, n int) string {
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// The guard exists for a memory bound, so the bound is what gets asserted — not just which patterns the
+// matcher happens to flag.
+//
+// A user pattern is up to 256 characters, compiled fresh on every list build, from a caller whose debrid
+// token is never verified. With counted repetition, 250 of those characters compile to 53 MiB of live
+// heap inside a 230 MiB GOMEMLIMIT. Without it, the compiled program is bounded by the pattern's length:
+// the worst shapes measured here — long alternations, deep nesting, case-folded literals, big character
+// classes, unicode classes, starred groups — all land under 0.05 MiB.
+func TestExcludeRegex_compiledSizeIsBounded(t *testing.T) {
+	worst := []string{
+		strings.Repeat("ab|", 84),
+		strings.Repeat("(", 60) + "a" + strings.Repeat(")", 60) + "*",
+		strings.Repeat("k", 250),
+		strings.Repeat("[a-zA-Z0-9]", 23),
+		strings.Repeat(`\p{Latin}`, 28),
+		strings.Repeat("(a*)", 62),
+	}
+	for _, pat := range worst {
+		if len(pat) > 256 {
+			pat = pat[:256]
+		}
+		cfg, ok := decodeConfig(nil, blob(`{"debrid":[{"service":"torbox","token":"t"}],"filters":{"excludeRegex":`+jsonString(pat)+`}}`))
+		if !ok {
+			t.Fatalf("rejected outright: %.40q", pat)
+		}
+		if cfg.Filters.ExcludeRegex == "" {
+			continue // dropped by the guard, which is also a safe outcome
+		}
+		var m1, m2 runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&m1)
+		re, err := regexp.Compile("(?i)" + cfg.Filters.ExcludeRegex)
+		runtime.ReadMemStats(&m2)
+		mib := float64(m2.TotalAlloc-m1.TotalAlloc) / (1 << 20)
+		if err == nil && mib > 2 {
+			t.Errorf("a %d-char pattern that survived validation compiled to %.1f MiB: %.40q",
+				len(pat), mib, pat)
+		}
+		_ = re
+	}
 }

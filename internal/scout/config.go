@@ -57,9 +57,34 @@ var disabledIndexers = map[Indexer]string{
 }
 var validResolutions = map[string]bool{"2160p": true, "1080p": true, "720p": true, "480p": true}
 
-// countedRepeat spots a `{n}` / `{n,}` / `{n,m}` quantifier in a user-supplied pattern — the one regex
-// construct whose COMPILED size is not bounded by the pattern's length. An escaped brace is not one.
-var countedRepeat = regexp.MustCompile(`(^|[^\\])\{\d+(,\d*)?\}`)
+// countedRepeatAt matches a `{n}` / `{n,}` / `{n,m}` quantifier at the start of what it is given.
+var countedRepeatAt = regexp.MustCompile(`^\{\d+(,\d*)?\}`)
+
+// hasCountedRepeat reports whether a user-supplied pattern contains a counted repetition — the one regex
+// construct whose COMPILED size is not bounded by the pattern's length.
+//
+// Scanned with real escape state rather than the one-character lookbehind this first used. `[^\\]\{`
+// asks "is the character before the brace a backslash", which is not the same question: in `a\\{1000}`
+// the `\\` is an ESCAPED BACKSLASH and the `{1000}` after it is a live quantifier, so the lookbehind saw
+// a backslash, called the brace escaped, and let it through. The residual was small — one escaped
+// character repeated, ~0.1 MiB against the 53 MiB the guard was written for — but a guard that answers a
+// different question than its comment claims is worth exactly nothing the next time someone edits it.
+//
+// Errs toward dropping: a brace inside a character class (`[a{2}]`, where it is literal) is treated as a
+// quantifier. That over-rejects a pattern nobody writes, and the failure direction is the safe one.
+func hasCountedRepeat(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++ // whatever follows is escaped, including a backslash or a brace
+		case '{':
+			if countedRepeatAt.MatchString(s[i:]) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 type DebridAccount struct {
 	Service DebridService
@@ -204,7 +229,7 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 			// words a viewer does not want in a release name ("hindi|dubbed|hc"), and none of that needs
 			// counted repetition. Without `{}` the compiled program is bounded by the pattern length.
 			// Dropped, not rejected, to match the existing tolerance for a malformed pattern.
-			if countedRepeat.MatchString(s) {
+			if hasCountedRepeat(s) {
 				s = ""
 			}
 			f.ExcludeRegex = s
