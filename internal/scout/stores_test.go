@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -703,6 +705,9 @@ func TestFetchAccountListing_largeAccountIsNotTruncated(t *testing.T) {
 	}
 }
 
+// Hands each run of the singleflight test its own account token — see the note at its top.
+var listingFlightTestSeq atomic.Int64
+
 // Joining an in-flight listing fetch respects the JOINER's budget, and the leader survives its caller.
 //
 // singleflight is context-blind: Do blocks a follower on the leader's WaitGroup with the follower's own
@@ -711,7 +716,16 @@ func TestFetchAccountListing_largeAccountIsNotTruncated(t *testing.T) {
 // poll read capped at statusBudget so a wait answers promptly — and a follower with ten seconds left was
 // measured inheriting a leader's 120 ms failure.
 func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
+	// A token unique to this invocation, because listingFlight is process-wide and keyed on the token
+	// alone. With a fixed one, a -count rerun can join the PREVIOUS iteration's flight before it has
+	// finished deregistering, get that iteration's result, and never call this iteration's transport — so
+	// the leader blocks at <-arrivals forever and a legible failure becomes a package-wide timeout.
+	token := fmt.Sprintf("shared-%d", listingFlightTestSeq.Add(1))
 	release := make(chan struct{})
+	// Released on EVERY exit, including a t.Fatal, so a failing assertion never strands an in-flight fetch
+	// holding the singleflight entry.
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
 	// One send per fetch STARTED, so "did anyone start a second fetch" is answerable without reading a
 	// counter across goroutines.
 	arrivals := make(chan struct{}, 4)
@@ -740,7 +754,7 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// The leader: a long budget, and it goes away before the fetch completes. A DEADLINE, not a bare
 	// cancel — the leader's context is only carved into a detached one when it has a deadline to copy, so
 	// a cancel-only fixture leaves that whole branch unexecuted and the detachment untested.
-	leader := newStore("shared")
+	leader := newStore(token)
 	leaderCtx, cancelLeader := context.WithTimeout(context.Background(), 30*time.Second)
 	leaderDone := make(chan struct{})
 	go func() {
@@ -752,7 +766,7 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// A follower on the same account with a SHORT budget must not wait for the leader. Run in a goroutine
 	// with its own ceiling: blocked on the leader's WaitGroup this never returns at all, and a test that
 	// simply called it would hang the package for the whole -timeout instead of saying why.
-	follower := newStore("shared")
+	follower := newStore(token)
 	short, cancelShort := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancelShort()
 	answered := make(chan bool, 1)
@@ -774,7 +788,7 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// fetch count. An earlier version of this simply called accountListing after cancelling the leader,
 	// which lets the caller start a NEW flight of its own and so passes whether or not the leader's fetch
 	// survived. It has to be attached before the leader goes away, or it proves nothing.
-	joiner := newStore("shared")
+	joiner := newStore(token)
 	joinerCtx, cancelJoiner := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelJoiner()
 	joined := make(chan bool, 1)
@@ -795,7 +809,7 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// already happened — otherwise the fetch can finish first and the assertion never gets to fire.
 	cancelLeader()
 	<-leaderDone
-	close(release)
+	releaseOnce()
 	select {
 	case ok := <-joined:
 		if !ok {
@@ -820,8 +834,11 @@ func TestAccountListing_aPanicInTheFetchIsAbandonedNotFatal(t *testing.T) {
 			panic("a parser went off the end")
 		}}}
 
-	// Two callers, because the second is what makes singleflight register a channel — which is the exact
-	// condition under which it re-raises the panic instead of returning it.
+	// Two callers only to exercise the shared-result path; ONE is already enough to make the panic fatal.
+	// DoChan registers a channel for the first caller too — `c := &call{chans: []chan<- Result{ch}}` — so
+	// the re-raise on a bare goroutine happens from the very first call, and there is no arrival count
+	// that avoids it. That is why the recover has to live inside the closure rather than around whatever
+	// starts it.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan bool, 2)

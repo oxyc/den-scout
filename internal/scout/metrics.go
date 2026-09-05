@@ -107,7 +107,7 @@ func (m *metricSet) render(cachePersistent int) string {
 			{`result="hit"`, num(m.probeCacheHit.Load())},
 			{`result="miss"`, num(m.probeCacheMiss.Load())},
 		})
-	counter(&b, "scout_background_panics_total", "Panics recovered on a background goroutine (probe fan-out, stale list rebuild).",
+	counter(&b, "scout_background_panics_total", "Panics recovered on a background goroutine (probe fan-out, stale list rebuild, account listing fetch).",
 		[][2]string{{"", num(m.backgroundPanic.Load())}})
 
 	reqs := make([][2]string, 0, len(allIndexers))

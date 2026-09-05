@@ -44,10 +44,13 @@ sorting by mint time evicts exactly the operator's own. Protecting recently-used
 was tried on top of that and reverted; the reasoning is in `pruneMintedLocked`. A legitimate install has
 one entry per (indexer, account) — under twenty.
 
-## The test suite is order-dependent above `-count=2`
+## The test suite shares process-global state between tests
 
-Not a regression — reproduced at every commit tried, including before the audit branch. Recorded because
-it silently caps how hard the suite can be re-run, which is the main tool the audit rounds verify with.
+Not a regression — both cases below reproduce at every commit tried, including before the audit branch.
+Recorded because they cap how hard the suite can be re-run, which is the main tool the audit rounds
+verify with.
+
+**The hourly add budget accumulates across repetitions.**
 
 ```
 go test ./internal/scout -count=3 -shuffle=on -cpu=1,4
@@ -55,13 +58,26 @@ go test ./internal/scout -count=3 -shuffle=on -cpu=1,4
     link = "", err = ... realdebrid scout's own hourly add budget for this account is spent
 ```
 
-The hourly add budget is process-global and keyed by account token (`addbudget.go`), so tests that spend
-an add against the same token accumulate across repetitions. Two passes stay under the 50/hour ceiling;
-three do not. `-count=2 -shuffle=on -race` is therefore clean and is what the audit rounds used, but that
-is a coincidence of the ceiling rather than isolation.
+It is process-global and keyed by account token (`addbudget.go`), so tests spending an add against the
+same token add up. Two passes stay under the 50/hour ceiling; three do not.
 
-The fix is test-side: give each test its own token, or reset the budget in a `t.Cleanup`. Left alone
-deliberately — it predates this branch and touching it means editing many unrelated tests.
+**The metrics counters are shared, and some builds are counted by another test.**
+
+```
+go test ./internal/scout -count=2 -shuffle=1788610563644591000 -race
+--- FAIL: TestMetrics_reportsWhatWasPreviouslyLogOnly
+    metrics_test.go:87: scout_list_builds_total{result="ok"} moved by 2, want 1
+```
+
+`metrics` is a package-level var (`metrics.go`) and the test measures a delta around one build, so any
+other test — or a background rebuild goroutine outliving the test that started it — landing between the
+two readings breaks it. Order-dependent, so it needs the seed above to reproduce.
+
+Both are the same root cause: package-level mutable state with no per-test isolation. The fix is
+test-side — a distinct token per test, and a metrics set that can be swapped or reset in a `t.Cleanup`.
+Left alone deliberately: both predate this branch and touching them means editing many unrelated tests.
+`-count=2` without a seed is usually green, which is what the audit rounds used, but that is the ceiling
+being generous rather than the tests being isolated.
 
 ## #13 — debrid file selection for multi-file packs
 

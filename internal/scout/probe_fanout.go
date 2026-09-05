@@ -171,8 +171,10 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 // its own.
 //
 // The listing fetch needs this for a reason the other two do not: it runs under singleflight's DoChan,
-// which re-raises a panic with `go panic(e)` on a bare goroutine as soon as anyone is waiting on a
-// channel. That is unrecoverable anywhere, so the recover has to be inside the closure itself.
+// which re-raises a panic with `go panic(e)` on a bare goroutine. That happens from the FIRST call, not
+// only once a second caller is waiting — DoChan registers a channel for the leader as well — so there is
+// no arrival count that avoids it, and it is unrecoverable anywhere outside the closure. The blocking Do
+// it replaced re-raised on the caller's own stack instead, where handler.serve's recover made it a 500.
 func recoverBackground(what string) {
 	if rec := recover(); rec != nil {
 		metrics.backgroundPanic.Add(1)

@@ -1640,24 +1640,29 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 		putCachedListing(s.cache, key, ids)
 		return ids, nil
 	})
-	// An answer already in hand wins, before the budget is even consulted. A plain two-way select picks at
-	// random when both are ready, so a listing that arrived in the same instant the budget expired was
-	// thrown away about half the time — on the path that decides whether to spend an add, and for nothing,
-	// since the fetch had already been paid for.
 	select {
 	case res := <-ch:
 		ids, _ := res.Val.(map[string]int)
 		return ids, ids != nil
-	default:
-	}
-	select {
 	case <-ctx.Done():
+		// One last look before giving up. A select picks at RANDOM among ready cases, so a listing that
+		// landed in the same instant the budget expired was discarded about half the time — on the path
+		// that decides whether to spend an add, and for nothing, since the fetch was already paid for. The
+		// answer is a fact about the account; it does not go stale because the asker ran out of clock.
+		//
+		// Deliberately not unit-tested: making both cases ready at once is not constructible from outside,
+		// because a caller reaching this is already blocked here and takes the result the moment it lands,
+		// while one arriving after the flight completed starts a fresh flight of its own. Asserting it
+		// would need a test that fakes the interleaving, which proves the fake rather than the code.
+		select {
+		case res := <-ch:
+			ids, _ := res.Val.(map[string]int)
+			return ids, ids != nil
+		default:
+		}
 		// Our own budget, not the leader's. Nothing is concluded from this: ok=false is indeterminate, so
 		// no miss marker is written and no caller reads it as "the account does not hold it".
 		return nil, false
-	case res := <-ch:
-		ids, _ := res.Val.(map[string]int)
-		return ids, ids != nil
 	}
 }
 
