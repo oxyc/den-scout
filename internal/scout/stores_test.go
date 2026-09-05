@@ -270,15 +270,14 @@ type answeringStore struct {
 	onAsk func()
 }
 
-func (a answeringStore) StatusAnswer(ctx context.Context, _ ResolveTarget) (StoreStatus, statusAnswer) {
+func (a answeringStore) StatusAnswer(_ context.Context, _ ResolveTarget) (StoreStatus, statusAnswer) {
 	if a.asked != nil {
 		*a.asked++
 	}
-	// Honours the embedded fakeStore's statusBlocks, so a store can both take too long AND report that it
-	// could not tell — which is the combination the pool's out-of-time branch has to get right.
-	if a.statusBlocks {
-		<-ctx.Done()
-	}
+	// Deliberately does NOT honour the embedded fakeStore's statusBlocks. That was added to drive the
+	// pool's out-of-time branch and does not reach it — a store's own slice expiring leaves the pool with
+	// time in hand, so it simply moves on. onAsk drives that branch instead, and a bare <-ctx.Done() here
+	// would hang forever the first time a test passed a context with no deadline.
 	if a.onAsk != nil {
 		a.onAsk()
 	}
@@ -566,15 +565,21 @@ func TestStorePoolStatusDetail_namesOnlyTheStoresThatCouldNotAnswer(t *testing.T
 // re-asks stores that were never asked (which answer promptly, and say no) while never re-asking the one
 // store that was uncertain. /play reads that as nobody fetching the torrent and spends an add on it.
 func TestStorePoolStatusDetail_keepsUncertainStoresWhenTimeRunsOut(t *testing.T) {
-	// Store 0 says it cannot tell; the caller then hangs up, so store 1 is never reached. A store's own
-	// slice expiring does not get here — the pool simply moves on with time left — so the branch is
-	// driven the way production reaches it, by the request context ending.
+	// THREE stores, one of each kind: answered, uncertain, never reached. With only the last two, the
+	// correct answer and "just return the whole pool" are the same slice, so the test could not tell the
+	// fix from the over-broad variant that re-asks a store which already answered — and returning
+	// p.stores left the whole suite green.
+	//
+	// Store 1 says it cannot tell; the caller then hangs up, so store 2 is never reached. A store's own
+	// slice expiring does not get here — the pool simply moves on with time left — so the branch is driven
+	// the way production reaches it, by the request context ending.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	answered := answeringStore{fakeStore: fakeStore{svc: ServicePremiumize}, answer: statusNo}
 	uncertain := answeringStore{fakeStore: fakeStore{svc: ServiceTorBox}, answer: statusUnknown, onAsk: cancel}
 	unreached := fakeStore{svc: ServiceRealDebrid}
 
-	pool := &StorePool{stores: []Store{uncertain, unreached}}
+	pool := &StorePool{stores: []Store{answered, uncertain, unreached}}
 	_, ok, unknown := pool.StatusDetail(ctx, ResolveTarget{InfoHash: H})
 	if ok {
 		t.Fatal("nothing was downloading")
@@ -583,12 +588,16 @@ func TestStorePoolStatusDetail_keepsUncertainStoresWhenTimeRunsOut(t *testing.T)
 	for _, st := range unknown {
 		named = append(named, st.Service())
 	}
-	if len(unknown) != 2 {
-		t.Fatalf("named %v as unable to answer, want both stores", named)
+	// Exactly the uncertain one and the unreached one: the tail alone would drop torbox, and the whole
+	// pool would add premiumize, which answered.
+	want := []DebridService{ServiceTorBox, ServiceRealDebrid}
+	if len(named) != len(want) {
+		t.Fatalf("named %v as unable to answer, want %v", named, want)
 	}
-	// The uncertain one specifically — the tail alone would name only realdebrid.
-	if named[0] != ServiceTorBox {
-		t.Errorf("named %v; the store that said it could not tell must be in the retry set", named)
+	for i, w := range want {
+		if named[i] != w {
+			t.Fatalf("named %v as unable to answer, want %v", named, want)
+		}
 	}
 }
 
@@ -784,6 +793,26 @@ func TestListingMemo_isBoundedByTorrentsAndDropsExpiredEntries(t *testing.T) {
 			total, maxListingMemoEntries)
 	}
 
+	// REFRESHING an account evicts nobody, because the entry it replaces stops counting first. Counting
+	// it twice — once in the running total and again as the incoming listing — makes a listing that fits
+	// perfectly well look like an overflow, and evicts a different account on every 15 s refresh. Each
+	// eviction is a full re-pull of that account's listing, ~13 MB at 2,000 torrents, on the poll path.
+	listingMemoMu.Lock()
+	listingMemo = map[listingMemoKey]listingMemoEntry{}
+	listingMemoMu.Unlock()
+	const half = maxListingMemoEntries / 2
+	putCachedListing(cache, "a", ids(half))
+	putCachedListing(cache, "b", ids(half))
+	for i := 0; i < 3; i++ {
+		putCachedListing(cache, "a", ids(half)) // a's own TTL refresh
+		listingMemoMu.Lock()
+		_, bKept := listingMemo[listingMemoKey{cache, "b"}]
+		listingMemoMu.Unlock()
+		if !bKept {
+			t.Fatalf("refresh %d of account a evicted account b, which still fits", i)
+		}
+	}
+
 	// An expired entry is dropped on LOOKUP, not left for the next account's put.
 	listingMemoMu.Lock()
 	listingMemo = map[listingMemoKey]listingMemoEntry{
@@ -812,19 +841,48 @@ type uncomparableCache struct {
 func (c uncomparableCache) Get(string) (string, bool)         { return "", false }
 func (c uncomparableCache) Put(string, string, time.Duration) {}
 
-// A Cache that cannot be a map key gets no memo, rather than panicking inside a request handler.
-func TestListingMemo_survivesAnUncomparableCache(t *testing.T) {
-	var cache Cache = uncomparableCache{}
-	if memoisable(cache) {
-		t.Fatal("the fixture is comparable, so this asserts nothing")
-	}
-	// Both halves, because either one panics on its own.
-	if _, hit := cachedListing(cache, "k"); hit {
-		t.Error("an unmemoisable cache reported a hit")
-	}
-	putCachedListing(cache, "k", map[string]int{H: 1})
+// optionCache is comparable as a TYPE — an interface field satisfies Comparable() — and panics as a
+// VALUE, because the field holds a slice. A static check passes it straight into the map.
+type optionCache struct {
+	Cache
+	opts any
+}
 
-	// And the store built on it still works, just without the memo.
+func (c optionCache) Get(string) (string, bool)         { return "", false }
+func (c optionCache) Put(string, string, time.Duration) {}
+
+// A Cache that cannot be a map key gets no memo, rather than panicking inside a request handler.
+//
+// Both shapes, because they fail different checks. The uncomparable TYPE is caught statically; the
+// comparable type holding an uncomparable VALUE is not, and a static check alone waves it through into
+// the map insert. Cache is exported and Deps.Cache takes any implementation, so both are shapes a caller
+// outside this package can supply.
+func TestListingMemo_survivesAnUncomparableCache(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cache Cache
+	}{
+		{"an uncomparable type", uncomparableCache{}},
+		{"a comparable type holding an uncomparable value", optionCache{opts: []string{"a"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if memoisable(tc.cache) {
+				t.Fatal("the fixture is memoisable, so this asserts nothing")
+			}
+			// Both halves, because either one panics on its own.
+			if _, hit := cachedListing(tc.cache, "k"); hit {
+				t.Error("an unmemoisable cache reported a hit")
+			}
+			putCachedListing(tc.cache, "k", map[string]int{H: 1})
+		})
+	}
+	// A comparable value in the same field is memoisable — or the guard is just refusing everything.
+	if !memoisable(optionCache{opts: "a string is fine"}) {
+		t.Error("a comparable Cache was refused the memo")
+	}
+
+	// And a store built on an unmemoisable cache still works, just without the memo.
+	var cache Cache = uncomparableCache{}
 	fetches := 0
 	s := &torBoxStore{token: "uncomparable", api: torboxAPI, cache: cache,
 		client: mockDoer{func(*http.Request) (*http.Response, error) {
@@ -1053,14 +1111,16 @@ func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 	}
 	skipped.WriteString(`],"data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`)
 
-	// The `data[]` walk keeps only hash→id, so its bulk costs almost nothing — 0.03x — while decoding the
-	// array into one []struct allocates 3.7x. The gap is wide enough that the ceiling can sit well under
-	// the body size, which is what makes this shape the sharper of the two.
+	// The `data[]` walk keeps only hash→id, so its bulk costs almost nothing — 0.03x. The gap to any
+	// buffering form is wide enough that the ceiling can sit well under the body size, which is what makes
+	// this shape the sharper of the two.
 	//
-	// 0.5x rather than something nearer the measured 0.03x, because the cheapest way to reintroduce the
-	// buffering is a []json.RawMessage over the array, which measures 1.09x — an order of magnitude below
-	// the 3.7x of a full slice decode. The ceiling has to sit under the CHEAPEST regression, not the
-	// worst, and 0.5 is the midpoint of that pair rather than of the loud one.
+	// 0.5x rather than something nearer the measured 0.03x, because a ceiling has to sit under the
+	// CHEAPEST regression rather than the loudest, and the buffering forms are not all alike. Capturing
+	// the whole array at once — into []struct or []json.RawMessage — measures between 2.7x and 3.7x
+	// depending on how the bytes are captured. The cheapest form is per-element: decode each entry into a
+	// json.RawMessage and unmarshal them afterwards, which retains the raw bytes without ever holding the
+	// array, and measures 1.08x. 0.5 clears that by half and still sits 16x above the shipped walk.
 	var inData strings.Builder
 	inData.WriteString(`{"success":true,"data":[`)
 	for i := 0; inData.Len() < 24<<20; i++ {

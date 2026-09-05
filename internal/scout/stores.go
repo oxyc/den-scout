@@ -1447,13 +1447,38 @@ type listingMemoEntry struct {
 //
 // 100,000 torrents is about 8 MiB by that measurement. It admits two accounts at the absolute per-account
 // cap, or fifty at the largest size this package has actually measured (2,000), which is far past any
-// real install: maxDebridAccounts is 8 per config, and only a token TorBox answered a listing for can
-// reach this map at all.
+// real install: buildStores keys accounts by SERVICE, so one config contributes exactly one TorBox
+// account here — not the eight maxDebridAccounts allows — and only a token TorBox answered a listing for
+// can reach this map at all.
+//
+// Two limits of the torrent count as the bound, both measured and both out of reach:
+//
+// A torrent count does not price the per-entry overhead, ~440 bytes of map header and key. At the extreme
+// — 100,000 accounts of one torrent each — the same ceiling admits 42 MiB rather than 8. That needs
+// 100,000 tokens TorBox answers for, so it is a clause about the shape of the bound, not a risk.
+//
+// Eviction is oldest-first, which is the worst possible policy for a cyclic access pattern: past the
+// ceiling, the entry evicted is always the one asked for next, so the hit rate does not degrade — it goes
+// straight from 100% to 0% and every poll re-pulls every listing. Measured at 8 accounts, the cliff is
+// 0.8% over capacity. Reaching it needs three or more distinct TorBox tokens on one instance averaging
+// over 33,000 torrents each, which is why the policy is left simple; anything that raises the account
+// count per instance should revisit it.
 const maxListingMemoEntries = 100_000
 
 // memoisable reports whether a Cache can be a map key at all — see listingMemo's comment.
-func memoisable(cache Cache) bool {
-	return cache != nil && reflect.TypeOf(cache).Comparable()
+//
+// Comparable() is a STATIC property of the type and is not sufficient on its own: a struct holding an
+// interface field is comparable as a type and panics as a value when that field holds a slice or a map.
+// Since the whole point is to avoid a panic in a request handler, the value is actually tried, with the
+// cheap static check first so the try is only reached by types that could pass it.
+func memoisable(cache Cache) (ok bool) {
+	if cache == nil || !reflect.TypeOf(cache).Comparable() {
+		return false
+	}
+	defer func() { ok = recover() == nil }()
+	probe := map[listingMemoKey]struct{}{}
+	probe[listingMemoKey{cache: cache}] = struct{}{}
+	return true
 }
 
 func cachedListing(cache Cache, key string) (map[string]int, bool) {
@@ -1482,7 +1507,9 @@ func putCachedListing(cache Cache, key string, ids map[string]int) {
 	}
 	listingMemoMu.Lock()
 	defer listingMemoMu.Unlock()
-	delete(listingMemo, listingMemoKey{cache, key}) // replaced, so it must not count toward the total
+	// The entry being REPLACED is dropped before the total is taken, or it is counted twice — once in
+	// held and again as len(ids) — and a refresh of one account evicts another that fits perfectly well.
+	delete(listingMemo, listingMemoKey{cache, key})
 	held := 0
 	for k, e := range listingMemo {
 		if time.Since(e.at) >= listingTTL {
@@ -3043,11 +3070,13 @@ func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, b
 // StatusDetail is Status, plus WHICH stores could not answer — so a retry asks only those.
 //
 // The escalated read went back through the whole pool, and a store that answered definitively has
-// nothing new to say a moment later: measured on a three-account pool, one unknown store cost nine store
-// reads per /play where six would do, and each TorBox read is up to two upstream calls. On a two-second
-// poll cadence for the length of a download, that is a wasted upstream read per extra account per poll,
-// on the path the escalation exists for — which is by definition a path where something is already
-// struggling.
+// nothing new to say a moment later: measured through the handler on a three-account pool, one unknown
+// store cost NINE store reads per /play where SEVEN suffice, and each TorBox read is up to two upstream
+// calls. Seven rather than six because the post-failure read below still asks everyone — deliberately,
+// since it runs after an add may have landed and any store's answer can have changed. On a two-second
+// poll cadence for the length of a download, the difference is a wasted upstream read per extra account
+// per poll, on the path the escalation exists for — which is by definition one where something is
+// already struggling.
 //
 // Each store gets its own SLICE of the budget, rather than all of them sharing one deadline. Sharing it
 // meant the first store could spend the lot: TorBox's status walks an account listing this package

@@ -44,6 +44,25 @@ sorting by mint time evicts exactly the operator's own. Protecting recently-used
 was tried on top of that and reverted; the reasoning is in `pruneMintedLocked`. A legitimate install has
 one entry per (indexer, account) — under twenty.
 
+## The test suite is order-dependent above `-count=2`
+
+Not a regression — reproduced at every commit tried, including before the audit branch. Recorded because
+it silently caps how hard the suite can be re-run, which is the main tool the audit rounds verify with.
+
+```
+go test ./internal/scout -count=3 -shuffle=on -cpu=1,4
+--- FAIL: TestRealDebridResolve_happyPathReturnsTheUnrestrictedLink
+    link = "", err = ... realdebrid scout's own hourly add budget for this account is spent
+```
+
+The hourly add budget is process-global and keyed by account token (`addbudget.go`), so tests that spend
+an add against the same token accumulate across repetitions. Two passes stay under the 50/hour ceiling;
+three do not. `-count=2 -shuffle=on -race` is therefore clean and is what the audit rounds used, but that
+is a coincidence of the ceiling rather than isolation.
+
+The fix is test-side: give each test its own token, or reset the budget in a `t.Cleanup`. Left alone
+deliberately — it predates this branch and touching it means editing many unrelated tests.
+
 ## #13 — debrid file selection for multi-file packs
 
 **Addressed** in commit `cfe8f1f`:
