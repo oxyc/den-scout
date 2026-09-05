@@ -1272,8 +1272,10 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		{"an entry is a scalar", `{"success":true,"data":[42]}`},
 		{"success is a string", `{"success":"yes","data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`},
 		// JSON that is not valid at all is deterministic in the same way, and arrives as a different error
-		// type — so it needs its own cases or the split is only half made. No truncation produces these:
-		// measured, every way a body can stop early returns io.ErrUnexpectedEOF instead.
+		// type — so it needs its own cases or the split is only half made. No truncation reaches these
+		// three: a body cut inside an object or a string reports an unexpected EOF instead. (Not a
+		// universal — a bare scalar cut at EOF scans as a complete value and reports a type error; see
+		// listingFaultFor, where it makes no difference because such an entry is a schema change anyway.)
 		{"a leading-zero number", `{"success":true,"data":[{"id":01}]}`},
 		{"a trailing comma", `{"success":true,"data":[{"id":1,}]}`},
 		{"an unquoted key", `{"success":true,"data":[{id:1}]}`},
@@ -1295,10 +1297,12 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		}
 	}
 
-	// Every place a body can be cut off is transient, and each has its own completeness check to get past.
-	// The decoder ends a loop for a read error exactly as it does for a closed bracket, so asking "was
-	// anything usable?" or "was the envelope good?" before reading that bracket classifies a blip as
-	// permanent — and a memoised blip suppresses the one retry that rediscovers a queued torrent.
+	// A body cut off inside a structure is transient, and each place it can happen has its own
+	// completeness check to get past. The decoder ends a loop for a read error exactly as it does for a
+	// closed bracket, so asking "was anything usable?" or "was the envelope good?" before reading that
+	// bracket classifies a blip as permanent — and a memoised blip suppresses the one retry that
+	// rediscovers a queued torrent. (The one cut that is NOT transient is a bare scalar at end of input,
+	// which scans as a complete value; it is a schema change either way, so the verdict is the same.)
 	//
 	// The array case is the subtle one: it needs an entry that PARSED and was then filtered, so the
 	// question "entries seen, none usable" is reachable before the array is known to have closed.
