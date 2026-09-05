@@ -55,9 +55,13 @@ volumes:
   makes the rootfs unwritable, so without a mount at that path `MkdirAll` fails, persistence disables
   itself after one log line, and every image push re-pays a debrid resolve per probed release — track
   probes are cached for 30 days precisely so it doesn't. A tmpfs would survive a restart but not a
-  redeploy, which is the case the tier was written for. Expired entries are swept hourly, so the
-  volume has a ceiling rather than growing without bound; it holds stream lists (minutes) and track
-  probes (30 days), and stays in the low tens of MB.
+  redeploy, which is the case the tier was written for. The volume has a real ceiling: expired entries
+  are swept hourly, and the sweep also enforces a 256 MiB byte budget, evicting oldest-first when the
+  store is over it (a burst of writes brings that sweep forward rather than waiting out the hour).
+  Legitimate traffic is nowhere near it — stream lists live for minutes, track probes for 30 days, and
+  a household's installs land in the low tens of MB. The budget is there because expiry alone is a
+  schedule and not a bound: nothing re-reads a stream list, so without it an entry occupies the volume
+  until its TTL passes however large the store has grown.
 - If you ever scale to >1 replica, add a `redis` service and back the cache with it (the `Cache`
   interface in `internal/scout/cache.go` is a drop-in). Not needed for the homelab's single container.
 

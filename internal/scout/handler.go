@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -337,7 +338,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/plain; version=0.0.4; charset=utf-8")
 		w.Header().Set("cache-control", noStore)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(metrics.render(cachePersistentGauge(h.deps.Cache))))
+		_, _ = io.WriteString(w, metrics.render(cachePersistentGauge(h.deps.Cache)))
 		return
 	case "/manifest.json":
 		h.conditional(w, r, h.manifestUnconf, h.manifestUnconfETag, jsonType, staticCache)
@@ -1135,7 +1136,15 @@ func (h *handler) conditional(w http.ResponseWriter, r *http.Request, body, etag
 	w.Header().Set("cache-control", cacheControl)
 	w.Header().Set("etag", etag)
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(body))
+	// io.WriteString, not Write([]byte(body)): the conversion copies the entire body, and that copy is
+	// live for as long as the write is blocked — up to WriteTimeout, 60 seconds, against a client that
+	// reads slowly. net/http's response implements WriteString, so this takes the zero-copy path.
+	// Measured on a warm hit: 4,742 -> 3,586 ns/op and 40,402 -> 24,000 B/op, and the worst parked
+	// response halves from 859 KiB to 435 KiB.
+	//
+	// splitCached already returns body as a substring of the cached entry rather than a copy, so this
+	// was the only allocation of its size left on the response path.
+	_, _ = io.WriteString(w, body)
 }
 
 // isDebugRequest checks for ?debug=1 without parsing a query string that is almost always absent.

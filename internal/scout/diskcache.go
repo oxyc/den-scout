@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,10 +30,27 @@ type TieredCache struct {
 	once sync.Once
 	off  bool
 	mu   sync.Mutex
+	// Bytes written since the last sweep, and the ceiling the sweep enforces. The memory tier has had a
+	// byte budget since audit #1 ("a count cap let a large resultCap × many titles blow the heap"); the
+	// disk tier had none, and nothing noticed while it was disabling itself on an unwritable directory.
+	// Giving it a writable volume made that live: measured 429 KiB per entry with a max-size config, one
+	// build per second past the indexer limiter, ≈1.5 GB an hour, reclaimed only by an hourly sweep of
+	// entries that have EXPIRED — and nothing re-reads them, so expiry alone frees nothing early.
+	//
+	// Filling the volume is worse than it sounds: the first failed write calls disable(), which turns
+	// persistence off for the life of the process, so one flood permanently costs the 30-day probe cache
+	// this tier exists for.
+	written  int
+	maxBytes int
 }
 
+// SweepEvery enforces this ceiling; a write burst past it triggers a sweep early. Sized well above
+// legitimate use — a household's installs write ~25 KiB per entry and land in the low tens of MB — and
+// far below filling a homelab volume.
+const defaultDiskBudget = 256 << 20
+
 func NewTieredCache(maxBytes int, dir string) *TieredCache {
-	c := &TieredCache{mem: NewMemoryCache(maxBytes), dir: dir}
+	c := &TieredCache{mem: NewMemoryCache(maxBytes), dir: dir, maxBytes: defaultDiskBudget}
 	if dir == "" {
 		c.off = true
 		return c
@@ -99,6 +117,17 @@ func (c *TieredCache) Put(key, value string, ttl time.Duration) {
 	}
 	if err := os.Rename(tmp.Name(), c.path(key)); err != nil {
 		c.disable("rename", err)
+		return
+	}
+	// A burst is what the hourly sweep cannot answer on its own, so it brings the sweep forward rather
+	// than waiting out the interval. Counted, not measured: stat-ing the directory per write would put a
+	// directory scan on every list build.
+	if c.noteWritten(len(body)) {
+		go func() {
+			if n := c.Sweep(); n > 0 {
+				log.Printf("den-scout: swept %d cache entries after a write burst", n)
+			}
+		}()
 	}
 }
 
@@ -134,14 +163,27 @@ func (c *TieredCache) Sweep() int {
 	}
 	now := time.Now()
 	removed := 0
+	// Survivors, so the budget pass below does not re-stat the directory.
+	type kept struct {
+		path string
+		size int64
+		mod  time.Time
+	}
+	var live []kept
+	var liveBytes int64
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
+		path := filepath.Join(c.dir, name)
 		switch {
 		case strings.HasSuffix(name, ".ent"):
-			if !c.entryExpired(filepath.Join(c.dir, name), now) {
+			if !c.entryExpired(path, now) {
+				if info, err := e.Info(); err == nil {
+					live = append(live, kept{path, info.Size(), info.ModTime()})
+					liveBytes += info.Size()
+				}
 				continue
 			}
 		case strings.HasPrefix(name, ".tmp-"):
@@ -154,11 +196,51 @@ func (c *TieredCache) Sweep() int {
 		default:
 			continue // not ours
 		}
-		if os.Remove(filepath.Join(c.dir, name)) == nil {
+		if os.Remove(path) == nil {
 			removed++
 		}
 	}
+	c.resetWritten()
+
+	// Expiry alone is not a ceiling — it is a schedule, and nothing re-reads a stream list, so an entry
+	// nobody asks for again occupies the volume until its TTL passes however large the store has grown.
+	// Oldest first, which for a write-once store is the closest thing to LRU that costs no bookkeeping.
+	if c.maxBytes <= 0 || liveBytes <= int64(c.maxBytes) {
+		return removed
+	}
+	sort.Slice(live, func(i, j int) bool { return live[i].mod.Before(live[j].mod) })
+	for _, e := range live {
+		if liveBytes <= int64(c.maxBytes) {
+			break
+		}
+		if os.Remove(e.path) == nil {
+			liveBytes -= e.size
+			removed++
+		}
+	}
+	log.Printf("den-scout: cache volume over its %d-byte budget; evicted down to %d bytes", c.maxBytes, liveBytes)
 	return removed
+}
+
+// noteWritten adds to the since-last-sweep counter and reports whether it has passed the budget.
+func (c *TieredCache) noteWritten(n int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.maxBytes <= 0 {
+		return false
+	}
+	c.written += n
+	if c.written < c.maxBytes {
+		return false
+	}
+	c.written = 0 // one sweep per burst, not one per write past the line
+	return true
+}
+
+func (c *TieredCache) resetWritten() {
+	c.mu.Lock()
+	c.written = 0
+	c.mu.Unlock()
 }
 
 // entryExpired reads just the expiry line. A file that cannot be read or parsed counts as expired — Get

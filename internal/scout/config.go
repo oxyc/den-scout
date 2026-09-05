@@ -67,9 +67,9 @@ const (
 	//
 	// This is the OTHER half of what one request can retain, and the larger half. Every stream in the
 	// reply embeds a full copy of the config segment in its /play URL, so the response body is
-	// len(blob) x resultCap — measured at 1,602,743 bytes for an 8 KiB blob and a 200 cap, 214 times the
-	// blob itself. Capping the blob alone left 150 concurrent requests, every value inside its own
-	// limit, pinning 311 MiB against a 230 MiB GOMEMLIMIT.
+	// len(blob) x resultCap — measured at 1,756,303 bytes for a full 8 KiB blob at a 200 cap, roughly 215
+	// times the blob itself. Capping the blob alone left 150 concurrent requests, every value inside its
+	// own limit, pinning 311 MiB against a 230 MiB GOMEMLIMIT.
 	//
 	// The blob ceiling cannot come down to fix it: the largest config the field caps admit measures 6,563
 	// bytes sealed, i.e. 80% of the 8 KiB already. So the multiplier is what gives. Fifty is well past

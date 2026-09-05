@@ -171,3 +171,75 @@ func TestTieredCache_sweepSurvivesAWriteFailure(t *testing.T) {
 		t.Errorf("swept %d after a write failure, want 5 — the store can no longer be reclaimed at all", got)
 	}
 }
+
+// The volume has a ceiling, not just a schedule.
+//
+// Expiry is enforced on read and by an hourly sweep, and nothing re-reads a stream list — so an entry
+// nobody asks for again sits on the volume until its TTL passes, however large the store has grown.
+// Measured before this: 429 KiB per entry with a max-size config, one build per second past the indexer
+// limiter, about 1.5 GB an hour. That mattered only once this tier had a writable volume to use.
+func TestTieredCache_sweepEnforcesAByteBudget(t *testing.T) {
+	dir := t.TempDir()
+	c := NewTieredCache(1<<20, dir)
+	// Budget off while writing, so the burst-triggered sweep inside Put does not do the trimming this
+	// test is here to observe. Turned on for the explicit Sweep below.
+	c.maxBytes = 0
+
+	// Well past the budget, all long-lived so expiry reclaims nothing.
+	body := repeat("x", 8<<10)
+	for i := 0; i < 40; i++ {
+		c.Put(fmt.Sprintf("k%d", i), body, time.Hour)
+		// Distinct mtimes, so "oldest first" is a defined order rather than a coin toss.
+		time.Sleep(time.Millisecond)
+	}
+	budget := 64 << 10
+	if got := diskBytes(t, dir); got <= int64(budget) {
+		t.Fatalf("the fixture only wrote %d bytes — it cannot exercise a %d budget", got, budget)
+	}
+	c.maxBytes = budget
+
+	c.Sweep()
+
+	after := diskBytes(t, dir)
+	if after > int64(c.maxBytes) {
+		t.Errorf("after the sweep the volume holds %d bytes, over the %d budget", after, c.maxBytes)
+	}
+	if after == 0 {
+		t.Error("the sweep emptied the store rather than trimming it to the budget")
+	}
+	// The newest entry is the one worth keeping, and it survived.
+	if _, ok := c.Get("k39"); !ok {
+		t.Error("the most recent entry was evicted before older ones")
+	}
+}
+
+// An unexpired store under the budget is left completely alone.
+func TestTieredCache_sweepKeepsAStoreUnderBudget(t *testing.T) {
+	dir := t.TempDir()
+	c := NewTieredCache(1<<20, dir)
+	for i := 0; i < 5; i++ {
+		c.Put(fmt.Sprintf("k%d", i), "small", time.Hour)
+	}
+	before := diskBytes(t, dir)
+	if n := c.Sweep(); n != 0 {
+		t.Errorf("swept %d entries from a store that is under budget and unexpired", n)
+	}
+	if diskBytes(t, dir) != before {
+		t.Error("a store under budget lost bytes to the sweep")
+	}
+}
+
+func diskBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && !e.IsDir() {
+			total += info.Size()
+		}
+	}
+	return total
+}
