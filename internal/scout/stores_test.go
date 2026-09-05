@@ -703,6 +703,89 @@ func TestFetchAccountListing_largeAccountIsNotTruncated(t *testing.T) {
 	}
 }
 
+// Joining an in-flight listing fetch respects the JOINER's budget, and the leader survives its caller.
+//
+// singleflight is context-blind: Do blocks a follower on the leader's WaitGroup with the follower's own
+// deadline unobserved, and runs the fetch on whichever caller arrived first. Both halves were live and
+// neither had a test. A follower with a 100 ms budget was measured returning after 851 ms — on a /play
+// poll read capped at statusBudget so a wait answers promptly — and a follower with ten seconds left was
+// measured inheriting a leader's 120 ms failure.
+func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
+	release := make(chan struct{})
+	arrived := make(chan struct{}, 1)
+	fetches := 0
+	newStore := func(token string) *torBoxStore {
+		return &torBoxStore{token: token, api: torboxAPI, cache: NewMemoryCache(1 << 20),
+			client: mockDoer{func(r *http.Request) (*http.Response, error) {
+				fetches++
+				select {
+				case arrived <- struct{}{}:
+				default:
+				}
+				// Honours the request context, like a real transport — otherwise cancelling the leader
+				// changes nothing and the detachment half of this test asserts nothing.
+				select {
+				case <-release: // held until the test lets the leader finish
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				}
+				return resp(200, `{"success":true,"data":[{"id":4,"hash":"`+H+`"}]}`), nil
+			}}}
+	}
+
+	// The leader: a long budget, and it goes away before the fetch completes.
+	leader := newStore("shared")
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_, _ = leader.accountListing(leaderCtx)
+	}()
+	<-arrived // the fetch is in flight
+
+	// A follower on the same account with a SHORT budget must not wait for the leader. Run in a goroutine
+	// with its own ceiling: blocked on the leader's WaitGroup this never returns at all, and a test that
+	// simply called it would hang the package for the whole -timeout instead of saying why.
+	follower := newStore("shared")
+	short, cancelShort := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelShort()
+	answered := make(chan bool, 1)
+	go func() {
+		_, ok := follower.accountListing(short)
+		answered <- ok
+	}()
+	select {
+	case ok := <-answered:
+		if ok {
+			t.Error("a follower that ran out of time reported an answer")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the follower is still waiting well past its 50ms budget — it is blocked on the " +
+			"leader's clock, not its own")
+	}
+
+	// The leader's caller hangs up. The fetch must survive it, because other callers are waiting on it.
+	cancelLeader()
+	patient := newStore("shared")
+	patientCtx, cancelPatient := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelPatient()
+	got := make(chan bool, 1)
+	go func() {
+		_, ok := patient.accountListing(patientCtx)
+		got <- ok
+	}()
+	close(release)
+	select {
+	case ok := <-got:
+		if !ok {
+			t.Error("a caller with ten seconds left inherited the departed leader's cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the patient caller never returned")
+	}
+	<-leaderDone
+}
+
 // StatusAnswer's doubt comes from the lookup it already did, not from a second one.
 //
 // The three-valued answer was first built by re-running findTorrentByHash purely to learn whether the

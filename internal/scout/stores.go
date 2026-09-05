@@ -1464,16 +1464,17 @@ type listingMemoEntry struct {
 //
 // The condition is total torrents across every TorBox account the process has seen, not a few large ones:
 // the memo is keyed on (cache, token) and the cache is process-wide, so fifty-one ordinary users at the
-// 2,000 this package has actually measured trips it just as well as three 33,000-torrent accounts. That is
-// still past what a self-hosted install is, which is why the policy stays simple — but the thing to watch
-// is the account COUNT, and oldest-first is the policy to replace when it moves. Random eviction degrades
-// to roughly capacity-over-working-set instead of to nothing; LRU does not, because a round-robin scan
-// evicts the next entry needed under LRU too.
+// 2,000 this package has actually measured trips it just as well as three 34,000-torrent accounts. Fifty
+// at 2,000 is exactly the ceiling and still hits 100%; the boundary is that sharp. That is all still past
+// what a self-hosted install is, which is why the policy stays simple — but the thing to watch is the
+// account COUNT, and oldest-first is the policy to replace when it moves. Random eviction degrades to
+// roughly capacity-over-working-set instead of to nothing; LRU does not, because a round-robin scan evicts
+// the next entry needed under LRU too.
 //
 // What "0%" costs is not "every poll re-pulls every listing": torrentID answers most polls from
 // torrentIDKey or the 15 s torrentMissKey without reaching the listing at all, and listingFlight collapses
-// concurrent misses. It is about one full pull per account per TTL window, plus one per sequential
-// distinct-infohash probe — measured at 1 fetch becoming 9 on the eight-release poster grid.
+// concurrent misses. The measured law is one pull per DISTINCT INFOHASH per TTL window — an eight-release
+// poster grid goes from 1 fetch to 8, and a repeat of a hash already resolved still costs nothing.
 const maxListingMemoEntries = 100_000
 
 // memoisable reports whether a Cache can be a map key at all — see listingMemo's comment.
@@ -1591,8 +1592,31 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 			return nil, false
 		}
 	}
-	out, _, _ := listingFlight.Do(key, func() (any, error) {
-		ids, ok, oversized := s.fetchAccountListing(ctx)
+	// DoChan and a select, NOT Do — singleflight is context-blind, and that broke this both ways.
+	//
+	// A follower blocked on the leader's WaitGroup with its own deadline unobserved: measured at a caller
+	// with a 100 ms budget returning after 851 ms. On this route that is not a latency nit — a /play poll
+	// read is capped at statusBudget precisely so a wait answers promptly, and joining a flight led by the
+	// 2x escalated read blew that cap to twice what the poll test asserts, on a URL a client hits every two
+	// seconds. The select below means a caller waits for its OWN budget and no longer.
+	//
+	// And the fetch ran on whichever caller happened to arrive first, so that caller going away killed the
+	// listing every other caller was waiting on: measured at a follower with ten seconds left inheriting a
+	// leader's 120 ms failure. The leader now runs detached from cancellation, on a deadline of its own.
+	//
+	// What is left, named rather than hidden: a follower with MORE budget than the leader still inherits
+	// the leader's shorter attempt, so an escalated read that joins a poll's in-flight fetch can be told
+	// "could not find out" while it still had time. That answer is indeterminate, so it costs a retry
+	// rather than a false "nobody is fetching it" — and the flight is per token, so it needs a second
+	// concurrent request against the same account in the window between the two reads.
+	leaderCtx := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		leaderCtx, cancel = context.WithDeadline(leaderCtx, deadline)
+		defer cancel()
+	}
+	ch := listingFlight.DoChan(key, func() (any, error) {
+		ids, ok, oversized := s.fetchAccountListing(leaderCtx)
 		if !ok {
 			if oversized && s.cache != nil {
 				s.cache.Put(key+":oversized", "1", listingTTL)
@@ -1602,8 +1626,15 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 		putCachedListing(s.cache, key, ids)
 		return ids, nil
 	})
-	ids, _ := out.(map[string]int)
-	return ids, ids != nil
+	select {
+	case <-ctx.Done():
+		// Our own budget, not the leader's. Nothing is concluded from this: ok=false is indeterminate, so
+		// no miss marker is written and no caller reads it as "the account does not hold it".
+		return nil, false
+	case res := <-ch:
+		ids, _ := res.Val.(map[string]int)
+		return ids, ids != nil
+	}
 }
 
 // The third result separates "this account's listing is too big to read" from every other failure. Only
