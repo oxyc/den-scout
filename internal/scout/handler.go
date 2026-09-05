@@ -961,8 +961,17 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 		writeQueued(w, infoHash, StoreStatus{})
 		return
 	}
-	// A refusal SCOUT made, ranked where /play ranks it: above the store refusals below, because it is
-	// ours rather than a service's. The probe had no channel for it at all — recordRefusal excludes
+	// A refusal SCOUT made, above the store refusals below because it is ours rather than a service's.
+	//
+	// NOT identical to /play's ranking, and an earlier note here claiming it was is corrected: /play
+	// takes the FIRST StoreUnavailableError in store order, scout-side or not, so with every budget
+	// spent AND a per-release store refusal already on record the two routes name different causes —
+	// probe scout_busy, /play store_unavailable. Both are 503 and the client retries either way, so the
+	// difference is in the detail a human reads, not in behaviour. Left as it is: naming scout's own
+	// ceiling is the more useful answer of the two, and reproducing /play's first-error-wins ordering
+	// here would mean resolving, which this route must not do.
+	//
+	// The probe had no channel for it at all — recordRefusal excludes
 	// errScoutSide by design, so the backoff memory this route reads stays empty and the request fell
 	// through every "could not ask" guard to 404 "not queued". Measured with the hourly allowance spent:
 	// /play answered 503 scout_busy while ?probe=1 answered 404, for the same release at the same

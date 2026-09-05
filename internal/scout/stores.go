@@ -868,6 +868,23 @@ func (s *realDebridStore) HoldsTorrent(t ResolveTarget) bool {
 	return held
 }
 
+// Premiumize's equivalent of "we have an id for this" is the queue marker: directdl is the only handle
+// on a transfer, and a marker means scout queued one and it may since have landed.
+//
+// Without this the READY fix one commit back only worked when Premiumize's own /cache/check answered
+// "cached" — the sole other channel that can name PM as a holder. Every other outcome of that check
+// (not cached, a 429, a transport error, an unreadable body) skipped the readiness enquiry entirely,
+// left AddInFlight reading the still-set marker, and answered 202 "downloading" for a completed
+// transfer /play was serving a 302 for. Measured across those five outcomes: one row 200, four rows
+// 202. And the shared statusBudget makes the bad rows ordinary — the route's own comment notes a slow
+// status read can leave the cache check a dead context.
+//
+// Keyed by hash alone, like the marker: directdl is per-magnet, so a pack queued for one episode
+// answers for any episode of the same release, at no charge.
+func (s *premiumizeStore) HoldsTorrent(t ResolveTarget) bool {
+	return alreadyQueued(s.cache, s.token, t.InfoHash)
+}
+
 // AddInFlight reports that some store has an add out for this release whose outcome we never saw.
 //
 // It is the one fact in this package that is about US rather than about a service, and both read-only

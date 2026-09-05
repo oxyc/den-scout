@@ -682,7 +682,7 @@ func TestProbe_aTorrentRealDebridAlreadyHoldsReadsAsReady(t *testing.T) {
 //
 // Both ends of the window are asserted. Past pendingGiveUp /play reports the release dead, so a probe
 // still claiming 202 there would be the same defect pointing the other way.
-func TestProbeAndPlay_agreeAboutAPremiumizeTransferAtBothEndsOfTheWindow(t *testing.T) {
+func TestPremiumizeAddInFlight_believesAQueuedTransferOnlyUntilTheGiveUp(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		queuedAgo  time.Duration
@@ -740,6 +740,65 @@ func TestHoldingServices_asksEveryStoreAndKeysEpisodesCorrectly(t *testing.T) {
 	other := 6
 	if got := pool.HoldingServices(ResolveTarget{InfoHash: hash, Season: &season, Episode: &other}); len(got) != 0 {
 		t.Errorf("episode 6 matched episode 5's entry: %v", got)
+	}
+	// And a different SEASON, same episode number. Without this the key could discriminate on episode
+	// alone — measured: dropping the season from rdTorrentKey's selector passed the whole suite, because
+	// every probe here used season 2.
+	otherSeason := 3
+	if got := pool.HoldingServices(ResolveTarget{InfoHash: hash, Season: &otherSeason, Episode: &episode}); len(got) != 0 {
+		t.Errorf("S03E05 matched S02E05's entry: %v — the key is not discriminating on season", got)
+	}
+}
+
+// EveryAddRefusedByScout means EVERY, and an empty pool refuses nothing.
+//
+// The quantifier was held by nothing: flipping it to ANY passed the entire suite, and shipped it would
+// answer 503 scout_busy on a two-account install where one budget is spent and the other is healthy —
+// while /play serves a 302 from the healthy account. That is a fresh disagreement of exactly the kind
+// the branch was added to remove.
+func TestEveryAddRefusedByScout_needsEveryAccountSpent(t *testing.T) {
+	spent, healthy := "spent-"+t.Name(), "healthy-"+t.Name()
+	for i := 0; i < addBudgetLimit; i++ {
+		globalAddBudget.take(budgetAccount(ServiceTorBox, spent))
+	}
+	cache := NewMemoryCache(1 << 20)
+
+	mixed := &StorePool{stores: []Store{
+		&torBoxStore{token: spent, cache: cache, api: torboxAPI},
+		&realDebridStore{token: healthy, cache: cache, api: realDebridAPI},
+	}}
+	if mixed.EveryAddRefusedByScout() {
+		t.Error("one spent account out of two reported as every add refused — the probe would answer " +
+			"503 scout_busy for a release the healthy account can still fetch")
+	}
+
+	allSpent := &StorePool{stores: []Store{&torBoxStore{token: spent, cache: cache, api: torboxAPI}}}
+	if !allSpent.EveryAddRefusedByScout() {
+		t.Error("the only account's allowance is spent and it was not reported")
+	}
+
+	if (&StorePool{}).EveryAddRefusedByScout() {
+		t.Error("an empty pool refused every add — vacuously true is not true here")
+	}
+}
+
+// A refusal on record outranks the queue marker, and NOT the other way round.
+//
+// premiumizeStore.AddInFlight checks the add marker first, then the refusal, then the queue marker.
+// Hoisting the refusal check above the add marker passed the whole suite, and it inverts the precedence
+// addStillBelievable's own comment calls the point: an add genuinely in flight would read as
+// not-in-flight whenever a stale per-release refusal happened to exist.
+func TestPremiumizeAddInFlight_anAddInFlightOutranksAStaleRefusal(t *testing.T) {
+	token, hash := "pm-order", repeat("c", 40)
+	cache := NewMemoryCache(1 << 20)
+	noteAddAttempt(cache, ServicePremiumize, token, hash) // an add of ours IS out
+	recordRefusal(cache, ServicePremiumize, token, hash,  // ...alongside an older per-release refusal
+		&DeadLinkError{"premiumize directdl: error something earlier"})
+
+	s := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI}
+	if !s.AddInFlight(hash) {
+		t.Error("an add scout has out read as not-in-flight because a stale refusal exists — /play " +
+			"answers 202 from that marker, so the probe must too")
 	}
 }
 
@@ -802,42 +861,69 @@ func TestProbeAndPlay_agreeWhenAQueuedPremiumizeTransferIsRefused(t *testing.T) 
 //
 // For an already-queued transfer directdl is a READ — the charge is suppressed in exactly that case —
 // so letting a read-only caller through buys nothing and is the only way to discover completion.
+// Every realistic outcome of Premiumize's /cache/check, because the readiness enquiry runs only when a
+// store NAMES itself a holder, and PM's cache check was for a while the only channel that could. The
+// first version of this test asserted the cached-true row alone — the one branch that worked — so the
+// other four kept answering 202 for a completed transfer and the suite stayed green.
 func TestProbeAndPlay_agreeWhenAPremiumizeTransferCompletes(t *testing.T) {
-	token, hash := "pm-complete", repeat("2", 40)
-	cache := NewMemoryCache(1 << 20)
-	cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
-
-	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
-		if strings.Contains(r.URL.Path, "cache/check") {
+	for _, tc := range []struct {
+		name       string
+		cacheCheck func() (*http.Response, error)
+	}{
+		{"cache check says cached", func() (*http.Response, error) {
 			return resp(200, `{"status":"success","response":[true]}`), nil
-		}
-		return resp(200, `{"status":"success","content":[`+
-			`{"path":"Movie.mkv","link":"https://pm.example/final.mkv","size":100}]}`), nil
-	}}
-	h := NewHandler(Deps{
-		Cache: cache,
-		MakeStores: func(*Config) []Store {
-			return []Store{&premiumizeStore{token: token, cache: cache, api: premiumizeAPI, client: client}}
-		},
-	})
-	pmBlob := blob(`{"debrid":[{"service":"premiumize","token":"` + token + `"}],` +
-		`"indexers":["torrentio"],"resultCap":20}`)
-	tok := encodePlayToken(PlayTarget{InfoHash: hash})
+		}},
+		{"cache check says not cached", func() (*http.Response, error) {
+			return resp(200, `{"status":"success","response":[false]}`), nil
+		}},
+		{"cache check throttled", func() (*http.Response, error) { return resp(429, `{}`), nil }},
+		{"cache check transport error", func() (*http.Response, error) {
+			return nil, context.DeadlineExceeded
+		}},
+		{"cache check unreadable", func() (*http.Response, error) { return resp(200, `not json`), nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token, hash := "pm-complete-"+tc.name, repeat("2", 40)
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
 
-	probe := httptest.NewRecorder()
-	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
-	play := httptest.NewRecorder()
-	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok, nil))
+			client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, "cache/check") {
+					return tc.cacheCheck()
+				}
+				return resp(200, `{"status":"success","content":[`+
+					`{"path":"Movie.mkv","link":"https://pm.example/final.mkv","size":100}]}`), nil
+			}}
+			h := NewHandler(Deps{
+				Cache: cache,
+				MakeStores: func(*Config) []Store {
+					return []Store{&premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+						client: client}}
+				},
+			})
+			pmBlob := blob(`{"debrid":[{"service":"premiumize","token":"` + token + `"}],` +
+				`"indexers":["torrentio"],"resultCap":20}`)
+			tok := encodePlayToken(PlayTarget{InfoHash: hash})
 
-	if play.Code != http.StatusFound {
-		t.Fatalf("/play = %d, want 302 — the fixture is not serving a completed transfer", play.Code)
-	}
-	if probe.Code == http.StatusAccepted {
-		t.Errorf("?probe=1 still says downloading (%s) while /play serves a 302 — the client polling to "+
-			"learn its download landed never finds out", strings.TrimSpace(probe.Body.String()))
-	}
-	if probe.Code != http.StatusOK {
-		t.Errorf("?probe=1 = %d (%s), want 200 ready", probe.Code, strings.TrimSpace(probe.Body.String()))
+			probe := httptest.NewRecorder()
+			h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
+			play := httptest.NewRecorder()
+			h.ServeHTTP(play, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok, nil))
+
+			if play.Code != http.StatusFound {
+				t.Fatalf("/play = %d, want 302 — the fixture is not serving a completed transfer",
+					play.Code)
+			}
+			if probe.Code == http.StatusAccepted {
+				t.Errorf("?probe=1 still says downloading (%s) while /play serves a 302 — the client "+
+					"polling to learn its download landed never finds out",
+					strings.TrimSpace(probe.Body.String()))
+			}
+			if probe.Code != http.StatusOK {
+				t.Errorf("?probe=1 = %d (%s), want 200 ready",
+					probe.Code, strings.TrimSpace(probe.Body.String()))
+			}
+		})
 	}
 }
 
