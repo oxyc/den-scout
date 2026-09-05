@@ -348,11 +348,11 @@ type rankFilters struct {
 	// PreferResolution sinks other resolutions below this one rather than dropping them. "" → off.
 	PreferResolution string
 	HDROnly          bool
-	MinSeeders   *int
-	MaxSizeGB    *int
-	ExcludeRegex string
-	CachedOnly   bool
-	ResultCap    int
+	MinSeeders       *int
+	MaxSizeGB        *int
+	ExcludeRegex     string
+	CachedOnly       bool
+	ResultCap        int
 	// ExpectedYear (movies): drop a release whose parsed year is clearly different — trackers sometimes
 	// mistag a torrent with another title's IMDb id. Year survives translation (a Spanish-titled release
 	// of the same film keeps the year); title matching would wrongly drop it. nil = no year filter.

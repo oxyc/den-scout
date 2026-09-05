@@ -245,14 +245,11 @@ func TestMintedCache_isBoundedByCount(t *testing.T) {
 		stamp := idleBase.Add(-time.Duration(i) * time.Second)
 		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "https://comet.example/x", at: now, used: stamp}
 	}
-	room := pruneMintedLocked()
+	pruneMintedLocked()
 	got := len(minted)
 	_, newestKept := minted["comet:0"]
 	_, oldestKept := minted[fmt.Sprintf("comet:%d", maxMintedEntries*3-1)]
 	mintedMu.Unlock()
-	if !room {
-		t.Error("prune found no room despite every entry being idle and evictable")
-	}
 
 	if got >= maxMintedEntries {
 		t.Errorf("kept %d entries, want under the %d ceiling (with room for the insert that follows)",
@@ -316,7 +313,7 @@ func TestMintedCache_keepsTheEntriesActuallyInUse(t *testing.T) {
 		stamp := now.Add(-time.Duration(i+1) * time.Second)
 		minted[fmt.Sprintf("comet:flood%d", i)] = mintedConfig{url: "https://flood.example/x", at: stamp, used: stamp}
 	}
-	room := pruneMintedLocked()
+	pruneMintedLocked()
 	var survived int
 	for _, k := range legit {
 		if _, ok := minted[k]; ok {
@@ -329,8 +326,8 @@ func TestMintedCache_keepsTheEntriesActuallyInUse(t *testing.T) {
 	if survived != len(legit) {
 		t.Errorf("%d of %d in-use entries survived — eviction is not ordered by last use", survived, len(legit))
 	}
-	if !room || total >= maxMintedEntries {
-		t.Errorf("ceiling not enforced: room=%v total=%d, want room and under %d", room, total, maxMintedEntries)
+	if total >= maxMintedEntries {
+		t.Errorf("ceiling not enforced: total=%d, want under %d", total, maxMintedEntries)
 	}
 }
 
@@ -353,21 +350,22 @@ func TestMintedCache_reclaimsIdleEntries(t *testing.T) {
 		stamp := now.Add(-time.Duration(i) * time.Second)
 		minted[fmt.Sprintf("comet:idle%d", i)] = mintedConfig{url: "https://x.example/x", at: now, used: stamp}
 	}
-	room := pruneMintedLocked()
+	pruneMintedLocked()
 	total := len(minted)
 	mintedMu.Unlock()
 
-	if !room || total >= maxMintedEntries {
-		t.Errorf("idle entries were not reclaimed: room=%v total=%d, want room and under %d",
-			room, total, maxMintedEntries)
+	if total >= maxMintedEntries {
+		t.Errorf("idle entries were not reclaimed: total=%d, want under %d",
+			total, maxMintedEntries)
 	}
 }
 
 // The ceiling holds through the REAL caller, not just through pruneMintedLocked.
 //
-// Under a flood the prune may evict nothing, and then the caller-side check is the only thing bounding
-// the map — so it has to be exercised where the caller lives. Making both call sites insert
-// unconditionally left the whole suite green while 1,000 caller-invented tokens sat in the map.
+// It is reached from two call sites — a successful mint and a remembered failure — and one of them
+// forgetting to prune is not something a direct test of pruneMintedLocked can see, so the flood is driven
+// through indexerBaseWithConfig. The rationale used to be a caller-side room check that gated the insert;
+// that guard is gone, because under plain LRU the prune always makes room and the answer was always yes.
 func TestIndexerBaseWithConfig_mapStaysBoundedUnderAFlood(t *testing.T) {
 	resetMinted()
 	t.Cleanup(resetMinted)

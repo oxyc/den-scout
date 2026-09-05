@@ -533,7 +533,7 @@ func TestAddInFlight_discoveringTheTorrentSettlesTheMarker(t *testing.T) {
 	}
 
 	// The account listing then shows the torrent: the add landed, so the marker must go.
-	if _, found := s.torrentID(context.Background(), H); !found {
+	if _, found, _ := s.torrentID(context.Background(), H); !found {
 		t.Fatal("the account holds it")
 	}
 	if err := addInFlight(cache, ServiceTorBox, "tok", H); err != nil {

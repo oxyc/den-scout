@@ -1341,6 +1341,10 @@ type deadlineStore struct {
 	// read was already correct — so keeping only the newest made the first one's budget invisible.
 	statusAt []time.Duration
 	resolve  func() (string, error)
+	// unknown makes the store answer "could not find out", which is the ONLY thing that fires the
+	// escalation. Without it the escalated read never happens, and an assertion phrased as "at most one
+	// read may exceed the ordinary budget" is vacuously true no matter what the handler does.
+	unknown bool
 }
 
 func (d *deadlineStore) Service() DebridService { return d.svc }
@@ -1354,6 +1358,16 @@ func (d *deadlineStore) Status(ctx context.Context, _ ResolveTarget) (StoreStatu
 	}
 	return StoreStatus{}, false
 }
+func (d *deadlineStore) StatusAnswer(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer) {
+	st, ok := d.Status(ctx, t)
+	switch {
+	case d.unknown:
+		return st, statusUnknown
+	case ok:
+		return st, statusDownloading
+	}
+	return st, statusNo
+}
 
 // A read that exists to answer a POLL must run under the status budget. A client polls /play for the
 // length of a fetch, so a read meant to answer promptly must not be able to hold that poll for
@@ -1361,38 +1375,56 @@ func (d *deadlineStore) Status(ctx context.Context, _ ResolveTarget) (StoreStatu
 // were already right and the one that was not looked identical to the suite.
 func TestHandlePlay_pollReadsUseTheStatusBudget(t *testing.T) {
 	for _, route := range []string{"", "?probe=1"} {
-		t.Run("play"+route, func(t *testing.T) {
-			store := &deadlineStore{svc: ServiceTorBox,
-				resolve: func() (string, error) { return "", &DeadLinkError{"nothing here"} }}
-			h := NewHandler(testDeps(func(d *Deps) {
-				d.MakeStores = func(*Config) []Store { return []Store{store} }
-			}))
-			tok := encodePlayToken(PlayTarget{InfoHash: repeat("a", 40)})
-			do(h, "/"+validBlob+"/play/"+tok+route, nil)
+		// Both answers, because the rule differs between them and an earlier version ran only the left
+		// one — where no read is ever escalated, so the clause permitting the escalation excused every
+		// read at once and the ceiling silently became the doubled budget for all of them.
+		for _, unknown := range []bool{false, true} {
+			name := "play" + route
+			if unknown {
+				name += "/unknown"
+			}
+			t.Run(name, func(t *testing.T) {
+				store := &deadlineStore{svc: ServiceTorBox, unknown: unknown,
+					resolve: func() (string, error) { return "", &DeadLinkError{"nothing here"} }}
+				h := NewHandler(testDeps(func(d *Deps) {
+					d.MakeStores = func(*Config) []Store { return []Store{store} }
+				}))
+				tok := encodePlayToken(PlayTarget{InfoHash: repeat("a", 40)})
+				do(h, "/"+validBlob+"/play/"+tok+route, nil)
 
-			if len(store.statusAt) == 0 {
-				t.Fatal("the status read never happened, so this asserts nothing")
-			}
-			// The rule, stated exactly: a read on the poll route never takes the RESOLVE budget, and at
-			// most one — the escalation, on the path about to spend an add — may take double the status
-			// budget. An earlier version asserted a flat statusBudget, which read as forbidding the
-			// escalation; cutting the escalation to fit made it a guard that could not succeed, because
-			// the retry is sliced from the same budget as the read that just timed out.
-			doubled := 0
-			for i, left := range store.statusAt {
-				if left > escalatedStatusBudget() {
-					t.Errorf("status read %d carried a %v deadline, want no more than %v — a poll read "+
-						"must not be able to hold the poll for the whole resolve budget",
-						i, left, escalatedStatusBudget())
+				if len(store.statusAt) == 0 {
+					t.Fatal("the status read never happened, so this asserts nothing")
 				}
-				if left > statusBudget {
-					doubled++
+				// The rule, stated exactly: a read on the poll route never takes the RESOLVE budget, and
+				// at most one — the escalation, on the path about to spend an add — may take double the
+				// status budget. An earlier version asserted a flat statusBudget, which read as
+				// forbidding the escalation; cutting the escalation to fit made it a guard that could
+				// not succeed, because the retry is sliced from the same budget as the read that just
+				// timed out.
+				doubled := 0
+				for i, left := range store.statusAt {
+					if left > escalatedStatusBudget() {
+						t.Errorf("status read %d carried a %v deadline, want no more than %v — a poll "+
+							"read must not be able to hold the poll for the whole resolve budget",
+							i, left, escalatedStatusBudget())
+					}
+					if left > statusBudget {
+						doubled++
+					}
 				}
-			}
-			if doubled > 1 {
-				t.Errorf("%d reads exceeded the ordinary status budget; only the single escalation may", doubled)
-			}
-		})
+				// Exactly one doubled read on the path that escalates, and none anywhere else. The probe
+				// never escalates — it answers 503 "ask again" rather than spending an add, so it has no
+				// reason to buy a second opinion.
+				want := 0
+				if unknown && route == "" {
+					want = 1
+				}
+				if doubled != want {
+					t.Errorf("%d of %v reads exceeded the ordinary status budget, want exactly %d",
+						doubled, store.statusAt, want)
+				}
+			})
+		}
 	}
 }
 

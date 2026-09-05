@@ -78,7 +78,7 @@ func TestTorBoxTorrentID_remembersAMiss(t *testing.T) {
 	}}
 	s := &torBoxStore{token: "t", client: d, api: torboxAPI, cache: NewMemoryCache(1 << 20)}
 	for i := 0; i < 5; i++ {
-		if _, ok := s.torrentID(context.Background(), H); ok {
+		if _, ok, _ := s.torrentID(context.Background(), H); ok {
 			t.Fatal("an empty account holds nothing")
 		}
 	}
@@ -256,6 +256,58 @@ func (f fakeStore) Status(ctx context.Context, _ ResolveTarget) (StoreStatus, bo
 		return StoreStatus{}, false
 	}
 	return *f.status, true
+}
+
+// answeringStore implements the optional three-valued statusAnswerer, and DISAGREES with its own
+// two-valued Status on purpose — that is the only way a test can tell which one the pool consulted.
+type answeringStore struct {
+	fakeStore
+	answer statusAnswer
+	asked  *int
+}
+
+func (a answeringStore) StatusAnswer(context.Context, ResolveTarget) (StoreStatus, statusAnswer) {
+	if a.asked != nil {
+		*a.asked++
+	}
+	return StoreStatus{Progress: 0.5}, a.answer
+}
+
+// The pool asks statusAnswerer where a store has one, in preference to the bool Status.
+//
+// Nothing asserted it: making the type switch never match left the whole suite green, and the fallback
+// answers only yes/no — so every "could not find out" collapsed to "nobody is fetching it", which is the
+// answer that makes /play queue a duplicate against an account that is already refusing.
+func TestStorePool_prefersTheThreeValuedAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		answer        statusAnswer
+		wantOK        bool
+		wantUnknown   bool
+		wantStoreAsks int
+	}{
+		// The bool Status of this fixture always answers (StoreStatus{}, false), i.e. "no". Neither of
+		// these two outcomes is reachable through it.
+		{"unknown is carried, not flattened to no", statusUnknown, false, true, 1},
+		{"downloading is carried too", statusDownloading, true, false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asked := 0
+			pool := &StorePool{stores: []Store{answeringStore{
+				fakeStore: fakeStore{svc: ServiceTorBox}, answer: tc.answer, asked: &asked}}}
+			status, ok, unknown := pool.Status(context.Background(), ResolveTarget{InfoHash: H})
+			if ok != tc.wantOK || unknown != tc.wantUnknown {
+				t.Errorf("pool answered ok=%v unknown=%v, want %v/%v", ok, unknown, tc.wantOK, tc.wantUnknown)
+			}
+			if asked != tc.wantStoreAsks {
+				t.Errorf("StatusAnswer called %d times, want %d — the pool used the bool fallback",
+					asked, tc.wantStoreAsks)
+			}
+			if tc.wantOK && status.Progress != 0.5 {
+				t.Errorf("the status itself was dropped: %+v", status)
+			}
+		})
+	}
 }
 
 func TestStorePool(t *testing.T) {
@@ -476,7 +528,7 @@ func TestFetchAccountListing_streamsAndDetectsTruncation(t *testing.T) {
 	}
 	big.WriteString(`]}`)
 
-	ids, ok := decodeListing(json.NewDecoder(strings.NewReader(big.String())))
+	ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(big.String())))
 	if !ok {
 		t.Fatal("a well-formed large listing was refused")
 	}
@@ -491,7 +543,7 @@ func TestFetchAccountListing_streamsAndDetectsTruncation(t *testing.T) {
 	// Constructed exactly as production does: the reader is given limit+1 so that "read the cap exactly"
 	// and "cut off at the cap" are distinguishable.
 	td := &truncationDetector{r: io.LimitReader(strings.NewReader(big.String()), (1<<10)+1), limit: 1 << 10}
-	if _, ok := decodeListing(json.NewDecoder(td)); ok {
+	if _, ok, _ := decodeListing(json.NewDecoder(td)); ok {
 		t.Error("a truncated listing decoded as a valid answer")
 	}
 	if !td.truncated() {
@@ -499,14 +551,14 @@ func TestFetchAccountListing_streamsAndDetectsTruncation(t *testing.T) {
 	}
 
 	// An envelope with no data key is not a claim about the account either.
-	if _, ok := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true}`))); ok {
+	if _, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true}`))); ok {
 		t.Error("a listing with no data key was treated as authoritative")
 	}
-	if _, ok := decodeListing(json.NewDecoder(strings.NewReader(`{"success":false,"data":[]}`))); ok {
+	if _, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(`{"success":false,"data":[]}`))); ok {
 		t.Error("success:false was treated as authoritative")
 	}
 	// An explicitly empty account IS an answer.
-	if ids, ok := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true,"data":[]}`))); !ok || len(ids) != 0 {
+	if ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true,"data":[]}`))); !ok || len(ids) != 0 {
 		t.Errorf("an empty account should be a real answer: ok=%v n=%d", ok, len(ids))
 	}
 }
@@ -546,6 +598,56 @@ func TestFetchAccountListing_largeAccountIsNotTruncated(t *testing.T) {
 	}
 }
 
+// StatusAnswer's doubt comes from the lookup it already did, not from a second one.
+//
+// The three-valued answer was first built by re-running findTorrentByHash purely to learn whether the
+// listing had been readable. That call goes straight to accountListing and so steps over torrentMissKey,
+// whose entire purpose is that a remembered miss costs no fetch — measured at four listing requests per
+// /play against a throttled account where one was enough, on the exact path that is already refusing.
+func TestTorBoxStatusAnswer_takesItsDoubtFromTheLookupItAlreadyDid(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// The listing reply, which decides whether the miss is authoritative.
+		listing    func() *http.Response
+		wantAnswer statusAnswer
+		// Fetches over two polls: the first reads the listing, the second must read nothing — either
+		// because the miss was remembered or because the oversize/failure path decided for itself.
+		wantFetches int
+	}{
+		// Read in full, hash absent: an authoritative no, remembered, so the second poll costs nothing.
+		{"an empty account is a definitive no", func() *http.Response {
+			return resp(200, `{"success":true,"data":[]}`)
+		}, statusNo, 1},
+		// The list was never read, so "not in it" is not a fact about the account. The miss must NOT be
+		// remembered here — that retry is the only thing that rediscovers a queued torrent — so the
+		// second poll does fetch again, and neither poll may fetch twice.
+		{"an unreadable listing is doubt, not a no", func() *http.Response {
+			return resp(503, "down")
+		}, statusUnknown, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fetches := 0
+			s := &torBoxStore{token: "t", api: torboxAPI, cache: NewMemoryCache(1 << 20),
+				client: mockDoer{func(r *http.Request) (*http.Response, error) {
+					if strings.Contains(r.URL.Path, "mylist") && r.URL.Query().Get("id") == "" {
+						fetches++
+						return tc.listing(), nil
+					}
+					t.Errorf("unexpected request: %s", r.URL)
+					return resp(404, "{}"), nil
+				}}}
+			for i := 0; i < 2; i++ {
+				if _, answer := s.StatusAnswer(context.Background(), ResolveTarget{InfoHash: H}); answer != tc.wantAnswer {
+					t.Fatalf("poll %d answered %v, want %v", i, answer, tc.wantAnswer)
+				}
+			}
+			if fetches != tc.wantFetches {
+				t.Errorf("listed the account %d times over two polls, want %d", fetches, tc.wantFetches)
+			}
+		})
+	}
+}
+
 // An account whose listing is too big to read is not re-pulled on every attempt — but a TRANSIENT
 // failure still is, because that retry is the only thing that rediscovers a queued torrent.
 //
@@ -579,6 +681,41 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		t.Errorf("pulled the oversized listing %d times for three attempts — it is not being remembered", fetches)
 	}
 
+	// The ENTRY cap takes the same road, and had to be given it separately: it trips before the body is
+	// drained, so the byte counter never reaches the cap, truncated() stays false, and the oversize memo
+	// was never written. That left the entry cap re-pulling the whole listing on every poll — the exact
+	// egress the memo above exists to stop — and, because the read now yields "could not find out",
+	// /play escalated and did it twice per request.
+	var compact strings.Builder
+	compact.WriteString(`{"success":true,"data":[`)
+	for i := 0; i <= maxListingEntries; i++ {
+		if i > 0 {
+			compact.WriteString(",")
+		}
+		fmt.Fprintf(&compact, `{"id":%d,"hash":"%040x"}`, i, i)
+	}
+	compact.WriteString(`]}`)
+	if compact.Len() >= maxListingBytes {
+		t.Fatalf("the fixture is %d bytes, past the %d byte cap — it would assert the wrong cap",
+			compact.Len(), maxListingBytes)
+	}
+
+	entryFetches := 0
+	tooMany := &torBoxStore{token: "t3", api: torboxAPI, cache: NewMemoryCache(4 << 20),
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			entryFetches++
+			return resp(200, compact.String()), nil
+		}}}
+	for i := 0; i < 3; i++ {
+		if ids, ok := tooMany.accountListing(context.Background()); ok || ids != nil {
+			t.Fatal("a listing past the entry cap must not read as an answer")
+		}
+	}
+	if entryFetches != 1 {
+		t.Errorf("pulled the over-entry-count listing %d times for three attempts — it is not being remembered",
+			entryFetches)
+	}
+
 	// A transient failure must NOT be remembered: suppressing that retry is how a queued torrent stops
 	// being rediscoverable, which this package has a separate test for.
 	transientFetches := 0
@@ -596,6 +733,40 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 	}
 }
 
+// A body of EXACTLY the cap is not truncated, which is the case the limit+1 read exists for.
+//
+// The detector is fed a LimitReader of limit+1 so that "read the cap exactly" and "cut off at the cap"
+// produce different byte counts. With the comparison at >= instead of >, a listing that landed precisely
+// on maxListingBytes parsed perfectly and was then discarded AND remembered as oversized for the listing
+// TTL — every poll for the next fifteen seconds answering "no idea" about an account that had just been
+// read in full. Nothing covered it: the existing truncation case is a body far past the cap, which reads
+// the same under either comparison.
+func TestTruncationDetector_aBodyOfExactlyTheCapIsWhole(t *testing.T) {
+	const limit = 1 << 10
+	for _, tc := range []struct {
+		name string
+		size int
+		want bool
+	}{
+		{"one short", limit - 1, false},
+		{"exactly the cap", limit, false},
+		{"one over", limit + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Constructed exactly as fetchAccountListing does it.
+			td := &truncationDetector{r: io.LimitReader(strings.NewReader(repeat("x", tc.size)), limit+1), limit: limit}
+			n, err := io.Copy(io.Discard, td)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if got := td.truncated(); got != tc.want {
+				t.Errorf("a %d-byte body under a %d-byte cap read %d bytes and reported truncated=%v, want %v",
+					tc.size, limit, n, got, tc.want)
+			}
+		})
+	}
+}
+
 // The listing decode must not RETAIN the body — that property, not just "it parses", is what keeps a
 // 64 MiB cap safe inside a 230 MiB budget.
 //
@@ -604,34 +775,41 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 // enormous (measured ~1 MiB against ~129 MiB on 40 MiB of JSON), so a coarse ceiling is plenty and there
 // is no need to measure precisely enough to be flaky.
 func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
+	// The bulk sits in a TOP-LEVEL key that is neither success nor data, so it goes through skipValue's
+	// default branch — which is the code under test. An earlier fixture put the bulk inside each array
+	// element, where it is discarded by the element decode instead, so the skip branch never ran at all
+	// and the test could not tell the streaming walk from the buffering decode it replaced.
 	var body strings.Builder
-	body.WriteString(`{"success":true,"data":[`)
+	body.WriteString(`{"success":true,"unknown_field":[`)
 	for i := 0; body.Len() < 24<<20; i++ {
 		if i > 0 {
 			body.WriteString(",")
 		}
-		// The bulk is in a field the walk skips, which is where a RawMessage or a full unmarshal shows up.
-		fmt.Fprintf(&body, `{"id":%d,"hash":"%040x","files":"%s"}`, i, i, repeat("f", 6000))
+		fmt.Fprintf(&body, `{"noise":"%s"}`, repeat("f", 6000))
 	}
-	body.WriteString(`]}`)
+	body.WriteString(`],"data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`)
 
+	// TotalAlloc, not HeapAlloc: the buffering decode's cost is a transient PEAK, and it is unreachable
+	// by the time a post-GC HeapAlloc reading is taken — an earlier version of this test measured
+	// residency and passed against every implementation it forbids, including the RawMessage skip. What
+	// GOMEMLIMIT actually sees is the volume allocated while the decode runs.
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	ids, ok := decodeListing(json.NewDecoder(strings.NewReader(body.String())))
-	runtime.GC()
+	ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(body.String())))
 	runtime.ReadMemStats(&after)
 	if !ok {
 		t.Fatal("the fixture did not decode")
 	}
 	runtime.KeepAlive(ids)
 
-	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
-	// The map itself is a few hundred KB at this size; the body is 24 MiB. Anything near the body means
-	// the decode is buffering it again.
-	if retained > 8<<20 {
-		t.Errorf("decoding a %d-byte listing retained %d bytes — the body is being held, not streamed",
-			body.Len(), retained)
+	allocated := int64(after.TotalAlloc) - int64(before.TotalAlloc)
+	// Measured on this fixture: the streaming walk allocates 1.06x the body (the decoder's own read
+	// buffer, which it grows geometrically and reuses), buffering the skipped field into a
+	// json.RawMessage allocates 3.7x. Two is the only number between them that is not a coincidence.
+	if allocated > 2*int64(body.Len()) {
+		t.Errorf("decoding a %d-byte listing allocated %d bytes — the body is being buffered, not streamed",
+			body.Len(), allocated)
 	}
 }
 
@@ -648,7 +826,9 @@ func TestDecodeListing_boundsEntryCount(t *testing.T) {
 	}
 	body.WriteString(`]}`)
 
-	if _, ok := decodeListing(json.NewDecoder(strings.NewReader(body.String()))); ok {
-		t.Errorf("a listing with more than %d entries was accepted", maxListingEntries)
+	// tooMany must be reported separately, because that is what makes the caller remember the account as
+	// oversized instead of re-pulling and re-discarding the whole listing on every poll.
+	if _, ok, tooMany := decodeListing(json.NewDecoder(strings.NewReader(body.String()))); ok || !tooMany {
+		t.Errorf("a listing with more than %d entries: ok=%v tooMany=%v (want false,true)", maxListingEntries, ok, tooMany)
 	}
 }

@@ -1179,11 +1179,12 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 }
 
 func (s *torBoxStore) StatusAnswer(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer) {
-	torrentID, ok := s.torrentID(ctx, t.InfoHash)
+	torrentID, ok, authoritative := s.torrentID(ctx, t.InfoHash)
 	if !ok {
 		// A miss here is only trustworthy when the listing was actually read. torrentID declines to
-		// remember one otherwise, and the same doubt has to reach the caller.
-		if _, _, authoritative := s.findTorrentByHash(ctx, t.InfoHash); !authoritative {
+		// remember one otherwise, and the same doubt has to reach the caller — taken from the lookup that
+		// already happened rather than by asking again, which was a second full account fetch.
+		if !authoritative {
 			return StoreStatus{}, statusUnknown
 		}
 		return StoreStatus{}, statusNo
@@ -1317,17 +1318,26 @@ func (s *torBoxStore) forgetTorrentID(infoHash string) {
 // it is lost by any of a redeploy, a pruned cache, or an add that recorded nothing. Without it `Status`
 // answers "nothing here" while the file downloads perfectly well — which a client can only read as a dead
 // link. Rediscovering the id costs one list call, and only on the path that was previously a dead end.
-func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool) {
+// The third result says whether a MISS is authoritative — the listing was read and the hash was not in
+// it — as opposed to the listing not having been read at all.
+//
+// Returned rather than re-derived. StatusAnswer needs the same fact, and asking findTorrentByHash a
+// second time for it meant a second real upstream fetch whenever the listing failed fast: measured at
+// four full account-listing requests per /play against a throttled account, where the whole point of
+// that code is not to pile load on an account already refusing. It also stepped over the miss marker
+// this function writes, so a remembered miss re-pulled the whole listing anyway — the one thing the
+// marker exists to prevent.
+func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool, bool) {
 	if s.cache != nil {
 		if raw, ok := s.cache.Get(torrentIDKey(s.token, infoHash)); ok {
 			if id, err := strconv.Atoi(raw); err == nil {
-				return id, true
+				return id, true, true
 			}
 		}
 	}
 	if s.cache != nil {
 		if _, missed := s.cache.Get(torrentMissKey(s.token, infoHash)); missed {
-			return 0, false
+			return 0, false, true // remembered, and only an authoritative miss is ever remembered
 		}
 	}
 	id, ok, authoritative := s.findTorrentByHash(ctx, infoHash)
@@ -1340,7 +1350,7 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 		if s.cache != nil && authoritative {
 			s.cache.Put(torrentMissKey(s.token, infoHash), "1", torrentMissTTL)
 		}
-		return 0, false
+		return 0, false, authoritative
 	}
 	// Remember it, so the next poll of this wait is a single-id lookup again rather than another list.
 	if s.cache != nil {
@@ -1350,7 +1360,7 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 	// this the marker outlives the fact it stood in for, and a release stays "awaiting the result" long
 	// after the result is sitting in the account listing.
 	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
-	return id, true
+	return id, true, true
 }
 
 // findTorrentByHash scans the account's torrent list for an infohash. TorBox reports hashes lower-case;
@@ -1471,7 +1481,17 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	// of exactly maxListingBytes parsed perfectly would otherwise be discarded AND remembered as oversized
 	// for the listing TTL.
 	limited := &truncationDetector{r: io.LimitReader(resp.Body, maxListingBytes+1), limit: maxListingBytes}
-	ids, ok := decodeListing(json.NewDecoder(limited))
+	ids, ok, tooManyEntries := decodeListing(json.NewDecoder(limited))
+	if tooManyEntries {
+		// The ENTRY cap, and it takes the same road as the byte cap: both mean "this account's listing is
+		// bigger than we will read", both are properties of the account rather than blips, and both are
+		// therefore worth remembering. Only the byte one was, so tripping the entry cap re-pulled the
+		// whole body on every poll — 14.9 MiB per /play on a two-second cadence, which is the egress the
+		// oversized memo exists to stop.
+		log.Printf("scout: torbox account listing holds more than %d torrents — treating it as no answer "+
+			"rather than as an empty account", maxListingEntries)
+		return nil, false, true
+	}
 	if limited.truncated() {
 		// Silent truncation is the failure this whole comment is about: it reads back as "the account
 		// holds nothing" and costs a duplicate add, with nothing anywhere saying the account simply
@@ -1491,33 +1511,35 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 // envelope missing, and listFiles reads exactly the same body as silence ("not a claim about the
 // account"). Calling that authoritative wrote a 15s miss marker that then suppressed the only lookup able
 // to rediscover a queued torrent.
-func decodeListing(dec *json.Decoder) (map[string]int, bool) {
+func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntries bool) {
 	tok, err := dec.Token()
 	if err != nil || tok != json.Delim('{') {
-		return nil, false
+		return nil, false, false
 	}
 	success := true
-	var ids map[string]int
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
-			return nil, false
+			return nil, false, false
 		}
 		switch key {
 		case "success":
 			var v *bool
 			if dec.Decode(&v) != nil {
-				return nil, false
+				return nil, false, false
 			}
 			if v != nil {
 				success = *v
 			}
 		case "data":
-			// First `data` wins. A duplicate key is not something TorBox produces, but letting a later
-			// null overwrite a list already read turns "no answer" into an answer — the unsafe direction.
+			// First non-null `data` wins — the guard is on ids, so `{"data":null,"data":[…]}` still reads
+			// the list. A duplicate key is not something TorBox produces, but letting a later null
+			// overwrite a list already read turns an answer into "no answer", and the reverse (an empty
+			// first array winning over a later populated one) is the unsafe direction: an authoritative
+			// "this account holds nothing", a miss marker, and a duplicate add.
 			if ids != nil {
 				if !skipValue(dec) {
-					return nil, false
+					return nil, false, false
 				}
 				continue
 			}
@@ -1525,13 +1547,13 @@ func decodeListing(dec *json.Decoder) (map[string]int, bool) {
 			if dec.More() {
 				open, err := dec.Token()
 				if err != nil {
-					return nil, false
+					return nil, false, false
 				}
 				if open == nil {
 					continue // explicit null
 				}
 				if open != json.Delim('[') {
-					return nil, false
+					return nil, false, false
 				}
 				ids = map[string]int{}
 				for dec.More() {
@@ -1540,7 +1562,7 @@ func decodeListing(dec *json.Decoder) (map[string]int, bool) {
 						Hash string `json:"hash"`
 					}
 					if dec.Decode(&e) != nil {
-						return nil, false
+						return nil, false, false
 					}
 					ids[strings.ToLower(e.Hash)] = e.ID
 					// The map is what this function retains, and its size is the ENTRY COUNT — which the
@@ -1548,27 +1570,32 @@ func decodeListing(dec *json.Decoder) (map[string]int, bool) {
 					// 346 MiB against a 230 MiB GOMEMLIMIT. No real account is near this; a body that is
 					// says something is wrong with the upstream, not with the account.
 					if len(ids) > maxListingEntries {
-						return nil, false
+						return nil, false, true
 					}
 				}
 				if _, err := dec.Token(); err != nil { // closing ]
-					return nil, false
+					return nil, false, false
 				}
 			}
 		default:
 			// Walked token by token, NOT decoded into a json.RawMessage. RawMessage keeps a full copy of
 			// the field's raw bytes on top of the decoder's own buffer, so a large unknown top-level field
-			// was retained twice — measured at +47 MiB for one 63 MiB field, which is the opposite of what
-			// this branch is for. Nothing here is retained now.
+			// was retained twice: measured on a 63 MiB array field, 196 MiB before and 3.9 MiB now.
+			//
+			// Nothing STRUCTURED is retained — a scalar is not helped, and saying otherwise would be the
+			// kind of comment this file keeps having to correct. A single 63 MiB string still costs
+			// ~159 MiB either way, because Token must buffer the whole token and allocate the string.
+			// That needs a hostile api.torbox.app rather than a caller (the base URL is a constant), which
+			// is the only reason it is tolerable rather than urgent.
 			if !skipValue(dec) {
-				return nil, false
+				return nil, false, false
 			}
 		}
 	}
 	if ids == nil || !success {
-		return nil, false
+		return nil, false, false
 	}
-	return ids, true
+	return ids, true, false
 }
 
 // truncationDetector reports whether a LimitReader was consumed all the way to its limit, which is the

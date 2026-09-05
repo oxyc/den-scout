@@ -99,8 +99,11 @@ func deadlinePassed(ctx context.Context) bool {
 //
 // So the rule is the thing that needed amending, not the number, and the test now states the real one:
 // no status read may take the RESOLVE budget, and exactly one — this one, on the path about to spend an
-// add — may take double. Worst-case poll latency is 3x statusBudget, 24 seconds, against a 45-second
-// resolve budget it is carved out of and a 60-second write timeout.
+// add — may take double.
+//
+// Worst-case status time on a /play is FOUR status budgets, 32 seconds: this read, the escalation, and
+// the post-failure read below, which is a fresh budget on a detached context and so outside the resolve
+// clock entirely. Measured end to end at 53 seconds all in, against a 60-second write timeout.
 func escalatedStatusCtx(parent context.Context) (context.Context, context.CancelFunc, bool) {
 	deadline, ok := parent.Deadline()
 	if !ok {
@@ -883,7 +886,7 @@ func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 // is true — which here means "nothing has been queued", not "this release is dead".
 func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config *Config, pool *StorePool,
 	infoHash string, rt ResolveTarget) {
-	status, ok, statusUnknown := pool.Status(ctx, rt)
+	status, ok, unknown := pool.Status(ctx, rt)
 	if ok {
 		writeQueued(w, infoHash, status)
 		return
@@ -939,7 +942,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// Same rule one step further out: a store that could not answer is not a store saying nothing is
 	// queued. 404 here is what makes a client blacklist a release, which is the single failure this route
 	// exists to prevent, so an indeterminate read gets the "ask again" answer rather than the claim.
-	if statusUnknown {
+	if unknown {
 		log.Printf("scout: probe %s → 503, a store could not answer", shortHash(infoHash))
 		writeJSON(w, http.StatusServiceUnavailable, errBody("status_unavailable"), noStore)
 		return

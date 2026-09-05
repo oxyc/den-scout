@@ -149,18 +149,16 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 		// every single stream request re-POSTed to it — with its own 10 s timeout, ahead of the scrape —
 		// meaning the worse it was, the harder scout hit it. The opposite of what a limiter is for.
 		mintedMu.Lock()
-		if pruneMintedLocked() {
-			now := time.Now()
-			minted[key] = mintedConfig{url: "", at: now, used: now, transient: transient}
-		}
+		pruneMintedLocked()
+		now := time.Now()
+		minted[key] = mintedConfig{url: "", at: now, used: now, transient: transient}
 		mintedMu.Unlock()
 		return "", transient
 	}
 	mintedMu.Lock()
-	if pruneMintedLocked() {
-		mintedNow := time.Now()
-		minted[key] = mintedConfig{url: url, at: mintedNow, used: mintedNow}
-	}
+	pruneMintedLocked()
+	mintedNow := time.Now()
+	minted[key] = mintedConfig{url: url, at: mintedNow, used: mintedNow}
 	mintedMu.Unlock()
 	log.Printf("scout: minted a config for the %s indexer from the %s account", id, acct.Service)
 	return url, false
@@ -180,18 +178,22 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 // ~298 KB in total — trivial against a 230 MiB heap, and the point is the bound rather than the size.
 const maxMintedEntries = 256
 
-// pruneMintedLocked drops entries past their own TTL, then enforces the count ceiling. It reports whether
-// there is now room for one more — the caller holds mintedMu and is about to insert, and must not when
-// this says no. Expiry was only ever consulted on READ, so an entry nobody asked for again stayed
-// resident forever.
-func pruneMintedLocked() bool {
+// pruneMintedLocked drops entries past their own TTL, then evicts until there is room for the one the
+// caller (holding mintedMu) is about to insert. Expiry was only ever consulted on READ, so an entry
+// nobody asked for again stayed resident forever.
+//
+// It used to return "is there room?" for the caller to gate its insert on, which was load-bearing only
+// while recently-used entries were protected and the eviction pass could therefore find nothing to drop.
+// That protection is gone (see below); plain LRU always makes room, the answer was always yes, and a
+// guard that cannot be false hides the bound rather than enforcing it.
+func pruneMintedLocked() {
 	for k, m := range minted {
 		if time.Since(m.at) >= m.ttl() {
 			delete(minted, k)
 		}
 	}
 	if len(minted) < maxMintedEntries {
-		return true
+		return
 	}
 	// Least-recently-USED first. Sorting by mint time instead evicted the operator's own entries
 	// preferentially, since a legitimate install's are the oldest in the map by construction — minted once
@@ -231,7 +233,6 @@ func pruneMintedLocked() bool {
 		log.Printf("scout: minted-config cache is at its %d-entry ceiling; evicting least-recently-used",
 			maxMintedEntries)
 	}
-	return len(minted) < maxMintedEntries
 }
 
 // primaryDebrid picks the account a minted config should speak for. First configured wins — the same

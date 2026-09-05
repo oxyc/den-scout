@@ -377,6 +377,45 @@ func TestHandleProbe_neverQueuesAndSaysWhenItCannotTell(t *testing.T) {
 	}
 }
 
+// One step further out than the case above: the cache check WORKED, and the status read is the part that
+// could not find out. 404 "not_queued" there is what makes a client blacklist a release that is
+// downloading right now, so an indeterminate read gets "ask again" instead.
+//
+// Nothing asserted it — deleting the branch left the whole suite green, because the case it exists for
+// (checkcached answers while mylist times out) is reachable only through a store that answers the two
+// questions differently.
+func TestHandleProbe_anIndeterminateStatusIsNotAnAbsence(t *testing.T) {
+	h := &handler{deps: Deps{Cache: NewMemoryCache(1 << 20)}}
+	// The cache check succeeds and honestly reports "not cached"; the status read cannot tell. Without
+	// the status read, this is the ordinary 404 path — which is what the definitive case below asserts.
+	uncertain := answeringStore{
+		fakeStore: fakeStore{svc: ServiceTorBox, check: map[string]bool{"abc": false},
+			resolve: func() (string, error) { return "", &DeadLinkError{"not held"} }},
+		answer: statusUnknown,
+	}
+	rec := httptest.NewRecorder()
+	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{uncertain}}, "abc",
+		ResolveTarget{InfoHash: "abc"})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("an indeterminate status read should be 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "status_unavailable") {
+		t.Errorf("the body must distinguish this from an unreachable cache check: %s", rec.Body.String())
+	}
+
+	// The same fixture answering DEFINITIVELY still 404s, or the branch above would just be a blanket 503
+	// and the route would never report an absence at all.
+	definitive := uncertain
+	definitive.answer = statusNo
+	rec = httptest.NewRecorder()
+	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{definitive}}, "abc",
+		ResolveTarget{InfoHash: "abc"})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("a store that answered should still be able to say nothing is queued, got %d: %s",
+			rec.Code, rec.Body.String())
+	}
+}
+
 // noAddAwareStore behaves like a real store: it can serve the release, but refuses when the caller
 // forbids queueing and the account does not already hold it.
 type noAddAwareStore struct {
