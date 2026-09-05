@@ -1757,9 +1757,9 @@ const (
 	// Entries arrived and not one was usable. An upstream that renamed `hash` looks exactly like this,
 	// and it will look like it again on the next poll, so it is remembered rather than re-fetched.
 	listingNoUsableEntries
-	// A complete envelope with no usable `data` array: the key renamed, `data` holding an object, or an
-	// explicit success:false. Same deterministic class as the two above — and separated from a truncated
-	// body, which reaches the same place and is not.
+	// A complete envelope with no usable `data` array: the key renamed, `data` holding an object, an
+	// explicit `data:null`, or an explicit success:false. Same deterministic class as the two above — and
+	// separated from a truncated body, which reaches the same place and is not.
 	//
 	// success:false is the arguable member, and it is arguable in one direction only. TorBox signals state
 	// in band at HTTP 200 — this file records elsewhere that a torrent still downloading answers exactly
@@ -1943,6 +1943,12 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 	// The loop ends either because the object closed or because the body ran out — dec.More() reports both
 	// as "no more", so the closing token is what tells them apart. Reading it is the ONLY way to know the
 	// envelope was complete, and that is what makes the difference between a persistent fault and a blip.
+	//
+	// It is also a CORRECTNESS fix, not only a cost one, which is worth saying before someone removes it as
+	// an optimisation: without it `{"success":true,"data":[]` — an empty array with the body cut off before
+	// the brace — parsed as an authoritative empty account and wrote a fifteen-second miss marker. A
+	// truncated body claiming "the account does not hold this" is exactly the failure the surrounding code
+	// spent several rounds removing, arrived at from the one direction nothing was watching.
 	if _, err := dec.Token(); err != nil {
 		return nil, false, listingFaultNone // cut off mid-body: transient, retry at once
 	}
