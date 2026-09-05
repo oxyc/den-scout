@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -743,12 +744,14 @@ func TestAccountListing_memoHitsShareOneParsedMap(t *testing.T) {
 		t.Errorf("fetched the listing %d times for nine reads", fetches)
 	}
 	// Same map, not an equal one: a private copy per caller is the cost this exists to remove, and two
-	// maps with the same contents would satisfy any assertion phrased on contents.
+	// maps with the same contents would satisfy any assertion phrased on contents. Compared by the
+	// underlying pointer rather than by writing a probe key through one of them — production shares this
+	// map read-only, and a test that mutates it models the one thing callers must never do.
 	for i, ids := range got {
 		if len(ids) != len(first) {
 			t.Fatalf("memo hit %d returned %d entries, want %d", i, len(ids), len(first))
 		}
-		if !mapsAreSame(ids, first) {
+		if reflect.ValueOf(ids).Pointer() != reflect.ValueOf(first).Pointer() {
 			t.Errorf("memo hit %d returned a private copy of the listing, not the shared map", i)
 		}
 	}
@@ -758,17 +761,6 @@ func TestAccountListing_memoHitsShareOneParsedMap(t *testing.T) {
 		t.Errorf("%d memo hits allocated %d bytes — the listing is being re-parsed per caller",
 			hits, allocated)
 	}
-}
-
-// mapsAreSame reports whether two maps are the SAME map, which is what distinguishes a shared memo from
-// a per-caller copy. Go has no pointer equality for maps, so it is done by observation: write a key into
-// one and see whether the other sees it.
-func mapsAreSame(a, b map[string]int) bool {
-	const probe = "\x00same-map-probe"
-	a[probe] = 1
-	_, seen := b[probe]
-	delete(a, probe)
-	return seen
 }
 
 // An account whose listing is too big to read is not re-pulled on every attempt — but a TRANSIENT
