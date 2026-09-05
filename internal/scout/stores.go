@@ -760,6 +760,46 @@ type scoutBudgetReporter interface {
 	ScoutBudgetSpent() bool
 }
 
+// accountRefusalReporter — a store whose ACCOUNT the service rejected a moment ago.
+type accountRefusalReporter interface {
+	AccountRefused() (string, bool)
+}
+
+// AccountRefusal reports a rejected key, which outranks an add of ours being in flight.
+//
+// A DEAD KEY IS NOT A WAIT. All three stores order it that way and say so — accountBackedOff sits above
+// addInFlight in every one of them, because a live marker pre-empting a rejected key answers 202
+// "downloading" where the store itself answers 503. The probe route consulted its in-flight reporter
+// first and so did exactly what that comment forbids: reproduced with no planted state, one release's
+// add reset mid-flight and another's answering 401, /play said 503 store_unavailable while ?probe=1 said
+// 202 downloading for the same release at the same instant — a viewer watching a spinner for a release
+// nothing is fetching, on an account whose key needs replacing.
+//
+// Account-level only. The per-release backoff must NOT be checked here: it is an add-path guard a
+// read-only caller is exempt from, and backedOff conflates the two by consulting the account key first.
+func (p *StorePool) AccountRefusal() (DebridService, string, bool) {
+	for _, st := range p.stores {
+		reporter, ok := st.(accountRefusalReporter)
+		if !ok {
+			continue
+		}
+		if reason, refused := reporter.AccountRefused(); refused {
+			return st.Service(), reason, true
+		}
+	}
+	return "", "", false
+}
+
+func (s *torBoxStore) AccountRefused() (string, bool) {
+	return accountBackedOff(s.cache, ServiceTorBox, s.token)
+}
+func (s *realDebridStore) AccountRefused() (string, bool) {
+	return accountBackedOff(s.cache, ServiceRealDebrid, s.token)
+}
+func (s *premiumizeStore) AccountRefused() (string, bool) {
+	return accountBackedOff(s.cache, ServicePremiumize, s.token)
+}
+
 // EveryAddRefusedByScout reports that scout's own allowance is spent on every configured account, so no
 // store could queue anything even if asked.
 //
@@ -3123,7 +3163,20 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		return "", err
 	}
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
-	noteAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
+	// Not for a read-only caller. The marker means "an add of OURS is out"; a NoAdd poll is reached here
+	// only for a transfer already queued, where this call is the READ that discovers it finished, so it
+	// has no add of its own to record.
+	//
+	// Letting it through was measured: the probe route runs on the client's context under statusBudget,
+	// and clients cancel aggressively, so a cut-off poll left a ninety-second in-flight marker behind.
+	// /play then short-circuits on that marker without ever calling directdl and answers 202
+	// "downloading" for a release Premiumize already HOLDS — unplayable for the marker's life, with no
+	// Status API to rescue it. A read-only route stranded a release by writing add-path memory, which is
+	// the contract recordRefusalFor exists to state; the commit that widened the gate above fixed that
+	// contract for Real-Debrid and missed the store it had just widened.
+	if !t.NoAdd {
+		noteAddAttempt(s.cache, ServicePremiumize, s.token, t.InfoHash)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		// The third store gets the same rule. Its ordering already answered 202 from the marker, so the
@@ -3143,7 +3196,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 				noteUnknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
 			}
 		} else {
-			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
+			recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, err, t.NoAdd)
 		}
 		return "", err
 	}
@@ -3183,14 +3236,14 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		if storeRefusedUs(resp.StatusCode) {
 			refused := &StoreUnavailableError{Service: ServicePremiumize, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("directdl http %d%s", resp.StatusCode, detail)}
-			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
+			recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, refused, t.NoAdd)
 			return "", refused
 		}
 		// Backed off for the same reason RD's twin is: without it a poll loop re-asks a magnet Premiumize
 		// has already rejected once every couple of seconds for as long as the viewer sits there. The
 		// answer to this poll stays a dead link so the client can fall through to another release.
 		dead := &DeadLinkError{fmt.Sprintf("premiumize directdl http %d%s", resp.StatusCode, detail)}
-		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
+		recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, dead, t.NoAdd)
 		return "", dead
 	}
 	// Premiumize accepted it. Same reason as RD: no Status endpoint, so without this the next poll
@@ -3242,7 +3295,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			dead = &DeadLinkError{"premiumize directdl: " +
 				strings.TrimSpace(redactToken(body.Status, s.token)+" "+msg[:min(len(msg), 200)])}
 		}
-		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
+		recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, dead, t.NoAdd)
 		return "", dead
 	}
 	if len(body.Content) == 0 {

@@ -841,6 +841,82 @@ func TestProbeAndPlay_agreeWhenAPremiumizeTransferCompletes(t *testing.T) {
 	}
 }
 
+// A read-only probe poll must not write Premiumize's ADD-path in-flight marker.
+//
+// The NoAdd gate was widened so the probe could see a queued transfer finish, and everything below that
+// gate is add-path bookkeeping. A probe runs on the client's context under statusBudget and clients
+// cancel aggressively, so a cut-off poll left a ninety-second marker behind — and /play then
+// short-circuits on that marker WITHOUT calling directdl, answering 202 "downloading" for a release
+// Premiumize already holds. Unplayable for the marker's life, with no Status API to clear it.
+//
+// A read-only route stranding a release by writing add-path memory is exactly the contract
+// recordRefusalFor states, and the commit that widened this gate fixed that contract for Real-Debrid
+// while missing the store it had just widened.
+func TestProbe_aReadOnlyPollWritesNoPremiumizeAddMemory(t *testing.T) {
+	token, hash := "pm-readonly", repeat("1", 40)
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+
+	s := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return nil, context.Canceled // the poll is cut off mid-call, as a focus change does
+		}}}
+
+	_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: hash, NoAdd: true})
+
+	if addOutcomeUnknown(cache, ServicePremiumize, token, hash) {
+		t.Error("a read-only poll left an add-path in-flight marker — /play then answers 202 " +
+			"'downloading' without calling directdl, for a release Premiumize already holds")
+	}
+	if _, backed := backedOff(cache, ServicePremiumize, token, hash); backed {
+		t.Error("a read-only poll wrote the per-release add backoff, which it is exempt from reading")
+	}
+}
+
+// A rejected KEY outranks an add in flight, on the probe route as in every store.
+//
+// All three stores check accountBackedOff above addInFlight and say why — a dead key is not a wait. The
+// probe consulted its in-flight reporter first, so a live marker pre-empted the rejected key and the two
+// routes disagreed: /play 503 naming the debrid, ?probe=1 202 downloading, for the same release at the
+// same instant, for up to ninety seconds per outstanding add.
+func TestProbeAndPlay_agreeWhenTheAccountKeyIsRejected(t *testing.T) {
+	token, hash := "dead-key", repeat("0", 40)
+	cache := NewMemoryCache(1 << 20)
+	noteAddAttempt(cache, ServiceTorBox, token, hash)                    // an add of ours is out
+	recordRefusal(cache, ServiceTorBox, token, repeat("f", 40),          // ...and the key is rejected
+		&StoreUnavailableError{Service: ServiceTorBox, Status: http.StatusUnauthorized,
+			Reason: "createtorrent http 401"})
+
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&torBoxStore{token: token, cache: cache, api: torboxAPI,
+				client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+					return resp(200, `{"success":true,"data":[]}`), nil
+				}}}}
+		},
+	})
+	tbBlob := blob(`{"debrid":[{"service":"torbox","token":"` + token + `"}],` +
+		`"indexers":["torrentio"],"resultCap":20}`)
+	tok := encodePlayToken(PlayTarget{InfoHash: hash})
+
+	probe := httptest.NewRecorder()
+	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+tbBlob+"/play/"+tok+"?probe=1", nil))
+	play := httptest.NewRecorder()
+	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+tbBlob+"/play/"+tok, nil))
+
+	if probe.Code == http.StatusAccepted && play.Code != http.StatusAccepted {
+		t.Errorf("?probe=1 says downloading (%s) while /play says %d (%s) — the viewer watches a spinner "+
+			"for a release nothing is fetching, on an account whose key needs replacing",
+			strings.TrimSpace(probe.Body.String()), play.Code, strings.TrimSpace(play.Body.String()))
+	}
+	if probe.Code != play.Code {
+		t.Errorf("?probe=1 = %d (%s), /play = %d (%s) — one vocabulary, two answers",
+			probe.Code, strings.TrimSpace(probe.Body.String()),
+			play.Code, strings.TrimSpace(play.Body.String()))
+	}
+}
+
 // A refusal SCOUT made must not read as "nothing is queued".
 //
 // recordRefusal excludes errScoutSide on purpose — scout's own ceiling is not the debrid declining, and

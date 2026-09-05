@@ -943,6 +943,19 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// URL the client polls to draw its progress bar. TorBox self-heals once its 15s miss marker lapses
 	// AND the add landed; Real-Debrid and Premiumize have no Status at all, so nothing clears it and the
 	// disagreement stands the full 90s addAttemptTTL.
+	// A rejected KEY outranks an add of ours being in flight, which is the order all three stores use and
+	// state: a dead key is not a wait. Consulted below AddInFlight, a live marker pre-empted it and the
+	// probe answered 202 "downloading" where /play answered 503 naming the debrid — for the same release
+	// at the same instant, for up to the marker's ninety seconds per outstanding add.
+	//
+	// Account-level only, deliberately. The per-release backoff belongs below the in-flight branch, where
+	// RecentRefusal reads it, because that one is an add-path guard a read-only caller is exempt from.
+	if svc, reason, refused := pool.AccountRefusal(); refused {
+		log.Printf("scout: probe %s → 503, %s refused the account (%s)", shortHash(infoHash), svc, reason)
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
+		return
+	}
 	if pool.AddInFlight(infoHash) {
 		log.Printf("scout: probe %s → 202, an add is already in flight", shortHash(infoHash))
 		writeQueued(w, infoHash, StoreStatus{})
