@@ -1308,7 +1308,10 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		// Cut at the two decode sites that now split type errors from blips: the same call that must
 		// memoise a wrong-typed field must still retry a body that simply stopped.
 		{"mid-entry", `{"success":true,"data":[{"id":1,"ha`},
-		{"mid-success", `{"suc`},
+		// Cut inside the VALUE, not the key. `{"suc` looks like it exercises the success decode and does
+		// not: the key token above fails first and returns before the decode is ever reached, so the
+		// site's retry direction went unpinned and memoising every error there passed the whole suite.
+		{"mid-success", `{"success":tru`},
 	} {
 		n := 0
 		s := &torBoxStore{token: "cut-" + cut.name, api: torboxAPI, cache: NewMemoryCache(1 << 20),

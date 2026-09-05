@@ -1776,21 +1776,31 @@ const (
 
 // listingFaultFor splits a decode error into the kind worth remembering and the kind worth retrying.
 //
-// The line is drawn by measurement, not by guessing which errors look serious. Every way a body can stop
-// early — cut mid-key, mid-number, mid-string, after a comma — returns io.ErrUnexpectedEOF, and every way
-// a COMPLETE body can be wrong returns one of the two below: a type error for the right JSON of the wrong
-// shape (`id` as a string), a syntax error for JSON that is not valid at all (a leading-zero number, a
-// trailing comma, an unquoted key, a bad escape). Nothing that was merely truncated produces either.
+// The line is drawn by measurement, not by guessing which errors look serious. Truncation INSIDE an
+// object or a string — cut mid-key, mid-number, mid-string, after a comma — returns io.ErrUnexpectedEOF,
+// and a COMPLETE body that is wrong returns one of the two below: a type error for valid JSON of the
+// wrong shape (`id` as a string), a syntax error for JSON that is not valid at all (a leading-zero
+// number, a trailing comma, an unquoted key, a bad escape). Both are deterministic — the same bytes
+// arrive next poll and fail the same way — and re-fetching them is the guaranteed waste, 45 fetches and
+// up to 538 MiB per wait, that every other deterministic fault here is memoised to avoid.
 //
-// So both are deterministic: the same bytes arrive next poll and fail the same way, and re-fetching them
-// is the guaranteed waste — 45 fetches and up to 538 MiB per wait — that every other deterministic fault
-// here is memoised to avoid. Anything else is a body that stopped early, and suppressing that retry is
-// how a queued torrent stops being rediscoverable.
+// One exception, measured rather than assumed: a BARE scalar cut at EOF is scanned as a complete value,
+// so `{"data":[123` reports a type error rather than an unexpected EOF and is memoised. It makes no
+// difference here, because an entry that is a bare number is a schema change whether or not the body was
+// also cut, so both readings reach the same verdict. Said plainly because an earlier version of this
+// comment claimed no truncation could produce a type error, and that is disprovable in one line.
 //
 // A syntax error could in principle come from corruption in transit rather than from the upstream, which
 // a retry would clear. Remembering it anyway costs fifteen seconds of "could not find out" — no add, no
 // miss marker — against re-pulling a body that will not parse, on a two-second cadence. Same asymmetry
 // that decides success:false.
+//
+// This runs at the two DECODE sites only, so invalid JSON elsewhere — in an unknown field, an unquoted
+// top-level key, a trailing comma in the envelope — still retries. That asymmetry is deliberate: those
+// surface as token failures, and the shape that most often produces one is an HTML error page from an
+// intermediary, which is exactly the transient case a retry should clear. Widening this to token errors
+// would memoise a proxy hiccup for fifteen seconds to save re-reading a body the upstream will probably
+// stop sending anyway.
 func listingFaultFor(err error) listingFault {
 	var typeErr *json.UnmarshalTypeError
 	var syntaxErr *json.SyntaxError
@@ -1874,9 +1884,11 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 					if err := dec.Decode(&e); err != nil {
 						// Decode fails for two unrelated reasons and they must not be collapsed. A body cut
 						// off mid-entry is a blip. An entry whose fields are the WRONG TYPE — `id` arriving
-						// as a string, `hash` as a number, an element that is a scalar — is a schema
-						// change, exactly as deterministic as the renamed `hash` this function already
-						// memoises, and exactly the v2-API shape that comment invokes.
+						// as a string, `hash` as a number, an element that is a number or a string — is a
+						// schema change, exactly as deterministic as the renamed `hash` this function
+						// already memoises, and exactly the v2-API shape that comment invokes. (A `null`
+						// element is the one scalar that decodes cleanly: it carries no hash, so it is
+						// filtered like any other unusable entry rather than reaching here.)
 						//
 						// Collapsing them put a single odd entry back on the re-fetch road: measured at 45
 						// listing fetches and up to 538 MiB per wait, on a two-second cadence, forever —
