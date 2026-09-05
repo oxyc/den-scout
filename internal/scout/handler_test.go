@@ -356,6 +356,94 @@ func TestRoutesPlay(t *testing.T) {
 	}
 }
 
+// The list cache key is scoped to the config blob, so one install never gets another's cached body.
+//
+// This is the part of that key which carries a secret. /play URLs embed the blob verbatim, and in
+// legacy plaintext mode the blob IS the debrid token, so a shared entry hands install B a list whose
+// every playback URL authenticates as install A. Dropping keyHash(configBlob) from cacheKey left the
+// whole package green.
+//
+// Asserted on the response BODY rather than on the key, so it still holds if the key is reformulated.
+func TestStream_aCachedListIsNeverServedToAnotherInstall(t *testing.T) {
+	tokenBlob := func(token string) string {
+		return blob(`{"debrid":[{"service":"torbox","token":"` + token + `"}],` +
+			`"indexers":["torrentio"],"filters":{"excludeCam":true},"cachedOnly":true,"resultCap":20}`)
+	}
+	blobA, blobB := tokenBlob("tb-aaa"), tokenBlob("tb-bbb")
+
+	h := NewHandler(testDeps(nil))
+
+	// A first, so its list is the entry sitting in the cache when B asks for the same title.
+	if n := streamsLen(do(h, "/"+blobA+"/stream/movie/tt44.json", nil)); n == 0 {
+		t.Fatal("install A got no streams, so there is nothing cached for B to be served")
+	}
+	rrB := do(h, "/"+blobB+"/stream/movie/tt44.json", nil)
+	if n := streamsLen(rrB); n == 0 {
+		t.Fatal("install B got no streams")
+	}
+	if body := rrB.Body.String(); strings.Contains(body, blobA) {
+		t.Error("install B was served install A's cached list: its /play URLs carry A's config blob, " +
+			"which in legacy plaintext mode is A's debrid token")
+	}
+	if body := rrB.Body.String(); !strings.Contains(body, blobB) {
+		t.Error("install B's /play URLs do not carry its own config blob")
+	}
+}
+
+// A client disconnect must not cancel the shared build.
+//
+// Stremio routinely races and cancels addon requests, and the build is behind a singleflight, so a
+// cancelled LEADER takes its followers down with it: an indexer that had not answered yet returns
+// context.Canceled, the partial list that remains is cached for the list TTL, and every follower is
+// served it. handleStream detaches the build with context.WithoutCancel for exactly this reason, and
+// replacing that with r.Context() left the whole package green.
+//
+// Asserted on what the scraper SEES rather than on the resulting list, because the damage is done by
+// the time a list can be inspected, and because a partial build is not distinguishable from a slow one
+// after the fact.
+func TestStream_aClientDisconnectDoesNotCancelTheSharedBuild(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var seenByScraper error
+
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{
+				fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+					return testSeeds(), nil
+				}},
+				fakeScraper{"comet", func(ctx context.Context) ([]RawStream, error) {
+					close(entered)
+					<-release // the request is cancelled while this indexer is still working
+					seenByScraper = ctx.Err()
+					return nil, nil
+				}},
+			}
+		}
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet,
+		"https://scout.example/"+validBlob+"/stream/movie/tt46.json", nil).WithContext(ctx)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	<-entered
+	cancel() // the client goes away mid-scrape
+	close(release)
+	<-done
+
+	if seenByScraper != nil {
+		t.Errorf("the scrape saw %v after the client disconnected — the build is riding the request "+
+			"context, so a cancelled leader yields a partial list that is cached and served to every "+
+			"singleflight follower", seenByScraper)
+	}
+}
+
 func streamsLen(rr *httptest.ResponseRecorder) int {
 	var body struct {
 		Streams []json.RawMessage `json:"streams"`

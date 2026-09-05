@@ -77,7 +77,8 @@ to a rounding error, and the refusal is remembered rather than retried — see t
 note that the same shape nested inside `data[]` already lands on `listingBadEnvelope` through
 `encoding/json`'s own 10,000-level ceiling. It is called out here because the first mitigation below was
 written as if it covered this shape and does not: at a 32 MiB cap the nesting case still peaks at
-701 MiB.
+**700 MiB or more**. That one is bimodal — 700 MiB or 847 MiB depending on whether the sampler catches
+the token stack's doubling copy — so treat 700 as a floor rather than a value.
 
 Three ways out for the huge-scalar case, none free:
 

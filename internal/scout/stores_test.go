@@ -141,7 +141,14 @@ func TestTorBoxBingeCacheAndNoPoison(t *testing.T) {
 		t.Errorf("binge cache: creates=%d lists=%d dls=%d (want 1,1,2)", creates, lists, dls)
 	}
 
-	// no-poison (#3): a failed mylist must not cache files:[] and mis-serve later episodes.
+	// The READ half of #3: an entry with no file list is skipped rather than served, so a pack whose
+	// list never succeeded re-lists on the next episode instead of mis-serving from an empty one.
+	//
+	// This covers stores.go's warm-entry guard (`!needFiles || len(e.Files) > 0`) and NOTHING ELSE.
+	// It was named for the write guard at the bottom of resolveHeldTorrent and does not reach it: the
+	// list fails on the FIRST resolve here, so there is no good entry to overwrite and the write guard
+	// is never the thing that keeps this green. TestTorBox_aFailedListDoesNotPoisonAWarmPackEntry is
+	// the one that pins the write side.
 	lists2 := 0
 	d2 := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 		switch {
@@ -160,6 +167,74 @@ func TestTorBoxBingeCacheAndNoPoison(t *testing.T) {
 	_, _ = s2.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
 	if lists2 != 2 {
 		t.Errorf("no-poison: mylist should be retried (got %d, want 2)", lists2)
+	}
+}
+
+// A failed mylist must not overwrite a GOOD pack entry with files:[], poisoning the pack for six hours.
+//
+// The write guard this pins (`s.cache != nil && (!needFiles || len(files) > 0)`, at the bottom of
+// resolveHeldTorrent) was previously named only by the no-poison half above, which cannot see it: that
+// fixture fails its first list, so no good entry exists to be overwritten and its assertion is satisfied
+// by the READ guard one branch up. Removing the write guard left the whole package green.
+//
+// Reaching the write guard while a warm entry exists is the whole difficulty, because the warm entry is
+// what the fast path serves from. The way through is a link request that fails WITHOUT being a store
+// outage: success:false is a DeadLinkError, and only a StoreUnavailableError returns early there, so it
+// falls through to the held path — which lists, blips, and would write the empty list.
+func TestTorBox_aFailedListDoesNotPoisonAWarmPackEntry(t *testing.T) {
+	creates, lists := 0, 0
+	listOK, dlOK := true, true
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			creates++
+			return resp(200, `{"data":{"torrent_id":9}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			lists++
+			if !listOK {
+				return resp(500, "boom"), nil
+			}
+			return resp(200, `{"data":{"files":[`+
+				`{"id":0,"name":"S01E01.mkv","size":10},`+
+				`{"id":1,"name":"S01E02.mkv","size":20},`+
+				`{"id":2,"name":"S01E03.mkv","size":30}]}}`), nil
+		case strings.Contains(r.URL.Path, "requestdl"):
+			if !dlOK {
+				return resp(200, `{"success":false}`), nil // a dead link, NOT a store outage
+			}
+			return resp(200, `{"success":true,"data":"https://cdn/`+r.URL.Query().Get("file_id")+`"}`), nil
+		}
+		return resp(404, "{}"), nil
+	}}
+	s := &torBoxStore{token: "t", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
+	ep := func(n int) ResolveTarget {
+		return ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(n)}
+	}
+
+	// Warm the pack entry with a real file list.
+	if link, err := s.Resolve(context.Background(), ep(1)); err != nil || link != "https://cdn/0" {
+		t.Fatalf("warming the pack: link=%q err=%v", link, err)
+	}
+
+	// A poll whose link request fails falls through to the held path, where the list blips. The warm
+	// entry must survive that.
+	listOK, dlOK = false, false
+	if _, err := s.Resolve(context.Background(), ep(2)); err == nil {
+		t.Fatal("a blipped list with no usable file list should refuse rather than guess an episode")
+	}
+
+	// The proof: a later episode still resolves from the warm entry, without re-listing.
+	listOK, dlOK = true, true
+	link, err := s.Resolve(context.Background(), ep(3))
+	if err != nil || link != "https://cdn/2" {
+		t.Errorf("after the blip: link=%q err=%v, want the pack entry to still pick S01E03", link, err)
+	}
+	if lists != 2 {
+		t.Errorf("mylist called %d times, want 2 (the warm list and the blip) — the blip overwrote the "+
+			"good entry with an empty file list, so the pack had to be listed again", lists)
+	}
+	if creates != 1 {
+		t.Errorf("createtorrent called %d times, want 1", creates)
 	}
 }
 
@@ -1316,6 +1391,12 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		// not: the key token above fails first and returns before the decode is ever reached, so the
 		// site's retry direction went unpinned and memoising every error there passed the whole suite.
 		{"mid-success", `{"success":tru`},
+		// Cut inside an UNKNOWN top-level field, which is the one place that reaches skipValue. Its two
+		// failures share a return and must not share a verdict: past maxSkipDepth is a property of the
+		// body and is memoised, while running out of brackets mid-walk is the ordinary blip. Without
+		// this fixture the whole suite stayed green with skipValue's token-error branch reporting
+		// tooDeep, i.e. with a truncated body memoised for the TTL.
+		{"mid-walk in an unknown field", `{"success":true,"x":[[`},
 	} {
 		n := 0
 		s := &torBoxStore{token: "cut-" + cut.name, api: torboxAPI, cache: NewMemoryCache(1 << 20),
@@ -1440,7 +1521,7 @@ func TestDecodeListing_entriesDoNotInheritFromTheEntryBefore(t *testing.T) {
 // bracket, and it is live rather than garbage — GOMEMLIMIT cannot reclaim it. Unbounded, 10 MiB of `[`
 // peaked at ~231 MiB against a 230 MiB limit, on a body a sixth of the byte cap. This is a different
 // mechanism from the huge-scalar case in FOLLOWUP.md, and lowering the byte cap does not fix it: at a
-// 32 MiB cap the same shape still peaks at 701 MiB.
+// 32 MiB cap the same shape still peaks at 700 MiB or more.
 func TestSkipValue_refusesRunawayNesting(t *testing.T) {
 	deep := `{"success":true,"x":` + strings.Repeat("[", 1<<20)
 
@@ -1528,9 +1609,9 @@ func TestDecodeListing_doesNotRetainTheBody(t *testing.T) {
 	// allocates 1.06x the body here; buffering the same field into a json.RawMessage allocates 3.7x.
 	//
 	// 1.06x is this FIXTURE, not the walk. Token allocates once per token, so the ratio tracks token
-	// density: the same 24 MiB written as a flat object of small fields measures 20.75x. The 6 KB strings
-	// below keep the walk's own cost near the body size, which is what makes a 2x ceiling meaningful
-	// against the 3.7x buffering form rather than a number that happens to pass.
+	// density: the same 24 MiB written as small tokens measures 13x to 37x depending on how tightly they
+	// are packed. The 6 KB strings below keep the walk's own cost near the body size, which is what makes
+	// a 2x ceiling meaningful against the 3.7x buffering form rather than a number that happens to pass.
 	var skipped strings.Builder
 	skipped.WriteString(`{"success":true,"unknown_field":[`)
 	for i := 0; skipped.Len() < 24<<20; i++ {
