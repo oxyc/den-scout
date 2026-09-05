@@ -1411,8 +1411,8 @@ func TestEscalatedStatusCtx_cannotOutliveTheResolveBudget(t *testing.T) {
 	if !has {
 		t.Fatal("the escalated context carries no deadline")
 	}
-	if left := time.Until(got); left > escalatedStatusBudget {
-		t.Errorf("escalated read got %v, want no more than the %v ceiling", left, escalatedStatusBudget)
+	if left := time.Until(got); left > statusBudget {
+		t.Errorf("escalated read got %v, want no more than the %v ceiling", left, statusBudget)
 	}
 	parentDeadline, _ := parent.Deadline()
 	if got.After(parentDeadline) {
@@ -1420,7 +1420,7 @@ func TestEscalatedStatusCtx_cannotOutliveTheResolveBudget(t *testing.T) {
 	}
 
 	// Too little left to do the add afterwards: declined, so the resolve keeps what remains.
-	tight, tightCancel := context.WithTimeout(context.Background(), escalatedStatusBudget)
+	tight, tightCancel := context.WithTimeout(context.Background(), statusBudget)
 	defer tightCancel()
 	if _, c, ok := escalatedStatusCtx(tight); ok {
 		if c != nil {

@@ -2,7 +2,9 @@ package scout
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -235,6 +237,8 @@ type fakeStore struct {
 	checkErr error
 	resolve  func() (string, error)
 	status   *StoreStatus
+	// statusBlocks makes Status outlast whatever budget it is given, the way a slow account listing does.
+	statusBlocks bool
 }
 
 func (f fakeStore) Service() DebridService { return f.svc }
@@ -242,7 +246,11 @@ func (f fakeStore) CacheCheck(context.Context, []string) (map[string]bool, error
 	return f.check, f.checkErr
 }
 func (f fakeStore) Resolve(context.Context, ResolveTarget) (string, error) { return f.resolve() }
-func (f fakeStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+func (f fakeStore) Status(ctx context.Context, _ ResolveTarget) (StoreStatus, bool) {
+	if f.statusBlocks {
+		<-ctx.Done()
+		return StoreStatus{}, false
+	}
 	if f.status == nil {
 		return StoreStatus{}, false
 	}
@@ -413,5 +421,124 @@ func TestTorBoxRemembersTorrentIDForQueuedEpisode(t *testing.T) {
 	}
 	if _, ok := cache.Get(torrentIDKey("t", H)); !ok {
 		t.Error("the torrent id must be remembered so Status can report the download")
+	}
+}
+
+// A store that could not answer is not a store saying "no", and the pool has to report the difference.
+//
+// Inferring it from the caller's own clock does not work once the budget is sliced per store: store 0 can
+// burn its slice and time out while the pool still returns long before the caller's deadline. "Did my
+// whole budget elapse" was then false exactly when a store HAD failed to answer, so /play queued a second
+// copy of a torrent store 0 was already fetching — the bug the escalation exists to prevent, reappearing
+// for every multi-account install.
+func TestStorePoolStatus_reportsWhenAStoreCouldNotAnswer(t *testing.T) {
+	wedged := fakeStore{svc: ServiceTorBox, status: nil, statusBlocks: true}
+	silent := fakeStore{svc: ServiceRealDebrid} // answers at once: "not downloading"
+
+	// One store that runs out of time → indeterminate, even though the pool returns early.
+	pool := &StorePool{stores: []Store{wedged, silent}}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, ok, unknown := pool.Status(ctx, ResolveTarget{InfoHash: H})
+	if ok {
+		t.Fatal("a wedged store reported a download")
+	}
+	if !unknown {
+		t.Error("a store that ran out of time was reported as a definitive 'not downloading'")
+	}
+	if elapsed := time.Since(start); elapsed >= 80*time.Millisecond {
+		t.Errorf("the first store consumed the whole budget (%v) — the slices are not being applied", elapsed)
+	}
+
+	// Every store answering promptly → a real answer, not indeterminate.
+	clean := &StorePool{stores: []Store{silent, silent}}
+	cctx, ccancel := context.WithTimeout(context.Background(), time.Second)
+	defer ccancel()
+	if _, ok, unknown := clean.Status(cctx, ResolveTarget{InfoHash: H}); ok || unknown {
+		t.Errorf("prompt answers reported ok=%v unknown=%v, want false/false", ok, unknown)
+	}
+}
+
+// The account listing is decoded element by element, so its size bounds time and not memory — which is
+// what makes the larger cap safe. A body past the cap must read as "no answer", never as "the account
+// holds nothing", because the second costs a duplicate add.
+func TestFetchAccountListing_streamsAndDetectsTruncation(t *testing.T) {
+	var big strings.Builder
+	big.WriteString(`{"success":true,"data":[`)
+	for i := 0; i < 3000; i++ {
+		if i > 0 {
+			big.WriteString(",")
+		}
+		// Each entry carries a large junk field, exactly what makes a real listing big.
+		fmt.Fprintf(&big, `{"id":%d,"hash":"%040x","files":"%s"}`, i, i, repeat("f", 400))
+	}
+	big.WriteString(`]}`)
+
+	ids, ok := decodeListing(json.NewDecoder(strings.NewReader(big.String())))
+	if !ok {
+		t.Fatal("a well-formed large listing was refused")
+	}
+	if len(ids) != 3000 {
+		t.Errorf("decoded %d entries, want 3000", len(ids))
+	}
+	if got := ids[fmt.Sprintf("%040x", 7)]; got != 7 {
+		t.Errorf("hash→id mapping wrong: %d", got)
+	}
+
+	// Truncation is detectable, and must not look like an empty account.
+	td := &truncationDetector{r: io.LimitReader(strings.NewReader(big.String()), 1<<10), limit: 1 << 10}
+	if _, ok := decodeListing(json.NewDecoder(td)); ok {
+		t.Error("a truncated listing decoded as a valid answer")
+	}
+	if !td.truncated() {
+		t.Error("truncation went undetected — it would read as 'this account holds nothing'")
+	}
+
+	// An envelope with no data key is not a claim about the account either.
+	if _, ok := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true}`))); ok {
+		t.Error("a listing with no data key was treated as authoritative")
+	}
+	if _, ok := decodeListing(json.NewDecoder(strings.NewReader(`{"success":false,"data":[]}`))); ok {
+		t.Error("success:false was treated as authoritative")
+	}
+	// An explicitly empty account IS an answer.
+	if ids, ok := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true,"data":[]}`))); !ok || len(ids) != 0 {
+		t.Errorf("an empty account should be a real answer: ok=%v n=%d", ok, len(ids))
+	}
+}
+
+// A listing larger than the ordinary store cap still parses, because the account listing has its own.
+//
+// 4 MiB truncates a real large account (~13 MB at 2,000 torrents), and a truncated listing read back as
+// "this account holds nothing" — so /play queued a second copy of a torrent already downloading. The
+// fixture sits between the two caps deliberately: it fails under maxStoreBytes and passes under
+// maxListingBytes, which is the only way this asserts the cap and not just the decoder.
+func TestFetchAccountListing_largeAccountIsNotTruncated(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(`{"success":true,"data":[`)
+	for i := 0; body.Len() < 6<<20; i++ {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		fmt.Fprintf(&body, `{"id":%d,"hash":"%040x","files":"%s"}`, i, i, repeat("f", 2000))
+	}
+	body.WriteString(`]}`)
+	if body.Len() <= maxStoreBytes {
+		t.Fatalf("fixture is %d bytes, not past the %d ordinary cap", body.Len(), maxStoreBytes)
+	}
+	if body.Len() >= maxListingBytes {
+		t.Fatalf("fixture is %d bytes, past even the %d listing cap", body.Len(), maxListingBytes)
+	}
+
+	s := &torBoxStore{token: "t", api: torboxAPI, client: mockDoer{func(*http.Request) (*http.Response, error) {
+		return resp(200, body.String()), nil
+	}}}
+	ids, ok := s.fetchAccountListing(context.Background())
+	if !ok {
+		t.Fatal("a large but legitimate account listing was refused — it reads back as 'holds nothing'")
+	}
+	if len(ids) < 100 {
+		t.Errorf("decoded only %d entries from a %d-byte listing", len(ids), body.Len())
 	}
 }

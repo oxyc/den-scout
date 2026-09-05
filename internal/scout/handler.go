@@ -68,44 +68,39 @@ const (
 // outside a test changes it.
 var statusBudget = 8 * time.Second
 
-// escalatedStatusBudget is the ONE extra status read a /play gets when the first one timed out and the
-// alternative is queueing a torrent that may already be downloading.
-//
-// Twice the ordinary budget, because the case this exists for was measured at a nine-second account
-// listing — one that a second eight-second read would time out on just as surely. Still nowhere near the
-// forty-five seconds the poll-latency rule in handler_test.go forbids, and paid only on the rare path
-// that is about to spend an add.
-var escalatedStatusBudget = 2 * statusBudget
-
 // deadlinePassed reports whether a context's deadline is in the past.
 //
-// Used instead of ctx.Err() wherever the answer decides something, because the two are NOT equivalent:
+// Used instead of ctx.Err() where the answer decides something, because the two are NOT equivalent:
 // Err() is set by the context's timer goroutine, so between the deadline passing and that timer running
-// there is a window where the deadline is gone and Err() is still nil. StorePool.Status declines to ask
-// a store once the budget is spent, and it makes that call on the clock — so handlePlay asking Err()
-// disagreed with it inside that window, skipped the escalation, and queued the add the escalation exists
-// to prevent. Roughly one run in thirty, which is exactly the kind of thing that never reproduces on the
-// machine where it is reported. Both sides ask the same question now.
+// there is a window where the deadline is gone and Err() is still nil. Asking Err() on one side of a
+// decision and the clock on the other let them disagree inside that window.
 func deadlinePassed(ctx context.Context) bool {
 	deadline, ok := ctx.Deadline()
 	return ok && !time.Now().Before(deadline)
 }
 
-// escalatedStatusCtx carves that read out of the RESOLVE budget rather than adding to it, and declines
-// when too little is left to do the add afterwards.
+// escalatedStatusCtx is the ONE extra status read a /play gets when the first could not answer and the
+// alternative is queueing a torrent that may already be downloading.
 //
-// Parented to the resolve context on purpose: a sibling context with its own deadline can outlive it, and
-// that is exactly how the first version of this made the add impossible. Requiring twice the budget to
-// remain leaves the resolve at least as long as the escalation costs.
+// Carved OUT of the resolve budget rather than added to it, and parented to it, because a sibling context
+// with its own deadline outlives it — which is how an earlier version burned the whole 45 seconds, handed
+// the resolve a dead context, and made the add impossible. It declines unless twice the budget remains,
+// so the resolve keeps at least as long as the escalation costs.
+//
+// One statusBudget, not two. The rule in handler_test.go is that a read on the poll route carries no more
+// than statusBudget, and giving this one double quietly broke that rule while the test that asserts it
+// looked away — its fixture answers instantly, so the escalation never fired under it. Worst-case poll
+// latency is therefore two short reads rather than one, and every individual read still obeys the rule.
+// The large-account case this was really for is fixed where it belongs, in the listing decode.
 func escalatedStatusCtx(parent context.Context) (context.Context, context.CancelFunc, bool) {
 	deadline, ok := parent.Deadline()
 	if !ok {
 		return nil, nil, false
 	}
-	if time.Until(deadline) < 2*escalatedStatusBudget {
+	if time.Until(deadline) < 2*statusBudget {
 		return nil, nil, false
 	}
-	ctx, cancel := context.WithTimeout(parent, escalatedStatusBudget)
+	ctx, cancel := context.WithTimeout(parent, statusBudget)
 	return ctx, cancel, true
 }
 
@@ -873,7 +868,7 @@ func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 // is true — which here means "nothing has been queued", not "this release is dead".
 func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config *Config, pool *StorePool,
 	infoHash string, rt ResolveTarget) {
-	if status, ok := pool.Status(ctx, rt); ok {
+	if status, ok, _ := pool.Status(ctx, rt); ok {
 		writeQueued(w, infoHash, status)
 		return
 	}
@@ -988,7 +983,8 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// three siblings already agreed; this was the third.
 	statusCtx, statusCancel := context.WithTimeout(r.Context(), statusBudget)
 	defer statusCancel()
-	if status, ok := pool.Status(statusCtx, rt); ok {
+	status, ok, unknown := pool.Status(statusCtx, rt)
+	if ok {
 		writeQueued(w, target.InfoHash, status)
 		return
 	}
@@ -1018,10 +1014,14 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// is short, and it is skipped entirely unless enough budget remains to do the add afterwards. If it
 	// still cannot tell, the resolve proceeds and may add — because a duplicate add is a bounded,
 	// self-healing cost, and never starting the download is not.
-	if deadlinePassed(statusCtx) {
+	// Asked of the POOL, not inferred from this function's clock. The pool gives each store a slice of the
+	// budget, so a store can time out while the pool still returns long before the caller's deadline —
+	// "did my whole budget elapse" was false exactly when a store had failed to answer, which is the case
+	// this branch exists for. The pool knows which store ran out of time, so it is the one that says.
+	if unknown {
 		if slowCtx, slowCancel, ok := escalatedStatusCtx(ctx); ok {
 			defer slowCancel()
-			if status, ok := pool.Status(slowCtx, rt); ok {
+			if status, ok, _ := pool.Status(slowCtx, rt); ok {
 				log.Printf("scout: play %s → 202, status needed longer than %s to answer",
 					shortHash(target.InfoHash), statusBudget)
 				writeQueued(w, target.InfoHash, status)
@@ -1051,7 +1051,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// wait into a 404.
 		statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(r.Context()), statusBudget)
 		defer statusCancel()
-		if status, ok := pool.Status(statusCtx, rt); ok {
+		if status, ok, _ := pool.Status(statusCtx, rt); ok {
 			writeQueued(w, target.InfoHash, status)
 			return
 		}

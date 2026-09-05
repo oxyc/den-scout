@@ -1356,42 +1356,121 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	if resp.StatusCode != http.StatusOK {
 		return nil, false
 	}
-	var body struct {
-		Success *bool `json:"success"`
-		Data    *[]struct {
-			ID   int    `json:"id"`
-			Hash string `json:"hash"`
-		} `json:"data"`
-	}
 	// The ACCOUNT LISTING gets its own, much larger cap, and it is the only read that does.
 	//
 	// 4 MiB truncates a real large account: the comment above this function already measured ~13 MB at
 	// 2,000 torrents and called it "close enough to the 4 MiB parse cap that answers would start being
 	// dropped". They are dropped — the decode fails in milliseconds, `Status` answers "nobody is fetching
-	// it", and /play queues a second copy of a torrent already downloading. That is the very failure the
-	// status escalation in handler.go was written for, and the escalation cannot help with it: this is a
-	// SIZE failure, not a slow one, so nothing ever times out.
+	// it", and /play queues a second copy of a torrent already downloading. A SIZE failure, not a slow
+	// one, so no timeout-based guard can see it.
 	//
-	// Safe to raise because this decode STREAMS and throws almost everything away — the struct below
-	// keeps two fields, so what is retained is a hash→id map sized by the torrent count (~100 KB at 2,000
-	// torrents), not the body. The read is also singleflighted and memoised for listingTTL, so at most one
-	// is ever in flight per account.
-	if json.NewDecoder(io.LimitReader(resp.Body, maxListingBytes)).Decode(&body) != nil {
+	// Decoded ELEMENT BY ELEMENT rather than into one big slice, which is what makes the larger cap safe.
+	// An earlier version raised the cap and claimed `Decode` streams — it does not: encoding/json buffers
+	// the entire top-level value and then materialises the whole []struct before anything reduces it.
+	// Measured at 2.1x the body, so a 60 MiB listing peaked at 128.9 MiB and two concurrent ones at
+	// 212 MiB, against a 230 MiB GOMEMLIMIT in a 256 MB container. Walking the array with Token/More
+	// keeps only the hash→id map, which is sized by the torrent count (~100 KB at 2,000) and not by the
+	// body. The read is singleflighted and memoised for listingTTL, but per TOKEN — two accounts do not
+	// collapse into one — so the per-call ceiling is what has to be small.
+	limited := &truncationDetector{r: io.LimitReader(resp.Body, maxListingBytes), limit: maxListingBytes}
+	ids, ok := decodeListing(json.NewDecoder(limited))
+	if limited.truncated() {
+		// Silent truncation is the failure this whole comment is about: it reads back as "the account
+		// holds nothing" and costs a duplicate add, with nothing anywhere saying the account simply
+		// outgrew the cap. Raising the cap moved that cliff to ~10,000 torrents rather than removing it.
+		log.Printf("scout: torbox account listing exceeded %d bytes and was truncated — treating it as no "+
+			"answer rather than as an empty account", maxListingBytes)
 		return nil, false
 	}
-	// No list, no verdict. A 200 carrying no `data` key at all, or an explicit success:false, is not the
-	// account saying it holds nothing — it is TorBox's envelope missing, and listFiles reads exactly the
-	// same body as silence ("not a claim about the account"). Calling it authoritative wrote a 15s miss
-	// marker that then suppressed the only lookup able to rediscover a queued torrent.
-	if body.Data == nil || (body.Success != nil && !*body.Success) {
+	return ids, ok
+}
+
+// decodeListing walks `{"success":…,"data":[{id,hash},…]}` and keeps only the hash→id map.
+//
+// Returns ok=false for anything it cannot read as a list. No list, no verdict: a 200 carrying no `data`
+// key at all, or an explicit success:false, is not the account saying it holds nothing — it is TorBox's
+// envelope missing, and listFiles reads exactly the same body as silence ("not a claim about the
+// account"). Calling that authoritative wrote a 15s miss marker that then suppressed the only lookup able
+// to rediscover a queued torrent.
+func decodeListing(dec *json.Decoder) (map[string]int, bool) {
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
 		return nil, false
 	}
-	ids := make(map[string]int, len(*body.Data))
-	for _, e := range *body.Data {
-		ids[strings.ToLower(e.Hash)] = e.ID
+	success := true
+	var ids map[string]int
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		switch key {
+		case "success":
+			var v *bool
+			if dec.Decode(&v) != nil {
+				return nil, false
+			}
+			if v != nil {
+				success = *v
+			}
+		case "data":
+			// A null `data` is the envelope-missing case and must stay distinct from an empty array.
+			if dec.More() {
+				open, err := dec.Token()
+				if err != nil {
+					return nil, false
+				}
+				if open == nil {
+					continue // explicit null
+				}
+				if open != json.Delim('[') {
+					return nil, false
+				}
+				ids = map[string]int{}
+				for dec.More() {
+					var e struct {
+						ID   int    `json:"id"`
+						Hash string `json:"hash"`
+					}
+					if dec.Decode(&e) != nil {
+						return nil, false
+					}
+					ids[strings.ToLower(e.Hash)] = e.ID
+				}
+				if _, err := dec.Token(); err != nil { // closing ]
+					return nil, false
+				}
+			}
+		default:
+			// Every other field — including the per-torrent file lists that make this body large — is
+			// skipped without being retained.
+			var skip json.RawMessage
+			if dec.Decode(&skip) != nil {
+				return nil, false
+			}
+		}
+	}
+	if ids == nil || !success {
+		return nil, false
 	}
 	return ids, true
 }
+
+// truncationDetector reports whether a LimitReader was consumed all the way to its limit, which is the
+// only way to tell "the body ended" from "the cap cut it off" — and those two must not look alike.
+type truncationDetector struct {
+	r    io.Reader
+	n    int64
+	limit int64
+}
+
+func (t *truncationDetector) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	t.n += int64(n)
+	return n, err
+}
+
+func (t *truncationDetector) truncated() bool { return t.n >= t.limit }
 
 // errNoFileList — mylist gave no usable answer. Distinct from errTorrentGone, which is mylist ANSWERING
 // that the account no longer holds this id. Collapsing the two is what wedged a stale id: the refusal to
@@ -2694,28 +2773,41 @@ func (p *StorePool) ResolveCachedOnly(ctx context.Context, t ResolveTarget,
 //
 // Split evenly across the stores still to be asked, so an early store that answers quickly hands its
 // unused time to the rest rather than the first one taking it all.
-func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool) {
+// The third result is the one that matters to a caller deciding whether to ADD: it reports that at least
+// one store could not answer, as opposed to answering "no".
+//
+// Returning only (status, ok) forced handlePlay to infer that from its own clock, and the slicing above
+// made the two questions different: store 0 can burn its slice and time out while the pool still returns
+// well before the caller's deadline, so "did the whole budget elapse" was false and the caller queued a
+// second copy of a torrent store 0 was already fetching. That is the exact bug the escalation exists to
+// prevent, reintroduced for every multi-account install by the fix for a different one. The pool knows
+// which store ran out of time; it now says so instead of leaving it to be guessed.
+func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool, bool) {
+	unknown := false
 	for i, st := range p.stores {
 		share := ctx
 		var cancel context.CancelFunc
 		if deadline, ok := ctx.Deadline(); ok {
-			// Asked on the clock, and deliberately the SAME question handlePlay asks before it decides
-			// whether to escalate — see deadlinePassed. Using ctx.Err() on one side and the clock on the
-			// other let them disagree in the window before the context's timer fires.
-			if deadlinePassed(ctx) {
-				return StoreStatus{}, false // nothing left; asking is a round trip that cannot answer
+			if deadlinePassed(ctx) || ctx.Err() != nil {
+				// Out of time, or the caller went away. Either way the stores still unasked have not
+				// answered — which is not the same as answering no.
+				return StoreStatus{}, false, true
 			}
 			share, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(p.stores)-i))
 		}
 		status, ok := st.Status(share, t)
+		// Cut short rather than answered: its own slice ran out, or the whole call was cancelled.
+		if !ok && (share.Err() != nil || ctx.Err() != nil) {
+			unknown = true
+		}
 		if cancel != nil {
 			cancel()
 		}
 		if ok {
-			return status, true
+			return status, true, false
 		}
 	}
-	return StoreStatus{}, false
+	return StoreStatus{}, false, unknown
 }
 
 // hasCacheTruth reports whether any configured store has a real cache API (TorBox/Premiumize). When

@@ -235,19 +235,24 @@ func TestMintedCache_isBoundedByCount(t *testing.T) {
 		mintedMu.Unlock()
 	})
 
-	// Far more distinct, unexpired entries than the ceiling — all fresh, so nothing expires out.
+	// Far more distinct, unexpired entries than the ceiling — all well inside mintedTTL so nothing expires
+	// out, and all IDLE past the protect window so all of them are eviction candidates.
 	now := time.Now()
+	idleBase := now.Add(-mintedProtectWindow - time.Hour)
 	mintedMu.Lock()
 	for i := 0; i < maxMintedEntries*3; i++ {
-		// Staggered so "least recently used first" is a defined order; all well inside mintedTTL.
-		stamp := now.Add(-time.Duration(i) * time.Second)
-		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "https://comet.example/x", at: stamp, used: stamp}
+		// Staggered so "least recently used first" is a defined order.
+		stamp := idleBase.Add(-time.Duration(i) * time.Second)
+		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "https://comet.example/x", at: now, used: stamp}
 	}
-	pruneMintedLocked()
+	room := pruneMintedLocked()
 	got := len(minted)
 	_, newestKept := minted["comet:0"]
 	_, oldestKept := minted[fmt.Sprintf("comet:%d", maxMintedEntries*3-1)]
 	mintedMu.Unlock()
+	if !room {
+		t.Error("prune found no room despite every entry being idle and evictable")
+	}
 
 	if got >= maxMintedEntries {
 		t.Errorf("kept %d entries, want under the %d ceiling (with room for the insert that follows)",
@@ -300,31 +305,65 @@ func TestMintedCache_keepsTheEntriesActuallyInUse(t *testing.T) {
 
 	now := time.Now()
 	mintedMu.Lock()
-	// The operator's own: minted an hour ago, and still being handed out right now.
+	// The operator's own: minted an hour ago, and served a couple of minutes ago — idle, but well inside
+	// the protect window. Plain LRU loses exactly these, because 256 slots against a sustained flood is a
+	// sliding window over the attacker's mint rate and any real entry idle longer than it is the
+	// least-recently-used thing in the map.
 	legit := []string{"comet:real", "mediafusion:real"}
 	for _, k := range legit {
-		minted[k] = mintedConfig{url: "https://real.example/x", at: now.Add(-time.Hour), used: now}
+		minted[k] = mintedConfig{url: "https://real.example/x", at: now.Add(-time.Hour), used: now.Add(-2 * time.Minute)}
 	}
-	// A flood of freshly minted entries that nobody has come back for.
+	// A flood, every entry minted and last used moments ago.
 	for i := 0; i < maxMintedEntries*2; i++ {
 		stamp := now.Add(-time.Duration(i) * time.Millisecond)
 		minted[fmt.Sprintf("comet:flood%d", i)] = mintedConfig{url: "https://flood.example/x", at: stamp, used: stamp}
 	}
-	pruneMintedLocked()
+	room := pruneMintedLocked()
 	var survived int
 	for _, k := range legit {
 		if _, ok := minted[k]; ok {
 			survived++
 		}
 	}
-	total := len(minted)
 	mintedMu.Unlock()
 
 	if survived != len(legit) {
 		t.Errorf("%d of %d in-use entries survived a flood — the ceiling evicts the operator's own first",
 			survived, len(legit))
 	}
-	if total >= maxMintedEntries {
-		t.Errorf("kept %d entries, want under the %d ceiling", total, maxMintedEntries)
+	// Nothing was idle enough to evict, so the honest answer is "no room" — the flood simply goes
+	// uncached. An uncached mint costs the flood a recomputation; an evicted one costs a real request a
+	// round trip to mediafusion in front of its scrape, so this is the right way round.
+	if room {
+		t.Error("prune claimed room while every entry was inside the protect window")
+	}
+}
+
+// An entry idle past the protect window is evictable again, so a genuinely disused config cannot pin a
+// slot until its 12-hour TTL runs out.
+func TestMintedCache_reclaimsIdleEntries(t *testing.T) {
+	mintedMu.Lock()
+	saved := minted
+	minted = map[string]mintedConfig{}
+	mintedMu.Unlock()
+	t.Cleanup(func() {
+		mintedMu.Lock()
+		minted = saved
+		mintedMu.Unlock()
+	})
+
+	now := time.Now()
+	mintedMu.Lock()
+	for i := 0; i < maxMintedEntries+10; i++ {
+		stamp := now.Add(-mintedProtectWindow - time.Duration(i)*time.Second)
+		minted[fmt.Sprintf("comet:idle%d", i)] = mintedConfig{url: "https://x.example/x", at: now, used: stamp}
+	}
+	room := pruneMintedLocked()
+	total := len(minted)
+	mintedMu.Unlock()
+
+	if !room || total >= maxMintedEntries {
+		t.Errorf("idle entries were not reclaimed: room=%v total=%d, want room and under %d",
+			room, total, maxMintedEntries)
 	}
 }

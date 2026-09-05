@@ -149,16 +149,18 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 		// every single stream request re-POSTed to it — with its own 10 s timeout, ahead of the scrape —
 		// meaning the worse it was, the harder scout hit it. The opposite of what a limiter is for.
 		mintedMu.Lock()
-		pruneMintedLocked()
-		now := time.Now()
-		minted[key] = mintedConfig{url: "", at: now, used: now, transient: transient}
+		if pruneMintedLocked() {
+			now := time.Now()
+			minted[key] = mintedConfig{url: "", at: now, used: now, transient: transient}
+		}
 		mintedMu.Unlock()
 		return "", transient
 	}
 	mintedMu.Lock()
-	pruneMintedLocked()
-	mintedNow := time.Now()
-	minted[key] = mintedConfig{url: url, at: mintedNow, used: mintedNow}
+	if pruneMintedLocked() {
+		mintedNow := time.Now()
+		minted[key] = mintedConfig{url: url, at: mintedNow, used: mintedNow}
+	}
 	mintedMu.Unlock()
 	log.Printf("scout: minted a config for the %s indexer from the %s account", id, acct.Service)
 	return url, false
@@ -178,31 +180,47 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 // ~298 KB in total — trivial against a 230 MiB heap, and the point is the bound rather than the size.
 const maxMintedEntries = 256
 
-// pruneMintedLocked drops entries past their own TTL, then enforces the count ceiling oldest-first.
-// Expiry was only ever consulted on READ, so an entry nobody asked for again stayed resident forever.
-// Caller holds mintedMu, and is about to insert — so this leaves room for one.
-func pruneMintedLocked() {
+// How long an entry is protected from eviction after it was last handed out. A real install serves a
+// stream every few minutes; five is long enough that an idle household keeps its configs and short enough
+// that a genuinely disused entry is reclaimable well inside the 12-hour TTL.
+const mintedProtectWindow = 5 * time.Minute
+
+// pruneMintedLocked drops entries past their own TTL, then enforces the count ceiling. It reports whether
+// there is now room for one more — the caller holds mintedMu and is about to insert, and must not when
+// this says no. Expiry was only ever consulted on READ, so an entry nobody asked for again stayed
+// resident forever.
+func pruneMintedLocked() bool {
 	for k, m := range minted {
 		if time.Since(m.at) >= m.ttl() {
 			delete(minted, k)
 		}
 	}
 	if len(minted) < maxMintedEntries {
-		return
+		return true
 	}
-	// Least-recently-USED first, not oldest-minted. These are all unexpired, so something live has to go,
-	// and the one nobody has asked for in the longest time is the one to lose. Sorting by mint time
-	// instead evicted the operator's own entries preferentially — see mintedConfig.used.
+	// Least-recently-USED first, and IDLE ones only. Sorting by mint time evicted the operator's own
+	// entries preferentially (they are the oldest by construction); plain LRU then only narrowed that,
+	// because 256 slots against a sustained flood is a sliding window over the attacker's mint rate, and
+	// any real entry idle longer than that window is still the least-recently-used thing in the map.
+	// Measured: legitimate entries idle five seconds, a flood at ~100 mints a second, none survived.
+	//
+	// So an entry touched inside mintedProtectWindow is not a candidate at all. When nothing is idle
+	// enough, prune reports no room and the caller simply does not cache the new mint — the flood gets
+	// no entries rather than the install losing its own. That is the right way round: an uncached mint
+	// costs the flood a recomputation, where an evicted one costs a real request a round trip to
+	// mediafusion in front of its scrape.
 	type aged struct {
 		key  string
 		used time.Time
 	}
-	all := make([]aged, 0, len(minted))
+	idle := make([]aged, 0, len(minted))
 	for k, m := range minted {
-		all = append(all, aged{k, m.used})
+		if time.Since(m.used) >= mintedProtectWindow {
+			idle = append(idle, aged{k, m.used})
+		}
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].used.Before(all[j].used) })
-	for _, e := range all {
+	sort.Slice(idle, func(i, j int) bool { return idle[i].used.Before(idle[j].used) })
+	for _, e := range idle {
 		if len(minted) < maxMintedEntries {
 			break
 		}
@@ -213,9 +231,10 @@ func pruneMintedLocked() {
 	// memory, written while holding the mint mutex. Once a minute is enough to notice.
 	if time.Since(lastMintEvictionLog) > time.Minute {
 		lastMintEvictionLog = time.Now()
-		log.Printf("scout: minted-config cache is at its %d-entry ceiling; evicting least-recently-used",
-			maxMintedEntries)
+		log.Printf("scout: minted-config cache is at its %d-entry ceiling; evicting entries idle over %s",
+			maxMintedEntries, mintedProtectWindow)
 	}
+	return len(minted) < maxMintedEntries
 }
 
 // primaryDebrid picks the account a minted config should speak for. First configured wins — the same
