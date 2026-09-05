@@ -948,6 +948,21 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 		writeQueued(w, infoHash, StoreStatus{})
 		return
 	}
+	// A refusal SCOUT made, ranked where /play ranks it: above the store refusals below, because it is
+	// ours rather than a service's. The probe had no channel for it at all — recordRefusal excludes
+	// errScoutSide by design, so the backoff memory this route reads stays empty and the request fell
+	// through every "could not ask" guard to 404 "not queued". Measured with the hourly allowance spent:
+	// /play answered 503 scout_busy while ?probe=1 answered 404, for the same release at the same
+	// instant, for the rest of the rolling hour.
+	if pool.EveryAddRefusedByScout() {
+		log.Printf("scout: probe %s → 503 (scout-side), the hourly add allowance is spent",
+			shortHash(infoHash))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error":  "scout_busy",
+			"detail": "scout's own hourly add budget for this account is spent",
+		}, noStore)
+		return
+	}
 	if refusedUs != nil {
 		log.Printf("scout: probe %s → 503, %s %s", shortHash(infoHash), refusedUs.Service, refusedUs.Reason)
 		writeJSON(w, http.StatusServiceUnavailable,

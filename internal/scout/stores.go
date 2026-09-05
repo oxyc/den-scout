@@ -754,6 +754,49 @@ type heldTorrentReporter interface {
 	HoldsTorrent(t ResolveTarget) bool
 }
 
+// scoutBudgetReporter — a store that can say whether SCOUT's own hourly allowance for its account is
+// gone, without asking the service anything.
+type scoutBudgetReporter interface {
+	ScoutBudgetSpent() bool
+}
+
+// EveryAddRefusedByScout reports that scout's own allowance is spent on every configured account, so no
+// store could queue anything even if asked.
+//
+// It exists because a refusal SCOUT makes is invisible to the probe route otherwise. recordRefusal
+// deliberately excludes errScoutSide — scout's ceiling is not the debrid declining, and filing it as one
+// blames a healthy service — so the backoff memory the probe reads stays empty, and the route falls
+// through its three "could not ask" guards to 404 "not queued". Measured with the hourly allowance
+// spent, same release, same instant: /play answered 503 scout_busy while ?probe=1 answered 404. The
+// budget is per account and rolling, so once the ceiling is hit every uncached release on that account
+// answers that way for the rest of the hour, and 404 is the answer that makes a client blacklist them.
+func (p *StorePool) EveryAddRefusedByScout() bool {
+	asked := 0
+	for _, st := range p.stores {
+		reporter, ok := st.(scoutBudgetReporter)
+		if !ok {
+			continue
+		}
+		asked++
+		if !reporter.ScoutBudgetSpent() {
+			return false
+		}
+	}
+	return asked > 0
+}
+
+func scoutBudgetSpent(svc DebridService, token string) bool {
+	return globalAddBudget.remaining(budgetAccount(svc, token)) <= 0
+}
+
+func (s *torBoxStore) ScoutBudgetSpent() bool { return scoutBudgetSpent(ServiceTorBox, s.token) }
+func (s *realDebridStore) ScoutBudgetSpent() bool {
+	return scoutBudgetSpent(ServiceRealDebrid, s.token)
+}
+func (s *premiumizeStore) ScoutBudgetSpent() bool {
+	return scoutBudgetSpent(ServicePremiumize, s.token)
+}
+
 // HoldingServices names the stores that already have an id for this release, so it can be resolved
 // without buying anything.
 //
@@ -876,6 +919,21 @@ func (s *realDebridStore) AddInFlight(infoHash string) bool {
 func (s *premiumizeStore) AddInFlight(infoHash string) bool {
 	if addStillBelievable(s.cache, ServicePremiumize, s.token, infoHash) {
 		return true
+	}
+	// A refusal on record outranks the queue marker. directdl's answered-failure branches — an
+	// unsupported magnet, an account at its limit, "not enough space", all of which Premiumize reports
+	// as HTTP 200 with status:error — record a refusal and do NOT clear pmQueuedKey, so the marker
+	// alone kept saying "coming" for the rest of the ten-minute window while /play, which actually made
+	// the call, had the verdict and condemned the release. Measured: /play 404 then 503 on every later
+	// poll, probe 202 downloading throughout, for ten minutes. An account out of space produces that
+	// for every release it queues.
+	//
+	// Reading the refusal rather than clearing the marker on failure is deliberate: the marker also
+	// suppresses the CHARGE, and clearing it would let a persistently failing account be charged once
+	// per sixty-second backoff instead of once per twenty-minute marker. This changes only what the
+	// probe reports, which is where the defect is.
+	if _, refused := backedOff(s.cache, ServicePremiumize, s.token, infoHash); refused {
+		return false
 	}
 	return alreadyQueued(s.cache, s.token, infoHash) &&
 		!pendingTooLong(s.cache, s.token, infoHash)

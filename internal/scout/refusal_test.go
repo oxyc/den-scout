@@ -705,6 +705,107 @@ func TestProbeAndPlay_agreeAboutAPremiumizeTransferAtBothEndsOfTheWindow(t *test
 	}
 }
 
+// A queued Premiumize transfer that directdl has SINCE refused must stop reading as "downloading".
+//
+// The test above pins the marker's boolean and drives only one route, which is how this escaped: it
+// answers success-with-no-content for every call, and the disagreeing case is the one where directdl
+// answers something else. Premiumize reports an unsupported magnet, an account at its limit and "not
+// enough space" as HTTP 200 with status:error — none of those branches clears pmQueuedKey, so the
+// marker alone kept the probe at 202 for the whole ten-minute window while /play had the verdict.
+//
+// Both routes are driven here, and the assertion is that they agree.
+func TestProbeAndPlay_agreeWhenAQueuedPremiumizeTransferIsRefused(t *testing.T) {
+	token, hash := "pm-refused", repeat("5", 40)
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+
+	// The shape an account out of space returns: HTTP 200, status error.
+	client := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		return resp(200, `{"status":"error","message":"not enough space"}`), nil
+	}}
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&premiumizeStore{token: token, cache: cache, api: premiumizeAPI, client: client}}
+		},
+	})
+	pmBlob := blob(`{"debrid":[{"service":"premiumize","token":"` + token + `"}],` +
+		`"indexers":["torrentio"],"resultCap":20}`)
+	tok := encodePlayToken(PlayTarget{InfoHash: hash})
+
+	// The first /play is what gets the verdict and records it.
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok, nil))
+
+	probe := httptest.NewRecorder()
+	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
+	play := httptest.NewRecorder()
+	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok, nil))
+
+	if probe.Code == http.StatusAccepted && play.Code != http.StatusAccepted {
+		t.Errorf("?probe=1 still says 202 downloading (%s) while /play says %d (%s) — the client sits "+
+			"on a 0%% spinner for ten minutes with nothing behind it",
+			strings.TrimSpace(probe.Body.String()), play.Code, strings.TrimSpace(play.Body.String()))
+	}
+	if probe.Code != play.Code {
+		t.Errorf("?probe=1 = %d (%s), /play = %d (%s) — one vocabulary, two answers",
+			probe.Code, strings.TrimSpace(probe.Body.String()),
+			play.Code, strings.TrimSpace(play.Body.String()))
+	}
+}
+
+// A refusal SCOUT made must not read as "nothing is queued".
+//
+// recordRefusal excludes errScoutSide on purpose — scout's own ceiling is not the debrid declining, and
+// filing it as one blames a healthy service — so the backoff memory the probe reads stays empty and the
+// route fell through all three of its "could not ask" guards to 404. The budget is per account and
+// rolling, so once the ceiling is reached every uncached release on that account answers that way for
+// the rest of the hour, and 404 is the answer that makes a client blacklist a release.
+func TestProbeAndPlay_agreeWhenScoutsOwnBudgetIsSpent(t *testing.T) {
+	token, hash := "budget-"+t.Name(), repeat("4", 40)
+	// Spend the account's allowance the way a busy hour does.
+	for i := 0; i < addBudgetLimit; i++ {
+		globalAddBudget.take(budgetAccount(ServiceTorBox, token))
+	}
+
+	cache := NewMemoryCache(1 << 20)
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			// The upstream must answer DEFINITIVELY, or the probe stops at "a store could not answer"
+			// and both routes return 503 for unrelated reasons — which is a green test that proves
+			// nothing. checkcached needs a decodable object; the account listing needs a valid empty
+			// envelope so Status says "not downloading" rather than "could not find out".
+			return []Store{&torBoxStore{token: token, cache: cache, api: torboxAPI,
+				client: mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+					if strings.Contains(r.URL.Path, "checkcached") {
+						return resp(200, `{"data":{}}`), nil
+					}
+					return resp(200, `{"success":true,"data":[]}`), nil
+				}}}}
+		},
+	})
+	tbBlob := blob(`{"debrid":[{"service":"torbox","token":"` + token + `"}],` +
+		`"indexers":["torrentio"],"resultCap":20}`)
+	tok := encodePlayToken(PlayTarget{InfoHash: hash})
+
+	probe := httptest.NewRecorder()
+	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+tbBlob+"/play/"+tok+"?probe=1", nil))
+	play := httptest.NewRecorder()
+	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+tbBlob+"/play/"+tok, nil))
+
+	if probe.Code == http.StatusNotFound {
+		t.Errorf("?probe=1 answered 404 not_queued while scout's own allowance is spent (/play = %d %s) "+
+			"— scout could not ask, which is not the same as nobody having it",
+			play.Code, strings.TrimSpace(play.Body.String()))
+	}
+	if probe.Code != play.Code {
+		t.Errorf("?probe=1 = %d (%s), /play = %d (%s) — one vocabulary, two answers",
+			probe.Code, strings.TrimSpace(probe.Body.String()),
+			play.Code, strings.TrimSpace(play.Body.String()))
+	}
+}
+
 // ?probe=1 and /play must give the SAME answer about an add scout has out.
 //
 // They are one vocabulary by design — the doc on handleProbe says so — and this is the one fact in the
