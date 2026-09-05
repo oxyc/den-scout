@@ -748,6 +748,43 @@ type addInFlightReporter interface {
 	AddInFlight(infoHash string) bool
 }
 
+// heldTorrentReporter — a store that already has an id for this release, so it can be resolved without
+// buying anything. A pure cache read in every implementation.
+type heldTorrentReporter interface {
+	HoldsTorrent(t ResolveTarget) bool
+}
+
+// HoldingServices names the stores that already have an id for this release, so it can be resolved
+// without buying anything.
+//
+// It exists because a cache check is NOT that question, and ResolveCachedOnly refuses outright when
+// given no holders. Real-Debrid publishes no cache API and answers CacheCheck all-false by design, so
+// HeldBy is always empty for it — which made the probe route's readiness enquiry unreachable on an
+// RD-only install even after the gate above it was widened. Measured with the torrent already bought:
+// /play answered 302 with a playable link while ?probe=1 answered 404 "not queued", for the same
+// release, for as long as the client kept polling.
+//
+// Every implementation is a cache read, so asking costs nothing on the installs where it adds nothing.
+func (p *StorePool) HoldingServices(t ResolveTarget) []DebridService {
+	var held []DebridService
+	for _, st := range p.stores {
+		if reporter, ok := st.(heldTorrentReporter); ok && reporter.HoldsTorrent(t) {
+			held = append(held, st.Service())
+		}
+	}
+	return held
+}
+
+func (s *torBoxStore) HoldsTorrent(t ResolveTarget) bool {
+	_, held := s.knownTorrentID(t.InfoHash)
+	return held
+}
+
+func (s *realDebridStore) HoldsTorrent(t ResolveTarget) bool {
+	_, held := s.knownTorrent(t)
+	return held
+}
+
 // AddInFlight reports that some store has an add out for this release whose outcome we never saw.
 //
 // It is the one fact in this package that is about US rather than about a service, and both read-only
@@ -792,8 +829,24 @@ func (s *realDebridStore) AddInFlight(infoHash string) bool {
 	return addOutcomeUnknown(s.cache, ServiceRealDebrid, s.token, infoHash)
 }
 
+// Premiumize has a SECOND way to be mid-fetch, and it is the usual one.
+//
+// directdl answering success with no content means the transfer was queued: the store stamps
+// pmQueuedKey and returns errAddInFlight, which /play renders as 202 downloading. That marker is not
+// addOutcomeUnknown — settleAddAttempt clears the add marker the moment the body is read — so a probe
+// asking only about the add saw nothing and answered 404 "not queued" for the entire ten minutes /play
+// spends saying "downloading". Measured at 0s, 1m, 5m and 9m: disagree; at 10m and 19m: agree, because
+// /play has itself given up by then.
+//
+// Bounded by pendingGiveUp rather than by the marker's own twenty-minute life, so the two routes stop
+// agreeing at the same moment rather than swapping sides — past the give-up /play reports the release
+// dead, and a probe still claiming 202 would be the same defect pointing the other way.
 func (s *premiumizeStore) AddInFlight(infoHash string) bool {
-	return addOutcomeUnknown(s.cache, ServicePremiumize, s.token, infoHash)
+	if addOutcomeUnknown(s.cache, ServicePremiumize, s.token, infoHash) {
+		return true
+	}
+	return alreadyQueued(s.cache, s.token, infoHash) &&
+		!pendingTooLong(s.cache, s.token, infoHash)
 }
 
 func (s *torBoxStore) RecentRefusal(infoHash string) (string, bool) {

@@ -905,10 +905,18 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// playback that would start with a download.
 	probeTruth, truthOK := pool.CacheCheck(ctx, []string{infoHash})
 	var refusedUs *StoreUnavailableError
-	if probeTruth.Cached(infoHash) {
+	// Cached OR already held. The cache check alone was the wrong question, and asking it alone left this
+	// enquiry unreachable on a Real-Debrid install: RD publishes no cache API and answers all-false by
+	// design, so HeldBy is always empty and ResolveCachedOnly — which refuses outright with no holders —
+	// was never given anything to ask. The route then answered 404 "not queued" for a release /play
+	// served a 302 for, from the same cache entry.
+	//
+	// HoldingServices is a cache read per store, so this costs nothing where it changes nothing.
+	holders := append(probeTruth.HeldBy(infoHash), pool.HoldingServices(rt)...)
+	if len(holders) > 0 {
 		readOnly := rt
 		readOnly.NoAdd = true
-		_, err := pool.ResolveCachedOnly(ctx, readOnly, probeTruth.HeldBy(infoHash))
+		_, err := pool.ResolveCachedOnly(ctx, readOnly, holders)
 		if err == nil {
 			log.Printf("scout: probe %s → 200 ready", shortHash(infoHash))
 			writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)

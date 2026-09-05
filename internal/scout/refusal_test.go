@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -520,6 +521,93 @@ func TestHandlePlay_anInFlightAddIsQueuedNotRefused(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "store_unavailable") {
 		t.Errorf("a release scout itself queued was reported as the debrid refusing: %s", rec.Body.String())
+	}
+}
+
+// A release Real-Debrid already holds is READY on the probe route, not "not queued".
+//
+// The probe's readiness branch was gated on the cache check alone, and RD publishes no cache API — it
+// answers all-false by design, saying "RD contributes no cache truth". So the branch was unreachable on
+// an RD-only install and the route fell through to 404, while /play resolved the very same release from
+// a cache lookup plus an info call and returned a 302. The client polls the probe to know when its
+// download has landed; it never learned that it had.
+func TestProbe_aTorrentRealDebridAlreadyHoldsReadsAsReady(t *testing.T) {
+	token, hash := "rd-held", repeat("f", 40)
+	cache := NewMemoryCache(1 << 20)
+	target := ResolveTarget{InfoHash: hash}
+	cache.Put(rdTorrentKey(token, hash, target), "RDID123", time.Hour) // already bought
+
+	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "/torrents/info/"):
+			return resp(200, `{"id":"RDID123","status":"downloaded",`+
+				`"files":[{"id":1,"path":"/Movie.mkv","bytes":100,"selected":1}],`+
+				`"links":["https://rd.example/link"]}`), nil
+		case strings.Contains(r.URL.Path, "/unrestrict/link"):
+			return resp(200, `{"download":"https://rd.example/final.mkv"}`), nil
+		}
+		return resp(200, `{}`), nil
+	}}
+
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&realDebridStore{token: token, cache: cache, api: realDebridAPI, client: client}}
+		},
+	})
+	tok := encodePlayToken(PlayTarget{InfoHash: hash})
+
+	// The config must name the same service the pool holds, or the route stops at "cache check
+	// unavailable" — hasCacheTruth reads the CONFIG — before reaching the branch under test.
+	rdOnly := blob(`{"debrid":[{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}`)
+	probe := httptest.NewRecorder()
+	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+rdOnly+"/play/"+tok+"?probe=1", nil))
+	if probe.Code == http.StatusNotFound {
+		t.Errorf("?probe=1 answered 404 for a torrent the account already holds: %s — /play resolves it "+
+			"from the same cache entry, so the client is told a release it can play does not exist",
+			strings.TrimSpace(probe.Body.String()))
+	}
+	if probe.Code != http.StatusOK {
+		t.Errorf("?probe=1 = %d, want 200 ready: %s", probe.Code, strings.TrimSpace(probe.Body.String()))
+	}
+}
+
+// Premiumize has a second way to be mid-fetch, and the probe could not see it either.
+//
+// directdl answering success with empty content means the transfer was queued: the store stamps
+// pmQueuedKey and returns errAddInFlight, so /play says 202 downloading. That is not the add marker —
+// settleAddAttempt clears the add marker as soon as the body is read — so a probe asking only about
+// adds answered 404 for the whole ten minutes /play spends saying "coming".
+//
+// Both ends of the window are asserted. Past pendingGiveUp /play reports the release dead, so a probe
+// still claiming 202 there would be the same defect pointing the other way.
+func TestProbeAndPlay_agreeAboutAPremiumizeTransferAtBothEndsOfTheWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		queuedAgo  time.Duration
+		wantQueued bool
+	}{
+		{"just queued", 0, true},
+		{"still believable", 9 * time.Minute, true},
+		{"past the give-up", pendingGiveUp + time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token, hash := "pm-"+tc.name, repeat("9", 40)
+			cache := NewMemoryCache(1 << 20)
+			// Stamp the marker at the age under test, the way noteQueued writes it.
+			cache.Put(pmQueuedKey(token, hash),
+				strconv.FormatInt(time.Now().Add(-tc.queuedAgo).Unix(), 10), queuedTTL)
+
+			s := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+				client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+					return resp(200, `{"status":"success","content":[]}`), nil // still nothing to serve
+				}}}
+			if got := s.AddInFlight(hash); got != tc.wantQueued {
+				t.Errorf("AddInFlight = %v, want %v — the probe route reads this to decide between "+
+					"202 downloading and 404 not_queued, and it must change sides at the same moment "+
+					"/play does", got, tc.wantQueued)
+			}
+		})
 	}
 }
 
