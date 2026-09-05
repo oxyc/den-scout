@@ -1473,8 +1473,10 @@ type listingMemoEntry struct {
 //
 // What "0%" costs is not "every poll re-pulls every listing": torrentID answers most polls from
 // torrentIDKey or the 15 s torrentMissKey without reaching the listing at all, and listingFlight collapses
-// concurrent misses. The measured law is one pull per DISTINCT INFOHASH per TTL window — an eight-release
-// poster grid goes from 1 fetch to 8, and a repeat of a hash already resolved still costs nothing.
+// concurrent misses. The measured law is one pull per DISTINCT INFOHASH per TTL window when the probes are
+// SEQUENTIAL — an eight-release poster grid goes from 1 fetch to 8, and a repeat of a hash already
+// resolved still costs nothing. Concurrently it is far less: the same eight measured 2 pulls, because the
+// flight collapses whatever overlaps.
 const maxListingMemoEntries = 100_000
 
 // memoisable reports whether a Cache can be a map key at all — see listingMemo's comment.
