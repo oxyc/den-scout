@@ -217,3 +217,65 @@ func TestMinted_expiredEntriesAreReclaimed(t *testing.T) {
 		t.Error("a live entry was pruned")
 	}
 }
+
+// The minted-config cache is bounded by COUNT as well as by age.
+//
+// TTL pruning alone cannot bound it, and that is what made it look guarded: the key derives from a token
+// the config supplies and nobody verifies, and comet's mint is local base64 with no round trip, so every
+// distinct token a caller invents mints successfully and is held for twelve hours. At ~500 bytes an
+// entry that is a memory bomb with a twelve-hour fuse inside a 230 MiB heap.
+func TestMintedCache_isBoundedByCount(t *testing.T) {
+	mintedMu.Lock()
+	saved := minted
+	minted = map[string]mintedConfig{}
+	mintedMu.Unlock()
+	t.Cleanup(func() {
+		mintedMu.Lock()
+		minted = saved
+		mintedMu.Unlock()
+	})
+
+	// Far more distinct, unexpired entries than the ceiling — all fresh, so nothing expires out.
+	now := time.Now()
+	mintedMu.Lock()
+	for i := 0; i < maxMintedEntries*3; i++ {
+		// Staggered so "oldest first" is a defined order; all well inside mintedTTL.
+		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "https://comet.example/x", at: now.Add(-time.Duration(i) * time.Second)}
+	}
+	pruneMintedLocked()
+	got := len(minted)
+	_, newestKept := minted["comet:0"]
+	_, oldestKept := minted[fmt.Sprintf("comet:%d", maxMintedEntries*3-1)]
+	mintedMu.Unlock()
+
+	if got >= maxMintedEntries {
+		t.Errorf("kept %d entries, want under the %d ceiling (with room for the insert that follows)",
+			got, maxMintedEntries)
+	}
+	if got == 0 {
+		t.Error("the prune emptied the cache rather than trimming it")
+	}
+	if !newestKept {
+		t.Error("the newest entry was evicted")
+	}
+	if oldestKept {
+		t.Error("the oldest entry survived while newer ones were evicted")
+	}
+}
+
+// A cache under the ceiling with nothing expired is left completely alone.
+func TestMintedCache_pruneKeepsAHealthyCache(t *testing.T) {
+	mintedMu.Lock()
+	saved := minted
+	minted = map[string]mintedConfig{}
+	for i := 0; i < 5; i++ {
+		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "https://comet.example/x", at: time.Now()}
+	}
+	pruneMintedLocked()
+	got := len(minted)
+	minted = saved
+	mintedMu.Unlock()
+	if got != 5 {
+		t.Errorf("a healthy cache of 5 was pruned to %d", got)
+	}
+}

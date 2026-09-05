@@ -3,37 +3,36 @@
 Deferred items from the TypeScript → Go port. Everything else in the audit was folded into
 the port itself (see the commit history and the intentional-deviation notes in the code).
 
-## Active goal
-- **Sealed config-in-URL** (get BYOK secrets out of plaintext addon URLs) — see
-  [`docs/SEALED-CONFIG.md`](docs/SEALED-CONFIG.md). den-scout is the reference impl.
+## Done
 
-## Raised by the 2026-09 audit, deliberately NOT fixed there
+- **Sealed config-in-URL** (get BYOK secrets out of plaintext addon URLs) —
+  [`docs/SEALED-CONFIG.md`](docs/SEALED-CONFIG.md) records den-scout as the reference impl and marks it
+  DONE. Activate per deployment with `SCOUT_CONFIG_KEY`; unset means legacy plaintext URLs, which still
+  resolve. The opaque `configId` this once pointed at is an explicit **non-goal** — sealing solved the
+  problem it was for.
 
-Both are pre-existing and neither is touched by that changeset, so they were raised rather than folded
-in. Measurements are from the audit and are reproducible.
+### `/play`'s status budget no longer spends an add on a torrent already downloading — fixed
 
-### `/play`'s 8-second status budget can spend an add on a torrent already downloading
+`pool.Status` reports "nobody is fetching it" and "I could not find out in time" both as `ok=false`, so
+a timed-out read fell through to `ResolvePreferring`, which queues the torrent. TorBox's `Status` makes
+two upstream calls, one of them the account listing `stores.go` measures at ~13 MB on a 2,000-torrent
+account, so the 8s budget is genuinely reachable there; measured against a 9-second listing, that was an
+add a 45-second budget did not make.
 
-`handlePlay`'s "is it already downloading?" read runs on `statusBudget` (8s). TorBox's `Status` makes
-**two** upstream calls inside it, one of them the account listing that `stores.go` itself measures at
-~13 MB on a 2,000-torrent account — and a timed-out `Status` falls through to `ResolvePreferring`,
-which queues the torrent. Measured against a 9-second listing: an add that a 45-second budget did not
-make. It self-heals after one add per release (the torrent id is then cached for `resolveCacheTTL`), so
-the cost is bounded — but opening a 10-episode season on a large account can spend 10 of the 50 hourly
-adds on torrents that were already being fetched.
+Fixed by giving the two questions two budgets rather than moving the number back — the budget was
+shortened deliberately, because this read answers a poll on a two-second cadence. The poll-answering
+read keeps `statusBudget`; only a read that actually TIMED OUT, which is the one path about to spend an
+add, escalates to `resolveBudget` for a definitive answer. That path was going to block on the add
+anyway, and it is self-limiting: once anything is queued the torrent id is cached and later reads are
+fast. See `TestPlay_statusTimeoutDoesNotAdd` and its control.
 
-The tension is real and recorded in `handlePlay`'s own comment: the budget was *deliberately* shortened
-from 45s because a poll-answering read must not hold a poll for forty-five seconds. Fixing this properly
-means separating "how long may this read take" from "may a timeout queue an add" — most likely a
-`NoAdd` retry on status timeout — rather than moving the number back.
+### `indexerconfig.go`'s `minted` map now has a count ceiling — fixed
 
-### `indexerconfig.go`'s `minted` map is keyed by an unverified token, with a 12-hour TTL and no ceiling
-
-`pruneMintedLocked` drops entries past their own TTL, which cannot bound a map whose keys the caller
-chooses: a config's debrid token is never verified, comet's mint is local base64 with no round trip, so
-every distinct token mints successfully and is retained for 12 hours. Estimated ~500 B/entry. Gated by
-`SCOUT_MINT_INDEXER_CONFIGS`, which is **off by default**, which is why this is a follow-up and not a
-fix. A size ceiling with LRU eviction is the shape.
+`pruneMintedLocked` dropped entries past their own TTL, which cannot bound a map whose keys the caller
+chooses: the key derives from a token nobody verifies, and comet's mint is local base64 with no round
+trip, so every distinct token minted successfully and was held for 12 hours (~500 B each). It now
+enforces `maxMintedEntries` (256) oldest-first as well. A legitimate install has one entry per
+(indexer, account) — under twenty.
 
 ## #13 — debrid file selection for multi-file packs
 

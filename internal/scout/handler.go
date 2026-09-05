@@ -33,9 +33,6 @@ const (
 	defaultListTTL = 5 * time.Minute
 	// Headroom over the scrape timeout for the cache-check phase of a detached list build.
 	listBuildSlack = 20 * time.Second
-	// A status read is one upstream call and runs on the client's poll cadence — keep it far under the
-	// resolve budget so a wait answers promptly instead of hanging the poll.
-	statusBudget = 8 * time.Second
 	// Hard cap on a /play resolve (addMagnet→select→unrestrict across stores) so a slow debrid account
 	// can't pin a goroutine/connection indefinitely.
 	resolveBudget = 45 * time.Second
@@ -62,6 +59,14 @@ const (
 	// while it refreshes" means.
 	maxStaleServeWindow = 2 * time.Minute
 )
+
+// statusBudget bounds a status read: one upstream question, asked on the client's poll cadence, so it
+// stays far under resolveBudget and a wait answers promptly instead of hanging the poll.
+//
+// A var rather than a const ONLY so a test can shorten it — eight seconds is not a unit-test wait, and
+// the timeout path is exactly what needs covering. There is no env knob and no Deps field; nothing
+// outside a test changes it.
+var statusBudget = 8 * time.Second
 
 // How long a key is barred from re-booking a background rebuild after one came back degraded. Long
 // enough that an indexer outage does not put a scrape and a debrid fan-out on every request for the rest
@@ -945,6 +950,32 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	if status, ok := pool.Status(statusCtx, rt); ok {
 		writeQueued(w, target.InfoHash, status)
 		return
+	}
+
+	// "Nobody is fetching it" and "I could not find out in time" are different answers, and only the
+	// first may lead to an add.
+	//
+	// pool.Status reports both as ok=false, so a TIMED-OUT read fell through to the resolve below, which
+	// queues the torrent — one that was very often already downloading. TorBox's Status makes two upstream
+	// calls, one of them the account listing this package measures at ~13 MB on a 2,000-torrent account,
+	// so an 8-second budget is genuinely reachable there. Measured against a 9-second listing: an add that
+	// the old 45-second budget did not make. Opening a ten-episode season on a large account could spend
+	// ten of the fifty hourly adds re-queueing torrents already in flight.
+	//
+	// Moving the budget back is not the fix — it was shortened deliberately, because this read answers a
+	// poll on a two-second cadence and must not hold it for forty-five seconds. So the two questions get
+	// two budgets: the poll-answering read keeps its short one, and only the rare path that is ABOUT TO
+	// SPEND AN ADD pays for a definitive answer. That path was going to block on the add anyway, and it is
+	// self-limiting — once anything is queued, the torrent id is cached and every later read is fast.
+	if errors.Is(statusCtx.Err(), context.DeadlineExceeded) {
+		slowCtx, slowCancel := context.WithTimeout(r.Context(), resolveBudget)
+		defer slowCancel()
+		if status, ok := pool.Status(slowCtx, rt); ok {
+			log.Printf("scout: play %s → 202, status needed longer than %s to answer",
+				shortHash(target.InfoHash), statusBudget)
+			writeQueued(w, target.InfoHash, status)
+			return
+		}
 	}
 
 	// Which services already hold it, so the resolve starts with one that can serve now rather than one

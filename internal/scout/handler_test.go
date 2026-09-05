@@ -1437,3 +1437,87 @@ func TestHandleProbe_reportsARefusalItDiscoversItself(t *testing.T) {
 		})
 	}
 }
+
+// slowStatusStore answers Status by waiting out the caller's context the first `slowCalls` times, then
+// reports a download in progress. It is the shape of a real TorBox account with a large listing: Status
+// makes two upstream calls, one of them an account listing measured at ~13 MB on 2,000 torrents.
+type slowStatusStore struct {
+	svc DebridService
+	// How many leading Status calls wait out the caller's context instead of answering.
+	slowCalls int32
+	// When set, a call that is not slow answers "nobody is fetching it" rather than "downloading".
+	neverDownloading bool
+	statusHits       int32
+	resolves         int32
+}
+
+func (s *slowStatusStore) Service() DebridService { return s.svc }
+func (s *slowStatusStore) CacheCheck(context.Context, []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+func (s *slowStatusStore) Resolve(context.Context, ResolveTarget) (string, error) {
+	atomic.AddInt32(&s.resolves, 1)
+	return "https://cdn.example/added.mkv", nil
+}
+func (s *slowStatusStore) Status(ctx context.Context, _ ResolveTarget) (StoreStatus, bool) {
+	if atomic.AddInt32(&s.statusHits, 1) <= atomic.LoadInt32(&s.slowCalls) {
+		<-ctx.Done() // outlast the caller's budget, exactly as a slow account listing does
+		return StoreStatus{}, false
+	}
+	if s.neverDownloading {
+		return StoreStatus{}, false
+	}
+	return StoreStatus{Progress: 0.4}, true
+}
+
+// A status read that TIMED OUT must not lead to an add.
+//
+// pool.Status reports "nobody is fetching it" and "I could not find out in time" both as ok=false, so a
+// timed-out read fell through to the resolve — which queues the torrent, very often one already
+// downloading. Opening a ten-episode season on a large account could spend ten of the fifty hourly adds
+// re-queueing torrents in flight.
+func TestPlay_statusTimeoutDoesNotAdd(t *testing.T) {
+	saved := statusBudget
+	statusBudget = 20 * time.Millisecond // the shipped 8s is not a unit-test wait
+	t.Cleanup(func() { statusBudget = saved })
+
+	store := &slowStatusStore{svc: ServiceTorBox, slowCalls: 1} // slow once, then answers
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store { return []Store{store} }
+	}))
+	tok := encodePlayToken(PlayTarget{InfoHash: repeat("a", 40)})
+
+	rr := do(h, "/"+validBlob+"/play/"+tok, nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("play: %d, want 202 — the release is downloading", rr.Code)
+	}
+	if got := atomic.LoadInt32(&store.resolves); got != 0 {
+		t.Errorf("a timed-out status read still queued the torrent (%d resolves)", got)
+	}
+	// The second, longer read is what answered — the first one is the timeout.
+	if got := atomic.LoadInt32(&store.statusHits); got != 2 {
+		t.Errorf("status called %d times, want 2 (the short read, then the definitive one)", got)
+	}
+}
+
+// The control: a status read that answers PROMPTLY with "nobody is fetching it" is a real answer, and
+// the add proceeds exactly as before. Without this, the fix above could simply be refusing to ever add.
+func TestPlay_promptNotDownloadingStillAdds(t *testing.T) {
+	saved := statusBudget
+	statusBudget = 20 * time.Millisecond
+	t.Cleanup(func() { statusBudget = saved })
+
+	store := &slowStatusStore{svc: ServiceTorBox, neverDownloading: true} // answers at once, and says no
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store { return []Store{store} }
+	}))
+	tok := encodePlayToken(PlayTarget{InfoHash: repeat("b", 40)})
+
+	rr := do(h, "/"+validBlob+"/play/"+tok, nil)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("play: %d, want 302", rr.Code)
+	}
+	if got := atomic.LoadInt32(&store.resolves); got != 1 {
+		t.Errorf("resolves = %d, want 1 — a prompt 'not downloading' must still add", got)
+	}
+}

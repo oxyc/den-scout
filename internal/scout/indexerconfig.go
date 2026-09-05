@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -143,16 +144,48 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 	return url, false
 }
 
-// pruneMintedLocked drops entries past their own TTL. Expiry was only ever consulted on READ, so an
-// entry nobody asked for again stayed resident forever — and the key is derived from a token the config
-// supplies unverified, with comet's mint needing no network at all, so every distinct token minted
-// successfully and was kept. Caller holds mintedMu.
+// maxMintedEntries caps the cache by COUNT as well as by age.
+//
+// TTL pruning alone cannot bound this map, and that is the whole problem with it: the key is derived
+// from a token the config supplies and nobody verifies, comet's mint is local base64 with no round trip
+// at all, so every distinct token a caller invents mints successfully and is then held for the full
+// twelve hours. At roughly 500 bytes an entry, an unbounded map inside a 230 MiB heap is a memory bomb
+// with a twelve-hour fuse — and TTL pruning makes it look guarded.
+//
+// A legitimate install has one entry per (indexer, account): four indexers and a handful of accounts,
+// so under twenty. 256 is an order of magnitude above that and ~128 KB at the ceiling.
+const maxMintedEntries = 256
+
+// pruneMintedLocked drops entries past their own TTL, then enforces the count ceiling oldest-first.
+// Expiry was only ever consulted on READ, so an entry nobody asked for again stayed resident forever.
+// Caller holds mintedMu, and is about to insert — so this leaves room for one.
 func pruneMintedLocked() {
 	for k, m := range minted {
 		if time.Since(m.at) >= m.ttl() {
 			delete(minted, k)
 		}
 	}
+	if len(minted) < maxMintedEntries {
+		return
+	}
+	// Oldest first. These are all unexpired, so something live has to go; the oldest is the one whose TTL
+	// has least left to run, and on a legitimate install this branch is never reached at all.
+	type aged struct {
+		key string
+		at  time.Time
+	}
+	all := make([]aged, 0, len(minted))
+	for k, m := range minted {
+		all = append(all, aged{k, m.at})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	for _, e := range all {
+		if len(minted) < maxMintedEntries {
+			break
+		}
+		delete(minted, e.key)
+	}
+	log.Printf("scout: minted-config cache hit its %d-entry ceiling; evicted the oldest", maxMintedEntries)
 }
 
 // primaryDebrid picks the account a minted config should speak for. First configured wins — the same
