@@ -380,6 +380,52 @@ func jsonString(s string) string {
 	return string(b)
 }
 
+// An absurd config segment is refused before it is decoded, and the slices a build carries are bounded.
+//
+// Nothing capped the segment, and net/http accepts a request line up to its 1 MiB default: 716,770
+// characters of path decoded to a VALID config with 16,289 debrid accounts, which one request then
+// retained for the length of a scrape. Distinct blobs defeat both the list cache and the singleflight, so
+// 150 concurrent misses measured 207 MiB inside a 230 MiB GOMEMLIMIT.
+func TestDecodeConfig_boundsWhatOneRequestCanRetain(t *testing.T) {
+	// A segment past the ceiling is refused without being decoded.
+	if _, ok := decodeConfig(nil, repeat("A", maxConfigBlob+1)); ok {
+		t.Error("an oversized config segment was accepted")
+	}
+	// An honest segment is nowhere near it — the real /configure output is a few hundred bytes.
+	honest := blob(`{"debrid":[{"service":"torbox","token":"` + repeat("t", 64) + `"}],` +
+		`"indexers":["torrentio","comet","mediafusion"],` +
+		`"filters":{"excludeCam":true,"hdrOnly":true,"resolutions":["2160p","1080p"],` +
+		`"preferResolution":"1080p","minSeeders":3,"maxSizeGB":40,"excludeRegex":"hindi|tamil|dubbed"},` +
+		`"cachedOnly":true,"resultCap":20}`)
+	if len(honest) > maxConfigBlob/4 {
+		t.Errorf("a full honest config is %d bytes, uncomfortably close to the %d cap", len(honest), maxConfigBlob)
+	}
+	if _, ok := decodeConfig(nil, honest); !ok {
+		t.Fatal("a full honest config was refused")
+	}
+
+	// Accounts are capped, and repeated resolutions are deduped rather than retained — four valid values
+	// mean a repeat carries no information, and rankStreams scans that slice per release.
+	// Sized to fit under the blob cap, so this exercises the FIELD caps rather than being refused by the
+	// segment cap one layer up.
+	var accounts, resolutions []string
+	for i := 0; i < 100; i++ {
+		accounts = append(accounts, `{"service":"torbox","token":"t"}`)
+		resolutions = append(resolutions, `"1080p"`)
+	}
+	cfg, ok := decodeConfig(nil, blob(`{"debrid":[`+strings.Join(accounts, ",")+`],`+
+		`"filters":{"resolutions":[`+strings.Join(resolutions, ",")+`]}}`))
+	if !ok {
+		t.Fatal("the padded config was refused outright")
+	}
+	if len(cfg.Debrid) > maxDebridAccounts {
+		t.Errorf("kept %d debrid accounts, want at most %d", len(cfg.Debrid), maxDebridAccounts)
+	}
+	if len(cfg.Filters.Resolutions) != 1 {
+		t.Errorf("kept %d resolutions for one repeated value, want 1", len(cfg.Filters.Resolutions))
+	}
+}
+
 // maxCompiledMiB bounds what a pattern surviving validation may cost to compile.
 //
 // Ten, and both ends of that are measured. The worst SURVIVING shape found is a repeated Unicode

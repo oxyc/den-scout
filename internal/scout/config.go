@@ -57,6 +57,14 @@ var disabledIndexers = map[Indexer]string{
 }
 var validResolutions = map[string]bool{"2160p": true, "1080p": true, "720p": true, "480p": true}
 
+const (
+	// Ceiling on the base64 config path segment. See decodeConfig.
+	maxConfigBlob = 8 << 10
+	// Ceiling on accounts in one config. There are three services; more than a handful of accounts is
+	// not a configuration, it is a way to make one request retain a large slice for a whole scrape.
+	maxDebridAccounts = 8
+)
+
 // countedRepeatAt matches a `{n}` / `{n,}` / `{n,m}` quantifier at the start of what it is given.
 var countedRepeatAt = regexp.MustCompile(`^\{\d+(,\d*)?\}`)
 
@@ -148,6 +156,19 @@ type rawConfig struct {
 // keyring) or a legacy plaintext JSON config (first byte '{'). Sealed with no keyring, or a decrypt
 // failure, fails CLOSED — never falls through to an empty/partial config. See docs/SEALED-CONFIG.md.
 func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
+	// Refuse an absurd segment before decoding it. Nothing bounded this, and net/http accepts a request
+	// line up to its 1 MiB default — measured: a real server hands the handler a 1,054,721-character
+	// path, and 716,770 characters of it decode to a VALID config with 16,289 debrid accounts. The build
+	// then retains the blob and the parsed config for the length of a scrape, so ~1.4 MiB of live heap per
+	// in-flight request, with distinct blobs defeating both the cache and the singleflight: 150 concurrent
+	// misses measured 207 MiB inside a 230 MiB GOMEMLIMIT.
+	//
+	// 8 KiB is roughly ten times the largest honest segment. A sealed config carrying a debrid token and a
+	// full set of filters is a few hundred bytes before base64; the cap exists to stop the absurd, not to
+	// be tight.
+	if len(blob) > maxConfigBlob {
+		return nil, false
+	}
 	data, err := b64urlDecode(blob)
 	if err != nil || len(data) == 0 {
 		return nil, false
@@ -177,6 +198,11 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 			continue
 		}
 		debrid = append(debrid, DebridAccount{Service: DebridService(d.Service), Token: d.Token})
+		// Stop at the ceiling rather than keeping every account named. With the blob capped this can no
+		// longer be large, but it is the slice a whole build carries, and a bound here is one line.
+		if len(debrid) == maxDebridAccounts {
+			break
+		}
 	}
 	if len(debrid) == 0 {
 		return nil, false
@@ -205,8 +231,11 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		if raw.Filters.ExcludeCam != nil {
 			f.ExcludeCam = *raw.Filters.ExcludeCam
 		}
+		// Deduped as well as whitelisted. There are four valid values, so a repeated one carries no
+		// information — and a config naming "1080p" ten thousand times was ten thousand retained strings
+		// and a linear scan per release in rankStreams.
 		for _, r := range raw.Filters.Resolutions {
-			if validResolutions[r] {
+			if validResolutions[r] && !containsString(f.Resolutions, r) {
 				f.Resolutions = append(f.Resolutions, r)
 			}
 		}
@@ -318,3 +347,14 @@ func clampPosInt(v *float64, max int) *int {
 }
 
 func isFinite(f float64) bool { return !math.IsNaN(f) && !math.IsInf(f, 0) }
+
+// containsString is a linear scan, which is right here: the slice it guards holds at most the four
+// valid resolutions, so a map would cost an allocation to save nothing.
+func containsString(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
