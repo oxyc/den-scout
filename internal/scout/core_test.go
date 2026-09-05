@@ -380,16 +380,35 @@ func jsonString(s string) string {
 	return string(b)
 }
 
+// maxCompiledMiB bounds what a pattern surviving validation may cost to compile.
+//
+// Ten, and both ends of that are measured. The worst SURVIVING shape found is a repeated Unicode
+// CATEGORY — `\pC|` sixty-two times — at 3.1 MiB, so a tighter bound fails on a legal pattern; the bomb
+// the guard exists for is 53.1 MiB, so a looser one stops catching it. An earlier version of this test
+// asserted 2 MiB and passed only because its samples used `\p{Latin}`, a SCRIPT of ~30 rune ranges,
+// where `\pL` and `\pC` are categories of hundreds — the same construct and length at ninety times the
+// cost. Sixteen concurrent worst-survivors is ~50 MiB of peak inside a 230 MiB GOMEMLIMIT, which is why
+// 3.1 MiB is tolerable and 53 is not.
+const maxCompiledMiB = 10
+
 // The guard exists for a memory bound, so the bound is what gets asserted — not just which patterns the
 // matcher happens to flag.
 //
 // A user pattern is up to 256 characters, compiled fresh on every list build, from a caller whose debrid
-// token is never verified. With counted repetition, 250 of those characters compile to 53 MiB of live
-// heap inside a 230 MiB GOMEMLIMIT. Without it, the compiled program is bounded by the pattern's length:
-// the worst shapes measured here — long alternations, deep nesting, case-folded literals, big character
-// classes, unicode classes, starred groups — all land under 0.05 MiB.
+// token is never verified. The BOMB IS IN THE TABLE deliberately: it is the only entry containing a
+// brace, so it is the only thing coupling this test to the guard. Without it, disabling
+// hasCountedRepeat entirely left this test green — every flagged pattern hits the `continue` below and
+// asserts nothing, so the test claimed a bound it could not have noticed being broken.
 func TestExcludeRegex_compiledSizeIsBounded(t *testing.T) {
 	worst := []string{
+		// The bomb. Dropped by the guard; if the guard ever stops dropping it, it lands at ~53 MiB and
+		// this test is what says so.
+		`(?:` + strings.Repeat("x", 240) + `){1000}`,
+		// Unicode categories — the worst shapes that legitimately SURVIVE, at 1.7-3.1 MiB.
+		strings.Repeat(`\pC|`, 62) + "a",
+		strings.Repeat(`\pL|`, 62) + "a",
+		strings.Repeat(`\pC`, 83),
+		// And the cheap shapes, all under 0.05 MiB.
 		strings.Repeat("ab|", 84),
 		strings.Repeat("(", 60) + "a" + strings.Repeat(")", 60) + "*",
 		strings.Repeat("k", 250),
@@ -406,7 +425,7 @@ func TestExcludeRegex_compiledSizeIsBounded(t *testing.T) {
 			t.Fatalf("rejected outright: %.40q", pat)
 		}
 		if cfg.Filters.ExcludeRegex == "" {
-			continue // dropped by the guard, which is also a safe outcome
+			continue // the guard dropped it, so it is bounded by construction
 		}
 		var m1, m2 runtime.MemStats
 		runtime.GC()
@@ -414,9 +433,9 @@ func TestExcludeRegex_compiledSizeIsBounded(t *testing.T) {
 		re, err := regexp.Compile("(?i)" + cfg.Filters.ExcludeRegex)
 		runtime.ReadMemStats(&m2)
 		mib := float64(m2.TotalAlloc-m1.TotalAlloc) / (1 << 20)
-		if err == nil && mib > 2 {
-			t.Errorf("a %d-char pattern that survived validation compiled to %.1f MiB: %.40q",
-				len(pat), mib, pat)
+		if err == nil && mib > maxCompiledMiB {
+			t.Errorf("a %d-char pattern that survived validation compiled to %.1f MiB (max %d): %.40q",
+				len(pat), mib, maxCompiledMiB, pat)
 		}
 		_ = re
 	}

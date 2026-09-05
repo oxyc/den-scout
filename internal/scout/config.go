@@ -70,8 +70,18 @@ var countedRepeatAt = regexp.MustCompile(`^\{\d+(,\d*)?\}`)
 // character repeated, ~0.1 MiB against the 53 MiB the guard was written for — but a guard that answers a
 // different question than its comment claims is worth exactly nothing the next time someone edits it.
 //
-// Errs toward dropping: a brace inside a character class (`[a{2}]`, where it is literal) is treated as a
-// quantifier. That over-rejects a pattern nobody writes, and the failure direction is the safe one.
+// WHAT THIS ALSO DROPS, stated in full because the previous version of this comment claimed a narrower
+// reach than the code has, which is the exact fault it was written to complain about:
+//
+//   - Any counted repetition, however small — `[0-9]{2}`, `\b\d{4}\b`, `S\d{2}E\d{2}`. A four-digit year
+//     is an ordinary thing to filter on, and `\d\d\d\d` is the workaround. Dropped rather than
+//     count-capped on purpose: a cap has to reason about NESTED counts, which multiply, and that is a
+//     lot of machinery to keep a brace.
+//   - `\x{...}` hex escapes whose payload happens to be all digits (`\x{1000}`), which expand nothing.
+//     `\x{1F600}` survives, since it has a hex letter in it. Obscure in a release-name filter.
+//   - A brace inside a character class (`[a{2}]`), where it is a literal.
+//
+// All of that is over-rejection, which is the safe direction: the filter goes away, the list does not.
 func hasCountedRepeat(s string) bool {
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
