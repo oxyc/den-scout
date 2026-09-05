@@ -717,9 +717,10 @@ var listingFlightTestSeq atomic.Int64
 // measured inheriting a leader's 120 ms failure.
 func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// A token unique to this invocation, because listingFlight is process-wide and keyed on the token
-	// alone. With a fixed one, a -count rerun can join the PREVIOUS iteration's flight before it has
-	// finished deregistering, get that iteration's result, and never call this iteration's transport — so
-	// the leader blocks at <-arrivals forever and a legible failure becomes a package-wide timeout.
+	// alone. With a fixed one, a -count rerun joins the PREVIOUS iteration's fetch — which is still live,
+	// because the leader's fetch is detached and outlives the test function that started it — takes that
+	// iteration's result, and never calls its own transport, so the leader blocks at <-arrivals forever
+	// and a legible failure becomes a package-wide timeout.
 	token := fmt.Sprintf("shared-%d", listingFlightTestSeq.Add(1))
 	release := make(chan struct{})
 	// Released on EVERY exit, including a t.Fatal, so a failing assertion never strands an in-flight fetch
@@ -729,9 +730,20 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 	// One send per fetch STARTED, so "did anyone start a second fetch" is answerable without reading a
 	// counter across goroutines.
 	arrivals := make(chan struct{}, 4)
+	// The deadline each fetch context carried, so the copy onto the detached context is asserted rather
+	// than merely executed.
+	fetchDeadline := make(chan time.Duration, 4)
 	newStore := func(token string) *torBoxStore {
 		return &torBoxStore{token: token, api: torboxAPI, cache: NewMemoryCache(1 << 20),
 			client: mockDoer{func(r *http.Request) (*http.Response, error) {
+				// The detached context must still carry the leader's DEADLINE. Executed by the fixture but
+				// unasserted until now: dropping the copy left the whole suite green, and an undeadlined
+				// background fetch is then bounded only by the http.Client's own 30 s.
+				if dl, ok := r.Context().Deadline(); !ok {
+					fetchDeadline <- 0
+				} else {
+					fetchDeadline <- time.Until(dl)
+				}
 				arrivals <- struct{}{}
 				// Honours the request context, like a real transport — otherwise cancelling the leader
 				// changes nothing and the detachment half of this test asserts nothing. Cancellation is
@@ -762,6 +774,12 @@ func TestAccountListing_singleflightRespectsEachCallersBudget(t *testing.T) {
 		_, _ = leader.accountListing(leaderCtx)
 	}()
 	<-arrivals // the fetch is in flight
+	// It runs detached from the leader's CANCELLATION but on the leader's CLOCK. Anything much under the
+	// 30 s given above means the deadline was not copied across.
+	if left := <-fetchDeadline; left < 25*time.Second {
+		t.Errorf("the detached fetch carried a %v deadline, want about the leader's 30s — the deadline "+
+			"was not copied onto the detached context", left)
+	}
 
 	// A follower on the same account with a SHORT budget must not wait for the leader. Run in a goroutine
 	// with its own ceiling: blocked on the leader's WaitGroup this never returns at all, and a test that
