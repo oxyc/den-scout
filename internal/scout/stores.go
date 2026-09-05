@@ -1953,8 +1953,10 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, fault listin
 		return nil, false, listingFaultNone // cut off mid-body: transient, retry at once
 	}
 	if ids == nil || !success {
-		// A complete, well-formed envelope that simply has no usable `data` array — the key renamed, or an
-		// explicit success:false. Deterministic: the same body arrives next poll and fails the same way.
+		// A complete, well-formed envelope that simply has no usable `data` array — the key renamed, an
+		// explicit `data:null`, or an explicit success:false. (A `data` that is present but not an array
+		// is the same fault, returned earlier, where its own shape is known.) Deterministic: the same body
+		// arrives next poll and fails the same way.
 		//
 		// This sat on the transient road while its sibling (entries present, none usable) was taken off
 		// it, which is the same defect one level out: measured at 45 listing fetches over a 15-poll wait

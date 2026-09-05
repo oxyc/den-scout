@@ -647,6 +647,16 @@ func TestFetchAccountListing_streamsAndDetectsTruncation(t *testing.T) {
 	if _, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(`{"success":true}`))); ok {
 		t.Error("a listing with no data key was treated as authoritative")
 	}
+	// Nor is an explicit null. It is the one member of the bad-envelope family that was documented and
+	// never pinned: initialising the map beside the null's `continue` — a one-line change someone might
+	// make to "simplify" — turns it into an authoritative empty account, which writes a fifteen-second
+	// miss marker and suppresses the only lookup that rediscovers a queued torrent. The duplicate-key
+	// fixtures below contain `data:null` too, but decide on the repeat, so they pin nothing here.
+	if _, ok, fault := decodeListing(json.NewDecoder(strings.NewReader(
+		`{"success":true,"data":null}`))); ok || fault != listingBadEnvelope {
+		t.Errorf("a null data reported ok=%v fault=%v — null is not the account saying it holds nothing",
+			ok, fault)
+	}
 	// A REPEATED data key is unreadable, whichever order it comes in. Every rule for picking one of them
 	// is unsafe in one direction — a trailing null erases a list that was read, and an empty first array
 	// beats a populated second one into an authoritative "holds nothing" that costs a duplicate add —
