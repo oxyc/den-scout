@@ -966,8 +966,23 @@ func TestProbe_aReadOnlyPollWritesNoPremiumizeAddMemory(t *testing.T) {
 		t.Error("a read-only poll left an add-path in-flight marker — /play then answers 202 " +
 			"'downloading' without calling directdl, for a release Premiumize already holds")
 	}
+
 	// The queue marker must survive a read-only poll: it is the only thing naming Premiumize a holder,
 	// so clearing it from here makes the very next probe answer 404 for a transfer /play still serves.
+	//
+	// A SECOND store, because the branch that clears it is only reached when directdl answers with
+	// content. The cancelled fixture above returns long before it, so asserting the marker there could
+	// not fail for the reason it names — which is exactly the flaw the previous version of this test was
+	// rewritten to remove, repeated one assertion over.
+	served := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			return resp(200, `{"status":"success","content":[`+
+				`{"path":"Movie.mkv","link":"https://pm.example/final.mkv","size":100}]}`), nil
+		}}}
+	if link, err := served.Resolve(context.Background(),
+		ResolveTarget{InfoHash: hash, NoAdd: true}); err != nil || link == "" {
+		t.Fatalf("the read-only resolve should serve a completed transfer: link=%q err=%v", link, err)
+	}
 	if !alreadyQueued(cache, token, hash) {
 		t.Error("a read-only poll cleared the queue marker — the next poll names no holder and answers " +
 			"404 not_queued for a release /play resolves from the same marker")
@@ -989,6 +1004,10 @@ func TestPremiumize_aReadOnlyPollRecordsAnAnsweredRefusal(t *testing.T) {
 	}{
 		{"out of space", `{"status":"error","message":"not enough space"}`, 200},
 		{"server error", `{}`, 500},
+		// A non-2xx that is NOT a refusal of the account (401/403/429/5xx are handled a branch up).
+		// Reverting only this site reproduced the whole defect through a different status code while the
+		// suite stayed green — the two rows above cover the other two sites.
+		{"bad request", `{}`, 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			token, hash := "pm-answered-"+tc.name, repeat("1", 40)
@@ -1133,6 +1152,25 @@ func TestTorBox_anAddInFlightOutranksARefusalRecordedMeanwhile(t *testing.T) {
 		t.Errorf("torbox answered %v, want errAddInFlight — it is blaming the store for a release scout "+
 			"has an add out for, which is the one answer this file says never to give", err)
 	}
+
+	// PAST the give-up, the refusal must be heard again. The gate is skipped only while the add is still
+	// BELIEVABLE, not merely while its marker exists — weakening it to the bare marker left the suite
+	// green while suppressing a real refusal behind a marker nothing will ever settle.
+	//
+	// Asserted on WHICH error surfaces, not on the absence of errAddInFlight: past the give-up both the
+	// shipped gate and the weakened one stop saying "in flight", and they differ in what they say
+	// instead. The gate lets the recorded refusal through (503, agreeing with the probe); the bare
+	// marker falls to addInFlight's give-up branch and answers a dead link (404), which is /play calling
+	// a release dead on the strength of a marker nothing settled.
+	cache.Put(unknownOutcomeKey(ServiceTorBox, token, hash),
+		strconv.FormatInt(time.Now().Add(-addGiveUp-time.Minute).Unix(), 10), unknownOutcomeTTL)
+	_, late := s.Resolve(context.Background(), ResolveTarget{InfoHash: hash})
+	var unavailable *StoreUnavailableError
+	if !errors.As(late, &unavailable) {
+		t.Errorf("past addGiveUp torbox answered %v, want the recorded refusal — a dead link here is "+
+			"/play calling a release dead while the probe reports the refusal, and it comes from "+
+			"trusting a marker past the point scout stops believing it", late)
+	}
 }
 
 // /play must not buy a release another configured account already holds.
@@ -1200,6 +1238,63 @@ func TestPlay_doesNotBuyAReleaseAnotherAccountAlreadyHolds(t *testing.T) {
 	}
 	if after := globalAddBudget.remaining(budgetAccount(ServiceTorBox, token)); after != before {
 		t.Errorf("TorBox's hourly allowance went %d → %d for a release another account held", before, after)
+	}
+}
+
+// A season pack Premiumize has already served must not read as "not queued" for its next episode.
+//
+// Premiumize has no torrent id to remember, so the queue marker was the only thing naming it a holder —
+// and /play settles that marker on success. The first play of a pack therefore blinded the probe to the
+// whole rest of it: every later poll answered 404 while /play kept serving 302s from the same transfer.
+// Measured across three polls of episode 2 after playing episode 1.
+//
+// The probe is driven AFTER the play here, deliberately. The sibling three-poll test polls before any
+// play and so cannot see a marker that /play removes.
+func TestProbeAndPlay_agreeOnALaterEpisodeAfterPremiumizeServedTheFirst(t *testing.T) {
+	token, hash := "pm-pack", repeat("e", 40)
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+
+	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "cache/check") {
+			return resp(200, `{"status":"success","response":[true]}`), nil
+		}
+		return resp(200, `{"status":"success","content":[`+
+			`{"path":"Show.S01E01.mkv","link":"https://pm.example/e1.mkv","size":100},`+
+			`{"path":"Show.S01E02.mkv","link":"https://pm.example/e2.mkv","size":100}]}`), nil
+	}}
+	h := NewHandler(Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&premiumizeStore{token: token, cache: cache, api: premiumizeAPI, client: client}}
+		},
+	})
+	pmBlob := blob(`{"debrid":[{"service":"premiumize","token":"` + token + `"}],` +
+		`"indexers":["torrentio"],"resultCap":20}`)
+	ep := func(n int) string {
+		return encodePlayToken(PlayTarget{InfoHash: hash, Season: intp(1), Episode: intp(n)})
+	}
+
+	// Episode 1 plays, which settles the queue marker.
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+ep(1), nil))
+	if first.Code != http.StatusFound {
+		t.Fatalf("playing episode 1 = %d, want 302", first.Code)
+	}
+
+	// Episode 2 of the same pack, polled the way a client polls.
+	for i := 1; i <= 3; i++ {
+		probe := httptest.NewRecorder()
+		h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+ep(2)+"?probe=1", nil))
+		if probe.Code == http.StatusNotFound {
+			t.Errorf("poll %d: ?probe=1 answered 404 not_queued for a pack Premiumize just served an "+
+				"episode of — the client blacklists a release /play resolves in the same breath", i)
+		}
+	}
+	play := httptest.NewRecorder()
+	h.ServeHTTP(play, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+ep(2), nil))
+	if play.Code != http.StatusFound {
+		t.Fatalf("playing episode 2 = %d, want 302", play.Code)
 	}
 }
 

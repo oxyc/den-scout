@@ -573,6 +573,29 @@ func settleQueuedTransfer(cache Cache, token, infoHash string) {
 	}
 }
 
+// pmHeldKey — Premiumize served this release from the account, so a later resolve needs no transfer.
+//
+// Premiumize has no torrent id to remember, which is how TorBox and Real-Debrid name themselves holders.
+// Without an equivalent, the moment /play settled the queue marker the store went back to being
+// unnameable, and the probe answered 404 for a pack it had just served an episode of.
+func pmHeldKey(token, infoHash string) string {
+	return "premiumize:held:" + keyHash(token) + ":" + infoHash
+}
+
+func noteHeld(cache Cache, token, infoHash string) {
+	if cache != nil {
+		cache.Put(pmHeldKey(token, infoHash), "1", resolveCacheTTL)
+	}
+}
+
+func heldRecently(cache Cache, token, infoHash string) bool {
+	if cache == nil {
+		return false
+	}
+	_, held := cache.Get(pmHeldKey(token, infoHash))
+	return held
+}
+
 func alreadyQueued(cache Cache, token, infoHash string) bool {
 	if cache == nil {
 		return false
@@ -882,17 +905,17 @@ func (s *realDebridStore) HoldsTorrent(t ResolveTarget) bool {
 // Keyed by hash alone, like the marker: directdl is per-magnet, so a pack queued for one episode
 // answers for any episode of the same release, at no charge.
 func (s *premiumizeStore) HoldsTorrent(t ResolveTarget) bool {
-	return alreadyQueued(s.cache, s.token, t.InfoHash)
+	return alreadyQueued(s.cache, s.token, t.InfoHash) ||
+		heldRecently(s.cache, s.token, t.InfoHash)
 }
 
-// AddInFlight reports that some store has an add out for this release whose outcome we never saw.
+// AddInFlight — some store with a USABLE key has an add out for this release whose outcome we never saw.
 //
-// It is the one fact in this package that is about US rather than about a service, and both read-only
-// routes must give the same answer to it. /play already does, via errAddInFlight raised from inside the
-// resolve; the probe route had no way to ask, because it never resolves — NoAdd is refused with
-// errWouldAdd before any store consults the marker — so it fell through to 404 "not queued" for a
-// release /play was reporting as downloading at the same instant.
-// AddInFlight — some store with a USABLE key has an add out for this release.
+// It is the one fact in this package that is about US rather than about a service, and both routes must
+// give the same answer to it. /play does via errAddInFlight raised inside the resolve; the probe route
+// cannot ask that way, because it never resolves — NoAdd is refused before any store consults the
+// marker — so without this it fell through to 404 "not queued" for a release /play was reporting as
+// downloading at the same instant.
 //
 // Two rules meet here and they point different ways, which is what made an earlier version wrong:
 //
@@ -3188,7 +3211,8 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// a transfer the probe answered 202 "downloading" until the marker aged past pendingGiveUp and then
 	// 404, never 200, while /play answered 302 with a playable link. Measured on a completed transfer:
 	// probe 202, /play 302, on the one URL that exists to tell a client its download landed.
-	if t.NoAdd && !alreadyQueued(s.cache, s.token, t.InfoHash) {
+	if t.NoAdd && !alreadyQueued(s.cache, s.token, t.InfoHash) &&
+		!heldRecently(s.cache, s.token, t.InfoHash) {
 		return "", errWouldAdd
 	}
 	// The account gate the other two have. It was genuinely redundant here — `backedOff` consults the
@@ -3209,7 +3233,12 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// the transfer finished, so blocking it made a release that completed in two minutes unresolvable for
 	// the remaining eighteen. What the marker suppresses is the CHARGE: the transfer is already paid for,
 	// so asking about it again must not spend another add.
-	queued := alreadyQueued(s.cache, s.token, t.InfoHash)
+	// "held recently" counts as queued for the CHARGE too: both mean this call needs no new transfer, so
+	// neither should spend an add. Without that a read-only poll of a release the account already served
+	// would pass through spendAdd — refunded below, but able to be refused by a spent allowance, and
+	// charging at all for a read is what this flag exists to prevent.
+	queued := alreadyQueued(s.cache, s.token, t.InfoHash) ||
+		heldRecently(s.cache, s.token, t.InfoHash)
 	// Charged BEFORE the call, because the budget has to be able to gate it — directdl queues a transfer
 	// for anything the account lacks, so a spent allowance must stop the request, not merely record it.
 	// But directdl is a READ for anything Premiumize already holds, and charging every one of those billed
@@ -3407,6 +3436,17 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	}
 	if !t.NoAdd {
 		settleQueuedTransfer(s.cache, s.token, t.InfoHash)
+		// ...and remember that the account HOLDS it, which is what the queue marker was standing in for.
+		//
+		// Clearing alone left Premiumize unable to name itself a holder at all: HoldsTorrent had only the
+		// queue marker to read, so the first /play of a season pack settled it and every later probe for
+		// another episode of the same infohash answered 404 "not queued" while /play kept serving 302s
+		// from the same transfer. Measured across three polls of episode 2 after playing episode 1.
+		//
+		// Separate from the queue marker on purpose: this one says "served, no add needed", so it must
+		// NOT suppress a later charge the way a pending transfer does. Same six hours as the other
+		// stores' remembered ids, and for the same reason — it is a convenience claim, not a promise.
+		noteHeld(s.cache, s.token, t.InfoHash)
 	}
 
 	files := make([]TorrentFile, len(body.Content))
