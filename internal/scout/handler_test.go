@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1768,6 +1769,139 @@ func (s *slowStatusStore) Status(ctx context.Context, _ ResolveTarget) (StoreSta
 		return StoreStatus{}, false
 	}
 	return StoreStatus{Progress: 0.4}, true
+}
+
+// recordingCheckStore answers its cache check at once and reports the budget it was handed.
+type recordingCheckStore struct {
+	svc     DebridService
+	budgets chan time.Duration
+}
+
+func (s *recordingCheckStore) Service() DebridService { return s.svc }
+func (s *recordingCheckStore) CacheCheck(ctx context.Context, _ []string) (map[string]bool, error) {
+	if d, ok := ctx.Deadline(); ok {
+		select {
+		case s.budgets <- time.Until(d):
+		default:
+		}
+	}
+	return map[string]bool{}, nil
+}
+func (s *recordingCheckStore) Resolve(context.Context, ResolveTarget) (string, error) {
+	return "https://cdn.example/added.mkv", nil
+}
+func (s *recordingCheckStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}
+
+// /play's preference cache check gets a SLICE of the resolve clock, never the whole thing.
+//
+// Its only product is an ordering — which store to try first — so it must not be able to cost the
+// resolve it is ordering. Handed the bare clock it could: a slow checkcached ate what the two status
+// reads left, ResolvePreferring then ran on an expired context, every store failed instantly, nothing
+// was queued, and a healthy release came back 404. Measured with shipped constants on a two-account
+// install: 404 after 53.0s with the check holding the clock for 21.0s, against 302 in 195µs when it
+// answers promptly. It also spent one add per configured store on requests that never left the process.
+//
+// That is the regression escalatedStatusCtx was written to prevent, one line further down. The
+// escalation was given a carved-out slice; this call was not, and nothing noticed because every other
+// /play fixture configures a single debrid account, which is the one case that skips this call entirely.
+//
+// Asserted on the DEADLINE rather than on elapsed time: the difference between fixed and broken is
+// statusBudget versus resolveBudget, and resolveBudget is a const, so a wall-clock test would have to
+// wait 45 seconds to fail.
+func TestPlay_thePreferenceCacheCheckIsBudgeted(t *testing.T) {
+	saved := statusBudget
+	statusBudget = 150 * time.Millisecond
+	t.Cleanup(func() { statusBudget = saved })
+
+	store := &recordingCheckStore{svc: ServiceTorBox, budgets: make(chan time.Duration, 4)}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store { return []Store{store} }
+	}))
+	// TWO accounts: the preference check is gated on more than one being configured.
+	twoAccounts := blob(`{"debrid":[{"service":"torbox","token":"tb"},` +
+		`{"service":"realdebrid","token":"rd"}],"indexers":["torrentio"],"resultCap":20}`)
+	tok := encodePlayToken(PlayTarget{InfoHash: repeat("c", 40)})
+
+	rr := do(h, "/"+twoAccounts+"/play/"+tok, nil)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("play: %d, want 302", rr.Code)
+	}
+
+	select {
+	case got := <-store.budgets:
+		// Generous: the point is statusBudget-sized rather than resolveBudget-sized, and the two differ
+		// by three hundred-fold.
+		if got > 10*statusBudget {
+			t.Errorf("the preference cache check was given %s of budget, want about %s — handed the "+
+				"resolve clock it can spend all of it and leave ResolvePreferring an expired context, "+
+				"which queues nothing and answers 404 for a release that is alive", got, statusBudget)
+		}
+	default:
+		t.Fatal("no cache check was made, so this test is not exercising its budget")
+	}
+}
+
+// deadCtxStore counts every entry and then fails on the caller's context, which is how a real store
+// behaves on a spent clock: the add is charged and its marker written before the request is built, and
+// client.Do is what returns the error. A fake that ignored ctx would resolve "successfully" on a dead
+// context and hide the very thing under test.
+type deadCtxStore struct {
+	svc DebridService
+	n   *int32
+}
+
+func (s *deadCtxStore) Service() DebridService { return s.svc }
+func (s *deadCtxStore) CacheCheck(context.Context, []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+func (s *deadCtxStore) Resolve(ctx context.Context, _ ResolveTarget) (string, error) {
+	atomic.AddInt32(s.n, 1) // the add is spent here, before anything reaches the wire
+	if err := ctx.Err(); err != nil {
+		return "", &StoreUnavailableError{Service: s.svc, Reason: err.Error()}
+	}
+	return "https://cdn.example/added.mkv", nil
+}
+func (s *deadCtxStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}
+
+// A resolve that has run out of clock stops, rather than charging every remaining store for an add it
+// cannot send — and says it could not find out, rather than that the release is dead.
+//
+// TorBox spends the hourly budget and writes the in-flight marker BEFORE the request goes out, and a
+// dead context fails at client.Do, which returns without refunding because a request that may have
+// reached the wire must not be re-sent. So a spent clock cost one add per configured service, issued
+// zero upstream requests, and left a 90-second marker that makes the next poll answer 202 "downloading"
+// for a torrent nobody queued.
+func TestResolvePreferring_spentClockDoesNotChargeEveryStore(t *testing.T) {
+	var resolves int32
+	pool := &StorePool{stores: []Store{
+		&deadCtxStore{svc: ServiceTorBox, n: &resolves},
+		&deadCtxStore{svc: ServiceRealDebrid, n: &resolves},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the resolve budget is already gone before the first store is asked
+
+	link, err := pool.ResolvePreferring(ctx, ResolveTarget{InfoHash: repeat("d", 40)}, nil)
+	if link != "" || err == nil {
+		t.Fatalf("expected a failure on a spent clock, got link=%q err=%v", link, err)
+	}
+	if got := atomic.LoadInt32(&resolves); got != 0 {
+		t.Errorf("%d store(s) were asked to resolve on an expired context — each charges an add before "+
+			"it sends, so this spends the hourly budget on requests that never leave the process", got)
+	}
+	var dead *DeadLinkError
+	if errors.As(err, &dead) {
+		t.Errorf("a spent clock reported %v — that is a 404, and it makes the client blacklist a "+
+			"release nobody was able to ask about", err)
+	}
+	var unavailable *StoreUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Errorf("want a StoreUnavailableError (could not find out), got %T: %v", err, err)
+	}
 }
 
 // A status read that TIMED OUT must not lead to an add.

@@ -3279,6 +3279,27 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	// accounts couldn't serve this" into "you cannot play this" — a release that used to play. Adds are
 	// bounded by `spendAdd`, which is a ceiling rather than a coin flip on which store gets to try.
 	for _, st := range p.ordered(preferred) {
+		// Out of clock: stop rather than charge every remaining store for an add it cannot send. TorBox
+		// spends the hourly budget and writes the in-flight marker BEFORE the request goes out (see
+		// addMagnet), and a dead context fails at client.Do, which returns without refunding because a
+		// request that may have reached the wire must not be re-sent. Measured on an expired context:
+		// zero upstream requests issued, one add spent per configured service, and a 90-second marker
+		// left behind that makes the next poll answer 202 "downloading" for a torrent nobody queued.
+		// Out of clock: stop rather than charge every remaining store for an add it cannot send. TorBox
+		// spends the hourly budget and writes the in-flight marker BEFORE the request goes out (see
+		// addMagnet), and a dead context fails at client.Do, which returns without refunding because a
+		// request that may have reached the wire must not be re-sent. Measured on an expired context:
+		// zero upstream requests issued, one add spent per configured service, and a 90-second marker
+		// left behind that makes the next poll answer 202 "downloading" for a torrent nobody queued.
+		// Out of clock: stop rather than charge every remaining store for an add it cannot send. TorBox
+		// spends the hourly budget and writes the in-flight marker BEFORE the request goes out (see
+		// addMagnet), and a dead context fails at client.Do, which returns without refunding because a
+		// request that may have reached the wire must not be re-sent. Measured on an expired context:
+		// zero upstream requests issued, one add spent per configured service, and a 90-second marker
+		// left behind that makes the next poll answer 202 "downloading" for a torrent nobody queued.
+		if ctx.Err() != nil {
+			break
+		}
 		link, err := st.Resolve(ctx, t)
 		if err == nil {
 			return link, nil
@@ -3308,6 +3329,13 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	}
 	if refused != nil {
 		return "", refused
+	}
+	// A resolve that ran out of clock did not learn the release is dead — it learned nothing at all, and
+	// possibly from no store. DeadLinkError here is the same conflation the rest of this file spent
+	// several rounds removing: it is a 404, and a 404 makes the client blacklist a release nobody was
+	// able to ask about.
+	if ctx.Err() != nil {
+		return "", &StoreUnavailableError{Reason: "the resolve budget was spent before a store could answer"}
 	}
 	return "", &DeadLinkError{"no store could resolve"}
 }

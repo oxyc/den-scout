@@ -1072,9 +1072,23 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// Which services already hold it, so the resolve starts with one that can serve now rather than one
 	// that would have to download it. Only worth asking with more than one account configured — with one
 	// there is nothing to choose between, and it would be a wasted upstream call on every play.
+	//
+	// BUDGETED, like every other read on this path. Its only product is an ORDERING, so it must never be
+	// able to cost the resolve it is ordering — and handed the bare resolve clock it could: a slow
+	// checkcached ate what the two status reads left, ResolvePreferring then ran on an expired context,
+	// every store failed instantly, nothing was queued, and a healthy release came back 404.
+	//
+	// That is the regression escalatedStatusCtx exists to prevent, one line further down and not caught
+	// by it, because the escalation was given a carved-out slice and this call was not. Measured with
+	// shipped constants on a two-account install: 404 after 53.0s with the check holding the clock for
+	// 21.0s, against 302 in 195µs when it answers at once.
+	//
+	// Failure here is free: no preference, and the pool falls back to configured order.
 	var preferred []DebridService
 	if len(config.Debrid) > 1 {
-		playTruth, _ := pool.CacheCheck(ctx, []string{target.InfoHash})
+		checkCtx, checkCancel := context.WithTimeout(ctx, statusBudget)
+		playTruth, _ := pool.CacheCheck(checkCtx, []string{target.InfoHash})
+		checkCancel()
 		preferred = playTruth.HeldBy(target.InfoHash)
 	}
 	link, err := pool.ResolvePreferring(ctx, rt, preferred)
