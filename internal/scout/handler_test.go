@@ -1831,9 +1831,11 @@ func TestPlay_thePreferenceCacheCheckIsBudgeted(t *testing.T) {
 
 	select {
 	case got := <-store.budgets:
-		// Generous: the point is statusBudget-sized rather than resolveBudget-sized, and the two differ
-		// by three hundred-fold.
-		if got > 10*statusBudget {
+		// statusBudget exactly, not "roughly". A 10x tolerance let escalatedStatusBudget() — 16s shipped,
+		// which would cut the resolve from 13s to 5s — pass this and every other test in the package.
+		// The measured value is always a shade UNDER the budget, since the deadline is set just before
+		// the read, so a bare comparison is tight without being flaky.
+		if got > statusBudget {
 			t.Errorf("the preference cache check was given %s of budget, want about %s — handed the "+
 				"resolve clock it can spend all of it and leave ResolvePreferring an expired context, "+
 				"which queues nothing and answers 404 for a release that is alive", got, statusBudget)
@@ -1843,64 +1845,74 @@ func TestPlay_thePreferenceCacheCheckIsBudgeted(t *testing.T) {
 	}
 }
 
-// deadCtxStore counts every entry and then fails on the caller's context, which is how a real store
-// behaves on a spent clock: the add is charged and its marker written before the request is built, and
-// client.Do is what returns the error. A fake that ignored ctx would resolve "successfully" on a dead
-// context and hide the very thing under test.
-type deadCtxStore struct {
-	svc DebridService
-	n   *int32
-}
-
-func (s *deadCtxStore) Service() DebridService { return s.svc }
-func (s *deadCtxStore) CacheCheck(context.Context, []string) (map[string]bool, error) {
-	return map[string]bool{}, nil
-}
-func (s *deadCtxStore) Resolve(ctx context.Context, _ ResolveTarget) (string, error) {
-	atomic.AddInt32(s.n, 1) // the add is spent here, before anything reaches the wire
-	if err := ctx.Err(); err != nil {
-		return "", &StoreUnavailableError{Service: s.svc, Reason: err.Error()}
-	}
-	return "https://cdn.example/added.mkv", nil
-}
-func (s *deadCtxStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
-	return StoreStatus{}, false
-}
-
-// A resolve that has run out of clock stops, rather than charging every remaining store for an add it
-// cannot send — and says it could not find out, rather than that the release is dead.
+// A resolve on a spent clock must not BUY an add, and must not stop asking either.
 //
-// TorBox spends the hourly budget and writes the in-flight marker BEFORE the request goes out, and a
-// dead context fails at client.Do, which returns without refunding because a request that may have
-// reached the wire must not be re-sent. So a spent clock cost one add per configured service, issued
-// zero upstream requests, and left a 90-second marker that makes the next poll answer 202 "downloading"
-// for a torrent nobody queued.
-func TestResolvePreferring_spentClockDoesNotChargeEveryStore(t *testing.T) {
-	var resolves int32
+// Both halves matter and they pull against each other. The charge and its 90-second marker are written
+// before the request is built, and a dead context fails at client.Do without refunding, so an add on a
+// spent clock costs one of the fifty per hour, sends nothing, and has the next poll report a download
+// nobody queued. But skipping the store to avoid that — which is what this guard first did — throws
+// away the answers that are FREE on a dead clock: addInFlight and both backoff gates are pure cache
+// reads sitting ahead of the charge, and errAddInFlight is what makes /play answer 202. Skipping turned
+// that 202 into a 503 naming the viewer's debrid as refusing, for a release scout was fetching.
+//
+// So the guard sits at the charge, and this test pins both sides of it against the REAL store rather
+// than a fake: a fake that charges on entry cannot express the free answer, which is exactly how the
+// first version of this test passed over the regression.
+func TestResolve_aSpentClockDoesNotBuyAnAdd(t *testing.T) {
+	token := "spent-clock-" + t.Name()
+	hash := repeat("d", 40)
+	before := globalAddBudget.remaining(budgetAccount(ServiceTorBox, token))
+
+	var upstream int32
+	s := &torBoxStore{token: token, cache: NewMemoryCache(1 << 20), api: torboxAPI,
+		client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			atomic.AddInt32(&upstream, 1)
+			return resp(200, `{"data":{}}`), nil
+		}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := s.Resolve(ctx, ResolveTarget{InfoHash: hash}); err == nil {
+		t.Fatal("a resolve on a spent clock should not succeed")
+	}
+	if after := globalAddBudget.remaining(budgetAccount(ServiceTorBox, token)); after != before {
+		t.Errorf("the hourly add budget went %d → %d on a spent clock — that add was charged for a "+
+			"request that never left the process, and it leaves a 90-second marker behind it",
+			before, after)
+	}
+	if got := atomic.LoadInt32(&upstream); got != 0 {
+		t.Errorf("%d upstream request(s) were issued on an expired context", got)
+	}
+}
+
+// The other half: a spent clock must still surface an add scout already has out.
+//
+// This is the free answer the first version of the guard discarded. The store reads it from its own
+// cache, ahead of any charge and any request, and ResolvePreferring ranks it above every refusal —
+// which is what turns it into 202 "downloading" rather than 503 "your debrid is refusing".
+func TestResolvePreferring_aSpentClockStillSurfacesAnInFlightAdd(t *testing.T) {
+	token := "inflight-" + t.Name()
+	hash := repeat("e", 40)
+	cache := NewMemoryCache(1 << 20)
+	noteAddAttempt(cache, ServiceRealDebrid, token, hash) // scout has an add out on the second store
+
+	quiet := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		return resp(200, `{"data":{}}`), nil
+	}}
 	pool := &StorePool{stores: []Store{
-		&deadCtxStore{svc: ServiceTorBox, n: &resolves},
-		&deadCtxStore{svc: ServiceRealDebrid, n: &resolves},
+		&torBoxStore{token: token, cache: cache, api: torboxAPI, client: quiet},
+		&realDebridStore{token: token, cache: cache, api: realDebridAPI, client: quiet},
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // the resolve budget is already gone before the first store is asked
+	cancel()
 
-	link, err := pool.ResolvePreferring(ctx, ResolveTarget{InfoHash: repeat("d", 40)}, nil)
-	if link != "" || err == nil {
-		t.Fatalf("expected a failure on a spent clock, got link=%q err=%v", link, err)
-	}
-	if got := atomic.LoadInt32(&resolves); got != 0 {
-		t.Errorf("%d store(s) were asked to resolve on an expired context — each charges an add before "+
-			"it sends, so this spends the hourly budget on requests that never leave the process", got)
-	}
-	var dead *DeadLinkError
-	if errors.As(err, &dead) {
-		t.Errorf("a spent clock reported %v — that is a 404, and it makes the client blacklist a "+
-			"release nobody was able to ask about", err)
-	}
-	var unavailable *StoreUnavailableError
-	if !errors.As(err, &unavailable) {
-		t.Errorf("want a StoreUnavailableError (could not find out), got %T: %v", err, err)
+	_, err := pool.ResolvePreferring(ctx, ResolveTarget{InfoHash: hash}, nil)
+	if !errors.Is(err, errAddInFlight) {
+		t.Errorf("a spent clock reported %v, want errAddInFlight — the marker is a pure cache read "+
+			"ahead of the charge, so it costs nothing to find, and it is what makes /play answer 202 "+
+			"instead of telling the viewer their debrid is refusing a release scout is fetching", err)
 	}
 }
 

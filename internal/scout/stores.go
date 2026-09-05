@@ -764,6 +764,26 @@ func (p *StorePool) AddInFlight(infoHash string) bool {
 	return false
 }
 
+// addWouldMissTheClock refuses to CHARGE an add the caller's deadline can no longer carry.
+//
+// The charge and the in-flight marker are both written before the request is built, and a dead context
+// fails at client.Do, which returns without refunding — deliberately, since a request that may have
+// reached the wire must not be re-sent. So an add attempted on a spent clock costs one of the fifty per
+// hour, sends nothing at all, and leaves a 90-second marker that has the next poll report a download
+// nobody queued. Measured on an expired context: zero upstream requests, one add spent per service.
+//
+// It guards the CHARGE rather than the store, and that distinction is the whole point. An earlier
+// version skipped the whole store from ResolvePreferring when the clock was gone, which also discarded
+// the free cache reads ahead of the charge — addInFlight and the two backoff gates — and so turned a
+// 202 "downloading" into a 503 naming the viewer's debrid as refusing, for a release scout had queued
+// moments earlier. Placed here, the free answers still surface and only the pointless purchase stops.
+func addWouldMissTheClock(ctx context.Context, svc DebridService) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	return &StoreUnavailableError{Service: svc, Reason: "the resolve budget was spent before the add could be sent"}
+}
+
 func (s *torBoxStore) AddInFlight(infoHash string) bool {
 	return addOutcomeUnknown(s.cache, ServiceTorBox, s.token, infoHash)
 }
@@ -1152,6 +1172,9 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, error) {
 	// An add we already sent and never heard back about must not be sent again — see addAttemptKey.
 	if err := addInFlight(s.cache, ServiceTorBox, s.token, infoHash); err != nil {
+		return 0, err
+	}
+	if err := addWouldMissTheClock(ctx, ServiceTorBox); err != nil {
 		return 0, err
 	}
 	if err := spendAdd(ServiceTorBox, s.token, infoHash); err != nil {
@@ -2427,6 +2450,9 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if reason, ok := backedOff(s.cache, ServiceRealDebrid, s.token, t.InfoHash); ok {
 		return "", &StoreUnavailableError{Service: ServiceRealDebrid, Reason: reason + " (backing off)"}
 	}
+	if err := addWouldMissTheClock(ctx, ServiceRealDebrid); err != nil {
+		return "", err
+	}
 	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
 		return "", err
 	}
@@ -2925,6 +2951,9 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// hourly fifty while adding nothing. So the charge is given back below the moment the answer shows
 	// nothing was queued.
 	if !queued {
+		if err := addWouldMissTheClock(ctx, ServicePremiumize); err != nil {
+			return "", err
+		}
 		if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
 			return "", err
 		}
@@ -3312,15 +3341,17 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	// accounts couldn't serve this" into "you cannot play this" — a release that used to play. Adds are
 	// bounded by `spendAdd`, which is a ceiling rather than a coin flip on which store gets to try.
 	for _, st := range p.ordered(preferred) {
-		// Out of clock: stop rather than charge every remaining store for an add it cannot send. TorBox
-		// spends the hourly budget and writes the in-flight marker BEFORE the request goes out (see
-		// addMagnet), and a dead context fails at client.Do, which returns without refunding because a
-		// request that may have reached the wire must not be re-sent. Measured on an expired context:
-		// zero upstream requests issued, one add spent per configured service, and a 90-second marker
-		// left behind that makes the next poll answer 202 "downloading" for a torrent nobody queued.
-		if ctx.Err() != nil {
-			break
-		}
+		// A spent clock must not stop this loop. Skipping the remaining stores was tried and reverted:
+		// the answers that matter most on a dead clock are FREE. addInFlight and both backoff gates are
+		// pure cache reads sitting ahead of the charge and ahead of the wire, so asking a store costs
+		// nothing and can still return errAddInFlight — which outranks every refusal below and is what
+		// makes /play answer 202. Skipping the store threw that away and answered 503 instead, naming
+		// the viewer's debrid as refusing for a release scout was actively fetching, which is the one
+		// answer this file twice says never to give. Measured: 202 before the skip, 503 after, with the
+		// second store never asked.
+		//
+		// What must not happen on a dead clock is the CHARGE, and that is guarded where it happens —
+		// see addWouldMissTheClock at the three spendAdd sites.
 		link, err := st.Resolve(ctx, t)
 		if err == nil {
 			return link, nil
@@ -3355,8 +3386,13 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 	// possibly from no store. DeadLinkError here is the same conflation the rest of this file spent
 	// several rounds removing: it is a 404, and a 404 makes the client blacklist a release nobody was
 	// able to ask about.
+	// Named as SCOUT's, not a service's, because that is whose clock ran out. An earlier version returned
+	// a bare StoreUnavailableError with no Service, which /play renders as {"service":""} — every other
+	// 503 on that route names someone, and naming nobody reads as a service that failed anonymously.
+	// errScoutSide is the existing way to say "this refusal is ours"; spendAdd wraps the same way.
 	if ctx.Err() != nil {
-		return "", &StoreUnavailableError{Reason: "the resolve budget was spent before a store could answer"}
+		return "", fmt.Errorf("%w: %w", errScoutSide, &StoreUnavailableError{
+			Reason: "the resolve budget was spent before a store could answer"})
 	}
 	return "", &DeadLinkError{"no store could resolve"}
 }

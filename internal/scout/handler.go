@@ -111,7 +111,13 @@ func escalatedStatusCtx(parent context.Context) (context.Context, context.Cancel
 		return nil, nil, false
 	}
 	budget := escalatedStatusBudget()
-	// Leave the resolve at least as long as the escalation costs, so the add remains possible.
+	// Leave at least as long as the escalation costs, so the add remains possible.
+	//
+	// "The resolve" is no longer all of what that protects: the preference cache check below takes a
+	// statusBudget slice out of the same remainder, so with shipped constants the resolve gets 13s of
+	// the 16s this reserves rather than all of it. Still enough for an add, which is what the guard is
+	// for, but the arithmetic is worth stating rather than leaving a comment that reads as an exact
+	// invariant and is not one.
 	if time.Until(deadline) < 2*budget {
 		return nil, nil, false
 	}
@@ -1100,7 +1106,18 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// shipped constants on a two-account install: 404 after 53.0s with the check holding the clock for
 	// 21.0s, against 302 in 195µs when it answers at once.
 	//
-	// Failure here is free: no preference, and the pool falls back to configured order.
+	// Failure here is NOT free, and an earlier note claiming it was is corrected rather than kept. Losing
+	// the ordering means the pool tries configured order, so an account that would have served the
+	// release from cache can be tried after one that has to fetch it — measured at one add spent and a
+	// download the viewer waits on for a file another of their accounts already held.
+	//
+	// Capped anyway, because the two costs are not comparable: losing the ordering costs at most one add
+	// on a release that still plays, while losing the RESOLVE costs a 404 on a live release AND an add
+	// per configured store. The trade is a real one and it has a window — with shipped constants the
+	// check is reached at t=24s with 21s left, so a checkcached answering between 8s and ~21s used to
+	// order correctly and now does not. Under 8s both behave the same; over ~21s the old code produced
+	// the 404 this cap exists to remove.
+	//
 	var preferred []DebridService
 	if len(config.Debrid) > 1 {
 		checkCtx, checkCancel := context.WithTimeout(ctx, statusBudget)
