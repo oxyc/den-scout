@@ -1776,13 +1776,25 @@ const (
 
 // listingFaultFor splits a decode error into the kind worth remembering and the kind worth retrying.
 //
-// A type error means the body was well-formed and the wrong SHAPE: that arrives identically on the next
-// poll, so re-fetching it is the guaranteed waste every other deterministic fault here is memoised to
-// avoid. Anything else — an unexpected EOF above all — is a body that stopped early, and suppressing that
-// retry is how a queued torrent stops being rediscoverable.
+// The line is drawn by measurement, not by guessing which errors look serious. Every way a body can stop
+// early — cut mid-key, mid-number, mid-string, after a comma — returns io.ErrUnexpectedEOF, and every way
+// a COMPLETE body can be wrong returns one of the two below: a type error for the right JSON of the wrong
+// shape (`id` as a string), a syntax error for JSON that is not valid at all (a leading-zero number, a
+// trailing comma, an unquoted key, a bad escape). Nothing that was merely truncated produces either.
+//
+// So both are deterministic: the same bytes arrive next poll and fail the same way, and re-fetching them
+// is the guaranteed waste — 45 fetches and up to 538 MiB per wait — that every other deterministic fault
+// here is memoised to avoid. Anything else is a body that stopped early, and suppressing that retry is
+// how a queued torrent stops being rediscoverable.
+//
+// A syntax error could in principle come from corruption in transit rather than from the upstream, which
+// a retry would clear. Remembering it anyway costs fifteen seconds of "could not find out" — no add, no
+// miss marker — against re-pulling a body that will not parse, on a two-second cadence. Same asymmetry
+// that decides success:false.
 func listingFaultFor(err error) listingFault {
 	var typeErr *json.UnmarshalTypeError
-	if errors.As(err, &typeErr) {
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
 		return listingBadEnvelope
 	}
 	return listingFaultNone

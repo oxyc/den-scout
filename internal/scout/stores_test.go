@@ -1271,6 +1271,12 @@ func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
 		{"an entry hash is a number", `{"success":true,"data":[{"id":1,"hash":7}]}`},
 		{"an entry is a scalar", `{"success":true,"data":[42]}`},
 		{"success is a string", `{"success":"yes","data":[{"id":1,"hash":"` + repeat("a", 40) + `"}]}`},
+		// JSON that is not valid at all is deterministic in the same way, and arrives as a different error
+		// type — so it needs its own cases or the split is only half made. No truncation produces these:
+		// measured, every way a body can stop early returns io.ErrUnexpectedEOF instead.
+		{"a leading-zero number", `{"success":true,"data":[{"id":01}]}`},
+		{"a trailing comma", `{"success":true,"data":[{"id":1,}]}`},
+		{"an unquoted key", `{"success":true,"data":[{id:1}]}`},
 	} {
 		fetches := 0
 		s := &torBoxStore{token: "envelope-" + tc.name, api: torboxAPI, cache: NewMemoryCache(1 << 20),
