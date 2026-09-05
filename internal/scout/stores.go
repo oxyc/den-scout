@@ -1579,9 +1579,10 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	// A listing this account will keep failing to produce is memoised, briefly. A transient failure is not.
 	//
 	// The distinction is the whole point, and it is the FAULT that draws it, not the size: too big to
-	// read, too many entries, or no usable entry among them. A transient failure — a timeout, a 5xx —
-	// must be retried at once, because that retry is the only thing able to rediscover a queued torrent;
-	// suppressing it is a bug this package has already had and has a test for. None of the three faults is
+	// read, too many entries, no usable entry among them, or an envelope carrying no usable array at all.
+	// A transient failure — a timeout, a 5xx, a body cut off mid-stream — must be retried at once,
+	// because that retry is the only thing able to rediscover a queued torrent;
+	// suppressing it is a bug this package has already had and has a test for. None of the four faults is
 	// transient: the body was that shape a moment ago and will be again, so re-pulling it is guaranteed
 	// waste. Without this an oversized account re-pulled the whole body on every attempt, and a single
 	// /play makes up to three status reads while a client polls it every two seconds — tens of megabytes
@@ -1671,10 +1672,10 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	}
 }
 
-// The third result says whether this failure is worth REMEMBERING: too big to read, too many entries, or
-// no usable entry among them. Each is a property of the listing rather than a blip, so each will fail the
-// same way on the next poll and retrying it immediately is guaranteed waste — where retrying a timeout is
-// the only way a queued torrent is ever rediscovered.
+// The third result says whether this failure is worth REMEMBERING: too big to read, too many entries, no
+// usable entry among them, or a complete envelope with no usable data array. Each is a property of the
+// listing rather than a blip, so each will fail the same way on the next poll and retrying it immediately
+// is guaranteed waste — where retrying a timeout is the only way a queued torrent is ever rediscovered.
 func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, bool, bool) {
 	resp, err := s.get(ctx, s.api+"/torrents/mylist?bypass_cache=true")
 	if err != nil {
@@ -1706,7 +1707,7 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	limited := &truncationDetector{r: io.LimitReader(resp.Body, maxListingBytes+1), limit: maxListingBytes}
 	ids, ok, fault := decodeListing(json.NewDecoder(limited))
 	if fault != listingFaultNone {
-		// Both faults take the same road as the byte cap: each is a property of this listing rather than a
+		// Every fault takes the same road as the byte cap: each is a property of this listing rather than a
 		// blip, so each will fail the same way on the next poll, and each is therefore remembered. Only
 		// the byte one was at first, and tripping the entry cap re-pulled the whole body every poll —
 		// 14.9 MiB per /play on a two-second cadence, which is the egress this memo exists to stop.
@@ -1740,8 +1741,8 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	return ids, ok, false
 }
 
-// listingFault says WHY a listing could not be read, for the two reasons that are properties of the
-// listing rather than blips. Both must be remembered: re-pulling a body that will fail the same way is
+// listingFault says WHY a listing could not be read, for the reasons that are properties of the
+// listing rather than blips. Each must be remembered: re-pulling a body that will fail the same way is
 // the egress the oversized memo exists to stop. Only a transient failure — a timeout, a 5xx — is worth
 // retrying at once, because that retry is the only thing that rediscovers a queued torrent.
 type listingFault int
@@ -1759,6 +1760,14 @@ const (
 	// A complete envelope with no usable `data` array: the key renamed, `data` holding an object, or an
 	// explicit success:false. Same deterministic class as the two above — and separated from a truncated
 	// body, which reaches the same place and is not.
+	//
+	// success:false is the arguable member, and it is arguable in one direction only. TorBox signals state
+	// in band at HTTP 200 — this file records elsewhere that a torrent still downloading answers exactly
+	// that — so if mylist ever returns it for something transient, a rate limit or a maintenance window,
+	// that blip is remembered for the listing TTL. Kept here because the cost is bounded and asymmetric:
+	// ok=false stays indeterminate, no miss marker is written, so nothing ever concludes the account does
+	// not hold a release, and what is lost is fifteen seconds of rediscovery. Treating it as transient
+	// instead reinstates the 45 fetches and 539 MiB per wait this fault was added to remove.
 	listingBadEnvelope
 )
 
