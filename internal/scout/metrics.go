@@ -31,9 +31,10 @@ type metricSet struct {
 
 	probeCacheHit  atomic.Int64
 	probeCacheMiss atomic.Int64
-	// Panics recovered on ANY background goroutine — the probe fan-out and the stale-list rebuild both
-	// route here. Deliberately not named for the probe: the two share one recover helper, and booking a
-	// rebuild's panic to a probe series would ruin the metric an operator alerts on for a parser crash.
+	// Panics recovered on ANY background goroutine — the probe fan-out, the stale-list rebuild and the
+	// account-listing fetch all route here. Deliberately not named for the probe: they share one recover
+	// helper, and booking a rebuild's panic to a probe series would ruin the metric an operator alerts on
+	// for a parser crash.
 	backgroundPanic atomic.Int64
 
 	// Fixed keys, populated once at construction and never written again, so concurrent reads need no

@@ -159,14 +159,20 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 // and an unrecovered panic there takes the PROCESS down, not the probe. Every viewer loses playback
 // because one release had a malformed header.
 //
-// Named for the goroutine rather than the probe because the stale-list rebuild uses it too, and the
-// counter is named to match: booking a rebuild's panic to a probe series would quietly ruin the one
-// metric an operator would alert on for "a malformed container header crashed a parser".
+// Named for the goroutine rather than the probe because the stale-list rebuild and the account-listing
+// fetch use it too, and the counter is named to match: booking a rebuild's panic to a probe series would
+// quietly ruin the one metric an operator would alert on for "a malformed container header crashed a
+// parser".
 //
-// Abandoning is already a first-class outcome on both paths — an unresolvable release, a server that
-// ignores Range, a container nobody parses all leave the entry exactly as the indexer described it, and a
-// failed rebuild just leaves the stale entry to expire — so a panic joins them rather than needing an
-// answer of its own.
+// Abandoning is already a first-class outcome on all three paths — an unresolvable release, a server that
+// ignores Range, a container nobody parses all leave the entry exactly as the indexer described it; a
+// failed rebuild just leaves the stale entry to expire; and an unreadable listing is already the
+// indeterminate answer that concludes nothing — so a panic joins them rather than needing an answer of
+// its own.
+//
+// The listing fetch needs this for a reason the other two do not: it runs under singleflight's DoChan,
+// which re-raises a panic with `go panic(e)` on a bare goroutine as soon as anyone is waiting on a
+// channel. That is unrecoverable anywhere, so the recover has to be inside the closure itself.
 func recoverBackground(what string) {
 	if rec := recover(); rec != nil {
 		metrics.backgroundPanic.Add(1)
