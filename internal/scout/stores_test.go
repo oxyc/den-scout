@@ -141,14 +141,19 @@ func TestTorBoxBingeCacheAndNoPoison(t *testing.T) {
 		t.Errorf("binge cache: creates=%d lists=%d dls=%d (want 1,1,2)", creates, lists, dls)
 	}
 
-	// The READ half of #3: an entry with no file list is skipped rather than served, so a pack whose
-	// list never succeeded re-lists on the next episode instead of mis-serving from an empty one.
+	// A pack whose list never succeeded re-lists on the next episode instead of mis-serving from an
+	// empty one.
 	//
-	// This covers stores.go's warm-entry guard (`!needFiles || len(e.Files) > 0`) and NOTHING ELSE.
-	// It was named for the write guard at the bottom of resolveHeldTorrent and does not reach it: the
-	// list fails on the FIRST resolve here, so there is no good entry to overwrite and the write guard
-	// is never the thing that keeps this green. TestTorBox_aFailedListDoesNotPoisonAWarmPackEntry is
-	// the one that pins the write side.
+	// This half names two guards and reaches NEITHER on its own. The write guard at the bottom of
+	// resolveHeldTorrent is out of reach because the list fails on the first resolve, so no good entry
+	// exists to overwrite; the read guard on the warm-entry fast path is out of reach because, with the
+	// write guard intact, no entry is ever written here at all and the fast path misses the cache. Only
+	// the PAIR is pinned: delete either one alone and this stays green.
+	//
+	// Both are pinned individually elsewhere, and a relabelling of this comment that claimed it covered
+	// the read guard "and NOTHING ELSE" was itself wrong — the misattribution moved rather than going
+	// away. See TestTorBox_aFailedListDoesNotPoisonAWarmPackEntry for the write side and
+	// TestTorBox_aPackEntryWithNoFileListIsNotServedToAnEpisode for the read side.
 	lists2 := 0
 	d2 := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
 		switch {
@@ -167,6 +172,64 @@ func TestTorBoxBingeCacheAndNoPoison(t *testing.T) {
 	_, _ = s2.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
 	if lists2 != 2 {
 		t.Errorf("no-poison: mylist should be retried (got %d, want 2)", lists2)
+	}
+}
+
+// A pack entry with no file list must not be served to an episode request.
+//
+// This is the READ guard on the warm-entry fast path (`!needFiles || len(e.Files) > 0`), and nothing
+// reached it: deleting it left the whole package green, because every fixture that had an empty entry to
+// read was also relying on the write guard to keep the entry from existing in the first place.
+//
+// Getting an entry with no file list past the intact write guard means writing one the way the shipped
+// code deliberately does: a movie-shaped resolve needs no list, so `needFiles` is false and the entry is
+// stored with `files:null` on purpose — the torrent id in it is what Status needs to report a download
+// in progress. Ask for an episode of that same infohash afterwards and the fast path has an entry it
+// must refuse.
+//
+// Without the guard the failure is silent rather than loud: selectFileID picks nothing out of an empty
+// list, requestdl is sent with no file_id at all, and TorBox answers 200 with a link to the wrong file.
+// No error, no retry, no log — the client just plays the wrong thing.
+func TestTorBox_aPackEntryWithNoFileListIsNotServedToAnEpisode(t *testing.T) {
+	creates, lists := 0, 0
+	d := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "createtorrent"):
+			creates++
+			return resp(200, `{"data":{"torrent_id":9}}`), nil
+		case strings.Contains(r.URL.Path, "mylist"):
+			lists++
+			return resp(200, `{"data":{"files":[`+
+				`{"id":0,"name":"S01E01.mkv","size":10},`+
+				`{"id":1,"name":"S01E02.mkv","size":20}]}}`), nil
+		case strings.Contains(r.URL.Path, "requestdl"):
+			return resp(200, `{"success":true,"data":"https://cdn/`+r.URL.Query().Get("file_id")+`"}`), nil
+		}
+		return resp(404, "{}"), nil
+	}}
+	s := &torBoxStore{token: "t", client: d, cache: NewMemoryCache(1 << 20), api: torboxAPI}
+
+	// Seed the entry the way a movie does: no episode selector, so no list is fetched and files is null.
+	if _, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, FileIdx: intp(0)}); err != nil {
+		t.Fatalf("seeding the pack entry: %v", err)
+	}
+	if lists != 0 {
+		t.Fatalf("the movie path listed files (%d times), so the entry under test is not empty and "+
+			"this test is not exercising the read guard", lists)
+	}
+
+	// Now an episode of the same pack. The entry cannot answer it.
+	link, err := s.Resolve(context.Background(), ResolveTarget{InfoHash: H, Season: intp(1), Episode: intp(2)})
+	if err != nil || link != "https://cdn/1" {
+		t.Errorf("episode resolve: link=%q err=%v, want https://cdn/1 — an entry with no file list was "+
+			"served to an episode request, so requestdl went out with no file_id and the client got a "+
+			"silently wrong file", link, err)
+	}
+	if lists != 1 {
+		t.Errorf("mylist called %d times, want 1 — the empty entry was served instead of re-listing", lists)
+	}
+	if creates != 1 {
+		t.Errorf("createtorrent called %d times, want 1", creates)
 	}
 }
 
