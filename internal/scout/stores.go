@@ -999,6 +999,19 @@ func (s *premiumizeStore) AddInFlight(infoHash string) bool {
 	if addStillBelievable(s.cache, ServicePremiumize, s.token, infoHash) {
 		return true
 	}
+	// NOTE FOR ANYONE TIGHTENING THIS: Premiumize's per-release refusal key is written by read-only
+	// callers too, unlike Real-Debrid's, and that asymmetry is deliberate. For RD the key is purely an
+	// add-path guard, so recordRefusalFor keeps a probe from writing one. Here it carries a SECOND
+	// meaning — it is the only thing that withdraws the queue marker's "coming" claim, in the branch just
+	// below — so suppressing the write suppressed the withdrawal: the probe answered 202 "downloading"
+	// on every poll of a transfer Premiumize had refused, for the full ten-minute window, and re-asked
+	// directdl once per poll for a magnet it kept refusing. Measured: 202/202/202 with four directdl
+	// calls, against 503/503/503 with one when the refusal is recorded.
+	//
+	// The cost of recording it from a read-only poll is the one agent B measured and called bounded: the
+	// next /play answers 503 with no upstream call where it would otherwise have answered 404 after one
+	// — and /play writes the same record itself a poll later regardless.
+	//
 	// A refusal on record outranks the queue marker. directdl's answered-failure branches — an
 	// unsupported magnet, an account at its limit, "not enough space", all of which Premiumize reports
 	// as HTTP 200 with status:error — record a refusal and do NOT clear pmQueuedKey, so the marker
@@ -3250,7 +3263,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 				noteUnknownOutcome(s.cache, ServicePremiumize, s.token, t.InfoHash)
 			}
 		} else {
-			recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, err, t.NoAdd)
+			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, err)
 		}
 		return "", err
 	}
@@ -3290,14 +3303,14 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		if storeRefusedUs(resp.StatusCode) {
 			refused := &StoreUnavailableError{Service: ServicePremiumize, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("directdl http %d%s", resp.StatusCode, detail)}
-			recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, refused, t.NoAdd)
+			recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, refused)
 			return "", refused
 		}
 		// Backed off for the same reason RD's twin is: without it a poll loop re-asks a magnet Premiumize
 		// has already rejected once every couple of seconds for as long as the viewer sits there. The
 		// answer to this poll stays a dead link so the client can fall through to another release.
 		dead := &DeadLinkError{fmt.Sprintf("premiumize directdl http %d%s", resp.StatusCode, detail)}
-		recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, dead, t.NoAdd)
+		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
 		return "", dead
 	}
 	// Premiumize accepted it. Same reason as RD: no Status endpoint, so without this the next poll
@@ -3349,7 +3362,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 			dead = &DeadLinkError{"premiumize directdl: " +
 				strings.TrimSpace(redactToken(body.Status, s.token)+" "+msg[:min(len(msg), 200)])}
 		}
-		recordRefusalFor(s.cache, ServicePremiumize, s.token, t.InfoHash, dead, t.NoAdd)
+		recordRefusal(s.cache, ServicePremiumize, s.token, t.InfoHash, dead)
 		return "", dead
 	}
 	if len(body.Content) == 0 {
@@ -3380,11 +3393,21 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	// another add while queueing nothing. Twenty polls, twenty adds, the hourly allowance gone in under
 	// two minutes, on the branch season packs always take.
 	//
-	// The transfer is likewise no longer pending, whatever we go on to make of its contents.
+	// The transfer is likewise no longer pending, whatever we go on to make of its contents — but only a
+	// caller that could have QUEUED it may say so.
+	//
+	// A read-only poll clearing this marker destroys the only thing that names Premiumize a holder, and
+	// so destroys its own next answer: the probe reported 200 ready once, then 404 "not queued" on every
+	// later poll, while /play kept serving a 302 from the same transfer. Measured across all five
+	// cache-check outcomes — 200, then 404, 404. That 404 is what this route calls the single failure it
+	// exists to prevent, so the read-only path leaves the marker for /play to settle. The marker's own
+	// TTL bounds it either way.
 	if !queued {
 		refundUnusedAdd(ServicePremiumize, s.token)
 	}
-	settleQueuedTransfer(s.cache, s.token, t.InfoHash)
+	if !t.NoAdd {
+		settleQueuedTransfer(s.cache, s.token, t.InfoHash)
+	}
 
 	files := make([]TorrentFile, len(body.Content))
 	for i, c := range body.Content {

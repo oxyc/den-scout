@@ -830,9 +830,16 @@ func TestProbeAndPlay_agreeWhenAQueuedPremiumizeTransferIsRefused(t *testing.T) 
 		`"indexers":["torrentio"],"resultCap":20}`)
 	tok := encodePlayToken(PlayTarget{InfoHash: hash})
 
-	// The first /play is what gets the verdict and records it.
-	first := httptest.NewRecorder()
-	h.ServeHTTP(first, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok, nil))
+	// The PROBE goes first, which is the order a real client uses — it polls to draw its progress bar and
+	// only calls /play when told the release is ready. An earlier version issued a /play first, which
+	// recorded the refusal on the probe's behalf and so hid whether the probe could learn it alone.
+	probeFirst := httptest.NewRecorder()
+	h.ServeHTTP(probeFirst, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
+	if probeFirst.Code == http.StatusAccepted {
+		t.Errorf("the first ?probe=1 says downloading (%s) for a transfer Premiumize refused on that "+
+			"very call — nothing withdraws the queue marker's claim, so the client sits on a spinner it "+
+			"cannot fall through", strings.TrimSpace(probeFirst.Body.String()))
+	}
 
 	probe := httptest.NewRecorder()
 	h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
@@ -905,23 +912,27 @@ func TestProbeAndPlay_agreeWhenAPremiumizeTransferCompletes(t *testing.T) {
 				`"indexers":["torrentio"],"resultCap":20}`)
 			tok := encodePlayToken(PlayTarget{InfoHash: hash})
 
-			probe := httptest.NewRecorder()
-			h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
+			// THREE polls, because a client polls. One poll cannot see a route that destroys the state
+			// its own next answer depends on: the readiness enquiry used to clear the queue marker, so
+			// the probe reported ready once and 404 "not queued" forever after, while /play kept serving
+			// the same transfer.
+			for i := 1; i <= 3; i++ {
+				probe := httptest.NewRecorder()
+				h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok+"?probe=1", nil))
+				if probe.Code == http.StatusAccepted {
+					t.Errorf("poll %d: ?probe=1 says downloading (%s) for a completed transfer",
+						i, strings.TrimSpace(probe.Body.String()))
+				}
+				if probe.Code != http.StatusOK {
+					t.Errorf("poll %d: ?probe=1 = %d (%s), want 200 ready",
+						i, probe.Code, strings.TrimSpace(probe.Body.String()))
+				}
+			}
 			play := httptest.NewRecorder()
 			h.ServeHTTP(play, httptest.NewRequest("GET", "/"+pmBlob+"/play/"+tok, nil))
-
 			if play.Code != http.StatusFound {
 				t.Fatalf("/play = %d, want 302 — the fixture is not serving a completed transfer",
 					play.Code)
-			}
-			if probe.Code == http.StatusAccepted {
-				t.Errorf("?probe=1 still says downloading (%s) while /play serves a 302 — the client "+
-					"polling to learn its download landed never finds out",
-					strings.TrimSpace(probe.Body.String()))
-			}
-			if probe.Code != http.StatusOK {
-				t.Errorf("?probe=1 = %d (%s), want 200 ready",
-					probe.Code, strings.TrimSpace(probe.Body.String()))
 			}
 		})
 	}
@@ -954,8 +965,52 @@ func TestProbe_aReadOnlyPollWritesNoPremiumizeAddMemory(t *testing.T) {
 		t.Error("a read-only poll left an add-path in-flight marker — /play then answers 202 " +
 			"'downloading' without calling directdl, for a release Premiumize already holds")
 	}
-	if _, backed := backedOff(cache, ServicePremiumize, token, hash); backed {
-		t.Error("a read-only poll wrote the per-release add backoff, which it is exempt from reading")
+	// The queue marker must survive a read-only poll: it is the only thing naming Premiumize a holder,
+	// so clearing it from here makes the very next probe answer 404 for a transfer /play still serves.
+	if !alreadyQueued(cache, token, hash) {
+		t.Error("a read-only poll cleared the queue marker — the next poll names no holder and answers " +
+			"404 not_queued for a release /play resolves from the same marker")
+	}
+}
+
+// A refusal Premiumize ANSWERS must be recorded even by a read-only poll, because for this store that
+// key is what withdraws the queue marker's "coming" claim.
+//
+// This half was previously asserted with a fixture whose error was context.Canceled — which recordRefusal
+// excludes by itself, so the assertion could not fail for the reason it named, and reverting the whole
+// change passed the entire suite. The errors below are the ones Premiumize actually returns: "not enough
+// space" and an invalid magnet arrive as HTTP 200 with status:error.
+func TestPremiumize_aReadOnlyPollRecordsAnAnsweredRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		code int
+	}{
+		{"out of space", `{"status":"error","message":"not enough space"}`, 200},
+		{"server error", `{}`, 500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token, hash := "pm-answered-"+tc.name, repeat("1", 40)
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(pmQueuedKey(token, hash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+
+			s := &premiumizeStore{token: token, cache: cache, api: premiumizeAPI,
+				client: mockDoer{fn: func(*http.Request) (*http.Response, error) {
+					return resp(tc.code, tc.body), nil
+				}}}
+
+			_, _ = s.Resolve(context.Background(), ResolveTarget{InfoHash: hash, NoAdd: true})
+
+			if _, backed := backedOff(cache, ServicePremiumize, token, hash); !backed {
+				t.Error("an answered refusal was not recorded by a read-only poll — nothing then " +
+					"withdraws the queue marker's claim, so the probe reports 202 downloading on every " +
+					"poll of a transfer Premiumize has refused, re-asking directdl each time")
+			}
+			if s.AddInFlight(hash) {
+				t.Error("the queue marker still reads as in-flight after Premiumize refused the " +
+					"transfer — the client sits on a spinner it cannot fall through")
+			}
+		})
 	}
 }
 
