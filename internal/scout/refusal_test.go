@@ -1192,9 +1192,18 @@ func TestPlay_doesNotBuyAReleaseAnotherAccountAlreadyHolds(t *testing.T) {
 
 	var creates int32
 	tb := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
-		if strings.Contains(r.URL.Path, "createtorrent") {
+		switch {
+		case strings.Contains(r.URL.Path, "createtorrent"):
 			atomic.AddInt32(&creates, 1)
 			return resp(200, `{"data":{"torrent_id":9}}`), nil
+		case strings.Contains(r.URL.Path, "checkcached"):
+			// TorBox reports it CACHED, which is the ordinary case for anything popular — and the case
+			// that matters, because a cache hit still costs a createtorrent while RD's held id does not.
+			// Answering "nothing cached" here left HeldBy empty, so RD was the only preferred service and
+			// the ordering was never actually under test.
+			return resp(200, `{"data":{"`+hash+`":{}}}`), nil
+		case strings.Contains(r.URL.Path, "requestdl"):
+			return resp(200, `{"success":true,"data":"https://tb.example/link.mkv"}`), nil
 		}
 		return resp(200, `{"success":true,"data":[]}`), nil
 	}}

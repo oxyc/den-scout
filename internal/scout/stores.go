@@ -3767,18 +3767,39 @@ func (p *StorePool) ordered(preferred []DebridService) []Store {
 	if len(preferred) == 0 {
 		return p.stores
 	}
-	wanted := make(map[DebridService]bool, len(preferred))
+	// The CALLER'S order within `preferred`, not the configured one. Those are different questions, and
+	// collapsing them to a set threw away the answer to the first.
+	//
+	// /play ranks its holders deliberately: stores that already have an id for the release come before
+	// stores a cache check merely reported as holding it, because the first can serve with no add and the
+	// second still costs a createtorrent — TorBox's checkcached says what TORBOX has, not what this
+	// ACCOUNT has. Re-sorting by configured priority handed the release back to whichever store happened
+	// to be listed first. Measured on TorBox + Real-Debrid with RD holding the torrent and TorBox's
+	// checkcached reporting it cached: /play resolved from TorBox, spent one of the fifty and left a
+	// duplicate torrent there, while ?probe=1 answered 200 ready from RD for free — the two routes
+	// disagreeing about which store serves, and only the paying one getting it wrong.
+	//
+	// Within one preferred service the configured order still decides, and every store still gets a turn:
+	// this reorders, it never drops.
+	rank := make(map[DebridService]int, len(preferred))
+	order := make([]DebridService, 0, len(preferred))
 	for _, svc := range preferred {
-		wanted[svc] = true
+		if _, seen := rank[svc]; seen {
+			continue
+		}
+		rank[svc] = len(order)
+		order = append(order, svc)
 	}
 	out := make([]Store, 0, len(p.stores))
-	for _, st := range p.stores {
-		if wanted[st.Service()] {
-			out = append(out, st)
+	for _, svc := range order {
+		for _, st := range p.stores {
+			if st.Service() == svc {
+				out = append(out, st)
+			}
 		}
 	}
 	for _, st := range p.stores {
-		if !wanted[st.Service()] {
+		if _, wanted := rank[st.Service()]; !wanted {
 			out = append(out, st)
 		}
 	}
