@@ -2,6 +2,7 @@ package scout
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"regexp"
 	"strings"
@@ -24,7 +25,18 @@ type playWire struct {
 	E *int   `json:"e,omitempty"`
 }
 
-var infoHashRe = regexp.MustCompile(`^[a-z0-9]{32,40}$`)
+// The only shape an infohash may take on the way in: 32 characters for base32, 40 for hex, lower-cased
+// before the match. Both ends are named because decodeListing filters the account listing on the same
+// range, and the two MUST agree — a listing key narrower than this range is one /play will still ask
+// about, and "not in the listing" is an authoritative miss, a 15 s marker, and a duplicate add for a
+// torrent the account holds. Built from the constants so the two cannot drift apart silently.
+const (
+	minInfoHashLen = 32
+	maxInfoHashLen = 40
+)
+
+var infoHashRe = regexp.MustCompile(
+	fmt.Sprintf(`^[a-z0-9]{%d,%d}$`, minInfoHashLen, maxInfoHashLen))
 
 func encodePlayToken(t PlayTarget) string {
 	b, _ := json.Marshal(playWire{H: t.InfoHash, F: t.FileIdx, S: t.Season, E: t.Episode})

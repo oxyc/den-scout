@@ -1792,19 +1792,10 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 					if dec.Decode(&e) != nil {
 						return nil, false, false
 					}
-					// A hash that could never be asked about is dropped BEFORE it is lowercased and
-					// retained. Entry count and byte count both miss this: the key is whatever the upstream
-					// sent, so one entry carrying a 60 MiB "hash" is one entry and 60 MiB — under both caps
-					// — and it decoded as a valid listing, retained the 60 MiB for the TTL, and allocated
-					// 248 MiB doing it, against a 230 MiB GOMEMLIMIT. ToLower is half of that, since it
-					// copies whenever the string is not already lower-case.
-					//
-					// Nothing is lost by dropping them: /play validates an infohash to 32-40 hex or base32
-					// before it ever reaches a lookup, so a key outside that range cannot match anything.
-					// The cap counts entries SEEN, and is checked BEFORE the length filter can skip past it.
+					// The cap counts entries SEEN, and is checked BEFORE the filter below can skip past it.
 					// The byte cap does not bound the entry count: 60 MiB of minimal entries is ~1M of them
 					// and peaked at 346 MiB against a 230 MiB GOMEMLIMIT. Counting only what survived the
-					// filter — or leaving the check below a `continue` — would let a body of a million
+					// filter — or leaving this check below a `continue` — would let a body of a million
 					// unusable hashes fall through to an empty map and be reported as an authoritative
 					// "this account holds nothing", which costs a duplicate add: worse than the retention
 					// the filter was added to prevent.
@@ -1812,10 +1803,41 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 					if seen > maxListingEntries {
 						return nil, false, true
 					}
-					if len(e.Hash) < 32 || len(e.Hash) > 40 {
+					// A hash that could never be asked about is dropped rather than retained. Both caps miss
+					// this, because the key is whatever the upstream sent: one entry carrying a 60 MiB
+					// "hash" is one entry and 60 MiB, under each of them, and it decoded as a valid listing,
+					// retained the 60 MiB for the memo TTL, and allocated 248 MiB doing it.
+					//
+					// Nothing real is lost: play.go admits only minInfoHashLen..maxInfoHashLen, and these
+					// bounds are shared with it so the two cannot drift. A listing filtered NARROWER than
+					// /play accepts would turn a torrent the account holds into an authoritative miss, a
+					// fifteen-second marker, and a duplicate add.
+					//
+					// Two steps, because the length that decides is the LOWERED one: a non-ASCII hash can be
+					// 96 raw bytes and 32 after lowering, and judging it on the raw length would drop a key
+					// that is perfectly askable. The cheap guard first bounds what ToLower may copy — 40
+					// runes of at most 4 bytes each is the most that can lower into range — so the 60 MiB
+					// case is still refused without allocating.
+					if len(e.Hash) > 4*maxInfoHashLen {
 						continue
 					}
-					ids[strings.ToLower(e.Hash)] = e.ID
+					hash := strings.ToLower(e.Hash)
+					if len(hash) < minInfoHashLen || len(hash) > maxInfoHashLen {
+						continue
+					}
+					ids[hash] = e.ID
+				}
+				// Entries arrived and NONE of them were usable: that is a listing we could not read, not an
+				// account holding nothing. The difference is an add — an empty map answers ok=true, which
+				// findTorrentByHash reports as an authoritative miss, which writes a fifteen-second marker
+				// and sends /play to queue a torrent the account may well already have.
+				//
+				// The filter above made this reachable at any size, not just past the entry cap: if TorBox
+				// renames `hash` — a v2 API, or `infohash` — every entry filters out, the map is empty, and
+				// a poll every two seconds spends an add for the whole memo TTL. An account that genuinely
+				// holds nothing sends no entries at all, so it still answers authoritatively.
+				if seen > 0 && len(ids) == 0 {
+					return nil, false, false
 				}
 				if _, err := dec.Token(); err != nil { // closing ]
 					return nil, false, false
@@ -1833,10 +1855,20 @@ func decodeListing(dec *json.Decoder) (ids map[string]int, ok bool, tooManyEntri
 			// transient and shallow rather than the body held twice at once.
 			//
 			// Nothing STRUCTURED is retained — a scalar is not helped, and saying otherwise would be the
-			// kind of comment this file keeps having to correct. A single 63 MiB string still costs
-			// ~159 MiB either way, because Token must buffer the whole token and allocate the string.
-			// That needs a hostile api.torbox.app rather than a caller (the base URL is a constant), which
-			// is the only reason it is tolerable rather than urgent.
+			// kind of comment this file keeps having to correct. A single huge string costs the same
+			// either way, because Token must buffer the whole token and allocate the string.
+			//
+			// That cost was understated here as ~159 MiB. Measured against the actual cap: one value just
+			// under maxListingBytes peaks at 256.7 MiB of LIVE heap — the decoder's buffer has doubled to
+			// 128 MiB and the materialised string is live at the same time, so the GC cannot reclaim
+			// either. That is above the 230 MiB GOMEMLIMIT and above the container, i.e. an OOM kill, and
+			// it is not reduced by the length filter on `hash` above, which runs only after the token has
+			// been materialised.
+			//
+			// Left as it is, deliberately: it needs a hostile or broken api.torbox.app rather than a caller
+			// (the base URL is a constant), and the alternative is lowering maxListingBytes, which governs
+			// real large accounts and would turn them oversized. Recorded in FOLLOWUP.md with the options
+			// rather than traded for a functional regression on a threat this package already accepts.
 			if !skipValue(dec) {
 				return nil, false, false
 			}

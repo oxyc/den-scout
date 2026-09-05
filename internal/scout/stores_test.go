@@ -1402,6 +1402,54 @@ func TestDecodeListing_dropsUnusableHashesWithoutInventingAnEmptyAccount(t *test
 		t.Errorf("a listing of unusable hashes reported ok=%v tooMany=%v with %d entries — an empty map "+
 			"here reads as an authoritative 'holds nothing' and costs a duplicate add", ok, tooMany, len(ids))
 	}
+
+	// Entries arrived and NONE survived: that is unreadable, not empty. This is the half the filter made
+	// reachable at ANY size — previously only a body past the entry cap went indeterminate, so a listing
+	// whose entries all filtered out answered ok=true with an empty map, which findTorrentByHash reports
+	// as an authoritative miss: a marker, and an add per poll for the memo TTL.
+	//
+	// The scenario needs no attacker. TorBox renaming `hash` — a v2 API, or `infohash` — empties every
+	// entry at once.
+	renamed := `{"success":true,"data":[{"id":1,"infohash":"` + good + `"},{"id":2,"infohash":"x"}]}`
+	if ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(renamed))); ok {
+		t.Errorf("a listing whose entries all filtered out answered ok=true (ids=%v) — that is an "+
+			"authoritative 'the account holds nothing', and it costs an add on every poll", ids)
+	}
+	// But an account that genuinely holds nothing sends no entries, and still answers authoritatively.
+	if ids, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(
+		`{"success":true,"data":[]}`))); !ok || len(ids) != 0 {
+		t.Errorf("a genuinely empty account must stay an ANSWER, not become indeterminate: ok=%v n=%d",
+			ok, len(ids))
+	}
+
+	// EVERY length /play accepts must survive the filter, or the listing is narrower than the lookup and a
+	// torrent the account holds becomes an authoritative miss. Nothing pinned the lower end: raising it to
+	// 33 — which drops base32 — passed the whole suite.
+	for _, n := range []int{minInfoHashLen, maxInfoHashLen} {
+		h := repeat("b", n)
+		if !infoHashRe.MatchString(h) {
+			t.Fatalf("the fixture is %d chars, which /play itself rejects — this asserts nothing", n)
+		}
+		got, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(
+			`{"success":true,"data":[{"id":9,"hash":"` + h + `"}]}`)))
+		if !ok || got[h] != 9 {
+			t.Errorf("a %d-char hash that /play accepts was dropped from the listing: ok=%v ids=%v",
+				n, ok, got)
+		}
+	}
+
+	// The length that decides is the LOWERED one. A hash of 32 upper-case Kelvin signs is 96 raw bytes and
+	// 32 after lowering, which /play would accept — judging it on the raw length drops an askable key.
+	kelvin := repeat("K", minInfoHashLen)
+	lowered := strings.ToLower(kelvin)
+	if !infoHashRe.MatchString(lowered) {
+		t.Fatalf("the fixture does not lower into an askable hash (%q) — this asserts nothing", lowered)
+	}
+	if got, ok, _ := decodeListing(json.NewDecoder(strings.NewReader(
+		`{"success":true,"data":[{"id":7,"hash":"` + kelvin + `"}]}`))); !ok || got[lowered] != 7 {
+		t.Errorf("a hash judged on its raw byte length was dropped though it lowers into range: ok=%v ids=%v",
+			ok, got)
+	}
 }
 
 func TestDecodeListing_boundsEntryCount(t *testing.T) {
@@ -1419,5 +1467,24 @@ func TestDecodeListing_boundsEntryCount(t *testing.T) {
 	// oversized instead of re-pulling and re-discarding the whole listing on every poll.
 	if _, ok, tooMany := decodeListing(json.NewDecoder(strings.NewReader(body.String()))); ok || !tooMany {
 		t.Errorf("a listing with more than %d entries: ok=%v tooMany=%v (want false,true)", maxListingEntries, ok, tooMany)
+	}
+
+	// And EXACTLY the cap still succeeds. Only the "one too many fails" side was pinned, so tightening the
+	// comparison by one passed the whole suite — and that direction is worse than the one covered: it turns
+	// a legitimate account at the ceiling into a permanent statusUnknown plus a 15 s oversized memo, on
+	// every poll, for an account that is merely large.
+	var atCap strings.Builder
+	atCap.WriteString(`{"success":true,"data":[`)
+	for i := 0; i < maxListingEntries; i++ {
+		if i > 0 {
+			atCap.WriteString(",")
+		}
+		fmt.Fprintf(&atCap, `{"id":%d,"hash":"%040x"}`, i, i)
+	}
+	atCap.WriteString(`]}`)
+	ids, ok, tooMany := decodeListing(json.NewDecoder(strings.NewReader(atCap.String())))
+	if !ok || tooMany || len(ids) != maxListingEntries {
+		t.Errorf("a listing of exactly %d entries: ok=%v tooMany=%v n=%d (want true,false,%d)",
+			maxListingEntries, ok, tooMany, len(ids), maxListingEntries)
 	}
 }

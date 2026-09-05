@@ -44,6 +44,32 @@ sorting by mint time evicts exactly the operator's own. Protecting recently-used
 was tried on top of that and reverted; the reasoning is in `pruneMintedLocked`. A legitimate install has
 one entry per (indexer, account) — under twenty.
 
+## One huge JSON value in an account listing can OOM the container
+
+Not a regression, and not reachable from a caller — `torboxAPI` is a constant, so this needs
+`api.torbox.app` itself to send it. Recorded because the number was understated in the source for
+several rounds and is worse than the tolerance that was written against it.
+
+`encoding/json`'s `Token` must buffer a whole token before it can hand it over, so a single value just
+under `maxListingBytes` is live twice at once: the decoder's own buffer, doubled to 128 MiB, plus the
+materialised string. Measured peak **256.7 MiB of live heap**, against `GOMEMLIMIT=230MiB` in a 256 MB
+container — an OOM kill. The length filter on `hash` does not help; it can only run once the token
+already exists. And because the body still decodes as a valid listing, it is memoised and the spike
+repeats every `listingTTL`.
+
+Three ways out, none free:
+
+- Lower `maxListingBytes`. The peak steps at the decoder's buffer doublings, so ~32 MiB would cap the
+  peak near 128 MiB. But this cap governs real large accounts, and lowering it makes them read as
+  oversized — indeterminate, then escalation. A functional regression traded for a hostile-upstream case.
+- Bound a single token. `encoding/json` offers no hook; it would mean a hand-written scanner for the
+  listing, which is a lot of surface for this.
+- Leave it and alert on it. `scout_background_panics_total` will not see an OOM, but the container
+  restart will.
+
+Left alone deliberately. If TorBox ever legitimately returns listings near the cap, revisit — at that
+point the first option stops being a regression and starts being correct.
+
 ## The test suite shares process-global state between tests
 
 Not a regression — both cases below reproduce at every commit tried, including before the audit branch.
