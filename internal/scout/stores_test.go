@@ -534,11 +534,61 @@ func TestFetchAccountListing_largeAccountIsNotTruncated(t *testing.T) {
 	s := &torBoxStore{token: "t", api: torboxAPI, client: mockDoer{func(*http.Request) (*http.Response, error) {
 		return resp(200, body.String()), nil
 	}}}
-	ids, ok := s.fetchAccountListing(context.Background())
+	ids, ok, _ := s.fetchAccountListing(context.Background())
 	if !ok {
 		t.Fatal("a large but legitimate account listing was refused — it reads back as 'holds nothing'")
 	}
 	if len(ids) < 100 {
 		t.Errorf("decoded only %d entries from a %d-byte listing", len(ids), body.Len())
+	}
+}
+
+// An account whose listing is too big to read is not re-pulled on every attempt — but a TRANSIENT
+// failure still is, because that retry is the only thing that rediscovers a queued torrent.
+//
+// Only successes were memoised, so an oversized account re-pulled the whole body every time: a /play
+// makes up to three status reads and a client polls it every two seconds, which is tens of megabytes of
+// egress per request to reach the same answer each time. Oversize is a property of the account, not a
+// blip, so it is the one failure worth remembering.
+func TestAccountListing_remembersOversizedButRetriesTransient(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(`{"success":true,"data":[`)
+	for i := 0; body.Len() < maxListingBytes+(1<<20); i++ {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		fmt.Fprintf(&body, `{"id":%d,"hash":"%040x","files":"%s"}`, i, i, repeat("f", 4000))
+	}
+	body.WriteString(`]}`)
+
+	fetches := 0
+	oversized := &torBoxStore{token: "t", api: torboxAPI, cache: NewMemoryCache(4 << 20),
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			fetches++
+			return resp(200, body.String()), nil
+		}}}
+	for i := 0; i < 3; i++ {
+		if ids, ok := oversized.accountListing(context.Background()); ok || ids != nil {
+			t.Fatal("a truncated listing must not read as an answer")
+		}
+	}
+	if fetches != 1 {
+		t.Errorf("pulled the oversized listing %d times for three attempts — it is not being remembered", fetches)
+	}
+
+	// A transient failure must NOT be remembered: suppressing that retry is how a queued torrent stops
+	// being rediscoverable, which this package has a separate test for.
+	transientFetches := 0
+	flaky := &torBoxStore{token: "t2", api: torboxAPI, cache: NewMemoryCache(1 << 20),
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			transientFetches++
+			return resp(503, "down"), nil
+		}}}
+	for i := 0; i < 3; i++ {
+		flaky.accountListing(context.Background())
+	}
+	if transientFetches != 3 {
+		t.Errorf("a transient listing failure was memoised (%d fetches for three attempts) — a queued "+
+			"torrent would stop being rediscoverable", transientFetches)
 	}
 }

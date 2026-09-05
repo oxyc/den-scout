@@ -1577,3 +1577,49 @@ func TestPlay_promptNotDownloadingStillAdds(t *testing.T) {
 		t.Errorf("resolves = %d, want 1 — a prompt 'not downloading' must still add", got)
 	}
 }
+
+// The same guarantee with SEVERAL accounts configured, which is where it was actually broken.
+//
+// Both other /play fixtures use a single store, and at one store the budget slice is the whole budget —
+// so the gate looked fine while, on any multi-account install, a slow first store timed out on its slice
+// and a fast second store answered "no" early, leaving budget on the clock. The handler read that as a
+// definitive answer and queued a second copy of a torrent the first store was already fetching:
+// measured 404 dead_link plus one add per configured store.
+func TestPlay_multiStoreStatusTimeoutDoesNotAdd(t *testing.T) {
+	saved := statusBudget
+	statusBudget = 150 * time.Millisecond
+	t.Cleanup(func() { statusBudget = saved })
+
+	// TorBox is slow once (the big account listing), then reports the download.
+	slow := &slowStatusStore{svc: ServiceTorBox, slowCalls: 1}
+	// The other accounts answer at once and know nothing, which is what used to end the pool early.
+	var quickResolves int32
+	quick := func(svc DebridService) Store {
+		return &countingResolveStore{Store: &slowStatusStore{svc: svc, neverDownloading: true}, n: &quickResolves}
+	}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeStores = func(*Config) []Store {
+			return []Store{slow, quick(ServiceRealDebrid), quick(ServicePremiumize)}
+		}
+	}))
+	tok := encodePlayToken(PlayTarget{InfoHash: repeat("a", 40)})
+
+	rr := do(h, "/"+validBlob+"/play/"+tok, nil)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("play: %d, want 202 — TorBox is downloading it", rr.Code)
+	}
+	if got := atomic.LoadInt32(&slow.resolves) + atomic.LoadInt32(&quickResolves); got != 0 {
+		t.Errorf("a store that ran out of time still led to %d resolves — one add per configured account", got)
+	}
+}
+
+// countingResolveStore counts resolves so a test can prove no store was asked to queue anything.
+type countingResolveStore struct {
+	Store
+	n *int32
+}
+
+func (c *countingResolveStore) Resolve(ctx context.Context, rt ResolveTarget) (string, error) {
+	atomic.AddInt32(c.n, 1)
+	return c.Store.Resolve(ctx, rt)
+}

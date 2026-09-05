@@ -1331,9 +1331,30 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 			}
 		}
 	}
+	// A listing too LARGE to read is memoised, briefly. Nothing else about a failure is.
+	//
+	// The distinction is the whole point. A transient failure — a timeout, a 5xx — must be retried at
+	// once, because that retry is the only thing able to rediscover a queued torrent; suppressing it is a
+	// bug this package has already had and has a test for. Oversize is not transient: the body was too big
+	// a moment ago and will be too big again, so re-pulling it is guaranteed waste. Without this an
+	// oversized account re-pulled the whole body on every attempt, and a single /play makes up to three
+	// status reads while a client polls it every two seconds — tens of megabytes of egress per request,
+	// sustained for the length of a wait, to reach the same answer each time.
+	//
+	// Still not the same thing as torrentMissKey, which the code below deliberately refuses to write here:
+	// this says "do not re-pull the listing yet", not "the account does not hold it". Callers get ok=false,
+	// which stays indeterminate, so nothing concludes the release is absent.
+	if s.cache != nil {
+		if _, oversized := s.cache.Get(key + ":oversized"); oversized {
+			return nil, false
+		}
+	}
 	out, _, _ := listingFlight.Do(key, func() (any, error) {
-		ids, ok := s.fetchAccountListing(ctx)
+		ids, ok, oversized := s.fetchAccountListing(ctx)
 		if !ok {
+			if oversized && s.cache != nil {
+				s.cache.Put(key+":oversized", "1", listingTTL)
+			}
 			return nil, nil
 		}
 		if s.cache != nil {
@@ -1347,14 +1368,18 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	return ids, ids != nil
 }
 
-func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, bool) {
+// The third result separates "this account's listing is too big to read" from every other failure. Only
+// the first is worth remembering: it is a property of the account rather than a blip, so retrying it
+// immediately is guaranteed waste — where retrying a timeout is the only way a queued torrent is ever
+// rediscovered.
+func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, bool, bool) {
 	resp, err := s.get(ctx, s.api+"/torrents/mylist?bypass_cache=true")
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, false
+		return nil, false, false
 	}
 	// The ACCOUNT LISTING gets its own, much larger cap, and it is the only read that does.
 	//
@@ -1377,12 +1402,13 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 	if limited.truncated() {
 		// Silent truncation is the failure this whole comment is about: it reads back as "the account
 		// holds nothing" and costs a duplicate add, with nothing anywhere saying the account simply
-		// outgrew the cap. Raising the cap moved that cliff to ~10,000 torrents rather than removing it.
+		// outgrew the cap. Raising the cap moved that cliff rather than removing it, so the case still
+		// has to be named — and remembered, so it is not re-pulled on every poll.
 		log.Printf("scout: torbox account listing exceeded %d bytes and was truncated — treating it as no "+
 			"answer rather than as an empty account", maxListingBytes)
-		return nil, false
+		return nil, false, true
 	}
-	return ids, ok
+	return ids, ok, false
 }
 
 // decodeListing walks `{"success":…,"data":[{id,hash},…]}` and keeps only the hash→id map.
