@@ -21,6 +21,12 @@ import (
 // hostile/misbehaving store from OOMing the container (mirrors maxScrapeBytes for indexers).
 const maxStoreBytes = 4 << 20
 
+// maxListingBytes is the ONE exception: the account listing is the whole account, and 4 MiB truncates a
+// real large one (~13 MB at 2,000 torrents), which reads back as "this account holds nothing" and costs a
+// duplicate add. It can be this large safely because the listing decode streams and keeps only hash→id —
+// see fetchAccountListing. Every other store read keeps the small cap.
+const maxListingBytes = 64 << 20
+
 // Debrid stores (ported from src/stores/*). Two ops: CacheCheck (which hashes are cached?) and Resolve
 // (infohash → playable https link). Scout resolves server-side; the token never leaves the server.
 
@@ -1357,7 +1363,20 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 			Hash string `json:"hash"`
 		} `json:"data"`
 	}
-	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+	// The ACCOUNT LISTING gets its own, much larger cap, and it is the only read that does.
+	//
+	// 4 MiB truncates a real large account: the comment above this function already measured ~13 MB at
+	// 2,000 torrents and called it "close enough to the 4 MiB parse cap that answers would start being
+	// dropped". They are dropped — the decode fails in milliseconds, `Status` answers "nobody is fetching
+	// it", and /play queues a second copy of a torrent already downloading. That is the very failure the
+	// status escalation in handler.go was written for, and the escalation cannot help with it: this is a
+	// SIZE failure, not a slow one, so nothing ever times out.
+	//
+	// Safe to raise because this decode STREAMS and throws almost everything away — the struct below
+	// keeps two fields, so what is retained is a hash→id map sized by the torrent count (~100 KB at 2,000
+	// torrents), not the body. The read is also singleflighted and memoised for listingTTL, so at most one
+	// is ever in flight per account.
+	if json.NewDecoder(io.LimitReader(resp.Body, maxListingBytes)).Decode(&body) != nil {
 		return nil, false
 	}
 	// No list, no verdict. A 200 carrying no `data` key at all, or an explicit success:false, is not the
@@ -2664,9 +2683,35 @@ func (p *StorePool) ResolveCachedOnly(ctx context.Context, t ResolveTarget,
 
 // Status — the first store that can say a queued release is still downloading. Only meaningful right
 // after a failed Resolve; ok=false means nobody is fetching it, i.e. genuinely dead.
+// Each store gets its own SLICE of the budget, rather than all of them sharing one deadline.
+//
+// Sharing it meant the first store could spend the lot: TorBox's Status walks an account listing this
+// package measures at ~13 MB on a large account, so with TorBox configured first, every later store was
+// called with an already-expired context and its request failed instantly. A Real-Debrid account that
+// was actively downloading the release was asked twice and answered neither time — the pool reported
+// "nobody is fetching it", and the caller queued a second copy. The store that knew the answer was in
+// the list the whole time.
+//
+// Split evenly across the stores still to be asked, so an early store that answers quickly hands its
+// unused time to the rest rather than the first one taking it all.
 func (p *StorePool) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool) {
-	for _, st := range p.stores {
-		if status, ok := st.Status(ctx, t); ok {
+	for i, st := range p.stores {
+		share := ctx
+		var cancel context.CancelFunc
+		if deadline, ok := ctx.Deadline(); ok {
+			// Asked on the clock, and deliberately the SAME question handlePlay asks before it decides
+			// whether to escalate — see deadlinePassed. Using ctx.Err() on one side and the clock on the
+			// other let them disagree in the window before the context's timer fires.
+			if deadlinePassed(ctx) {
+				return StoreStatus{}, false // nothing left; asking is a round trip that cannot answer
+			}
+			share, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(p.stores)-i))
+		}
+		status, ok := st.Status(share, t)
+		if cancel != nil {
+			cancel()
+		}
+		if ok {
 			return status, true
 		}
 	}

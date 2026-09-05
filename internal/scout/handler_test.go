@@ -1383,6 +1383,60 @@ func TestHandlePlay_pollReadsUseTheStatusBudget(t *testing.T) {
 	}
 }
 
+// The same rule, on the ONE path that is allowed an exception: a first read that timed out earns a
+// second, longer one, because the alternative is queueing a torrent already downloading.
+//
+// The exception is bounded, and the bound is the whole point — the first version of it took a FRESH
+// resolveBudget, which always outlives the resolve clock started at the top of handlePlay, so the read
+// burned the entire budget, the add became impossible, and the release was never queued at all. That is
+// worse than the duplicate add it set out to prevent.
+//
+// Asserted on escalatedStatusCtx directly rather than through a request. An end-to-end version of this
+// depended on a real budget elapsing, which made it flake on its own fixture at about one run in thirty:
+// StorePool.Status declines to ask a store whose budget is already spent, so ordinary scheduling jitter
+// could delete the first read. The property here is arithmetic and deserves an arithmetic test; that the
+// handler ESCALATES at all is pinned separately, and without any clock, by
+// TestPlay_statusTimeoutDoesNotAdd asserting two status reads.
+func TestEscalatedStatusCtx_cannotOutliveTheResolveBudget(t *testing.T) {
+	// A resolve budget with plenty left: the escalation is granted, and bounded by its own ceiling.
+	parent, cancel := context.WithTimeout(context.Background(), resolveBudget)
+	defer cancel()
+	ctx, escCancel, ok := escalatedStatusCtx(parent)
+	if !ok {
+		t.Fatal("a full resolve budget refused the escalation")
+	}
+	defer escCancel()
+
+	got, has := ctx.Deadline()
+	if !has {
+		t.Fatal("the escalated context carries no deadline")
+	}
+	if left := time.Until(got); left > escalatedStatusBudget {
+		t.Errorf("escalated read got %v, want no more than the %v ceiling", left, escalatedStatusBudget)
+	}
+	parentDeadline, _ := parent.Deadline()
+	if got.After(parentDeadline) {
+		t.Error("the escalated read outlives the resolve budget it is gating — the add becomes impossible")
+	}
+
+	// Too little left to do the add afterwards: declined, so the resolve keeps what remains.
+	tight, tightCancel := context.WithTimeout(context.Background(), escalatedStatusBudget)
+	defer tightCancel()
+	if _, c, ok := escalatedStatusCtx(tight); ok {
+		if c != nil {
+			c()
+		}
+		t.Error("escalated with too little budget left to add afterwards")
+	}
+	// A parent with no deadline at all has nothing to carve from.
+	if _, c, ok := escalatedStatusCtx(context.Background()); ok {
+		if c != nil {
+			c()
+		}
+		t.Error("escalated from a context with no deadline")
+	}
+}
+
 // The probe DISCOVERS refusals; it just used to throw them away, inspecting only `err == nil` and then
 // relying on the backoff cache to have been written by someone else. A refusal that reaches it
 // unrecorded fell through to 404 "not_queued" — a claim, not a shrug — so during a throttle the very URL
@@ -1477,8 +1531,10 @@ func (s *slowStatusStore) Status(ctx context.Context, _ ResolveTarget) (StoreSta
 // downloading. Opening a ten-episode season on a large account could spend ten of the fifty hourly adds
 // re-queueing torrents in flight.
 func TestPlay_statusTimeoutDoesNotAdd(t *testing.T) {
+	// The shipped 8s is not a unit-test wait, but not so small that scheduling jitter can spend it before
+	// the read is even attempted — StorePool.Status declines to ask a store whose budget is already gone.
 	saved := statusBudget
-	statusBudget = 20 * time.Millisecond // the shipped 8s is not a unit-test wait
+	statusBudget = 150 * time.Millisecond
 	t.Cleanup(func() { statusBudget = saved })
 
 	store := &slowStatusStore{svc: ServiceTorBox, slowCalls: 1} // slow once, then answers
@@ -1504,7 +1560,7 @@ func TestPlay_statusTimeoutDoesNotAdd(t *testing.T) {
 // the add proceeds exactly as before. Without this, the fix above could simply be refusing to ever add.
 func TestPlay_promptNotDownloadingStillAdds(t *testing.T) {
 	saved := statusBudget
-	statusBudget = 20 * time.Millisecond
+	statusBudget = 150 * time.Millisecond
 	t.Cleanup(func() { statusBudget = saved })
 
 	store := &slowStatusStore{svc: ServiceTorBox, neverDownloading: true} // answers at once, and says no

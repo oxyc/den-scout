@@ -52,7 +52,19 @@ func EnableIndexerConfigMinting(on bool) { mintIndexerConfigs = on }
 
 type mintedConfig struct {
 	url string
-	at  time.Time
+	// When it was minted — the clock the TTL runs on, and deliberately NOT refreshed by use: a minted
+	// config should be re-minted every mintedTTL however busy it is.
+	at time.Time
+	// When it was last handed out — the clock EVICTION runs on, which is a different question.
+	//
+	// Evicting by `at` was first-in-first-out by creation, and that is exactly backwards under the attack
+	// the ceiling exists for: a legitimate install's entries are the oldest things in the map by
+	// construction (minted once, good for twelve hours), so a flood of caller-invented tokens evicted the
+	// operator's own entries and kept the attacker's. Measured: four legitimate entries aged an hour, then
+	// 300 attacker mints, and none of the four survived. Every later stream request then re-mints — for
+	// mediafusion that is a POST with a 3s timeout sitting in front of the scrape, so the ceiling turned a
+	// memory bomb into a latency one.
+	used time.Time
 	// transient marks a failure a retry could fix — the indexer was unreachable, timed out, or refused
 	// the payload — as opposed to one no retry will: there is no debrid account to mint from. Only the
 	// latter is a misconfiguration, and the difference decides whether the indexer is excluded from the
@@ -80,6 +92,8 @@ func (m mintedConfig) ttl() time.Duration {
 var (
 	mintedMu sync.Mutex
 	minted   = map[string]mintedConfig{}
+	// Rate-limits the eviction log. Guarded by mintedMu, like everything else here.
+	lastMintEvictionLog time.Time
 	// One round trip per (indexer, account) in flight at a time — the cache alone only collapses
 	// SEQUENTIAL repeats, and a burst of episode requests is anything but sequential.
 	mintFlight singleflight.Group
@@ -98,6 +112,10 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 
 	mintedMu.Lock()
 	if m, hit := minted[key]; hit && time.Since(m.at) < m.ttl() {
+		// Touched on read, which is what makes eviction least-recently-USED rather than oldest-minted.
+		// The TTL still runs on `at`, so this cannot keep a stale config alive.
+		m.used = time.Now()
+		minted[key] = m
 		mintedMu.Unlock()
 		return m.url, m.transient
 	}
@@ -132,13 +150,15 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 		// meaning the worse it was, the harder scout hit it. The opposite of what a limiter is for.
 		mintedMu.Lock()
 		pruneMintedLocked()
-		minted[key] = mintedConfig{url: "", at: time.Now(), transient: transient}
+		now := time.Now()
+		minted[key] = mintedConfig{url: "", at: now, used: now, transient: transient}
 		mintedMu.Unlock()
 		return "", transient
 	}
 	mintedMu.Lock()
 	pruneMintedLocked()
-	minted[key] = mintedConfig{url: url, at: time.Now()}
+	mintedNow := time.Now()
+	minted[key] = mintedConfig{url: url, at: mintedNow, used: mintedNow}
 	mintedMu.Unlock()
 	log.Printf("scout: minted a config for the %s indexer from the %s account", id, acct.Service)
 	return url, false
@@ -153,7 +173,9 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 // with a twelve-hour fuse — and TTL pruning makes it look guarded.
 //
 // A legitimate install has one entry per (indexer, account): four indexers and a handful of accounts,
-// so under twenty. 256 is an order of magnitude above that and ~128 KB at the ceiling.
+// so under twenty. 256 is an order of magnitude above that. Measured at the ceiling with the largest
+// token validateConfig admits (512 chars, which the minted comet URL embeds): ~1,193 bytes an entry,
+// ~298 KB in total — trivial against a 230 MiB heap, and the point is the bound rather than the size.
 const maxMintedEntries = 256
 
 // pruneMintedLocked drops entries past their own TTL, then enforces the count ceiling oldest-first.
@@ -168,24 +190,32 @@ func pruneMintedLocked() {
 	if len(minted) < maxMintedEntries {
 		return
 	}
-	// Oldest first. These are all unexpired, so something live has to go; the oldest is the one whose TTL
-	// has least left to run, and on a legitimate install this branch is never reached at all.
+	// Least-recently-USED first, not oldest-minted. These are all unexpired, so something live has to go,
+	// and the one nobody has asked for in the longest time is the one to lose. Sorting by mint time
+	// instead evicted the operator's own entries preferentially — see mintedConfig.used.
 	type aged struct {
-		key string
-		at  time.Time
+		key  string
+		used time.Time
 	}
 	all := make([]aged, 0, len(minted))
 	for k, m := range minted {
-		all = append(all, aged{k, m.at})
+		all = append(all, aged{k, m.used})
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	sort.Slice(all, func(i, j int) bool { return all[i].used.Before(all[j].used) })
 	for _, e := range all {
 		if len(minted) < maxMintedEntries {
 			break
 		}
 		delete(minted, e.key)
 	}
-	log.Printf("scout: minted-config cache hit its %d-entry ceiling; evicted the oldest", maxMintedEntries)
+	// Once at the ceiling every insert evicts, so logging per eviction is one line per request under
+	// exactly the flood this ceiling exists to absorb — unbounded log volume in place of unbounded
+	// memory, written while holding the mint mutex. Once a minute is enough to notice.
+	if time.Since(lastMintEvictionLog) > time.Minute {
+		lastMintEvictionLog = time.Now()
+		log.Printf("scout: minted-config cache is at its %d-entry ceiling; evicting least-recently-used",
+			maxMintedEntries)
+	}
 }
 
 // primaryDebrid picks the account a minted config should speak for. First configured wins — the same

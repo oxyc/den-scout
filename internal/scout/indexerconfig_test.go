@@ -239,8 +239,9 @@ func TestMintedCache_isBoundedByCount(t *testing.T) {
 	now := time.Now()
 	mintedMu.Lock()
 	for i := 0; i < maxMintedEntries*3; i++ {
-		// Staggered so "oldest first" is a defined order; all well inside mintedTTL.
-		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "https://comet.example/x", at: now.Add(-time.Duration(i) * time.Second)}
+		// Staggered so "least recently used first" is a defined order; all well inside mintedTTL.
+		stamp := now.Add(-time.Duration(i) * time.Second)
+		minted[fmt.Sprintf("comet:%d", i)] = mintedConfig{url: "https://comet.example/x", at: stamp, used: stamp}
 	}
 	pruneMintedLocked()
 	got := len(minted)
@@ -277,5 +278,53 @@ func TestMintedCache_pruneKeepsAHealthyCache(t *testing.T) {
 	mintedMu.Unlock()
 	if got != 5 {
 		t.Errorf("a healthy cache of 5 was pruned to %d", got)
+	}
+}
+
+// Eviction is least-recently-USED, not oldest-minted — and the difference is the whole point.
+//
+// A legitimate install's entries are the OLDEST things in the map by construction: minted once and good
+// for twelve hours. Evicting by mint time therefore threw them out first and kept a flood of
+// caller-invented ones, so every later stream request re-minted — for mediafusion a POST with a 3s
+// timeout sitting in front of the scrape. The ceiling turned a memory bomb into a latency one.
+func TestMintedCache_keepsTheEntriesActuallyInUse(t *testing.T) {
+	mintedMu.Lock()
+	saved := minted
+	minted = map[string]mintedConfig{}
+	mintedMu.Unlock()
+	t.Cleanup(func() {
+		mintedMu.Lock()
+		minted = saved
+		mintedMu.Unlock()
+	})
+
+	now := time.Now()
+	mintedMu.Lock()
+	// The operator's own: minted an hour ago, and still being handed out right now.
+	legit := []string{"comet:real", "mediafusion:real"}
+	for _, k := range legit {
+		minted[k] = mintedConfig{url: "https://real.example/x", at: now.Add(-time.Hour), used: now}
+	}
+	// A flood of freshly minted entries that nobody has come back for.
+	for i := 0; i < maxMintedEntries*2; i++ {
+		stamp := now.Add(-time.Duration(i) * time.Millisecond)
+		minted[fmt.Sprintf("comet:flood%d", i)] = mintedConfig{url: "https://flood.example/x", at: stamp, used: stamp}
+	}
+	pruneMintedLocked()
+	var survived int
+	for _, k := range legit {
+		if _, ok := minted[k]; ok {
+			survived++
+		}
+	}
+	total := len(minted)
+	mintedMu.Unlock()
+
+	if survived != len(legit) {
+		t.Errorf("%d of %d in-use entries survived a flood — the ceiling evicts the operator's own first",
+			survived, len(legit))
+	}
+	if total >= maxMintedEntries {
+		t.Errorf("kept %d entries, want under the %d ceiling", total, maxMintedEntries)
 	}
 }
