@@ -113,6 +113,39 @@ agreeing rather than a new class of work — but if a real account is ever seen 
 while polling, this is the first thing to look at. The obvious mitigation is a short-lived memo of the
 read chain's verdict, keyed per hash, which nothing needs yet.
 
+## A cross-host redirect on a GET still carries the credential in the query string
+
+Measured, not theorised, and deliberately left for now.
+
+`RefuseRedirectReplay` closed the body channel: a 307/308 can no longer replay a POST, which was
+multiplying a charged add by up to ten and forwarding Premiumize's apikey — carried in the `directdl`
+form body — to whatever host the redirect named. The **query** channel is still open. Two call sites put
+a credential in the URL:
+
+- `stores.go` `requestDownload` — `token=<debrid token>`
+- `stores.go` `premiumizeStore.CacheCheck` — `apikey=<debrid token>`
+
+Go strips `Authorization` across hosts but never strips the query string, so a redirect to a different
+host that preserves the query hands the credential over. Measured against a genuinely different hostname
+(same host on another port proves nothing — Go compares host without port):
+
+```
+requestdl   302 -> foreign host:  tokenReachedForeignHost=1   authHeaderForwarded=0
+cache/check 302 -> foreign host:  apikeyReachedForeignHost=1
+```
+
+**Reachability is the same class as the listing OOM above**: the API hosts are constants, so it needs
+`api.torbox.app` / `api.premiumize.me` itself, a terminator in front of one, or the operator's own proxy
+(`main.go` sets `Proxy: http.ProxyFromEnvironment`) to answer with a cross-host redirect that keeps the
+query.
+
+Left alone because the honest fix is structural rather than a guard. The rule wanted here is by URL and
+host, not by method: a debrid API call should refuse any redirect that changes host, while the probe
+client must keep following them, since reading a playback link through a CDN redirect is its entire job.
+That means splitting the single shared `http.Client` into a store client and a probe client — a change
+worth making deliberately rather than as the last edit before a tag. Revisit with that split; the guard
+that exists already covers the more expensive half.
+
 ## The test suite shares process-global state between tests
 
 Not a regression — both cases below reproduce at every commit tried, including before the audit branch.
