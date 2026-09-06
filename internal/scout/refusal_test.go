@@ -1359,6 +1359,82 @@ func TestPremiumize_anEvictedReleaseIsNotBoughtBackByReadOnlyPolls(t *testing.T)
 	}
 }
 
+// A Real-Debrid release that is DOWNLOADING must not read as dead on either route.
+//
+// This was the plainest failure in the route and it survived every earlier round, because both routes
+// agreed and every comparison between them looked fine. An uncached release on an RD-only install is
+// added, starts downloading, and has no links until it finishes — so the resolve returned a dead link,
+// which is neither errAddInFlight nor a StoreUnavailableError, and RD reported no status to rescue it.
+// The add is already spent, so the viewer pays for the fetch and is told the release is dead throughout.
+//
+// The terminal statuses are asserted alongside, because the guard this replaces existed to stop scout
+// turning a dead torrent into a promise — that must still hold.
+func TestRealDebrid_aDownloadingReleaseIsNotReportedDead(t *testing.T) {
+	for _, tc := range []struct {
+		status   string
+		wantWait bool
+	}{
+		{"downloading", true},
+		{"magnet_conversion", true},
+		{"queued", true},
+		{"compressing", true},
+		{"uploading", true},
+		{"error", false},
+		{"virus", false},
+		{"dead", false},
+		{"magnet_error", false},
+		{"waiting_files_selection", false},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			token, hash := "rd-"+tc.status, repeat("a", 40)
+			cache := NewMemoryCache(1 << 20)
+			rt := ResolveTarget{InfoHash: hash}
+			cache.Put(rdTorrentKey(token, hash, rt), "RDID1", time.Hour)
+
+			client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+				if strings.Contains(r.URL.Path, "/torrents/info/") {
+					return resp(200, `{"id":"RDID1","status":"`+tc.status+`","progress":37,`+
+						`"files":[{"id":1,"path":"/Movie.mkv","bytes":100,"selected":1}],"links":[]}`), nil
+				}
+				return resp(200, `{}`), nil
+			}}
+			h := NewHandler(Deps{
+				Cache: cache,
+				MakeStores: func(*Config) []Store {
+					return []Store{&realDebridStore{token: token, cache: cache,
+						api: realDebridAPI, client: client}}
+				},
+			})
+			rdBlob := blob(`{"debrid":[{"service":"realdebrid","token":"` + token + `"}],` +
+				`"indexers":["torrentio"],"resultCap":20}`)
+			tok := encodePlayToken(PlayTarget{InfoHash: hash})
+
+			play := httptest.NewRecorder()
+			h.ServeHTTP(play, httptest.NewRequest("GET", "/"+rdBlob+"/play/"+tok, nil))
+			probe := httptest.NewRecorder()
+			h.ServeHTTP(probe, httptest.NewRequest("GET", "/"+rdBlob+"/play/"+tok+"?probe=1", nil))
+
+			if tc.wantWait {
+				if play.Code != http.StatusAccepted {
+					t.Errorf("/play = %d (%s), want 202 — the account is fetching this right now, and "+
+						"the add is already spent", play.Code, strings.TrimSpace(play.Body.String()))
+				}
+				if probe.Code != http.StatusAccepted {
+					t.Errorf("?probe=1 = %d (%s), want 202", probe.Code,
+						strings.TrimSpace(probe.Body.String()))
+				}
+				return
+			}
+			// A dead or errored torrent must NOT become a promise scout cannot keep.
+			if play.Code == http.StatusAccepted || probe.Code == http.StatusAccepted {
+				t.Errorf("status %q reported as downloading (play=%d probe=%d) — a failure has been "+
+					"turned into a wait the client can never come out of",
+					tc.status, play.Code, probe.Code)
+			}
+		})
+	}
+}
+
 // A refusal SCOUT made must not read as "nothing is queued".
 //
 // recordRefusal excludes errScoutSide on purpose — scout's own ceiling is not the debrid declining, and

@@ -2697,12 +2697,59 @@ type rdInfo struct {
 		Selected int    `json:"selected"`
 	} `json:"files"`
 	Links []string `json:"links"`
+	// Status/Progress are what tell a download apart from a dead release. RD's own vocabulary:
+	// magnet_conversion, waiting_files_selection, queued, downloading, compressing, uploading,
+	// downloaded, error, virus, dead, magnet_error.
+	Status   string  `json:"status"`
+	Progress float64 `json:"progress"`
 }
 
-// Real-Debrid exposes no queue state we can poll per infohash here, so it never reports a wait — a
-// failure stays a failure rather than becoming a promise we can't keep.
-func (s *realDebridStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
-	return StoreStatus{}, false
+// rdFetching — the statuses that mean the ACCOUNT is actively fetching this right now.
+//
+// Listed explicitly rather than treated as "anything that is not downloaded", because the whole point is
+// never to turn a dead release into a promise: error, virus, dead and magnet_error must stay failures,
+// and waiting_files_selection is a torrent nothing has asked for yet.
+func rdFetching(status string) bool {
+	switch status {
+	case "magnet_conversion", "queued", "downloading", "compressing", "uploading":
+		return true
+	}
+	return false
+}
+
+// Status reports a Real-Debrid download in progress, which for a long time it could not.
+//
+// The note that stood here said RD "exposes no queue state we can poll per infohash", and that was true
+// of the infohash — but not of a torrent id, and this store remembers one from the moment addMagnet
+// answers. The consequence of never reporting a wait was the plainest failure in the whole route: an
+// uncached release on an RD-only install is ADDED, starts downloading, and has no links until it
+// finishes, so resolveExisting returned a dead link — which is neither errAddInFlight nor a
+// StoreUnavailableError, and nothing else could rescue it. Measured on a torrent RD reports as
+// downloading at 37%, three polls:
+//
+//	play  404 {"error":"dead_link"}  |  probe 404 {"error":"not_queued"}   (x3)
+//
+// The add is already spent at that point, so the viewer pays for the fetch and is told the release is
+// dead for its entire duration, on every poll. Both routes agreed, which is why no amount of
+// probe-versus-play comparison found it.
+//
+// Still never invents a wait: it answers only for a torrent this account is recorded as holding, only
+// when RD itself names a fetching status, and only while there are no links to serve. A dead, errored or
+// virus-flagged torrent stays a failure, which is what the original note was protecting.
+func (s *realDebridStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus, bool) {
+	id, held := s.knownTorrent(t)
+	if !held {
+		return StoreStatus{}, false
+	}
+	info, err := s.info(ctx, id)
+	if err != nil || info == nil {
+		return StoreStatus{}, false
+	}
+	// Links present means it is ready to serve, not waiting — that is the resolve's answer, not a status.
+	if len(info.Links) > 0 || !rdFetching(info.Status) {
+		return StoreStatus{}, false
+	}
+	return StoreStatus{Progress: info.Progress / 100}, true
 }
 
 func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
