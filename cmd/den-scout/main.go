@@ -27,6 +27,9 @@ func main() {
 	// Pooled keep-alive client so the scrape/debrid fan-out reuses connections.
 	client := &http.Client{
 		Timeout: 30 * time.Second,
+		// A redirect must never replay a request that carries a body: an add is charged once and would
+		// otherwise be SENT up to ten times. See RefuseRedirectReplay for the measurements.
+		CheckRedirect: scout.RefuseRedirectReplay,
 		Transport: &http.Transport{
 			Proxy:               http.ProxyFromEnvironment,
 			MaxIdleConns:        100,

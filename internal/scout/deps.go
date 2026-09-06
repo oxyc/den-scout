@@ -61,6 +61,33 @@ func SettingsFromEnv(get func(string) string) Settings {
 	}
 }
 
+// RefuseRedirectReplay is the CheckRedirect policy every client touching a debrid must carry.
+//
+// A redirect must never REPLAY a request that carries a body. Every add is charged once through
+// spendAdd and then sent once — unless the endpoint answers 307 or 308, where Go's default policy
+// re-sends the same method AND body to the new location, up to ten hops. Measured against all three
+// stores: one charged add became two real POSTs on a single hop and ten on a redirect loop, so the
+// fifty-an-hour ceiling would have permitted five hundred real adds. (301/302/303 are safe — Go
+// downgrades them to GET and drops the body.)
+//
+// It also moves a credential. Premiumize's apikey travels in the directdl FORM BODY, and Go strips the
+// Authorization header across hosts but replays the body regardless, so a 308 to a foreign host hands
+// that token to an unrelated server verbatim.
+//
+// Refused by METHOD rather than by disabling redirects, because the same client reads playback links,
+// and following a CDN's redirects on a GET is the entire job there. GET and HEAD carry no body to
+// replay and keep working; anything else stops at the 3xx and the caller sees the non-2xx it is.
+//
+// Reachability is the same class as the listing OOM in FOLLOWUP.md — the API hosts are constants, so it
+// needs the debrid itself, a terminator in front of it, or the operator's own proxy to answer 307/308.
+// The cost of being wrong is a multiplied add budget, so it is guarded rather than argued about.
+func RefuseRedirectReplay(req *http.Request, _ []*http.Request) error {
+	if req.Method == http.MethodGet || req.Method == http.MethodHead {
+		return nil
+	}
+	return http.ErrUseLastResponse
+}
+
 // BuildDeps wires the core to a concrete HTTP client + cache.
 func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 	// Decided once, at startup, from the operator's environment — never from a request.
