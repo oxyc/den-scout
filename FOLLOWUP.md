@@ -112,8 +112,12 @@ At the client's ~2s cadence that is roughly 90 RD calls a minute for the length 
 a state-changing `selectFiles` on every poll while it downloads and a fresh unrestricted link minted and
 discarded on every ready probe poll. `/play` walks the same chain on the same cadence, so this is the price of the two routes
 agreeing rather than a new class of work — but if a real account is ever seen hitting an RD rate limit
-while polling, this is the first thing to look at. The obvious mitigation is a short-lived memo of the
-read chain's verdict, keyed per hash, which nothing needs yet.
+while polling, this is the first thing to look at.
+
+Partly addressed in 0.12.0: `/play` keeps minted links for ten minutes (`linkMemo` in `linkmemo.go`,
+filled by `/play` and by the probe fan-out), so a repeat play of the same file makes no debrid call at
+all. `?probe=1` still walks the chain on every poll, on purpose — "ready" has to describe the account
+now, not ten minutes ago.
 
 ## A cross-host redirect on a GET still carries the credential in the query string
 

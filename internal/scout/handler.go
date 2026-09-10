@@ -273,6 +273,10 @@ type handler struct {
 	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
 	scrapeFails atomic.Int32
 
+	// Playback links minted in the last few minutes, so /play can serve a repeat without asking the
+	// debrid again. Filled by /play and by the probe fan-out, which mints one per probed release anyway.
+	links linkMemo
+
 	// Precomputed static responses (audit #15 — no per-request rebuild/rehash).
 	manifestUnconf     string
 	manifestUnconfETag string
@@ -1139,6 +1143,24 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		return
 	}
 
+	// A link minted in the last few minutes for this same file is served as it is: no status read, no
+	// resolve, nothing upstream at all. Before this, the stream list's probe minted a link and threw it
+	// away, and the play that followed a second later minted the same file again.
+	//
+	// `fresh=1` is the client saying the link it last got would not open. That link is dropped rather
+	// than kept as a fallback — it is the only evidence there is about it, and the evidence is bad — and
+	// the resolve below mints its replacement. Dropped up front, not only overwritten on success, so a
+	// resolve that fails this time does not leave the dead link to be served on the next plain request.
+	memoKey := linkMemoKey(config, rt)
+	if r.URL.Query().Get("fresh") == "1" {
+		h.links.forget(memoKey)
+	} else if hit, ok := h.links.get(memoKey, time.Now()); ok {
+		logLimited("play-memo-hit", "play %s → 302 from a link minted in the last %s",
+			shortHash(target.InfoHash), linkMemoTTL)
+		writePlayRedirect(w, hit.link)
+		return
+	}
+
 	// Already known to be downloading? Answer from the status alone. A waiting client polls this URL for
 	// the whole fetch, and a full resolve is ~3 upstream calls (cache miss → add → link), so re-running it
 	// per poll is how an account gets itself throttled — and a throttled 5xx is exactly what a client
@@ -1310,8 +1332,16 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
 		return
 	}
-	// Standard bodyless 302 (audit / AetherEngine fix): explicit Content-Length:0 so the Node/Go layer
-	// doesn't send a chunked empty body that strict redirect-followers read as 0 bytes and fail on.
+	// Only a link that was actually minted reaches here; every failure above returned without writing.
+	h.links.put(memoKey, link, false, time.Now())
+	writePlayRedirect(w, link)
+}
+
+// writePlayRedirect is /play's success answer.
+//
+// Standard bodyless 302 (audit / AetherEngine fix): explicit Content-Length:0 so the Node/Go layer
+// doesn't send a chunked empty body that strict redirect-followers read as 0 bytes and fail on.
+func writePlayRedirect(w http.ResponseWriter, link string) {
 	w.Header().Set("location", link)
 	w.Header().Set("cache-control", noStore)
 	w.Header().Set("content-length", "0")

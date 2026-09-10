@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"time"
 
@@ -137,6 +138,13 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 						return nil, nil
 					}
 					p, err := ProbeTracks(gctx, h.deps.ProbeClient, link)
+					// The link was minted for this probe and is exactly what /play would mint again a moment
+					// later, so it is kept rather than thrown away. Only when the read got an answer: a
+					// container this cannot parse is still a file being served, but a refused or unreachable
+					// link is a failure, and a failure is never remembered.
+					if err == nil || errors.Is(err, ErrNoTracks) {
+						h.links.put(linkMemoKey(config, job.target), link, false, time.Now())
+					}
 					if err != nil {
 						return nil, nil
 					}
