@@ -309,7 +309,7 @@ func TestSeriesStreamAndForwardedOrigin(t *testing.T) {
 	if !strings.HasPrefix(first.URL, "https://scout.den.example/") {
 		t.Errorf("forwarded origin: %s", first.URL)
 	}
-	if first.BehaviorHints.BingeGroup != "den-scout-tt99" {
+	if first.BehaviorHints.BingeGroup != "den-scout|1080p|webdl||" {
 		t.Errorf("bingeGroup: %s", first.BehaviorHints.BingeGroup)
 	}
 	tok := first.URL[strings.LastIndex(first.URL, "/play/")+len("/play/"):]

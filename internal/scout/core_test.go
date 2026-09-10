@@ -142,8 +142,8 @@ func TestParseStreamID(t *testing.T) {
 		}
 	}
 
-	// The id is retained for the whole build — cache key, rebuild-gate map key, and the bingeGroup of
-	// EVERY stream in the response — and it is concatenated into the outbound indexer URL. `tt\d+` had no
+	// The id is retained for the whole build — cache key and rebuild-gate map key — and it is
+	// concatenated into the outbound indexer URL. `tt\d+` had no
 	// bound: `tt` plus 900,000 digits was accepted, pinned 2.7 MiB per in-flight request, and turned one
 	// small inbound GET into a ~900 KB outbound URL per indexer.
 	if _, ok := parseStreamID("movie", "tt"+repeat("1", 900_000)+".json"); ok {

@@ -149,7 +149,7 @@ func TestRoutesStream(t *testing.T) {
 		t.Fatalf("want 2 streams, got %d", len(body.Streams))
 	}
 	first := body.Streams[0]
-	if first.Name != "Den Scout" || first.Title != "Movie 2160p WEB-DL HDR" || first.BehaviorHints.BingeGroup != "den-scout-tt1234567" {
+	if first.Name != "Den Scout" || first.Title != "Movie 2160p WEB-DL HDR" || first.BehaviorHints.BingeGroup != "den-scout|2160p|webdl|hdr|" {
 		t.Errorf("first stream: %+v", first)
 	}
 	if !strings.Contains(first.URL, "/"+validBlob+"/play/") || strings.Contains(first.URL, "tb-secret") {

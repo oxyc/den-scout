@@ -69,6 +69,10 @@ var (
 	bareCam = mustRE2(`\bcam\b`)
 	bareTS  = mustRE2(`\bts\b`)
 	bareScr = mustRE2(`\bscr\b`)
+	// A container extension at the end of a file name. `.ts` is MPEG transport stream, not TeleSync: without
+	// this, `Show.S01E01.ts` matched the bare-TS rule and was dropped as junk. Only at the end of a name
+	// (or of a line in a multi-line title) — a `.TS.` in the middle is still a TeleSync tag.
+	containerExt = regexp.MustCompile(`\.(?:m2ts|ts|mkv|mp4|avi|m4v|webm)(\s|$)`)
 )
 
 // junkClass returns the junk class of a title, or "" if it's a legit source.
@@ -76,6 +80,7 @@ func junkClass(title string) string { return junkClassOf(strings.ToLower(title))
 
 // junkClassOf assumes an already-lowercased title (audit #17: compute the lowercasing once).
 func junkClassOf(t string) string {
+	t = containerExt.ReplaceAllString(t, "$1")
 	for _, j := range unambiguousJunk {
 		if j.re.match(t) {
 			return j.class
@@ -123,9 +128,16 @@ func detectResolutionLower(t string) string {
 	return ""
 }
 
+// A "2160p" file smaller than this is not 4K in any sense that matters — mislabelled or starved of bitrate
+// — so it ranks as 1080p. The bare 4k/uhd tag already had a size check; an explicit 2160p had none.
+const fake4KFloor = 700 * mib
+
 func resolutionBase(t string, sizeBytes *int) int {
 	switch {
 	case res2160.match(t):
+		if sizeBytes != nil && *sizeBytes < fake4KFloor {
+			return 1080
+		}
 		return 4000
 	case res1440.match(t):
 		return 1440
@@ -156,7 +168,7 @@ var (
 	reHDTV     = mustRE2(`\bhdtv\b`)
 	reDvdRip   = mustRE2(`dvd[ .\-_]?rip`)
 	reLowSrc   = mustRE2(`tvrip|satrip|pdtv`)
-	reDoVi     = mustRE2(`dolby vision|dolbyvision|dovi`)
+	reDoVi     = mustRE2(`dolby vision|dolbyvision|dovi|\bdv\b`) // bare DV: the common scene tag
 	reHDR10p   = mustRE2(`hdr10\+|hdr10plus`)
 	reHDR      = mustRE2(`\bhdr\b|\bhlg\b`)
 	reAtmos    = mustRE2(`atmos`)

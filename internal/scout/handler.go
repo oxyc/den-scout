@@ -1365,7 +1365,7 @@ func toStremioStream(s RawStream, sid *StreamID, origin, configBlob string) stre
 		Title:         s.Title, // raw release name
 		URL:           origin + "/" + configBlob + "/play/" + token,
 		Attributes:    streamAttributes(s),
-		BehaviorHints: streamHints{BingeGroup: "den-scout-" + sid.IMDb, NotWebReady: false},
+		BehaviorHints: streamHints{BingeGroup: bingeGroup(strings.ToLower(s.Title), s.Title), NotWebReady: false},
 	}
 }
 

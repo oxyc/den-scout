@@ -18,8 +18,8 @@ type StreamID struct {
 // A real IMDb id is `tt` plus seven or eight digits; ten leaves room for a couple of decades of growth.
 //
 // The bound matters because `\d+` did not have one. This segment is retained for the whole build — it
-// goes into the cache key, into the rebuild gate's map key, and into the bingeGroup of EVERY stream in
-// the response — and it is also concatenated into the outbound indexer URL. Measured on a server with
+// goes into the cache key and into the rebuild gate's map key — and it is also concatenated into the
+// outbound indexer URL. Measured on a server with
 // net/http's DEFAULT 1 MiB header allowance: `tt` followed by 900,000 digits was accepted, pinned 2.7 MiB
 // per in-flight request (150 concurrent parked at the scrape reached 408 MiB against a 230 MiB
 // GOMEMLIMIT), and turned one small inbound GET into a ~900 KB outbound URL per configured indexer —

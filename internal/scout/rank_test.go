@@ -2,6 +2,7 @@ package scout
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -88,6 +89,66 @@ func TestQualityScore(t *testing.T) {
 	large := qualityScore(rs("Movie 4K WEB", func(s *RawStream) { s.SizeBytes = intp(20 * gib) }))
 	if small >= large {
 		t.Error("a tiny 4k file should score below a large one")
+	}
+}
+
+func TestJunkClass_containerExtensionIsNotTeleSync(t *testing.T) {
+	for _, title := range []string{"Show.S01E01.ts", "Show S01E01.m2ts", "Show.S01E01.ts\n👤 12 💾 1.2 GB"} {
+		if got := junkClass(title); got != "" {
+			t.Errorf("junkClass(%q)=%q want none", title, got)
+		}
+	}
+	if got := junkClass("Movie.2024.TS.x264"); got != "telesync" {
+		t.Errorf("a mid-name TS tag is still TeleSync, got %q", got)
+	}
+}
+
+func TestQualityScore_bareDVTagIsDolbyVision(t *testing.T) {
+	if qualityScore(rs("Movie.2024.2160p.WEB-DL.DV.x265", nil)) <= qualityScore(rs("Movie.2024.2160p.WEB-DL.x265", nil)) {
+		t.Error("a DV-tagged release should get the Dolby Vision bonus")
+	}
+}
+
+func TestQualityScore_tiny2160pRanksAs1080p(t *testing.T) {
+	fake := qualityScore(rs("Movie 2160p WEB-DL", func(s *RawStream) { s.SizeBytes = intp(300 * mib) }))
+	real1080 := qualityScore(rs("Movie 1080p WEB-DL", func(s *RawStream) { s.SizeBytes = intp(300 * mib) }))
+	if fake != real1080 {
+		t.Errorf("a 300 MB 2160p (%d) should score as 1080p (%d)", fake, real1080)
+	}
+	if qualityScore(rs("Movie 2160p WEB-DL", func(s *RawStream) { s.SizeBytes = intp(8 * gib) })) <= real1080 {
+		t.Error("a real-sized 2160p keeps its 4K rank")
+	}
+}
+
+func TestBingeGroup_separatesReleases(t *testing.T) {
+	a := "Show.S01E01.1080p.WEB-DL.DDP5.1.H.264-NTb"
+	b := "Show.S01E02.1080p.WEB-DL.DDP5.1.H.264-NTb.mkv"
+	c := "Show.S01E02.1080p.WEB-DL.DDP5.1.H.264-FLUX"
+	d := "Show.S01E02.2160p.WEB-DL.DV.H.265-NTb"
+	group := func(title string) string { return bingeGroup(strings.ToLower(title), title) }
+	if group(a) != group(b) {
+		t.Errorf("same release across episodes should match: %q vs %q", group(a), group(b))
+	}
+	if group(a) == group(c) || group(a) == group(d) {
+		t.Errorf("different groups or quality must not match: %q %q %q", group(a), group(c), group(d))
+	}
+	if got := group(a); got != "den-scout|1080p|webdl||ntb" {
+		t.Errorf("bingeGroup(%q)=%q", a, got)
+	}
+}
+
+func TestReleaseGroup(t *testing.T) {
+	cases := map[string]string{
+		"Show.S01E01.1080p.WEB-DL-NTb.mkv": "ntb",
+		"Show - S01E01 - Pilot":            "",
+		"Movie.2024.WEB-DL-1080p.x265":     "",
+		"Movie 2024 1080p":                 "",
+		"Show 1080p WEB-DL":                "",
+	}
+	for in, want := range cases {
+		if got := releaseGroup(in); got != want {
+			t.Errorf("releaseGroup(%q)=%q want %q", in, got, want)
+		}
 	}
 }
 
