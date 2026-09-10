@@ -242,6 +242,8 @@ type Deps struct {
 	// MetricsToken gates /metrics. Empty disables the route entirely (404) — the counters describe when
 	// this install is being watched and which indexers it uses, which is not public information.
 	MetricsToken string
+	// LogRequests writes one redacted line per response (reqlog.go).
+	LogRequests bool
 }
 
 type handler struct {
@@ -334,6 +336,10 @@ func NewHandler(deps Deps) http.Handler {
 	h.manifestUnconf = string(b)
 	h.manifestUnconfETag = etagFor(h.manifestUnconf)
 	h.configureETag = etagFor(configurePage)
+	// Decided here, once: with the request log off the handler is not wrapped at all.
+	if deps.LogRequests {
+		return logRequests(http.HandlerFunc(h.serve))
+	}
 	return http.HandlerFunc(h.serve)
 }
 

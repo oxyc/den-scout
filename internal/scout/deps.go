@@ -35,6 +35,9 @@ type Settings struct {
 	// token to those hosts**, so it is off unless the operator turns it on. An explicit <NAME>_URL (e.g.
 	// COMET_URL) still wins, for a token-free config.
 	MintIndexerConfigs bool
+	// One redacted line per response (reqlog.go). Off when LOG_REQUESTS is unset, empty or exactly "0";
+	// any other value turns it on — the rule every den addon shares.
+	LogRequests bool
 }
 
 func SettingsFromEnv(get func(string) string) Settings {
@@ -58,6 +61,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 		MetricsToken:   get("METRICS_TOKEN"),
 		MintIndexerConfigs: strings.EqualFold(get("MINT_INDEXER_CONFIGS"), "true") ||
 			get("MINT_INDEXER_CONFIGS") == "1",
+		LogRequests: get("LOG_REQUESTS") != "" && get("LOG_REQUESTS") != "0",
 	}
 }
 
@@ -103,6 +107,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		Meta:          cinemetaMeta(client, settings.CinemetaURL),
 		SealKeyring:   buildKeyring(settings.ConfigKey, settings.ConfigKeysPrev),
 		MetricsToken:  settings.MetricsToken,
+		LogRequests:   settings.LogRequests,
 	}
 }
 

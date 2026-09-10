@@ -106,6 +106,7 @@ only tunes runtime behaviour; every variable is listed, commented, in `.env.exam
 | `LIST_TTL_SECS` | `300` | how long a ranked stream list stays fresh |
 | `MEMORY_CACHE_BYTES` | `50331648` (48 MiB) | in-memory cache byte budget |
 | `CACHE_DIR` | `/cache` in the image (else `$TMPDIR/den-scout-cache`) | durable cache tier; **must be writable** or persistence disables itself after one log line |
+| `LOG_REQUESTS` | `0` | any value but empty or `0` logs one line per response, `<METHOD> <path> <status> <ms>ms`, with the config segment and `/play` token replaced by `<config>`/`<token>` and the query string dropped |
 | `CINEMETA_URL` | `https://v3-cinemeta.strem.io` | metadata source for the mistagged-torrent filter |
 | `METRICS_TOKEN` | — | bearer token for `/metrics`; unset = the route 404s (the counters reveal when the install is being watched) |
 | `CONFIG_KEY` | — | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |
