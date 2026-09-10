@@ -2181,12 +2181,32 @@ const (
 // would memoise a proxy hiccup for fifteen seconds to save re-reading a body the upstream will probably
 // stop sending anyway.
 func listingFaultFor(err error) listingFault {
+	if bodyEndedEarly(err) {
+		return listingFaultNone
+	}
 	var typeErr *json.UnmarshalTypeError
 	var syntaxErr *json.SyntaxError
 	if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
 		return listingBadEnvelope
 	}
 	return listingFaultNone
+}
+
+// bodyEndedEarly reports whether a decode error means the input stopped, rather than that it was wrong.
+//
+// Go 1.26's decoder says so with io.EOF or io.ErrUnexpectedEOF. Go 1.27's reports a body that stops
+// BETWEEN values — after a complete entry, or right after `[` — as a *json.SyntaxError reading
+// "unexpected end of JSON input", which wraps neither; measured on both toolchains. Without this check
+// listingFaultFor filed that blip with the schema changes and memoised it for fifteen seconds, on exactly
+// the retry that rediscovers a queued torrent. The message is the one encoding/json has always used for
+// truncated input (json.Unmarshal of a cut body returns it on every version), and the cut cases in
+// TestAccountListing_remembersOversizedButRetriesTransient pin it.
+func bodyEndedEarly(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var syntaxErr *json.SyntaxError
+	return errors.As(err, &syntaxErr) && syntaxErr.Error() == "unexpected end of JSON input"
 }
 
 // decodeListing walks `{"success":…,"data":[{id,hash},…]}` and keeps only the hash→id map.
