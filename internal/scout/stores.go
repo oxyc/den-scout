@@ -3000,6 +3000,8 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 			return "", &DeadLinkError{"realdebrid blocked filename"}
 		}
 	}
+	// For /play's link check, which can then tell a link to this file from a link to another one.
+	s.rememberFileSize(t, files, *fileID)
 
 	// Already downloaded, with this very file selected: the link is in the answer we are holding, so go
 	// straight to unrestrict. Every held play and every probe poll used to walk info → selectFiles → info →

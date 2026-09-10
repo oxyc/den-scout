@@ -1155,10 +1155,23 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	if r.URL.Query().Get("fresh") == "1" {
 		h.links.forget(memoKey)
 	} else if hit, ok := h.links.get(memoKey, time.Now()); ok {
-		logLimited("play-memo-hit", "play %s → 302 from a link minted in the last %s",
-			shortHash(target.InfoHash), linkMemoTTL)
-		writePlayRedirect(w, hit.link)
-		return
+		// A link /play minted was checked before it was served; one the probe minted was not. So the check
+		// runs once per link rather than once per play. A remembered link that fails it is dropped and a
+		// fresh one minted below, not answered as dead — it may only be the one that went stale.
+		verdict := linkPlayable
+		if !hit.checked {
+			verdict = h.verifyLink(r.Context(), pool, rt, hit.link)
+		}
+		if verdict != linkBroken {
+			if verdict == linkPlayable {
+				h.links.markChecked(memoKey, hit.link)
+			}
+			logLimited("play-memo-hit", "play %s → 302 from a link minted in the last %s",
+				shortHash(target.InfoHash), linkMemoTTL)
+			writePlayRedirect(w, hit.link)
+			return
+		}
+		h.links.forget(memoKey)
 	}
 
 	// Already known to be downloading? Answer from the status alone. A waiting client polls this URL for
@@ -1332,8 +1345,27 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
 		return
 	}
-	// Only a link that was actually minted reaches here; every failure above returned without writing.
-	h.links.put(memoKey, link, false, time.Now())
+	h.servePlayLink(w, r, pool, rt, memoKey, link)
+}
+
+// servePlayLink answers /play with a link a store has just minted: checked, remembered, redirected.
+//
+// A link that fails its check is answered exactly as a release no store could resolve — 404 dead_link —
+// because to the client it is the same thing: this source will not play, try the next one. It is not
+// remembered, and anything remembered under the key goes too.
+//
+// The check runs on the REQUEST's context rather than the resolve clock. A resolve that took most of its
+// budget would otherwise leave the check nothing, and a check with no time is a check that cannot answer;
+// linkCheckTimeout bounds it on its own.
+func (h *handler) servePlayLink(w http.ResponseWriter, r *http.Request, pool *StorePool, rt ResolveTarget,
+	memoKey, link string) {
+	verdict := h.verifyLink(r.Context(), pool, rt, link)
+	if verdict == linkBroken {
+		h.links.forget(memoKey)
+		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
+		return
+	}
+	h.links.put(memoKey, link, verdict == linkPlayable, time.Now())
 	writePlayRedirect(w, link)
 }
 
