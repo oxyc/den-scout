@@ -1174,6 +1174,46 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		h.links.forget(memoKey)
 	}
 
+	// Held already? Then try to serve it before asking whether it is downloading.
+	//
+	// The status read below is a mylist round trip on TorBox and an info call on Real-Debrid, and for a
+	// release the account has finished it only ever answers "not downloading" — after which the resolve
+	// runs anyway. Every warm play paid for that answer. HoldingServices is a cache read per store, so a
+	// release no store has an id for pays nothing here and goes down the old path untouched.
+	//
+	// NoAdd is what makes it safe to put this ahead of the status read, and the stores enforce it rather
+	// than this caller promising it: a remembered id that turns out stale is exactly when a resolve would
+	// reach for createtorrent, and a NoAdd resolve refuses instead. Any failure falls through to the
+	// sequence below unchanged, so what this step cannot do costs one read-only attempt and nothing more.
+	//
+	// Skipped while /play is answering "downloading" for this file. A download in progress is when this
+	// step always fails — no link yet — and each poll would pay a link request on top of the one status
+	// read it needs. playPendingTTL lets it lapse soon after the polls stop.
+	//
+	// On a slice of the resolve clock, and HALF the status budget rather than all of it, because what
+	// follows still needs its share: the ordinary status read, then — on the path about to add — the
+	// escalated read, which declines unless twice its own budget remains. With shipped constants that is
+	// 45 − 4 − 8 = 33 s left against the 32 it needs; a full 8 s here would leave 29 and switch the
+	// escalation off for exactly the slow accounts it exists for.
+	pendingKey := playPendingKey(memoKey)
+	if _, waiting := h.deps.Cache.Get(pendingKey); !waiting {
+		if holders := pool.HoldingServices(rt); len(holders) > 0 {
+			readOnly := rt
+			readOnly.NoAdd = true
+			heldCtx, heldCancel := context.WithTimeout(ctx, warmResolveBudget())
+			heldStart := time.Now()
+			link, err := pool.ResolveCachedOnly(heldCtx, readOnly, holders)
+			heldCancel()
+			tw.phases = "held;dur=" + msDur(time.Since(heldStart)) + ", "
+			if err == nil {
+				h.servePlayLink(w, r, pool, rt, memoKey, link)
+				return
+			}
+			logLimited("play-held-miss", "play %s: the held resolve could not serve (%v), asking status",
+				shortHash(target.InfoHash), err)
+		}
+	}
+
 	// Already known to be downloading? Answer from the status alone. A waiting client polls this URL for
 	// the whole fetch, and a full resolve is ~3 upstream calls (cache miss → add → link), so re-running it
 	// per poll is how an account gets itself throttled — and a throttled 5xx is exactly what a client
@@ -1187,7 +1227,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	defer statusCancel()
 	status, ok, unknown := pool.StatusDetail(statusCtx, rt)
 	if ok {
-		writeQueued(w, target.InfoHash, status)
+		h.writePlayQueued(w, pendingKey, target.InfoHash, status)
 		return
 	}
 
@@ -1230,7 +1270,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 			if status, ok, _ := (&StorePool{stores: unknown}).StatusDetail(slowCtx, rt); ok {
 				logLimited("play-slow-status", "play %s → 202, status needed longer than %s to answer",
 					shortHash(target.InfoHash), statusBudget)
-				writeQueued(w, target.InfoHash, status)
+				h.writePlayQueued(w, pendingKey, target.InfoHash, status)
 				return
 			}
 		}
@@ -1290,7 +1330,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	}
 	resolveStart := time.Now()
 	link, err := pool.ResolvePreferring(ctx, rt, preferred)
-	tw.phases = "resolve;dur=" + msDur(time.Since(resolveStart)) + ", "
+	tw.phases += "resolve;dur=" + msDur(time.Since(resolveStart)) + ", "
 	if err != nil {
 		// Queued is not dead. An uncached release is added to the debrid by the Resolve above and then
 		// takes minutes to land; answering 404 for that made the client remember a perfectly good release
@@ -1304,7 +1344,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(r.Context()), statusBudget)
 		defer statusCancel()
 		if status, ok, _ := pool.Status(statusCtx, rt); ok {
-			writeQueued(w, target.InfoHash, status)
+			h.writePlayQueued(w, pendingKey, target.InfoHash, status)
 			return
 		}
 		// An add scout already sent is not a refusal at all — the release is being fetched, by us, right
@@ -1312,7 +1352,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// other sources, for a release scout had queued moments earlier. 202 is simply what is true.
 		if errors.Is(err, errAddInFlight) {
 			logLimited("play-add-in-flight", "play %s → 202, an add is already in flight", shortHash(target.InfoHash))
-			writeQueued(w, target.InfoHash, StoreStatus{})
+			h.writePlayQueued(w, pendingKey, target.InfoHash, StoreStatus{})
 			return
 		}
 		// A refusal SCOUT made — its hourly allowance — is not the debrid refusing, and must not be
