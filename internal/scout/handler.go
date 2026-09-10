@@ -345,6 +345,24 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, errBody("internal"), noStore)
 		}
 	}()
+	// Every response is readable cross-origin, errors included: browser-based Stremio clients fetch the
+	// manifest and stream lists from another origin, and an error body a browser hides is an error nobody
+	// can act on. Set before anything else so no branch below can forget it. Nothing here rides on ambient
+	// credentials — the config and its token are in the path — so `*` grants no access a plain curl does
+	// not already have.
+	w.Header().Set("access-control-allow-origin", "*")
+	// A CORS preflight is answered on EVERY path, ahead of the method gate below, which would otherwise
+	// refuse it with a 405 and fail the preflight — /validate's JSON POST is one a browser preflights. It
+	// does nothing but name what may follow, so it cannot reach /play's resolve.
+	if r.Method == http.MethodOptions {
+		hdr := w.Header()
+		hdr.Set("access-control-allow-methods", "GET, HEAD, POST, OPTIONS")
+		hdr.Set("access-control-allow-headers", "*")
+		// A day, so a browser stops re-preflighting every request.
+		hdr.Set("access-control-max-age", "86400")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	// /validate is the one route that is not a read: it takes a pasted token and asks the service whether
 	// it works, so it is a POST and is matched before the gate below rather than carved out of it.
 	if r.URL.Path == "/validate" {
@@ -372,7 +390,8 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		// state so a monitor sees a total-indexer outage instead of just "empty results".
 		status := map[string]any{"status": "ok"}
 		if h.scrapeFails.Load() >= scrapeFailThreshold {
-			status = map[string]any{"status": "degraded", "reason": "indexers"}
+			status = map[string]any{"status": "degraded", "reason": "indexers",
+				"detail": "No indexer has answered the last few stream-list builds, so lists are coming back empty."}
 		}
 		// A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
 		// other evidence is one log line per refusal. The tightest remaining allowance is what an operator

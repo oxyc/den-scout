@@ -47,7 +47,7 @@ resolve to a server you control, so the app just renders what comes back.
 ```
 GET  /                                   configure page
 GET  /configure                          configure page
-GET  /health                             { status: "ok" | "degraded" }
+GET  /health                             always 200: { status: "ok" } | { status: "degraded", reason, detail }
 GET  /metrics                            Prometheus text (bearer token; 404 unless METRICS_TOKEN is set)
 GET  /config-key                         { key } — X25519 public key for sealing (404 if unset)
 POST /validate                           { service, token } → { valid, reason } — check a debrid key
@@ -61,6 +61,9 @@ GET  /<config>/play/<token>?probe=1      "can this play yet?" — reports, start
 
 Everything is `GET` (and `HEAD`) except `/validate`. `/play` is `GET` only: resolving is what *adds* an
 uncached release, so a prefetcher's `HEAD` is refused rather than answered.
+
+Every response carries `Access-Control-Allow-Origin: *`, and `OPTIONS` on any path is a `204` CORS
+preflight. An unknown path — and `/metrics` without its token — is `404` with `{"error":"not_found"}`.
 
 `<id>` is `tt…` (movie) or `tt…:S:E` (series episode). Scout advertises `idPrefixes: ["tt"]` because
 Den bridges TMDB → IMDb before it asks for streams.

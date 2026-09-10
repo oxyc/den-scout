@@ -229,6 +229,61 @@ func TestRoutesRejectNonReadMethods(t *testing.T) {
 	}
 }
 
+// A preflight is answered on every path — including /play, which refuses every other non-GET verb, and
+// paths that do not exist — and every real response, error or not, is readable cross-origin.
+func TestCORS(t *testing.T) {
+	h := NewHandler(testDeps(nil))
+	for _, path := range []string{"/", "/health", "/validate", "/metrics", "/nope",
+		"/" + validBlob + "/stream/movie/tt1234567.json", "/" + validBlob + "/play/anything"} {
+		rr := doMethod(h, http.MethodOptions, path, nil)
+		hdr := rr.Header()
+		if rr.Code != http.StatusNoContent || rr.Body.Len() != 0 ||
+			hdr.Get("access-control-allow-origin") != "*" ||
+			hdr.Get("access-control-allow-methods") != "GET, HEAD, POST, OPTIONS" ||
+			hdr.Get("access-control-allow-headers") != "*" ||
+			hdr.Get("access-control-max-age") != "86400" {
+			t.Errorf("OPTIONS %s: %d %v", path, rr.Code, hdr)
+		}
+	}
+	for _, c := range []struct {
+		method, path string
+		code         int
+	}{
+		{http.MethodGet, "/manifest.json", 200},
+		{http.MethodGet, "/health", 200},
+		{http.MethodGet, "/@@@/manifest.json", 400},
+		{http.MethodGet, "/nope", 404},
+		{http.MethodPost, "/health", 405},
+	} {
+		rr := doMethod(h, c.method, c.path, nil)
+		if rr.Code != c.code || rr.Header().Get("access-control-allow-origin") != "*" {
+			t.Errorf("%s %s: %d acao=%q, want %d with acao *", c.method, c.path, rr.Code,
+				rr.Header().Get("access-control-allow-origin"), c.code)
+		}
+	}
+}
+
+// One 404 for everything that is not here, byte for byte the same across den addons — and /metrics
+// without its token is indistinguishable from a path that does not exist.
+func TestNotFoundBody(t *testing.T) {
+	open := NewHandler(testDeps(nil))
+	gated := NewHandler(testDeps(func(d *Deps) { d.MetricsToken = "secret" }))
+	for _, c := range []struct {
+		h    http.Handler
+		path string
+	}{
+		{open, "/nope"}, {open, "/a/b/c"}, {open, "/" + validBlob + "/bogus"},
+		{open, "/metrics"}, {gated, "/metrics"},
+	} {
+		rr := do(c.h, c.path, nil)
+		if rr.Code != 404 || rr.Header().Get("content-type") != jsonType ||
+			rr.Header().Get("cache-control") != noStore || rr.Body.String() != `{"error":"not_found"}` {
+			t.Errorf("%s: %d ct=%q cc=%q body=%s", c.path, rr.Code, rr.Header().Get("content-type"),
+				rr.Header().Get("cache-control"), rr.Body.String())
+		}
+	}
+}
+
 // countingStore counts resolves so a test can prove a route never reached the debrid.
 type countingStore struct {
 	Store
@@ -469,8 +524,12 @@ func TestHealthDegradedOnScrapeOutage(t *testing.T) {
 	if rr.Code != 200 {
 		t.Errorf("health must stay 200 (liveness), got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "degraded") {
-		t.Errorf("health should be degraded after %d scrape failures: %s", scrapeFailThreshold, rr.Body.String())
+	// The shape every den addon shares: a machine-readable reason plus one sentence a person can read.
+	var body struct{ Status, Reason, Detail string }
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if body.Status != "degraded" || body.Reason != "indexers" || body.Detail == "" {
+		t.Errorf("health should be degraded with a reason and a detail after %d scrape failures: %s",
+			scrapeFailThreshold, rr.Body.String())
 	}
 }
 
