@@ -8,6 +8,13 @@ on:
   # docker-publish.yml calls this as its gate, so a tag cannot publish an image CI would reject.
   workflow_call:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -52,3 +59,21 @@ jobs:
           awk -v p="$pct" 'BEGIN { exit (p+0 >= 90) ? 0 : 1 }' || {
             echo "coverage ${pct}% is below the 90% gate"; exit 1;
           }
+
+  # The image is what actually ships (cross-compiled, distroless). Catching a Dockerfile break on the
+  # PR rather than at `git tag` time, without pushing, for amd64 — the only arch the box runs. A tag's
+  # publish job builds it anyway.
+  build-pr:
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
