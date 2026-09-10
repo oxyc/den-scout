@@ -360,6 +360,10 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	// credentials — the config and its token are in the path — so `*` grants no access a plain curl does
 	// not already have.
 	w.Header().Set("access-control-allow-origin", "*")
+	// The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
+	// Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
+	w.Header().Set("access-control-expose-headers", "Server-Timing, X-Den-Degraded")
+	w.Header().Set("timing-allow-origin", "*")
 	// A CORS preflight is answered on EVERY path, ahead of the method gate below, which would otherwise
 	// refuse it with a 405 and fail the preflight — /validate's JSON POST is one a browser preflights. It
 	// does nothing but name what may follow, so it cannot reach /play's resolve.
