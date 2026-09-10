@@ -48,14 +48,14 @@ func SettingsFromEnv(get func(string) string) Settings {
 		Port:           orDefault(get("PORT"), "8080"),
 		ScrapeTimeout:  durEnv(get("SCOUT_SCRAPE_TIMEOUT_MS"), time.Millisecond, defaultTimeout),
 		ListTTL:        durEnv(get("SCOUT_LIST_TTL_SECONDS"), time.Second, defaultListTTL),
-		PublicURL:      get("SCOUT_PUBLIC_URL"),
+		PublicURL:      get("PUBLIC_BASE_URL"),
 		IndexerURLs:    urls,
 		CacheBytes:     intEnv(get("SCOUT_CACHE_BYTES"), 48<<20), // 48 MiB
-		CacheDir:       strEnvOr(get("SCOUT_CACHE_DIR"), filepath.Join(os.TempDir(), "den-scout-cache")),
+		CacheDir:       strEnvOr(get("CACHE_DIR"), filepath.Join(os.TempDir(), "den-scout-cache")),
 		CinemetaURL:    orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
-		ConfigKey:      get("SCOUT_CONFIG_KEY"),
-		ConfigKeysPrev: get("SCOUT_CONFIG_KEYS_PREV"),
-		MetricsToken:   get("SCOUT_METRICS_TOKEN"),
+		ConfigKey:      get("CONFIG_KEY"),
+		ConfigKeysPrev: get("CONFIG_KEYS_PREV"),
+		MetricsToken:   get("METRICS_TOKEN"),
 		MintIndexerConfigs: strings.EqualFold(get("SCOUT_MINT_INDEXER_CONFIGS"), "true") ||
 			get("SCOUT_MINT_INDEXER_CONFIGS") == "1",
 	}
@@ -111,7 +111,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 func buildKeyring(current, prev string) *sealKeyring {
 	kr, err := parseSealKeyring(current, prev)
 	if err != nil {
-		log.Printf("den-scout: SCOUT_CONFIG_KEY invalid — sealed configs disabled: %v", err)
+		log.Printf("den-scout: CONFIG_KEY invalid — sealed configs disabled: %v", err)
 		return nil
 	}
 	return kr

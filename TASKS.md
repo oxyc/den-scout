@@ -15,7 +15,7 @@ below, and one reverted — all recorded in their commit messages:
 - **#1** fixes the deployment with a named volume, not a tmpfs: a tmpfs survives a restart but not the
   container recreate an image push performs, which is the case `diskcache.go` was written for. The
   "make it louder" half became the `scout_cache_persistent` gauge in #6.
-- **#6** ended up behind a bearer token (`SCOUT_METRICS_TOKEN`, route 404s without one) rather than
+- **#6** ended up behind a bearer token (`METRICS_TOKEN`, route 404s without one) rather than
   relying on aggregation discipline: withholding debrid labels answered the credential-oracle question
   but not the two the counters raise on their own — a cache-miss counter is a timeline of when the
   household is watching, and per-indexer counters disclose per-install configuration.
@@ -182,7 +182,7 @@ fires on year-less titles and needs one significant-token overlap.
 
 ### 11. Documentation drift
 
-- `SCOUT_CONFIG_KEY`, `SCOUT_CONFIG_KEYS_PREV`, `SCOUT_MINT_INDEXER_CONFIGS`, `SCOUT_CACHE_DIR`,
+- `CONFIG_KEY`, `CONFIG_KEYS_PREV`, `SCOUT_MINT_INDEXER_CONFIGS`, `CACHE_DIR`,
   `SCOUT_CINEMETA_URL` all exist (`deps.go:44-57`) but appear in neither `README.md`, `.env.example`,
   nor `DEPLOY.md`. Net effect: the sealed-config feature `docs/SEALED-CONFIG.md:3` marks DONE is
   **off** in the deploy recipe, and the opt-in that sends the debrid token to elfhosted

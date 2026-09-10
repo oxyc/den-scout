@@ -48,7 +48,7 @@ resolve to a server you control, so the app just renders what comes back.
 GET  /                                   configure page
 GET  /configure                          configure page
 GET  /health                             { status: "ok" | "degraded" }
-GET  /metrics                            Prometheus text (bearer token; 404 unless SCOUT_METRICS_TOKEN is set)
+GET  /metrics                            Prometheus text (bearer token; 404 unless METRICS_TOKEN is set)
 GET  /config-key                         { key } — X25519 public key for sealing (404 if unset)
 POST /validate                           { service, token } → { valid, reason } — check a debrid key
 GET  /manifest.json                      unconfigured manifest (configurationRequired)
@@ -94,12 +94,12 @@ Env only tunes runtime behavior (see `.env.example`):
 | `SCOUT_SCRAPE_TIMEOUT_MS` | per-indexer scrape timeout (default `8000`) |
 | `SCOUT_LIST_TTL_SECONDS` | how long a ranked list stays fresh (default `300`) |
 | `SCOUT_CACHE_BYTES` | in-memory list-cache byte budget (default 48 MiB) |
-| `SCOUT_CACHE_DIR` | durable cache tier; **needs a writable mount** — see `DEPLOY.md` |
-| `SCOUT_PUBLIC_URL` | external origin for `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored |
+| `CACHE_DIR` | durable cache tier; **needs a writable mount** — see `DEPLOY.md` |
+| `PUBLIC_BASE_URL` | external origin for `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored |
 | `SCOUT_CINEMETA_URL` | metadata source for the mistag filter (default: public Cinemeta) |
-| `SCOUT_METRICS_TOKEN` | bearer token for `/metrics`; unset = the route 404s (the counters reveal when the install is being watched) |
-| `SCOUT_CONFIG_KEY` | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |
-| `SCOUT_CONFIG_KEYS_PREV` | prior keys, comma-separated, so a rotation doesn't break live installs |
+| `METRICS_TOKEN` | bearer token for `/metrics`; unset = the route 404s (the counters reveal when the install is being watched) |
+| `CONFIG_KEY` | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |
+| `CONFIG_KEYS_PREV` | prior keys, comma-separated, so a rotation doesn't break live installs |
 | `SCOUT_MINT_INDEXER_CONFIGS` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts** — off unless set |
 | `SCOUT_{TORRENTIO,COMET,MEDIAFUSION,TORZ}_URL` | per-indexer base-URL overrides (point MediaFusion at a base including its encrypted-config segment) |
 

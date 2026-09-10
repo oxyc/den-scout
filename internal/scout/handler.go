@@ -1340,7 +1340,7 @@ func (h *handler) metricsAuthorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(given), []byte(h.deps.MetricsToken)) == 1
 }
 
-// publicOrigin: SCOUT_PUBLIC_URL when set (audit #8), else forwarded headers / Host.
+// publicOrigin: PUBLIC_BASE_URL when set (audit #8), else forwarded headers / Host.
 func (h *handler) publicOrigin(r *http.Request) string {
 	if h.deps.PublicURL != "" {
 		return strings.TrimRight(h.deps.PublicURL, "/")

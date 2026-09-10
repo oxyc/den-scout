@@ -33,7 +33,7 @@ EXPOSE 8080
 # Mount a named volume here to keep the store across image pushes. Under `read_only: true` the rootfs
 # is not writable either, so a mount at this path is REQUIRED for persistence to work at all — a
 # tmpfs survives a restart but not the image push, which is the case the tier was written for.
-ENV SCOUT_CACHE_DIR=/cache
+ENV CACHE_DIR=/cache
 
 # Soft heap ceiling under the documented 256 MiB container limit — Go's GC isn't cgroup-memory-aware,
 # so without this RSS can ~2× before a GC and the container gets OOM-killed. Override to match the

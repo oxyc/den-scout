@@ -7,7 +7,7 @@ the port itself (see the commit history and the intentional-deviation notes in t
 
 - **Sealed config-in-URL** (get BYOK secrets out of plaintext addon URLs) —
   [`docs/SEALED-CONFIG.md`](docs/SEALED-CONFIG.md) records den-scout as the reference impl and marks it
-  DONE. Activate per deployment with `SCOUT_CONFIG_KEY`; unset means legacy plaintext URLs, which still
+  DONE. Activate per deployment with `CONFIG_KEY`; unset means legacy plaintext URLs, which still
   resolve. The opaque `configId` this once pointed at is an explicit **non-goal** — sealing solved the
   problem it was for.
 

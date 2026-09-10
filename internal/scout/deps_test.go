@@ -18,14 +18,36 @@ func TestSettingsFromEnv(t *testing.T) {
 		"PORT":                    "9000",
 		"SCOUT_SCRAPE_TIMEOUT_MS": "5000",
 		"SCOUT_LIST_TTL_SECONDS":  "60",
-		"SCOUT_PUBLIC_URL":        "https://scout.example",
+		"PUBLIC_BASE_URL":         "https://scout.example",
 		"SCOUT_MEDIAFUSION_URL":   "https://mf.self/CONFIG",
 		"SCOUT_CACHE_BYTES":       "1048576",
+		"CACHE_DIR":               "/cache",
+		"CONFIG_KEY":              "current-key",
+		"CONFIG_KEYS_PREV":        "old-a,old-b",
+		"METRICS_TOKEN":           "metrics-secret",
 	}
 	s = SettingsFromEnv(func(k string) string { return env[k] })
 	if s.Port != "9000" || s.ScrapeTimeout != 5*time.Second || s.ListTTL != 60*time.Second ||
 		s.PublicURL != "https://scout.example" || s.IndexerURLs["mediafusion"] != "https://mf.self/CONFIG" || s.CacheBytes != 1<<20 {
 		t.Errorf("from env: %+v", s)
+	}
+	if s.CacheDir != "/cache" || s.ConfigKey != "current-key" || s.ConfigKeysPrev != "old-a,old-b" ||
+		s.MetricsToken != "metrics-secret" {
+		t.Errorf("shared names from env: %+v", s)
+	}
+
+	// The names every den addon shares are read unprefixed, and the scout-prefixed spellings they replaced
+	// are not read at all — a stale env file must show up as an unset key, not keep working by accident.
+	old := map[string]string{
+		"SCOUT_PUBLIC_URL":       "https://old.example",
+		"SCOUT_CACHE_DIR":        "/old",
+		"SCOUT_CONFIG_KEY":       "old",
+		"SCOUT_CONFIG_KEYS_PREV": "old",
+		"SCOUT_METRICS_TOKEN":    "old",
+	}
+	s = SettingsFromEnv(func(k string) string { return old[k] })
+	if s.PublicURL != "" || s.CacheDir == "/old" || s.ConfigKey != "" || s.ConfigKeysPrev != "" || s.MetricsToken != "" {
+		t.Errorf("a retired SCOUT_ name was still read: %+v", s)
 	}
 
 	// non-numeric / non-positive fall back to defaults

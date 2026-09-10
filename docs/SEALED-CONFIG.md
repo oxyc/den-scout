@@ -4,8 +4,8 @@
 DONE** (`5e39112`). All three addons seal the config in the browser at `/configure` and resolve sealed
 URLs end-to-end; legacy plaintext still works; token never logged; tiny deps only. Interop proven every
 direction: **libsodium ↔ Go ↔ Rust** (via the fixed PyNaCl vector) and **JS (browser bundle) → Go and →
-Rust**. Activate per deployment by setting `SCOUT_CONFIG_KEY` / `SUBS_CONFIG_KEY` / `REEL_CONFIG_KEY`
-(base64 32-byte X25519 private key; unset = legacy, still works). den-reel additionally moved its former
+Rust**. Activate per deployment by setting `CONFIG_KEY` in each addon's env (the same name in all three;
+base64 32-byte X25519 private key; unset = legacy, still works). den-reel additionally moved its former
 server-side `TMDB_KEY` into the sealed config (BYOK), keeping the env key only as a migration fallback.
 **Remaining:** P3 (optional) den-app minter — the web `/configure` already mints, so this is a nicety;
 for den-reel it's what lets the app inject its Keychain TMDB key so the server env key can be dropped.
@@ -15,7 +15,7 @@ for den-reel it's what lets the app inject its Keychain TMDB key so the server e
 - [x] **P0** crypto module `seal.go` (crypto_box_seal over nacl/box+blake2b) + the libsodium interop
       gate (`TestSealInteropVector` opens a real PyNaCl ciphertext + matches the derived pubkey) +
       round-trip / fail-closed / rotation tests.
-- [x] **P1 (server)** keyring from env (`SCOUT_CONFIG_KEY`/`SCOUT_CONFIG_KEYS_PREV`), version-byte
+- [x] **P1 (server)** keyring from env (`CONFIG_KEY`/`CONFIG_KEYS_PREV`), version-byte
       decode branch in `decodeConfig` (sealed `0x01` vs legacy JSON), fail-closed, `GET /config-key`,
       never-log. `TestDecodeConfigSealed` + `TestRoutesSealedConfig` prove a sealed URL resolves
       manifest+streams end-to-end and legacy still resolves.
@@ -53,15 +53,13 @@ head -c 32 /dev/urandom | base64
 Do this once per addon. **Back each key up** in the homelab secret store — losing it makes every URL
 sealed to it un-decryptable (installs would have to be re-configured).
 
-**2. Set it in the homelab env** for that service, then let it redeploy:
-| addon | env var | rotation var |
-|---|---|---|
-| den-scout | `SCOUT_CONFIG_KEY` | `SCOUT_CONFIG_KEYS_PREV` |
-| den-subtitles | `SUBS_CONFIG_KEY` | `SUBS_CONFIG_KEYS_PREV` |
-| den-reel | `REEL_CONFIG_KEY` | `REEL_CONFIG_KEYS_PREV` |
+**2. Set it in the homelab env** for that service, then let it redeploy. Every addon (den-scout,
+den-subtitles, den-reel) reads the key as `CONFIG_KEY` and prior keys as `CONFIG_KEYS_PREV`, each from its
+own env file, so the keys stay distinct per addon.
 
-**3. Push each repo** (`git push` → CI builds → GHCR → the homelab watchtower auto-pulls the new image).
-Pushing is the deploy. Setting the env key first means sealing is live the moment the new image boots.
+**3. Ship each repo** — a `v*` tag builds the image to GHCR, and the box's `den-update` (the den repo's
+`deploy/README.md`) verifies and pins it. Setting the env key first means sealing is live the moment the
+new image boots.
 
 **4. Re-configure each install** (turns an existing plaintext URL into a sealed one):
 open the addon's `/configure`, enter the key(s), copy the new URL (it now shows **🔒 Sealed**), and
@@ -72,7 +70,7 @@ replace the old URL in the app under **Settings → Plugins**. For **den-reel** 
 `KINOCHECK_KEY` from the den-reel env. They exist only as a migration fallback; after step 4 the key
 rides in the (sealed) URL and the server holds nothing.
 
-**Rotation:** move the current key into `*_CONFIG_KEYS_PREV`, set a fresh `*_CONFIG_KEY`, redeploy.
+**Rotation:** move the current key into `CONFIG_KEYS_PREV`, set a fresh `CONFIG_KEY`, redeploy.
 Old URLs keep decrypting via the prev list; keep the rotated-out key in `_PREV` until every install is
 re-sealed and past the `/config-key` 1-hour cache (see the risk note below), then drop it.
 
@@ -119,9 +117,9 @@ resolution (VortX's model) = the App-Store surface the neutral-addon pivot exist
     (Never emit a version byte for legacy; only read it.)
 - **Keyring / rotation:** the addon holds a **current** private key + **prior** keys; decrypt tries each in
   order. So rotating the keypair doesn't break existing installs (old URLs decrypt with an old key).
-  - `SCOUT_CONFIG_KEY` = current X25519 private key (base64, 32 bytes).
-  - `SCOUT_CONFIG_KEYS_PREV` = comma-separated prior private keys (may be empty).
-  - Public key = derived from `SCOUT_CONFIG_KEY`; served to `/configure` (embedded) and exposed at
+  - `CONFIG_KEY` = current X25519 private key (base64, 32 bytes).
+  - `CONFIG_KEYS_PREV` = comma-separated prior private keys (may be empty).
+  - Public key = derived from `CONFIG_KEY`; served to `/configure` (embedded) and exposed at
     `GET /config-key` (base64 pubkey) so den-app can seal in-app later.
 - **Payload plaintext** = the same validated config JSON as today (`SingularityConfig`-equivalent), i.e. the
   secret lives *inside* the sealed payload; nothing is split out.
@@ -142,7 +140,7 @@ resolution (VortX's model) = the App-Store surface the neutral-addon pivot exist
 - AC: `go test` round-trips; the libsodium.js vector opens; a tampered blob fails closed.
 
 ### Phase 1 — den-scout wiring (reference)
-- [ ] Load keyring from env (`SCOUT_CONFIG_KEY` + `SCOUT_CONFIG_KEYS_PREV`); fail fast if malformed.
+- [ ] Load keyring from env (`CONFIG_KEY` + `CONFIG_KEYS_PREV`); fail fast if malformed.
 - [ ] `decodeConfig(seg)`: base64url-decode → version-branch → sealed (`Open` over keyring) or legacy JSON.
       Route it everywhere the config path segment is parsed (manifest/stream/play/configure).
 - [ ] `GET /config-key` → base64 current pubkey. `/configure` page embeds the pubkey + does the sealing in
@@ -153,7 +151,7 @@ resolution (VortX's model) = the App-Store surface the neutral-addon pivot exist
       negligible (report the before/after MB).
 
 ### Phase 2 — den-subtitles (Rust) mirror
-- [ ] `crypto_box` sealedbox `Open` over a keyring (`SUBS_CONFIG_KEY` + `_PREV`); `/config-key`;
+- [ ] `crypto_box` sealedbox `Open` over a keyring (`CONFIG_KEY` + `CONFIG_KEYS_PREV`); `/config-key`;
       `/configure` seals in-browser (share the same JS).
 - [ ] Version-branch decode in `userconfig.rs`; legacy plaintext still accepted; never log.
 - AC: OpenSubtitles + LLM keys resolve from a sealed URL; legacy still works; no plaintext in logs.
@@ -170,14 +168,14 @@ resolution (VortX's model) = the App-Store surface the neutral-addon pivot exist
 - AC: no existing install breaks; new installs are sealed by default.
 
 ## Risks & mitigations
-- **Key loss → every install breaks.** Back up `SCOUT_CONFIG_KEY`; keep it in the homelab secret store,
+- **Key loss → every install breaks.** Back up `CONFIG_KEY`; keep it in the homelab secret store,
   not just the container env. Keyring lets you rotate without breakage.
 - **JS/Go/Rust crypto mismatch.** The fixed libsodium.js **test vector** in Phase 0 is the gate — do it
   first; every impl must open it.
 - **Fail-open on decrypt error.** Must fail **closed** (no config → 400/empty), never fall back to serving
   with an empty/partial config.
 - **`/config-key` is cached `public, max-age=3600`.** After a rotation a browser may seal to the *previous*
-  pubkey for up to an hour — harmless **as long as the rotated-out key stays in `*_CONFIG_KEYS_PREV`** (the
+  pubkey for up to an hour — harmless **as long as the rotated-out key stays in `CONFIG_KEYS_PREV`** (the
   keyring tries prior keys), which the rotation procedure already requires. Don't drop a key from `_PREV`
   until well past the cache TTL.
 
