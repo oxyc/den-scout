@@ -54,7 +54,7 @@ const (
 	// stale by an hour is not a kindness.
 	//
 	// A CEILING, not the value: staleWindowFor caps it at the configured TTL as well. Left absolute, an
-	// operator who set SCOUT_LIST_TTL_SECONDS=30 got a 30-second freshness followed by a two-minute stale
+	// operator who set LIST_TTL_SECS=30 got a 30-second freshness followed by a two-minute stale
 	// window — an entry spending 80% of its life stale, which is not what "briefly serve the old one
 	// while it refreshes" means.
 	maxStaleServeWindow = 2 * time.Minute
@@ -319,7 +319,7 @@ func NewHandler(deps Deps) http.Handler {
 	h.listCache = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
 	// A short list and a stale one must never be held LONGER than a complete fresh one. Both windows are
 	// therefore capped by the configured TTL, not just written as the 60s that suits the default: at
-	// SCOUT_LIST_TTL_SECONDS=30 a knowingly-short list was being advertised as fresh for 60s and usable
+	// LIST_TTL_SECS=30 a knowingly-short list was being advertised as fresh for 60s and usable
 	// for 120 while a complete one got 30 — the exact inversion three comments in this file forbid, and
 	// the first attempt at this fixed it only for the stale header, one branch over from the partial one.
 	shortSec := int(partialListTTL.Seconds())
@@ -391,7 +391,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		// once per title opened cold, so polling this endpoint is a timeline of when the household is
 		// watching and how much it browses — /health exposes nothing comparable. And per-indexer counters
 		// disclose which indexers this install has configured, which IS per-install configuration: with
-		// SCOUT_MINT_INDEXER_CONFIGS on, a nonzero mediafusion counter says the debrid token was minted
+		// MINT_INDEXER_CONFIGS on, a nonzero mediafusion counter says the debrid token was minted
 		// and sent to that host.
 		//
 		// Dropping the useful labels would have left an endpoint not worth scraping, so the other option

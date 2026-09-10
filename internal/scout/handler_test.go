@@ -1136,7 +1136,7 @@ func TestStreamList_aDisconnectDoesNotKillTheStaleRebuild(t *testing.T) {
 }
 
 // The stale window is a ceiling scaled by the configured TTL, not an absolute. Pinned at two minutes, an
-// operator running SCOUT_LIST_TTL_SECONDS=30 got 30 seconds of freshness followed by two minutes of
+// operator running LIST_TTL_SECS=30 got 30 seconds of freshness followed by two minutes of
 // staleness — an entry spending 80% of its life stale — and was told to hold the stale body for 60s,
 // twice the freshness they configured.
 func TestStreamList_staleWindowScalesWithTheTTL(t *testing.T) {

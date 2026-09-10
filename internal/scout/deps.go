@@ -32,32 +32,32 @@ type Settings struct {
 	MetricsToken string
 	// Let scout build comet's and mediafusion's per-install config segments from the debrid account it
 	// already holds, instead of skipping those indexers for want of a pasted URL. **This sends the debrid
-	// token to those hosts**, so it is off unless the operator turns it on. An explicit SCOUT_<name>_URL
-	// still wins, for a token-free config.
+	// token to those hosts**, so it is off unless the operator turns it on. An explicit <NAME>_URL (e.g.
+	// COMET_URL) still wins, for a token-free config.
 	MintIndexerConfigs bool
 }
 
 func SettingsFromEnv(get func(string) string) Settings {
 	urls := map[Indexer]string{}
 	for _, id := range allIndexers {
-		if v := get("SCOUT_" + strings.ToUpper(string(id)) + "_URL"); v != "" {
+		if v := get(strings.ToUpper(string(id)) + "_URL"); v != "" {
 			urls[id] = v
 		}
 	}
 	return Settings{
 		Port:           orDefault(get("PORT"), "8080"),
-		ScrapeTimeout:  durEnv(get("SCOUT_SCRAPE_TIMEOUT_MS"), time.Millisecond, defaultTimeout),
-		ListTTL:        durEnv(get("SCOUT_LIST_TTL_SECONDS"), time.Second, defaultListTTL),
+		ScrapeTimeout:  durEnv(get("SCRAPE_TIMEOUT_MS"), time.Millisecond, defaultTimeout),
+		ListTTL:        durEnv(get("LIST_TTL_SECS"), time.Second, defaultListTTL),
 		PublicURL:      get("PUBLIC_BASE_URL"),
 		IndexerURLs:    urls,
-		CacheBytes:     intEnv(get("SCOUT_CACHE_BYTES"), 48<<20), // 48 MiB
+		CacheBytes:     intEnv(get("MEMORY_CACHE_BYTES"), 48<<20), // 48 MiB
 		CacheDir:       strEnvOr(get("CACHE_DIR"), filepath.Join(os.TempDir(), "den-scout-cache")),
-		CinemetaURL:    orDefault(get("SCOUT_CINEMETA_URL"), cinemetaBase),
+		CinemetaURL:    orDefault(get("CINEMETA_URL"), cinemetaBase),
 		ConfigKey:      get("CONFIG_KEY"),
 		ConfigKeysPrev: get("CONFIG_KEYS_PREV"),
 		MetricsToken:   get("METRICS_TOKEN"),
-		MintIndexerConfigs: strings.EqualFold(get("SCOUT_MINT_INDEXER_CONFIGS"), "true") ||
-			get("SCOUT_MINT_INDEXER_CONFIGS") == "1",
+		MintIndexerConfigs: strings.EqualFold(get("MINT_INDEXER_CONFIGS"), "true") ||
+			get("MINT_INDEXER_CONFIGS") == "1",
 	}
 }
 

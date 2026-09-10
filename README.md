@@ -91,17 +91,17 @@ Env only tunes runtime behavior (see `.env.example`):
 | Variable | Purpose |
 | --- | --- |
 | `PORT` | listen port (default `8080`) |
-| `SCOUT_SCRAPE_TIMEOUT_MS` | per-indexer scrape timeout (default `8000`) |
-| `SCOUT_LIST_TTL_SECONDS` | how long a ranked list stays fresh (default `300`) |
-| `SCOUT_CACHE_BYTES` | in-memory list-cache byte budget (default 48 MiB) |
+| `SCRAPE_TIMEOUT_MS` | per-indexer scrape timeout (default `8000`) |
+| `LIST_TTL_SECS` | how long a ranked list stays fresh (default `300`) |
+| `MEMORY_CACHE_BYTES` | in-memory list-cache byte budget (default 48 MiB) |
 | `CACHE_DIR` | durable cache tier; **needs a writable mount** — see `DEPLOY.md` |
 | `PUBLIC_BASE_URL` | external origin for `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored |
-| `SCOUT_CINEMETA_URL` | metadata source for the mistag filter (default: public Cinemeta) |
+| `CINEMETA_URL` | metadata source for the mistag filter (default: public Cinemeta) |
 | `METRICS_TOKEN` | bearer token for `/metrics`; unset = the route 404s (the counters reveal when the install is being watched) |
 | `CONFIG_KEY` | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |
 | `CONFIG_KEYS_PREV` | prior keys, comma-separated, so a rotation doesn't break live installs |
-| `SCOUT_MINT_INDEXER_CONFIGS` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts** — off unless set |
-| `SCOUT_{TORRENTIO,COMET,MEDIAFUSION,TORZ}_URL` | per-indexer base-URL overrides (point MediaFusion at a base including its encrypted-config segment) |
+| `MINT_INDEXER_CONFIGS` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts** — off unless set |
+| `{TORRENTIO,COMET,MEDIAFUSION,TORZ}_URL` | per-indexer base-URL overrides (point MediaFusion at a base including its encrypted-config segment) |
 
 ## Architecture
 

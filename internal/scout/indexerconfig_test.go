@@ -197,13 +197,13 @@ func TestMintingIsOptIn(t *testing.T) {
 		t.Error("minting must default to off — it sends the debrid token to a third party")
 	}
 	on := SettingsFromEnv(func(k string) string {
-		if k == "SCOUT_MINT_INDEXER_CONFIGS" {
+		if k == "MINT_INDEXER_CONFIGS" {
 			return "true"
 		}
 		return ""
 	})
 	if !on.MintIndexerConfigs {
-		t.Error("SCOUT_MINT_INDEXER_CONFIGS=true should enable it")
+		t.Error("MINT_INDEXER_CONFIGS=true should enable it")
 	}
 }
 

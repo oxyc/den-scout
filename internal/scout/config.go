@@ -35,9 +35,9 @@ var defaultIndexers = []Indexer{"torrentio", "mediafusion"}
 // response, so it voted on whether a release exists, and an episode with fifty releases was reported as
 // having none. An indexer that cannot be asked properly must not be asked at all.
 var configPathIndexers = map[Indexer]string{
-	"comet":       "SCOUT_COMET_URL",
-	"mediafusion": "SCOUT_MEDIAFUSION_URL",
-	"torz":        "SCOUT_TORZ_URL",
+	"comet":       "COMET_URL",
+	"mediafusion": "MEDIAFUSION_URL",
+	"torz":        "TORZ_URL",
 }
 
 // Named but known-broken indexers, removed from any config. An install's sealed config cannot be edited

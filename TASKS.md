@@ -182,8 +182,8 @@ fires on year-less titles and needs one significant-token overlap.
 
 ### 11. Documentation drift
 
-- `CONFIG_KEY`, `CONFIG_KEYS_PREV`, `SCOUT_MINT_INDEXER_CONFIGS`, `CACHE_DIR`,
-  `SCOUT_CINEMETA_URL` all exist (`deps.go:44-57`) but appear in neither `README.md`, `.env.example`,
+- `CONFIG_KEY`, `CONFIG_KEYS_PREV`, `MINT_INDEXER_CONFIGS`, `CACHE_DIR`,
+  `CINEMETA_URL` all exist (`deps.go:44-57`) but appear in neither `README.md`, `.env.example`,
   nor `DEPLOY.md`. Net effect: the sealed-config feature `docs/SEALED-CONFIG.md:3` marks DONE is
   **off** in the deploy recipe, and the opt-in that sends the debrid token to elfhosted
   (`indexerconfig.go:29-33`) is documented only inside that source file.

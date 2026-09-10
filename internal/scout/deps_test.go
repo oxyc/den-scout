@@ -15,16 +15,18 @@ func TestSettingsFromEnv(t *testing.T) {
 	}
 
 	env := map[string]string{
-		"PORT":                    "9000",
-		"SCOUT_SCRAPE_TIMEOUT_MS": "5000",
-		"SCOUT_LIST_TTL_SECONDS":  "60",
-		"PUBLIC_BASE_URL":         "https://scout.example",
-		"SCOUT_MEDIAFUSION_URL":   "https://mf.self/CONFIG",
-		"SCOUT_CACHE_BYTES":       "1048576",
-		"CACHE_DIR":               "/cache",
-		"CONFIG_KEY":              "current-key",
-		"CONFIG_KEYS_PREV":        "old-a,old-b",
-		"METRICS_TOKEN":           "metrics-secret",
+		"PORT":                 "9000",
+		"SCRAPE_TIMEOUT_MS":    "5000",
+		"LIST_TTL_SECS":        "60",
+		"PUBLIC_BASE_URL":      "https://scout.example",
+		"MEDIAFUSION_URL":      "https://mf.self/CONFIG",
+		"MEMORY_CACHE_BYTES":   "1048576",
+		"CACHE_DIR":            "/cache",
+		"CINEMETA_URL":         "https://cinemeta.self",
+		"CONFIG_KEY":           "current-key",
+		"CONFIG_KEYS_PREV":     "old-a,old-b",
+		"METRICS_TOKEN":        "metrics-secret",
+		"MINT_INDEXER_CONFIGS": "1",
 	}
 	s = SettingsFromEnv(func(k string) string { return env[k] })
 	if s.Port != "9000" || s.ScrapeTimeout != 5*time.Second || s.ListTTL != 60*time.Second ||
@@ -32,30 +34,42 @@ func TestSettingsFromEnv(t *testing.T) {
 		t.Errorf("from env: %+v", s)
 	}
 	if s.CacheDir != "/cache" || s.ConfigKey != "current-key" || s.ConfigKeysPrev != "old-a,old-b" ||
-		s.MetricsToken != "metrics-secret" {
-		t.Errorf("shared names from env: %+v", s)
+		s.MetricsToken != "metrics-secret" || s.CinemetaURL != "https://cinemeta.self" || !s.MintIndexerConfigs {
+		t.Errorf("unprefixed names from env: %+v", s)
 	}
 
-	// The names every den addon shares are read unprefixed, and the scout-prefixed spellings they replaced
-	// are not read at all — a stale env file must show up as an unset key, not keep working by accident.
+	// No variable carries the addon's name — the container is the namespace — and the SCOUT_-prefixed
+	// spellings they replaced are not read at all: a stale env file must show up as an unset key, not keep
+	// working by accident.
 	old := map[string]string{
-		"SCOUT_PUBLIC_URL":       "https://old.example",
-		"SCOUT_CACHE_DIR":        "/old",
-		"SCOUT_CONFIG_KEY":       "old",
-		"SCOUT_CONFIG_KEYS_PREV": "old",
-		"SCOUT_METRICS_TOKEN":    "old",
+		"SCOUT_PUBLIC_URL":           "https://old.example",
+		"SCOUT_CACHE_DIR":            "/old",
+		"SCOUT_CONFIG_KEY":           "old",
+		"SCOUT_CONFIG_KEYS_PREV":     "old",
+		"SCOUT_METRICS_TOKEN":        "old",
+		"SCOUT_SCRAPE_TIMEOUT_MS":    "5000",
+		"SCOUT_LIST_TTL_SECONDS":     "60",
+		"SCOUT_CACHE_BYTES":          "1048576",
+		"SCOUT_CINEMETA_URL":         "https://old.example",
+		"SCOUT_MINT_INDEXER_CONFIGS": "true",
+		"SCOUT_TORRENTIO_URL":        "https://old.example",
+		"SCOUT_COMET_URL":            "https://old.example",
+		"SCOUT_MEDIAFUSION_URL":      "https://old.example",
+		"SCOUT_TORZ_URL":             "https://old.example",
 	}
 	s = SettingsFromEnv(func(k string) string { return old[k] })
-	if s.PublicURL != "" || s.CacheDir == "/old" || s.ConfigKey != "" || s.ConfigKeysPrev != "" || s.MetricsToken != "" {
+	if s.PublicURL != "" || s.CacheDir == "/old" || s.ConfigKey != "" || s.ConfigKeysPrev != "" || s.MetricsToken != "" ||
+		s.ScrapeTimeout != defaultTimeout || s.ListTTL != defaultListTTL || s.CacheBytes != 48<<20 ||
+		s.CinemetaURL != cinemetaBase || s.MintIndexerConfigs || len(s.IndexerURLs) != 0 {
 		t.Errorf("a retired SCOUT_ name was still read: %+v", s)
 	}
 
 	// non-numeric / non-positive fall back to defaults
 	s = SettingsFromEnv(func(k string) string {
-		if k == "SCOUT_SCRAPE_TIMEOUT_MS" {
+		if k == "SCRAPE_TIMEOUT_MS" {
 			return "-1"
 		}
-		if k == "SCOUT_LIST_TTL_SECONDS" {
+		if k == "LIST_TTL_SECS" {
 			return "abc"
 		}
 		return ""
@@ -99,7 +113,7 @@ func TestBuildDeps(t *testing.T) {
 	}
 	// Given the URL, it is asked.
 	withComet := BuildDeps(SettingsFromEnv(func(k string) string {
-		if k == "SCOUT_COMET_URL" {
+		if k == "COMET_URL" {
 			return "https://comet.example/CONFIG"
 		}
 		return ""

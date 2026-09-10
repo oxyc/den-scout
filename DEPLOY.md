@@ -27,7 +27,7 @@ The image is built and pushed to `ghcr.io/oxyc/den-scout` by this repo's `docker
 ## The cache directory is not optional
 
 The cache is a `TieredCache` (`internal/scout/diskcache.go`): the byte-bounded in-memory `MemoryCache`
-(TTL + LRU, sized by `SCOUT_CACHE_BYTES`, default 48 MiB) in front of a durable disk tier at `CACHE_DIR`,
+(TTL + LRU, sized by `MEMORY_CACHE_BYTES`, default 48 MiB) in front of a durable disk tier at `CACHE_DIR`,
 which the image sets to `/cache`. The unit bind-mounts the host's `/var/lib/den/scout-cache` there, and
 that directory must be **owned by uid 65532** (`provision-podman.sh` does it).
 

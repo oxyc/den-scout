@@ -28,8 +28,8 @@ import (
 // Scout is already given the debrid account on every request, so it can build those configs itself
 // rather than asking the operator to paste two URLs. **This sends the debrid token to the indexer**,
 // which is a real change in who holds it: it goes from "our homelab and the debrid" to "and the two
-// indexer hosts too". That is why it is opt-in via SCOUT_MINT_INDEXER_CONFIGS, and why an explicit
-// SCOUT_COMET_URL / SCOUT_MEDIAFUSION_URL always wins — an operator who has pasted a token-free config
+// indexer hosts too". That is why it is opt-in via MINT_INDEXER_CONFIGS, and why an explicit
+// COMET_URL / MEDIAFUSION_URL always wins — an operator who has pasted a token-free config
 // keeps it.
 //
 // The indexers are asked to SEARCH, not to resolve: scout takes infohashes from them and does its own
@@ -41,7 +41,7 @@ import (
 // rotated token stops being replayed to a third party within the day.
 const mintedTTL = 12 * time.Hour
 
-// Opt-in, because it decides who holds the debrid token. Set by SCOUT_MINT_INDEXER_CONFIGS at startup.
+// Opt-in, because it decides who holds the debrid token. Set by MINT_INDEXER_CONFIGS at startup.
 var mintIndexerConfigs bool
 
 // EnableIndexerConfigMinting is called once from BuildDeps. A package-level switch rather than a field
@@ -208,7 +208,7 @@ func pruneMintedLocked() {
 	// What remains true, and is the honest limit of this ceiling: a sustained flood of caller-invented
 	// tokens degrades the minted cache to re-minting, which for mediafusion is a POST in front of the
 	// scrape. That is a latency cost, not a memory one — the bound this exists for still holds — and the
-	// whole feature is off unless SCOUT_MINT_INDEXER_CONFIGS is set.
+	// whole feature is off unless MINT_INDEXER_CONFIGS is set.
 	//
 	// A scan for the single oldest, not a sort of the whole map. Only one entry has to go — the caller is
 	// about to insert exactly one — and sorting 256 entries to drop one of them cost 31 µs and 15 KB per
