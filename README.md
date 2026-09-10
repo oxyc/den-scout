@@ -82,6 +82,10 @@ uncached release, so a prefetcher's `HEAD` is refused rather than answered.
 Every response carries `Access-Control-Allow-Origin: *`, and `OPTIONS` on any path is a `204` CORS
 preflight. An unknown path — and `/metrics` without its token — is `404` with `{"error":"not_found"}`.
 
+A stream list that is served but cannot be trusted carries `X-Den-Degraded` — `indexers` when no indexer
+answered, `cache-check` when the debrid could not be asked about a release in it — and is `no-store`, so
+the app can say "sources temporarily unavailable" instead of "nothing found".
+
 `<id>` is `tt…` (movie) or `tt…:S:E` (series episode). Scout advertises `idPrefixes: ["tt"]` because
 Den bridges TMDB → IMDb before it asks for streams.
 

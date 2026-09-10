@@ -529,7 +529,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		})
 		res := v.(buildResult)
 		if res.degraded != "" {
-			w.Header().Set("X-Scout-Degraded", res.degraded)
+			w.Header().Set("X-Den-Degraded", res.degraded)
 		}
 		_, _, _, body := splitCached(res.value)
 		writeJSON(w, http.StatusOK, json.RawMessage(body), noStore)
@@ -580,7 +580,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	// Signal a degraded build so the app can say "sources temporarily unavailable" rather than treating
 	// an empty list as "no results" (a total indexer/cache-check outage otherwise looks identical).
 	if res.degraded != "" {
-		w.Header().Set("X-Scout-Degraded", res.degraded)
+		w.Header().Set("X-Den-Degraded", res.degraded)
 	}
 	_, _, etag, body := splitCached(res.value)
 	// A degraded build is deliberately not cached server-side, "so the next request retries instead of

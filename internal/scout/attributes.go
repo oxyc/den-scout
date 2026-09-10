@@ -32,7 +32,7 @@ type StreamAttributes struct {
 	// Whether the debrid already holds this release. A POINTER, because there are three answers and the
 	// third one matters: it holds it, it does not, or nobody could ask. When the cache check failed a flat
 	// `false` went out for every release — a definite claim — while the same response's
-	// `X-Scout-Degraded: cache-check` header said we did not know. The client's field is optional and
+	// `X-Den-Degraded: cache-check` header said we did not know. The client's field is optional and
 	// reads nil as "unknown", so the lie was believed: every release counted as needing a download, and
 	// the app queued a real fetch for releases the debrid already held, during the minute the debrid was
 	// already refusing requests. Omitted rather than guessed.

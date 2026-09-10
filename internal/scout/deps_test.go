@@ -102,7 +102,7 @@ func TestBuildDeps(t *testing.T) {
 	// NOT transient. The distinction decides whether the operator is told to configure something or
 	// told an upstream is down, and it is read one level up to decide whether an empty list is an
 	// outage. Inverting it on this, the shipped default, reported every genuinely empty title as an
-	// indexer outage: X-Scout-Degraded on every response, no-store so negative caching never runs, and
+	// indexer outage: X-Den-Degraded on every response, no-store so negative caching never runs, and
 	// three in a row flipping /health to degraded on a service that is perfectly healthy.
 	//
 	// Only the CONSUMPTION of this flag was covered, never its production, so the inversion was green.

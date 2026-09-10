@@ -550,8 +550,8 @@ func TestRoutesDegradedScrapeNotCached(t *testing.T) {
 	if n := streamsLen(degradedRR); n != 0 {
 		t.Fatalf("degraded scrape should yield 0 streams, got %d", n)
 	}
-	if got := degradedRR.Header().Get("X-Scout-Degraded"); got != "indexers" {
-		t.Errorf("degraded scrape should set X-Scout-Degraded: indexers, got %q", got)
+	if got := degradedRR.Header().Get("X-Den-Degraded"); got != "indexers" {
+		t.Errorf("degraded scrape should set X-Den-Degraded: indexers, got %q", got)
 	}
 	atomic.StoreInt32(&healthy, 1)
 	if n := streamsLen(do(h, "/"+validBlob+"/stream/movie/tt42.json", nil)); n == 0 {
@@ -637,8 +637,8 @@ func TestStream_partialCacheCheckIsDegraded(t *testing.T) {
 	})
 	rec := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil)
 
-	if got := rec.Header().Get("X-Scout-Degraded"); got != "cache-check" {
-		t.Errorf("X-Scout-Degraded = %q, want cache-check — a release nobody could check was served as fact", got)
+	if got := rec.Header().Get("X-Den-Degraded"); got != "cache-check" {
+		t.Errorf("X-Den-Degraded = %q, want cache-check — a release nobody could check was served as fact", got)
 	}
 	// validBlob sets cachedOnly. The held release and the unchecked one are served; the one the store
 	// definitively does not hold is dropped. Switching the filter off wholesale on a partial failure —
@@ -676,8 +676,8 @@ func TestStream_uncheckedReleasesThatAreFilteredOutDoNotDegrade(t *testing.T) {
 	})
 	rec := do(h, "/"+validBlob+"/stream/movie/tt7654321.json", nil)
 
-	if got := rec.Header().Get("X-Scout-Degraded"); got != "" {
-		t.Errorf("X-Scout-Degraded = %q: an unchecked release nobody will see is not a degraded answer", got)
+	if got := rec.Header().Get("X-Den-Degraded"); got != "" {
+		t.Errorf("X-Den-Degraded = %q: an unchecked release nobody will see is not a degraded answer", got)
 	}
 	if n := streamsLen(rec); n != 1 {
 		t.Errorf("served %d streams, want 1", n)
@@ -710,8 +710,8 @@ func TestStream_oneStoreEntirelyDownIsDegradedAndStopsFiltering(t *testing.T) {
 	})
 	rec := do(h, "/"+validBlob+"/stream/movie/tt5555555.json", nil)
 
-	if got := rec.Header().Get("X-Scout-Degraded"); got != "cache-check" {
-		t.Errorf("X-Scout-Degraded = %q: a store being out is not an ordinary answer", got)
+	if got := rec.Header().Get("X-Den-Degraded"); got != "cache-check" {
+		t.Errorf("X-Den-Degraded = %q: a store being out is not an ordinary answer", got)
 	}
 	if n := streamsLen(rec); n != 1 {
 		t.Errorf("served %d streams: cachedOnly must stop filtering when a store cannot be asked", n)
@@ -749,8 +749,8 @@ func TestStream_aDownStoreIsDegradedEvenWhenEverythingServedIsKnownHeld(t *testi
 	if n := streamsLen(rec); n != 1 {
 		t.Fatalf("served %d streams, want the held one", n)
 	}
-	if got := rec.Header().Get("X-Scout-Degraded"); got != "cache-check" {
-		t.Errorf("X-Scout-Degraded = %q: a store is down and nothing in the response says so", got)
+	if got := rec.Header().Get("X-Den-Degraded"); got != "cache-check" {
+		t.Errorf("X-Den-Degraded = %q: a store is down and nothing in the response says so", got)
 	}
 	if cc := rec.Header().Get("cache-control"); !strings.Contains(cc, "no-store") {
 		t.Errorf("cache-control = %q: a list built during an outage must not be cached", cc)
@@ -778,8 +778,8 @@ func TestStream_noReleasesIsAnAnswerNotAnOutage(t *testing.T) {
 		},
 	})
 	first := do(h, "/"+validBlob+"/stream/movie/tt7777777.json", nil)
-	if got := first.Header().Get("X-Scout-Degraded"); got != "" {
-		t.Errorf("X-Scout-Degraded = %q for a title that simply has no releases", got)
+	if got := first.Header().Get("X-Den-Degraded"); got != "" {
+		t.Errorf("X-Den-Degraded = %q for a title that simply has no releases", got)
 	}
 	do(h, "/"+validBlob+"/stream/movie/tt7777777.json", nil)
 	if scrapes != 1 {
@@ -815,8 +815,8 @@ func TestStream_aPartialListIsStillServedAndCached(t *testing.T) {
 	if n := streamsLen(first); n != 1 {
 		t.Fatalf("served %d streams; what the healthy indexer returned is real", n)
 	}
-	if got := first.Header().Get("X-Scout-Degraded"); got != "" {
-		t.Errorf("X-Scout-Degraded = %q over a list that is short, not broken", got)
+	if got := first.Header().Get("X-Den-Degraded"); got != "" {
+		t.Errorf("X-Den-Degraded = %q over a list that is short, not broken", got)
 	}
 	// The client must not be told to hold it longer than the server does. The server keeps a partial list
 	// for a minute; advertising the full five-minute max-age pinned a knowingly-short list on the device
