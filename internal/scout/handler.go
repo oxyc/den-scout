@@ -273,6 +273,11 @@ type handler struct {
 	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
 	scrapeFails atomic.Int32
 
+	// Availability checks running behind replies, by verdict key — never more than maxAvailabilityChecks,
+	// so the map holds only live checks.
+	availMu       sync.Mutex
+	availInFlight map[string]bool
+
 	// Playback links minted in the last few minutes, so /play can serve a repeat without asking the
 	// debrid again. Filled by /play and by the probe fan-out, which mints one per probed release anyway.
 	links linkMemo
@@ -384,6 +389,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	// it works, so it is a POST and is matched before the gate below rather than carved out of it.
 	if r.URL.Path == "/validate" {
 		h.handleValidate(w, r)
+		return
+	}
+	// The availability batch is a POST as well — a page of ids does not belong in a URL — and it too is
+	// matched ahead of the gate. It answers from cache or starts a read-only check; it never resolves.
+	if strings.HasSuffix(r.URL.Path, "/availability") {
+		h.handleAvailability(w, r)
 		return
 	}
 	// Every route here is a read, so GET/HEAD is the entire vocabulary — and until this gate existed the
@@ -531,6 +542,9 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 			return
 		}
+		if refuseScoped(w, config) {
+			return
+		}
 		if !debugLimiter.allow(debugLimiterKey) {
 			w.Header().Set("retry-after", "10")
 			writeJSON(w, http.StatusTooManyRequests, errBody("debug_rate_limited"), noStore)
@@ -583,6 +597,11 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
+		return
+	}
+	// Only the miss path needs this: a warm hit is keyed on the blob, and nothing builds a list for a
+	// scoped blob to hit.
+	if refuseScoped(w, config) {
 		return
 	}
 
@@ -696,6 +715,29 @@ type buildResult struct {
 // dbg is nil on every normal request. When it is not, the accounting rides along in the response body and
 // the result is NOT cached — a debug build is a diagnostic, not an entry other viewers should be served.
 func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string, dbg *rankDebug) buildResult {
+	list := h.rankList(ctx, config, sid, dbg)
+	// A movie's list answers the availability route's question too, so a title someone opened needs no
+	// check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one.
+	if sid.Type == "movie" && list.degraded == "" && dbg == nil {
+		h.recordVerdict(verdictPrefix(config)+sid.IMDb, len(list.ranked) > 0)
+	}
+	return h.finishStreamList(ctx, config, configBlob, sid, origin, cacheKey, dbg, list)
+}
+
+// rankedList is a title's releases after the scrape, the debrid cache check and ranking: what a stream list
+// serves, before any probe or serialisation — and all the availability route needs.
+type rankedList struct {
+	ranked []RawStream
+	truth  CacheTruth
+	// degraded — why the list cannot be trusted, "" when it can (buildResult's vocabulary).
+	degraded string
+	complete bool
+	timing   string
+}
+
+// rankList scrapes, cache-checks and ranks. Nothing here changes anything on the debrid: the cache check
+// is a read.
+func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, dbg *rankDebug) rankedList {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	phase := time.Now()
 	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
@@ -832,7 +874,6 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	} else if truthOut || unchecked > 0 {
 		degradedReason = "cache-check"
 	}
-	degraded := degradedReason != ""
 	if unchecked > 0 {
 		logLimited("cache-check-partial", "%s %s: %d of %d served releases could not be cache-checked",
 			sid.Type, sid.IMDb, unchecked, len(ranked))
@@ -854,9 +895,18 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 			config.Filters.Resolutions, config.Filters.MinSeeders, config.Filters.MaxSizeGB,
 			config.Filters.ExcludeCam, config.Filters.HDROnly)
 	}
+	return rankedList{ranked: ranked, truth: truth, degraded: degradedReason, complete: scrapeComplete, timing: timing}
+}
+
+// finishStreamList probes the top of a ranked list, serialises it and caches it — the half of a build only a
+// stream list needs.
+func (h *handler) finishStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin,
+	cacheKey string, dbg *rankDebug, list rankedList) buildResult {
+	ranked, truth, degradedReason, scrapeComplete, timing := list.ranked, list.truth, list.degraded, list.complete, list.timing
+	degraded := degradedReason != ""
 	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
 	// the viewer will see; before serialisation, so a cached probe rides along in this same response.
-	phase = time.Now()
+	phase := time.Now()
 	if h.probeTop(ctx, config, ranked, sid, truth) {
 		timing += ", probe;dur=" + msDur(time.Since(phase))
 	}
@@ -1103,6 +1153,9 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
+		return
+	}
+	if refuseScoped(w, config) {
 		return
 	}
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
@@ -1653,6 +1706,16 @@ func writeJSON(w http.ResponseWriter, status int, body any, cacheControl string)
 }
 
 func errBody(msg string) map[string]string { return map[string]string{"error": msg} }
+
+// refuseScoped answers 403 for a scoped config on a route outside its scope — every route that lists or
+// plays streams — and reports whether it did.
+func refuseScoped(w http.ResponseWriter, config *Config) bool {
+	if config.Scope == "" {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, errBody("out_of_scope"), noStore)
+	return true
+}
 
 func splitPath(p string) []string {
 	var out []string

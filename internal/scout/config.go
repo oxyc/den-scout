@@ -142,7 +142,15 @@ type Config struct {
 	Filters    Filters
 	CachedOnly bool
 	ResultCap  int
+	// Scope limits what the config may be used for. "" is the full config. scopeAvailability is the
+	// read-only one a browser holds: it answers the availability batch and the manifest, and every route
+	// that lists or plays streams refuses it. It carries the same debrid token — the availability check
+	// needs the account — so the scope, and the seal around it, are what keep that token from resolving
+	// anything.
+	Scope string
 }
+
+const scopeAvailability = "availability"
 
 // rawConfig mirrors the untrusted wire JSON before validation/clamping.
 type rawConfig struct {
@@ -162,6 +170,7 @@ type rawConfig struct {
 	} `json:"filters"`
 	CachedOnly *bool    `json:"cachedOnly"`
 	ResultCap  *float64 `json:"resultCap"`
+	Scope      *string  `json:"scope"`
 }
 
 // decodeConfig decodes the config path segment into a validated config, or ok=false (→ 400). The segment
@@ -191,7 +200,8 @@ func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
 	if err != nil || len(data) == 0 {
 		return nil, false
 	}
-	if data[0] == sealedVersion {
+	sealed := data[0] == sealedVersion
+	if sealed {
 		if kr == nil {
 			return nil, false // sealed URL but no key configured → can't open; refuse
 		}
@@ -203,6 +213,12 @@ func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
 	}
 	var raw rawConfig
 	if json.Unmarshal(data, &raw) != nil {
+		return nil, false
+	}
+	// A scope only means something sealed. A plaintext segment IS the debrid token in the clear, so a
+	// "scoped" plaintext URL would hand its holder the very thing the scope exists to keep from them —
+	// refusing it makes that mistake loud instead of quietly shipping the token to a browser.
+	if raw.Scope != nil && !sealed {
 		return nil, false
 	}
 	return validateConfig(&raw)
@@ -308,7 +324,17 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		resultCap = clampInt(int(math.Round(*raw.ResultCap)), 1, maxResultCap)
 	}
 
-	return &Config{Debrid: debrid, Indexers: idx, Filters: f, CachedOnly: cachedOnly, ResultCap: resultCap}, true
+	// An unknown scope fails closed: read as the full config, a typo would grant everything.
+	scope := ""
+	if raw.Scope != nil {
+		if *raw.Scope != scopeAvailability {
+			return nil, false
+		}
+		scope = *raw.Scope
+	}
+
+	return &Config{Debrid: debrid, Indexers: idx, Filters: f, CachedOnly: cachedOnly, ResultCap: resultCap,
+		Scope: scope}, true
 }
 
 func isDebridService(s string) bool {

@@ -74,10 +74,20 @@ GET  /<config>/stream/<movie|series>/<id>.json   ranked, clean, cached streams
 GET  /<config>/stream/…?debug=1          the same list plus per-filter drop counts and scores
 GET  /<config>/play/<token>              302 → cached debrid link
 GET  /<config>/play/<token>?probe=1      "can this play yet?" — reports, starts nothing
+POST /<config>/availability              { ids: ["tt…"] } → { availability: { "tt…": available|unavailable|unknown } }
 ```
 
-Everything is `GET` (and `HEAD`) except `/validate`. `/play` is `GET` only: resolving is what *adds* an
-uncached release, so a prefetcher's `HEAD` is refused rather than answered.
+Everything is `GET` (and `HEAD`) except `/validate` and `/availability`. `/play` is `GET` only: resolving
+is what *adds* an uncached release, so a prefetcher's `HEAD` is refused rather than answered.
+
+`/availability` answers a page of movies (at most 100) at once, from verdicts cached for 30 days
+("available") or 10 minutes ("unavailable") — the same lifetimes the Den TV app uses. A title with no
+verdict comes back `unknown` and is checked in the background (four at a time), so ask again for those.
+A stream list scout builds records its title's verdict too. `unknown` never means "nothing to play".
+
+A config sealed with `"scope":"availability"` is the read-only one a browser may hold: it answers
+`/availability` and its manifest, and `/stream` and `/play` refuse it with `403`. It shares the full
+config's verdicts. A scope is refused on a plaintext config, and an unknown scope is refused outright.
 
 Every response carries `Access-Control-Allow-Origin: *`, and `OPTIONS` on any path is a `204` CORS
 preflight. An unknown path — and `/metrics` without its token — is `404` with `{"error":"not_found"}`.
