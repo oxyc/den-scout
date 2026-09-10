@@ -1,6 +1,6 @@
 module github.com/oxyc/den-scout
 
-go 1.26.3
+go 1.27.0
 
 require (
 	github.com/dlclark/regexp2 v1.12.0

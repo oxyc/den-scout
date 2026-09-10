@@ -39,7 +39,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.13.1
           # Build golangci-lint from source with this job's Go — a prebuilt binary built with an older Go
           # refuses a module whose go directive targets a newer one.
           install-mode: goinstall
