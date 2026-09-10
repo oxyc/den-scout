@@ -16,7 +16,7 @@ func TestSettingsFromEnv(t *testing.T) {
 
 	env := map[string]string{
 		"PORT":                 "9000",
-		"SCRAPE_TIMEOUT_MS":    "5000",
+		"SCRAPE_TIMEOUT_SECS":  "5",
 		"LIST_TTL_SECS":        "60",
 		"PUBLIC_BASE_URL":      "https://scout.example",
 		"MEDIAFUSION_URL":      "https://mf.self/CONFIG",
@@ -48,6 +48,7 @@ func TestSettingsFromEnv(t *testing.T) {
 		"SCOUT_CONFIG_KEYS_PREV":     "old",
 		"SCOUT_METRICS_TOKEN":        "old",
 		"SCOUT_SCRAPE_TIMEOUT_MS":    "5000",
+		"SCRAPE_TIMEOUT_MS":          "5000",
 		"SCOUT_LIST_TTL_SECONDS":     "60",
 		"SCOUT_CACHE_BYTES":          "1048576",
 		"SCOUT_CINEMETA_URL":         "https://old.example",
@@ -66,7 +67,7 @@ func TestSettingsFromEnv(t *testing.T) {
 
 	// non-numeric / non-positive fall back to defaults
 	s = SettingsFromEnv(func(k string) string {
-		if k == "SCRAPE_TIMEOUT_MS" {
+		if k == "SCRAPE_TIMEOUT_SECS" {
 			return "-1"
 		}
 		if k == "LIST_TTL_SECS" {

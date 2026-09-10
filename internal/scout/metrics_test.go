@@ -30,7 +30,8 @@ func TestMetrics_isGated(t *testing.T) {
 	}{
 		{"no header", nil, 404},
 		{"wrong token", map[string]string{"authorization": "Bearer nope"}, 404},
-		{"no bearer prefix", map[string]string{"authorization": metricsToken}, 200},
+		{"no bearer prefix", map[string]string{"authorization": metricsToken}, 404},
+		{"padded token", map[string]string{"authorization": "Bearer  " + metricsToken + " "}, 200},
 		{"correct", metricsAuth, 200},
 	} {
 		if rr := do(on, "/metrics", tc.headers); rr.Code != tc.want {

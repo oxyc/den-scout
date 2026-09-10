@@ -69,16 +69,13 @@ func StartupSummary(s Settings, persistent bool) string {
 			disabled = append(disabled, id)
 		}
 	}
-	cache := s.CacheDir + " persistent"
-	if !persistent {
-		cache = s.CacheDir + " NOT persistent, memory only"
-	}
-	return "den-scout " + manifestVersion +
-		" — indexers: default " + names(defaultIndexers) + ", url overrides " + names(overridden) +
-		", disabled " + names(disabled) + ", minting " + onOff(s.MintIndexerConfigs) +
-		" — cache " + cache +
-		" — sealed configs " + onOff(s.ConfigKey != "") + ", metrics " + onOff(s.MetricsToken != "") +
-		", request log " + onOff(s.LogRequests)
+	// The fleet's one startup shape: `den-<addon> <version> listening on :<port> — <shared k=v> <own k=v>`.
+	return "den-scout " + manifestVersion + " listening on :" + s.Port +
+		" — metrics=" + onOff(s.MetricsToken != "") + " log_requests=" + onOff(s.LogRequests) +
+		" sealed=" + onOff(s.ConfigKey != "") +
+		" indexers=" + names(defaultIndexers) + " overrides=" + names(overridden) +
+		" disabled=" + names(disabled) + " minting=" + onOff(s.MintIndexerConfigs) +
+		" cache=" + s.CacheDir + " cache_persistent=" + onOff(persistent)
 }
 
 func SettingsFromEnv(get func(string) string) Settings {
@@ -90,7 +87,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 	}
 	return Settings{
 		Port:           orDefault(get("PORT"), "8080"),
-		ScrapeTimeout:  durEnv(get("SCRAPE_TIMEOUT_MS"), time.Millisecond, defaultTimeout),
+		ScrapeTimeout:  durEnv(get("SCRAPE_TIMEOUT_SECS"), time.Second, defaultTimeout),
 		ListTTL:        durEnv(get("LIST_TTL_SECS"), time.Second, defaultListTTL),
 		PublicURL:      get("PUBLIC_BASE_URL"),
 		IndexerURLs:    urls,

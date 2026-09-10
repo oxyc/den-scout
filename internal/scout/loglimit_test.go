@@ -48,9 +48,9 @@ func TestStartupSummary(t *testing.T) {
 	}
 	s := SettingsFromEnv(func(k string) string { return env[k] })
 	line := StartupSummary(s, true)
-	for _, want := range []string{"den-scout " + manifestVersion, "default torrentio,mediafusion",
-		"url overrides mediafusion", "disabled torz", "minting off", "/cache persistent",
-		"sealed configs on", "metrics on", "request log off"} {
+	for _, want := range []string{"den-scout " + manifestVersion + " listening on :8080 — ",
+		"indexers=torrentio,mediafusion", "overrides=mediafusion", "disabled=torz", "minting=off",
+		"cache=/cache cache_persistent=on", "sealed=on", "metrics=on", "log_requests=off"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("startup line lacks %q: %s", want, line)
 		}
@@ -60,7 +60,7 @@ func TestStartupSummary(t *testing.T) {
 			t.Errorf("startup line carries %q: %s", leak, line)
 		}
 	}
-	if line := StartupSummary(s, false); !strings.Contains(line, "/cache NOT persistent") {
+	if line := StartupSummary(s, false); !strings.Contains(line, "cache_persistent=off") {
 		t.Errorf("an unwritable cache should say so: %s", line)
 	}
 }

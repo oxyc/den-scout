@@ -68,7 +68,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("%s; listening on :%s", scout.StartupSummary(settings, cache.Persistent()), settings.Port)
+	log.Print(scout.StartupSummary(settings, cache.Persistent()))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	if err := serve(ctx, stop, srv, ln, drainGrace); err != nil {

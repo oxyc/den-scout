@@ -102,7 +102,7 @@ only tunes runtime behaviour; every variable is listed, commented, in `.env.exam
 | --- | --- | --- |
 | `PORT` | `8080` | listen port |
 | `PUBLIC_BASE_URL` | — | external origin for `/play` URLs; when set, `X-Forwarded-*`/`Host` are ignored |
-| `SCRAPE_TIMEOUT_MS` | `8000` | per-indexer scrape timeout |
+| `SCRAPE_TIMEOUT_SECS` | `8` | per-indexer scrape timeout |
 | `LIST_TTL_SECS` | `300` | how long a ranked stream list stays fresh |
 | `MEMORY_CACHE_BYTES` | `50331648` (48 MiB) | in-memory cache byte budget |
 | `CACHE_DIR` | `/cache` in the image (else `$TMPDIR/den-scout-cache`) | durable cache tier; **must be writable** or persistence disables itself after one log line |

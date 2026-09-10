@@ -22,7 +22,7 @@ import (
 // the app never sees a torrent or a debrid token. Routes are served at the service root.
 
 const (
-	staticCache = "public, max-age=3600"
+	staticCache = "public, max-age=3600, stale-while-revalidate=600"
 	// The sealing key can rotate, so keep its freshness window short — the ETag is the primary
 	// correctness mechanism (a rotated key changes the body hash and busts any stale cache).
 	keyCache       = "public, max-age=300"
@@ -1403,14 +1403,19 @@ func rdOnly(config *Config) bool {
 	return true
 }
 
-// metricsAuthorized reports whether this request may read /metrics. Compared in constant time: the token
-// is a shared secret and a timing-variable compare on a route anyone can reach is a needless gift.
+// metricsAuthorized reports whether this request may read /metrics: `Authorization: Bearer <token>`, the
+// token trimmed, the rule every den addon shares. A bare token without the scheme is refused. Compared in
+// constant time: the token is a shared secret and a timing-variable compare on a route anyone can reach
+// is a needless gift.
 func (h *handler) metricsAuthorized(r *http.Request) bool {
 	if h.deps.MetricsToken == "" {
 		return false
 	}
-	given := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("authorization"), "Bearer "))
-	return subtle.ConstantTimeCompare([]byte(given), []byte(h.deps.MetricsToken)) == 1
+	given, ok := strings.CutPrefix(r.Header.Get("authorization"), "Bearer ")
+	if !ok {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(given)), []byte(h.deps.MetricsToken)) == 1
 }
 
 // publicOrigin: PUBLIC_BASE_URL when set (audit #8), else forwarded headers / Host.
