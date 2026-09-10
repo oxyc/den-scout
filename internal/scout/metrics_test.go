@@ -109,6 +109,8 @@ func TestMetrics_reportsWhatWasPreviouslyLogOnly(t *testing.T) {
 		"scout_add_budget_remaining",
 		"scout_cache_persistent",
 		"# TYPE scout_list_cache_total counter",
+		"# TYPE scout_build_info gauge",
+		`scout_build_info{version="` + manifestVersion + `"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing series %q", want)

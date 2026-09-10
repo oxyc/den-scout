@@ -90,6 +90,12 @@ func (m *metricSet) render(cachePersistent int) string {
 	var b strings.Builder
 	b.Grow(2048)
 
+	// Which release is answering, in the same shape every den addon publishes (<addon>_build_info), so one
+	// query across the stack shows what each box is running without asking each manifest.
+	b.WriteString("# HELP scout_build_info The running den-scout version.\n")
+	b.WriteString("# TYPE scout_build_info gauge\n")
+	b.WriteString(`scout_build_info{version="` + manifestVersion + `"} 1` + "\n")
+
 	counter(&b, "scout_list_cache_total", "Stream-list cache lookups by outcome.",
 		[][2]string{
 			{`result="hit"`, num(m.listCacheHit.Load())},
