@@ -3001,6 +3001,21 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 		}
 	}
 
+	// Already downloaded, with this very file selected: the link is in the answer we are holding, so go
+	// straight to unrestrict. Every held play and every probe poll used to walk info → selectFiles → info →
+	// unrestrict, re-POSTing a selection RD had already made and then re-reading the info it had just
+	// sent — two of the four calls, one of them a write, spent learning nothing.
+	//
+	// All three conditions, not just the status. `downloaded` with the file unselected is a torrent that
+	// was bought for a different file, and rdLinkFor's one-link fallback would hand back that file's link;
+	// requiring Selected here keeps the fallback out of it. Anything short of all three takes the full
+	// chain below, unchanged.
+	if info.Status == "downloaded" && rdFileSelected(info, *fileID) {
+		if link, ok := rdLinkFor(info, *fileID); ok {
+			return s.unrestrictFor(ctx, link, t)
+		}
+	}
+
 	sel, err := s.post(ctx, "/torrents/selectFiles/"+id, url.Values{"files": {fmt.Sprintf("%d", *fileID)}})
 	if err != nil {
 		return "", err
@@ -3039,6 +3054,12 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 	if !ok {
 		return "", &DeadLinkError{"realdebrid has no link for the selected file"}
 	}
+	return s.unrestrictFor(ctx, link, t)
+}
+
+// unrestrictFor is the last call of resolveExisting, shared by the full chain and the already-downloaded
+// shortcut so both remember a refusal the same way.
+func (s *realDebridStore) unrestrictFor(ctx context.Context, link string, t ResolveTarget) (string, error) {
 	got, err := s.unrestrict(ctx, link)
 	// Classifying a refusal only matters if it is REMEMBERED: `info`'s branch above records its own, and
 	// without this the two calls after it were classified and then forgotten, so every poll walked the
@@ -3048,6 +3069,16 @@ func (s *realDebridStore) resolveExisting(ctx context.Context, id string, t Reso
 		recordRefusalFor(s.cache, ServiceRealDebrid, s.token, t.InfoHash, err, t.NoAdd)
 	}
 	return got, err
+}
+
+// rdFileSelected reports whether RD says this file is part of the torrent's current selection.
+func rdFileSelected(info *rdInfo, fileID int) bool {
+	for _, f := range info.Files {
+		if f.ID == fileID {
+			return f.Selected == 1
+		}
+	}
+	return false
 }
 
 // rdLinkFor picks the link belonging to a file id.

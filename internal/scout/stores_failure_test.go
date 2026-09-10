@@ -116,6 +116,52 @@ func TestRealDebridResolve_happyPathReturnsTheUnrestrictedLink(t *testing.T) {
 	}
 }
 
+// A held torrent RD has finished, with the requested file already selected, resolves in two calls: the
+// link is in the first info, so re-POSTing the selection and re-reading info learns nothing. Anything
+// short of that — not finished, or finished for a different selection — keeps the full four-call chain.
+func TestRealDebridResolve_downloadedAndSelectedSkipsSelectFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		info       string
+		wantSelect int
+		wantInfo   int
+	}{
+		{"downloaded, file selected", `{"status":"downloaded","links":["https://rd/l"],` +
+			`"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}`, 0, 1},
+		{"downloaded, file not selected", `{"status":"downloaded","links":["https://rd/l"],` +
+			`"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":0}]}`, 1, 2},
+		{"still waiting for a selection", `{"status":"waiting_files_selection","links":["https://rd/l"],` +
+			`"files":[{"id":1,"path":"Show.S01E01.mkv","bytes":900,"selected":1}]}`, 1, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := map[string]int{}
+			count := func(name string, fn func() (*http.Response, error)) func() (*http.Response, error) {
+				return func() (*http.Response, error) { calls[name]++; return fn() }
+			}
+			target := ResolveTarget{InfoHash: H}
+			cache := NewMemoryCache(1 << 20)
+			cache.Put(rdTorrentKey("k", H, target), "abc", resolveCacheTTL) // already bought: the held path
+			s := &realDebridStore{token: "k", api: realDebridAPI, cache: cache, client: routed{
+				routes: map[string]func() (*http.Response, error){
+					"addMagnet":     count("add", ok(`{"id":"abc"}`)),
+					"torrents/info": count("info", ok(tc.info)),
+					"selectFiles":   count("select", ok(`{}`)),
+					"unrestrict":    count("unrestrict", ok(`{"download":"https://rd/final.mkv"}`)),
+				}}}
+			link, err := s.Resolve(t.Context(), target)
+			if err != nil || link != "https://rd/final.mkv" {
+				t.Fatalf("link = %q, err = %v", link, err)
+			}
+			if calls["select"] != tc.wantSelect || calls["info"] != tc.wantInfo || calls["unrestrict"] != 1 {
+				t.Errorf("calls = %v, want select=%d info=%d unrestrict=1", calls, tc.wantSelect, tc.wantInfo)
+			}
+			if calls["add"] != 0 {
+				t.Errorf("a held torrent was added again: %v", calls)
+			}
+		})
+	}
+}
+
 // RD refuses certain release SOURCE tags outright (web-dl, webrip, bdrip and friends). Failing fast on
 // those is the point: the pool then tries another service, instead of spending an unrestrict call to
 // surface a link that will not play.

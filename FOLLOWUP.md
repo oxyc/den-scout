@@ -103,12 +103,14 @@ The readiness enquiry asks any store holding a torrent id, which was the fix for
 `not_queued` for a release `/play` served a 302 for. For Real-Debrid that means the whole read chain per
 poll. Measured on an RD-held release:
 
-- **ready:** 4 calls — `GET info`, `POST selectFiles`, `GET info`, `POST unrestrict/link`
+- **ready:** 2 calls — `GET info`, `POST unrestrict/link`. `resolveExisting` now goes straight to
+  unrestrict when the first `info` says `downloaded` with the requested file already selected (0.12.0);
+  it was 4 calls (`info`, `selectFiles`, `info`, `unrestrict/link`) and still is for any other state.
 - **still downloading:** 3 calls — `GET info`, `POST selectFiles`, `GET info`
 
 At the client's ~2s cadence that is roughly 90 RD calls a minute for the length of a download, including
-a state-changing `selectFiles` on every poll and a fresh unrestricted link minted and discarded on every
-ready poll. `/play` walks the same chain on the same cadence, so this is the price of the two routes
+a state-changing `selectFiles` on every poll while it downloads and a fresh unrestricted link minted and
+discarded on every ready probe poll. `/play` walks the same chain on the same cadence, so this is the price of the two routes
 agreeing rather than a new class of work — but if a real account is ever seen hitting an RD rate limit
 while polling, this is the first thing to look at. The obvious mitigation is a short-lived memo of the
 read chain's verdict, keyed per hash, which nothing needs yet.
