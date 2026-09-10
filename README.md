@@ -157,6 +157,22 @@ http), a 256 MiB memory cap, read-only rootfs, uid 65532, and the cache bind-mou
 Provisioning, env rendering, releases and rollback are in that repo's `deploy/README.md`. No secrets
 belong in the env file; the debrid token rides in each install's URL.
 
+**Release images.** `docker-publish` builds on a `v*` tag, and again every Monday: the weekly run
+rebuilds the newest `v*` tag (never `main`) with the base images re-pulled and no build cache, and
+publishes it as `:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Go or distroless security fix
+reaches the box between releases — through `den-update`'s probe and rollback like any release. Trivy
+scans each image before `:latest` moves: a CRITICAL with a fix available fails the run (on the weekly
+rebuild only in OS packages, the part a rebuild can fix), and fixable HIGH and CRITICAL findings go to
+code scanning. A finding that does not apply goes in `.trivyignore` with a reason. Every image carries
+SLSA provenance and an SBOM and is signed keylessly with cosign; verify a digest with:
+
+```
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/oxyc/den-scout/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/oxyc/den-scout@sha256:<digest>
+```
+
 If the cache mount is missing or not writable, memory keeps serving and nothing looks wrong, but every
 redeploy re-pays a debrid resolve per probed release. `scout_cache_persistent` on `/metrics` reads 1
 when the disk tier is writing.
