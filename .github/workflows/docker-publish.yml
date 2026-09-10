@@ -1,6 +1,6 @@
 # Build the den-scout image and push it to GitHub Container Registry.
-# The homelab compose pulls ghcr.io/oxyc/den-scout:<tag> (like the trailer service),
-# so a code change here → new image → `docker compose pull && up -d` on the box.
+# The box runs ghcr.io/oxyc/den-scout:latest from a Quadlet unit; its `den-update` verifies each new
+# :latest and pins the digest (the den repo's deploy/README.md), so a tag here reaches the box on that run.
 name: docker-publish
 
 # Publish only on a v* tag (deliberate release) or a manual run — NOT every main push. Per-push

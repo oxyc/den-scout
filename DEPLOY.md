@@ -1,137 +1,96 @@
-# Deploying den-scout on the homelab
+# Deploying den-scout
 
-den-scout runs as a Docker service **beside the trailer service** (`github.com/oxyc/cameras`
-→ `homelab/docker`). The image is built + pushed to `ghcr.io/oxyc/den-scout` by this repo's
-`docker-publish` workflow; the homelab just pulls a tag.
+den-scout runs on the Den host as one of the backend stack's Podman Quadlet units, deployed from the
+private `den` repo's `deploy/` directory. **The stack mechanics — provisioning, env rendering, releases,
+the `den-update` verify-and-pin updater, rollback — are documented once, in that repo's
+`deploy/README.md`.** This file covers only what is specific to scout.
 
-**LAN-only for now (like the trailer service).** Den's `NSAllowsLocalNetworking` exempts LAN hosts
-from the https-only addon check, so Den reaches Scout directly at `http://<lxc-ip>:8080` — no cert
-needed. Egress is the box's single fixed WAN IP, which is what Real-Debrid pins tokens to, so RD
-resolve works. The Caddy `scout.<domain>` route (below) is the eventual **public-https** path and is
-harmless to leave configured meanwhile; you only need it when Den runs off-LAN.
+The image is built and pushed to `ghcr.io/oxyc/den-scout` by this repo's `docker-publish` workflow, on a
+`v*` tag only; the box picks a release up on its next `den-update` run.
 
-## 1. Compose service (homelab `docker/compose.yml`)
+## The unit
 
-Added under `profiles: ["scout"]` so a plain `docker compose up` doesn't start it:
+`deploy/quadlet/den-scout.container` in the den repo:
 
-```yaml
-  den-scout:
-    image: ghcr.io/oxyc/den-scout:${DEN_SCOUT_VERSION:-latest}
-    container_name: den-scout
-    restart: unless-stopped
-    profiles: ["scout"]
-    environment:
-      PORT: "8080"
-      GOMEMLIMIT: "230MiB"                                   # soft heap ceiling ≈ mem_limit; keep in sync
-      SCOUT_SCRAPE_TIMEOUT_MS: "${SCOUT_SCRAPE_TIMEOUT_MS:-8000}"
-      SCOUT_LIST_TTL_SECONDS: "${SCOUT_LIST_TTL_SECONDS:-300}"
-      SCOUT_MEDIAFUSION_URL: "${SCOUT_MEDIAFUSION_URL:-}"   # base incl. its encrypted-config segment
-      # Sealed config-in-URL (docs/SEALED-CONFIG.md). Unset = links carry the debrid token in PLAIN
-      # TEXT; the feature is built and tested but does nothing until this key exists.
-      SCOUT_CONFIG_KEY: "${SCOUT_CONFIG_KEY:-}"             # base64 32-byte X25519 private key
-      SCOUT_CONFIG_KEYS_PREV: "${SCOUT_CONFIG_KEYS_PREV:-}" # prior keys (rotation), comma-separated
-      SCOUT_METRICS_TOKEN: "${SCOUT_METRICS_TOKEN:-}"       # bearer token for /metrics; unset = route 404s
-    read_only: true
-    volumes:
-      - den-scout-cache:/cache        # durable cache tier; MUST be a volume (read_only rootfs)
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: ["ALL"]
-    mem_limit: 256m
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "3" }   # log rotation
+- **Host port 8080**, LAN http. Den's `NSAllowsLocalNetworking` exempts LAN hosts from the https-only
+  addon check, so Den reaches scout directly at `http://<host>:8080` — no certificate involved.
+- **Read-only rootfs, all capabilities dropped, no-new-privileges.** The distroless/static image runs as
+  uid 65532 with no shell or libc; it needs only outbound https and its listen socket.
+- `--memory=256m`. The image sets `GOMEMLIMIT=230MiB` to match (Go's GC is not cgroup-aware); change
+  both together.
+- Env comes from an env file rendered from the deploy `.env` (`render-env.sh`). **No secrets belong
+  there** — the debrid token is per-install, carried in the addon URL. See `README.md` for every variable.
+- No HEALTHCHECK. `den-update` probes `/health` and `/manifest.json` over HTTP when there is a new image,
+  and not otherwise, so an idle box stays idle.
+- On SIGTERM scout drains in-flight requests for up to 8s; the unit's stop timeout leaves headroom.
 
-volumes:
-  den-scout-cache:
-```
+## The cache directory is not optional
 
-- **No secrets in env** — the debrid token is per-install, encoded in the addon URL, never here.
-- The distroless/static image runs as non-root (uid 65532) with no shell or libc; `read_only` +
-  `no-new-privileges` + `cap_drop` harden it further (it only needs outbound https + the listen
-  socket). The single static Go binary idles well under the 256 MiB `mem_limit`.
-- **Cache backend**: a `TieredCache` (`internal/scout/diskcache.go`) — the byte-bounded `MemoryCache`
-  (TTL + LRU, sized by `SCOUT_CACHE_BYTES`, default 48 MiB) as the hot tier, backed by a durable disk
-  tier at `SCOUT_CACHE_DIR` (`/cache` in the image). **The volume is not optional.** `read_only: true`
-  makes the rootfs unwritable, so without a mount at that path `MkdirAll` fails, persistence disables
-  itself after one log line, and every image push re-pays a debrid resolve per probed release — track
-  probes are cached for 30 days precisely so it doesn't. A tmpfs would survive a restart but not a
-  redeploy, which is the case the tier was written for. The volume has a real ceiling: expired entries
-  are swept hourly, and the sweep also enforces a 256 MiB byte budget, evicting oldest-first when the
-  store is over it (a burst of writes brings that sweep forward rather than waiting out the hour).
-  Legitimate traffic is nowhere near it — stream lists live for minutes, track probes for 30 days, and
-  a household's installs land in the low tens of MB. The budget is there because expiry alone is a
-  schedule and not a bound: nothing re-reads a stream list, so without it an entry occupies the volume
-  until its TTL passes however large the store has grown.
-- If you ever scale to >1 replica, add a `redis` service and back the cache with it (the `Cache`
-  interface in `internal/scout/cache.go` is a drop-in). Not needed for the homelab's single container.
+The cache is a `TieredCache` (`internal/scout/diskcache.go`): the byte-bounded in-memory `MemoryCache`
+(TTL + LRU, sized by `SCOUT_CACHE_BYTES`, default 48 MiB) in front of a durable disk tier at `CACHE_DIR`,
+which the image sets to `/cache`. The unit bind-mounts the host's `/var/lib/den/scout-cache` there, and
+that directory must be **owned by uid 65532** (`provision-podman.sh` does it).
 
-## 2. Caddy route (homelab `docker/caddy/Caddyfile`)
+With the rootfs read-only, a missing or unwritable mount means `MkdirAll` fails, persistence disables
+itself after one log line, and memory keeps serving — so nothing looks wrong, but every redeploy re-pays a
+debrid resolve per probed release. Track probes are cached for 30 days precisely so it doesn't. A tmpfs
+would survive a restart but not the container recreate an update performs, which is the case the tier
+exists for. `scout_cache_persistent` on `/metrics` reads 1 when the tier is writing.
 
-```
-  @scout host scout.{$CADDY_LOCAL_DOMAIN}
-  handle @scout {
-    reverse_proxy den-scout:8080
-  }
-```
+The tier has a real ceiling: expired entries are swept hourly, and the sweep also enforces a 256 MiB byte
+budget, evicting oldest-first (a burst of writes brings the sweep forward). A household's installs land in
+the low tens of MB. The budget exists because expiry alone is a schedule, not a bound: nothing re-reads a
+stream list, so without it an entry occupies the disk until its TTL passes however large the store grows.
 
-Caddy already issues a real wildcard cert for `*.{$CADDY_LOCAL_DOMAIN}` via Cloudflare DNS-01, so
-`https://scout.<domain>` gets a valid cert with no ATS exception in Den. Caddy forwards `Host` +
-`X-Forwarded-Proto`, and the handler honors them to build correct `https://scout.<domain>/play/…`
-URLs. Set `SCOUT_PUBLIC_URL=https://scout.<domain>` to pin the origin explicitly (then the forwarded
-headers are ignored) — recommended once the public path is the only one clients use.
+A second replica would need a shared cache — the `Cache` interface in `internal/scout/cache.go` is the
+seam — but one container is all the box runs.
 
-### Fixed egress IP (Real-Debrid)
+## Fixed egress IP (Real-Debrid)
 
-RD binds an unrestricted link to the requesting IP. The homelab has a single static WAN IP, so all
-Scout egress already comes from one address — nothing extra to configure. If Scout is ever moved
-behind a NAT with a changing IP, put it behind the same fixed-IP egress the rest of the box uses
-(document the WAN IP in the RD account's allowlist if RD tightens this). TorBox and Premiumize are
-not IP-bound.
+Real-Debrid binds an unrestricted link to the IP that requested it, so resolve and playback must leave from
+the same address. The box has a single static WAN IP, so all scout egress already does — nothing to
+configure. If scout ever moves behind a NAT with a changing IP, give it a fixed-IP egress first (and
+allowlist that IP in the RD account if RD tightens this). TorBox and Premiumize are not IP-bound.
 
-## 3. `.env` additions (homelab `docker/.env.example`)
+## Sealed config keys
 
-```
-DEN_SCOUT_VERSION=latest                # ghcr.io/oxyc/den-scout (profile: scout)
-# SCOUT_MEDIAFUSION_URL=                 # optional: self-hosted MediaFusion base incl. config segment
-# SCOUT_CONFIG_KEY=                      # base64 X25519 private key → sealed (not plaintext) addon URLs
-# SCOUT_CONFIG_KEYS_PREV=                # prior keys, comma-separated, so a rotation keeps old links working
-# SCOUT_METRICS_TOKEN=                   # bearer token for /metrics (unset = the route 404s)
-```
-
-Generate a config key with:
+Without `CONFIG_KEY` the addon URL carries the debrid token in plain text — anyone who sees the link (a
+log, a screenshot, browser history) can read it. `/config-key` 404s until it is set, and `/configure` then
+says "⚠︎ Not sealed" on the link it builds. Generate a key with:
 
 ```
 head -c 32 /dev/urandom | base64
 ```
 
-Without it the addon URL carries the debrid token in plain text — anyone who sees the link (a log, a
-screenshot, browser history) can read it. `/config-key` 404s until it is set, and `/configure` then says
-"⚠︎ Not sealed" on the link it builds.
+Back it up: losing it makes every URL sealed to it undecryptable. To rotate, move the current key into
+`CONFIG_KEYS_PREV` (comma-separated) and set a fresh `CONFIG_KEY`; keep the old one there until every
+install is re-sealed. The runbook is in `docs/SEALED-CONFIG.md`.
 
-## 4. Bring it up + smoke test
+`METRICS_TOKEN` likewise gates `/metrics`; unset, the route 404s. `PUBLIC_BASE_URL` pins the origin used
+in `/play` URLs, and is only needed if scout ever sits behind a proxy that rewrites the host.
+
+## Smoke test
 
 ```
-docker compose --profile scout pull
-docker compose --profile scout up -d
+curl -fsS http://<host>:8080/health                             # {"status":"ok"}
+curl -fsS http://<host>:8080/manifest.json | jq .version        # the release you expect
+curl -fsS http://<host>:8080/configure | grep "Configure Den Scout"
+curl -fsS -H "Authorization: Bearer $METRICS_TOKEN" http://<host>:8080/metrics | grep -E "build_info|cache_persistent"
 
-# --- LAN (now) — <lxc-ip> is the Docker LXC's IP, e.g. 192.168.86.193 ---
-curl -fsS http://<lxc-ip>:8080/health                        # {"status":"ok"}
-curl -fsS http://<lxc-ip>:8080/configure | grep "Configure Den Scout"
-
-# The disk tier is silent when it fails, so check it once after the first deploy: no match here, and
-# .ent files appearing under the volume once a title has been opened.
-docker compose --profile scout logs den-scout | grep "persistence disabled"   # expect no output
-docker run --rm -v den-scout-cache:/c busybox ls /c | head
-
-# build <config> at http://<lxc-ip>:8080/configure (pick your debrid, paste the token) then:
-curl -fsS "http://<lxc-ip>:8080/<config>/stream/movie/tt0111161.json" | jq '.streams[0]'
-curl -sS -o /dev/null -w "%{http_code} %{redirect_url}\n" "http://<lxc-ip>:8080/<config>/play/<token>"
-
-# --- Public https (later, via Caddy) — same paths under https://scout.<domain> ---
+# build <config> at http://<host>:8080/configure (pick your debrid, paste the token), then:
+curl -fsS "http://<host>:8080/<config>/stream/movie/tt0111161.json" | jq '.streams[0]'
+curl -sS -o /dev/null -w "%{http_code} %{redirect_url}\n" "http://<host>:8080/<config>/play/<token>"
 ```
 
-Then in Den: **Settings → Streaming source** → enter `http://<lxc-ip>:8080` as the server, pick your
-debrid, paste the token (or paste the whole `http://<lxc-ip>:8080/<config>/manifest.json` built at
-`/configure`). A title should resolve to cached streams and play through the 302 with no CAM/TS/screener
-rows. In DEBUG you can instead drop that manifest URL into Den's gitignored `App/Config/dev-addons.json`,
-right next to the trailer service's `http://<lxc-ip>:8092/manifest.json`.
+On the host, confirm once after a fresh provision that the disk tier is writing — no "persistence
+disabled" line in the journal, and `.ent` files appearing under the cache dir once a title has been opened:
+
+```
+journalctl -u den-scout | grep "persistence disabled"     # expect no output
+ls /var/lib/den/scout-cache | head
+```
+
+Then in Den: **Settings → Streaming source** → enter `http://<host>:8080` as the server, pick your debrid,
+paste the token (or paste the whole `http://<host>:8080/<config>/manifest.json` built at `/configure`). A
+title should resolve to cached streams and play through the 302 with no CAM/TS/screener rows. In DEBUG you
+can instead drop that manifest URL into Den's gitignored `App/Config/dev-addons.json`.

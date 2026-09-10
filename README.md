@@ -116,5 +116,6 @@ user input is never routed through it.
 
 ## Deploy
 
-Homelab (Docker beside the trailer service, Caddy TLS, fixed egress IP for Real-Debrid): see
-`DEPLOY.md`.
+Homelab: a Podman Quadlet unit on host port 8080, deployed with the rest of Den's backend from the den
+repo's `deploy/`. What is scout-specific — the cache-dir mount, the fixed egress IP Real-Debrid needs,
+sealed-config keys, smoke tests — is in `DEPLOY.md`.
