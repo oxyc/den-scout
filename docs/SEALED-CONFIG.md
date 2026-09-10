@@ -73,6 +73,72 @@ rides in the (sealed) URL and the server holds nothing.
 **Rotation:** move the current key into `CONFIG_KEYS_PREV`, set a fresh `CONFIG_KEY`, redeploy.
 Old URLs keep decrypting via the prev list; keep the rotated-out key in `_PREV` until every install is
 re-sealed and past the `/config-key` 1-hour cache (see the risk note below), then drop it.
+**Rotation is not revocation.** Every URL sealed to the old key keeps working for as long as that key is in
+`_PREV`. Dropping it kills every install at once, so it is no way to cut off one leaked URL. For that,
+see below.
+
+## Revoking installs (den-scout)
+
+Every config `/configure` builds carries two more sealed fields:
+- `iid`, an install id: 16 random bytes from `crypto.getRandomValues`, unpadded base64url, 22 characters.
+  Each link gets a fresh one.
+- `ep`, the epoch it was minted under. `/config-key` serves the addon's current `CONFIG_EPOCH` as `epoch`.
+
+Both are optional, and they are accepted in plaintext configs too. A config with a malformed `iid` or `ep`
+is refused.
+
+- **One install:** add its id to `REVOKED_INSTALLS=<iid>,<iid>,…` and restart. Its config segment is
+  refused on every route, and so is every play ticket it already holds. The log line names the reason
+  (`install revoked`) and the first six characters of the id. The id of an install that is not revoked is
+  never logged.
+- **Every install:** raise `CONFIG_EPOCH` and restart. Every config with a lower `ep`, including one with
+  no `ep` (minted before this existed), is refused with `install epoch too old`, and so are its tickets.
+  Then rebuild the installs you keep at `/configure`. `/config-key` is cached for five minutes, so wait
+  that long after the restart before rebuilding, or the new link may still carry the old epoch.
+
+A refused config gets the same answer as an undecodable one (`400`). A config without an `iid` can't be
+revoked individually; only the epoch reaches it.
+
+What this does not cover:
+- **A debrid token that was ever in plaintext** — in a legacy URL, a screenshot or a log — can only be
+  killed at the debrid. Regenerate the token in the debrid account's settings. Revoking the install
+  stops *this addon* using the URL; the token itself still works against the debrid's API.
+- **There is no tool to read an `iid` back out of a sealed URL yet.** Only the addon's key can open it.
+  Until there is one, `CONFIG_EPOCH` is the practical lever for a URL whose id nobody recorded.
+- **Without `CONFIG_KEY`, `/config-key` answers 404**, so `/configure` can't learn the epoch. Raising
+  `CONFIG_EPOCH` on an addon with no key refuses the plaintext links built afterwards as well.
+- **A warm stream-list hit is served without opening the config.** For a few minutes after a revocation,
+  that install can still read a list it had cached. Every play URL in that list is refused.
+
+## Play tickets (den-scout)
+
+With `CONFIG_KEY` set, a stream list names its play URLs `/p/<ticket>` instead of
+`/<config>/play/<token>`, so a stream URL is no longer the whole install credential.
+- `ticket = base64url(nonce(24) ‖ XChaCha20-Poly1305(K_play, payload))`, where
+  `K_play = HKDF-SHA256(CONFIG_KEY, info "den-scout/play/v1")`.
+- The payload is only what one resolve reads: the debrid accounts, the infohash, the file index,
+  season/episode, the expiry, `iid` and `ep`. There are no filters, indexers or scope.
+- It is stateless. Keys derived from `CONFIG_KEYS_PREV` still open tickets minted before a rotation.
+- A scoped (`availability`) config never lists streams, so it never mints a ticket.
+
+**Lifetime.** `PLAY_TICKET_TTL_SECS`, default 86400, is measured from when the list is built. It has to
+outlast two things:
+- **The list:** a client can first use it up to 3×`LIST_TTL_SECS` after it was built. The server serves a
+  complete list as fresh for `LIST_TTL_SECS`, and the device then keeps it `max-age` plus
+  `stale-while-revalidate`, one TTL each.
+- **The viewing session:** the player may ask the same URL again.
+
+The addon warns at startup when the TTL is not above 3×`LIST_TTL_SECS`. A list the device holds only
+through `stale-if-error` (up to a day) can outlive its tickets. That is acceptable, because it only
+happens while `/stream` is erroring. An expired ticket answers **410**, meaning: fetch the list again.
+
+**Rollout.** The legacy `/<config>/play` route keeps working, because clients hold cached stream lists
+(for up to a day on `stale-if-error`). The route also honours `REVOKED_INSTALLS` and `CONFIG_EPOCH`, and
+the first time it serves a request while tickets are on, the addon logs that once. When no client should
+hold a pre-ticket list any more, set `LEGACY_PLAY_UNTIL` to an RFC 3339 moment, e.g. a day after the
+deploy. Once that passes, the legacy route answers **403**. Unset means it stays open. A value that does
+not parse counts as already passed, the same rule den-reel applies to `PLAY_SIGNING_GRACE_UNTIL`. The
+variable has no effect without `CONFIG_KEY`, because then there is no other play route.
 
 ## Goal (one line)
 Keep the single paste-one-URL Stremio install flow, but make the config bytes in the URL **ciphertext

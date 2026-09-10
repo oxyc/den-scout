@@ -47,8 +47,9 @@ func requestID(v string) string {
 
 // redactPath is the path as it may be logged. The first segment of any per-install route IS the
 // credential — sealed or not, whoever holds it can spend the account's quota — and a /play token names
-// exactly which release a household is watching, so both are replaced. The query string is never passed
-// in, so it cannot leak either.
+// exactly which release a household is watching, so both are replaced. A /p/<ticket> is both at once — a
+// credential for one release — so the ticket goes as well. The query string is never passed in, so it
+// cannot leak either.
 //
 // Split exactly as the handler splits (splitPath drops empty segments), so a `//<config>/…` path is
 // redacted at the segment the handler reads as the config, not the empty one before it. What is kept is
@@ -63,8 +64,13 @@ func redactPath(p string) string {
 		return "/"
 	}
 	out := make([]string, len(parts))
+	ticketed := len(parts) == 2 && parts[0] == ticketRoute
 	for i, seg := range parts {
 		switch {
+		case ticketed && i == 0:
+			out[i] = ticketRoute
+		case ticketed && i == 1:
+			out[i] = "<ticket>"
 		case i == 0:
 			out[i] = "<config>"
 		case i == 2 && parts[1] == "play":

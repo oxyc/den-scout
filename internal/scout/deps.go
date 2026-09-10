@@ -38,6 +38,14 @@ type Settings struct {
 	// One redacted line per response (reqlog.go). Off when LOG_REQUESTS is unset, empty or exactly "0";
 	// any other value turns it on — the rule every den addon shares.
 	LogRequests bool
+	// Revocation (docs/SEALED-CONFIG.md, "Revoking installs"). RevokedInstalls holds the valid ids from
+	// REVOKED_INSTALLS; ConfigEpoch (CONFIG_EPOCH) refuses every config minted under an older epoch.
+	RevokedInstalls []string
+	ConfigEpoch     int
+	// PLAY_TICKET_TTL_SECS: how long a /p/ ticket in a stream list stays good.
+	PlayTicketTTL time.Duration
+	// LEGACY_PLAY_UNTIL: when the /<config>/play route closes, once tickets are on. Zero = never.
+	LegacyPlayUntil time.Time
 }
 
 // StartupSummary is the one line an operator reads to confirm what this process is running with. Nothing
@@ -73,6 +81,7 @@ func StartupSummary(s Settings, persistent bool) string {
 	return "den-scout " + manifestVersion + " listening on :" + s.Port +
 		" — metrics=" + onOff(s.MetricsToken != "") + " log_requests=" + onOff(s.LogRequests) +
 		" sealed=" + onOff(s.ConfigKey != "") +
+		" revoked=" + strconv.Itoa(len(s.RevokedInstalls)) + " epoch=" + strconv.Itoa(s.ConfigEpoch) +
 		" indexers=" + names(defaultIndexers) + " overrides=" + names(overridden) +
 		" disabled=" + names(disabled) + " minting=" + onOff(s.MintIndexerConfigs) +
 		" cache=" + s.CacheDir + " cache_persistent=" + onOff(persistent)
@@ -99,8 +108,65 @@ func SettingsFromEnv(get func(string) string) Settings {
 		MetricsToken:   get("METRICS_TOKEN"),
 		MintIndexerConfigs: strings.EqualFold(get("MINT_INDEXER_CONFIGS"), "true") ||
 			get("MINT_INDEXER_CONFIGS") == "1",
-		LogRequests: get("LOG_REQUESTS") != "" && get("LOG_REQUESTS") != "0",
+		LogRequests:     get("LOG_REQUESTS") != "" && get("LOG_REQUESTS") != "0",
+		RevokedInstalls: parseRevokedInstalls(get("REVOKED_INSTALLS")),
+		ConfigEpoch:     parseConfigEpoch(get("CONFIG_EPOCH")),
+		PlayTicketTTL:   durEnv(get("PLAY_TICKET_TTL_SECS"), time.Second, defaultPlayTicketTTL),
+		// Only read with a key set: without one there are no tickets, and the legacy route is the only one.
+		LegacyPlayUntil: parseLegacyPlayUntil(get("LEGACY_PLAY_UNTIL"), get("CONFIG_KEY") != ""),
 	}
+}
+
+// parseRevokedInstalls reads REVOKED_INSTALLS, a comma-separated list of install ids. A malformed entry is
+// skipped and said, like a malformed CONFIG_KEYS_PREV entry: it could never match a config, because
+// validateConfig refuses a config carrying such an id.
+func parseRevokedInstalls(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if !validInstallID(s) {
+			log.Printf("skipping a malformed REVOKED_INSTALLS entry (want a %d-character install id)", installIDLen)
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// parseConfigEpoch reads CONFIG_EPOCH. A value that does not parse is said loudly and read as 0, which
+// refuses nothing: refusing every install over a typo would take the whole addon down.
+func parseConfigEpoch(v string) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > maxConfigEpoch {
+		log.Printf("CONFIG_EPOCH=%q is not a non-negative integer — ignoring it, so no config is refused by epoch", v)
+		return 0
+	}
+	return n
+}
+
+// parseLegacyPlayUntil reads LEGACY_PLAY_UNTIL, as den-reel reads PLAY_SIGNING_GRACE_UNTIL: unset (or no
+// tickets to move to) leaves the legacy route open, and a value that does not parse is said loudly and read
+// as already passed. A typo then refuses the stragglers and says why, instead of leaving open a route that
+// was meant to close.
+func parseLegacyPlayUntil(v string, ticketsOn bool) time.Time {
+	v = strings.TrimSpace(v)
+	if v == "" || !ticketsOn {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		log.Printf("LEGACY_PLAY_UNTIL=%q is not an RFC 3339 timestamp such as 2026-09-17T12:00:00Z — "+
+			"reading it as passed, so the legacy /play route is refused from now on", v)
+		return time.Unix(0, 0)
+	}
+	return t
 }
 
 // RefuseRedirectReplay is the CheckRedirect policy every client touching a debrid must carry.
@@ -150,6 +216,16 @@ var credentialQueryHosts = map[string]bool{
 func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 	// Decided once, at startup, from the operator's environment — never from a request.
 	EnableIndexerConfigMinting(settings.MintIndexerConfigs)
+	revoked := make(map[string]bool, len(settings.RevokedInstalls))
+	for _, iid := range settings.RevokedInstalls {
+		revoked[iid] = true
+	}
+	// A client can first use a list's tickets up to 3×LIST_TTL_SECS after the list was built (see
+	// defaultPlayTicketTTL), so a TTL at or under that hands out tickets that are dead on arrival.
+	if settings.ConfigKey != "" && settings.PlayTicketTTL <= 3*settings.ListTTL {
+		log.Printf("PLAY_TICKET_TTL_SECS (%s) is not above 3×LIST_TTL_SECS (%s) — a stream list's play URLs "+
+			"can expire before the client uses them", settings.PlayTicketTTL, 3*settings.ListTTL)
+	}
 	return Deps{
 		Cache:         cache,
 		ProbeClient:   client,
@@ -162,6 +238,11 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		SealKeyring:   buildKeyring(settings.ConfigKey, settings.ConfigKeysPrev),
 		MetricsToken:  settings.MetricsToken,
 		LogRequests:   settings.LogRequests,
+
+		RevokedInstalls: revoked,
+		ConfigEpoch:     settings.ConfigEpoch,
+		PlayTicketTTL:   settings.PlayTicketTTL,
+		LegacyPlayUntil: settings.LegacyPlayUntil,
 	}
 }
 

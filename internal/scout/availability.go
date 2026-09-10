@@ -53,7 +53,7 @@ func (h *handler) handleAvailability(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errBody("not_found"), noStore)
 		return
 	}
-	config, ok := decodeConfig(h.deps.SealKeyring, parts[0])
+	config, ok := h.openConfig(parts[0])
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 		return
@@ -92,9 +92,11 @@ func (h *handler) handleAvailability(w http.ResponseWriter, r *http.Request) {
 
 // verdictPrefix keys a config's verdicts. The scope is left out, so the scoped config a browser holds reads
 // the verdicts the TV's full config writes: the same account, indexers and filters give the same answer.
+// The install id and epoch are left out for the same reason — the browser mints its scoped config
+// separately, so it carries an id of its own.
 func verdictPrefix(config *Config) string {
 	c := *config
-	c.Scope = ""
+	c.Scope, c.IID, c.Epoch = "", "", 0
 	b, _ := json.Marshal(c)
 	return "avail:" + keyHash(string(b)) + ":"
 }

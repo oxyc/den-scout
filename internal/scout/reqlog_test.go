@@ -54,6 +54,8 @@ func TestRedactPath(t *testing.T) {
 		{"/" + validBlob + "/stream/series/tt1:2:3.json", "/<config>/stream/series/tt1:2:3.json"},
 		{"/" + validBlob + "/play/secret-token", "/<config>/play/<token>"},
 		{"//" + validBlob + "/play/secret-token", "/<config>/play/<token>"},
+		{"/p/secret-ticket", "/p/<ticket>"},
+		{"//p//secret-ticket", "/p/<ticket>"},
 		{"/nope", "/<config>"},
 		// A slash is a segment boundary, as it is to the handler; the newline and spaces are escaped.
 		{"/cfg/stream/movie/tt1\nGET /health 200 0ms.json", "/<config>/stream/movie/tt1%0AGET%20/health%20200%200ms.json"},

@@ -244,6 +244,15 @@ type Deps struct {
 	MetricsToken string
 	// LogRequests writes one redacted line per response (reqlog.go).
 	LogRequests bool
+	// RevokedInstalls (REVOKED_INSTALLS) are install ids refused outright; ConfigEpoch (CONFIG_EPOCH) refuses
+	// every config minted under an older epoch. Both reach play tickets too. See admitInstall.
+	RevokedInstalls map[string]bool
+	ConfigEpoch     int
+	// PlayTicketTTL (PLAY_TICKET_TTL_SECS) is how long a /p/ ticket stays good; zero takes the default.
+	PlayTicketTTL time.Duration
+	// LegacyPlayUntil (LEGACY_PLAY_UNTIL) closes the /<config>/play route once passed, while tickets are on.
+	// Zero leaves it open.
+	LegacyPlayUntil time.Time
 }
 
 type handler struct {
@@ -281,6 +290,12 @@ type handler struct {
 	// Playback links minted in the last few minutes, so /play can serve a repeat without asking the
 	// debrid again. Filled by /play and by the probe fan-out, which mints one per probed release anyway.
 	links linkMemo
+
+	// The play-ticket keys (ticket.go). nil when no CONFIG_KEY is set, which leaves stream lists on the
+	// legacy /<config>/play URLs.
+	tickets *ticketKeys
+	// Set once a legacy play URL has been served while tickets are on, so that is logged once per process.
+	legacyPlayNoted atomic.Bool
 
 	// Precomputed static responses (audit #15 — no per-request rebuild/rehash).
 	manifestUnconf     string
@@ -328,7 +343,10 @@ func NewHandler(deps Deps) http.Handler {
 	if deps.ListTTL == 0 {
 		deps.ListTTL = defaultListTTL
 	}
-	h := &handler{deps: deps}
+	if deps.PlayTicketTTL == 0 {
+		deps.PlayTicketTTL = defaultPlayTicketTTL
+	}
+	h := &handler{deps: deps, tickets: newTicketKeys(deps.SealKeyring)}
 	ttlSec := int(deps.ListTTL.Seconds())
 	h.listCache = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
 	// A short list and a stale one must never be held LONGER than a complete fresh one. Both windows are
@@ -461,7 +479,11 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		if pub := h.deps.SealKeyring.currentPubBase64(); pub != "" {
 			// ETag over the key JSON so a rotated key isn't masked by a stale cache and If-None-Match
 			// yields 304, consistent with the other cacheable routes.
-			body, _ := json.Marshal(map[string]string{"key": pub})
+			//
+			// The epoch rides along: /configure stamps it into a new config as `ep`, so a link built after
+			// CONFIG_EPOCH is bumped is not refused by it. keyCache lets a browser keep the old answer for
+			// five minutes, so a link built within five minutes of a bump can still carry the old epoch.
+			body, _ := json.Marshal(map[string]any{"key": pub, "epoch": h.deps.ConfigEpoch})
 			h.conditional(w, r, string(body), etagFor(string(body)), jsonType, keyCache)
 		} else {
 			writeJSON(w, http.StatusNotFound, errBody("no_key"), noStore)
@@ -470,6 +492,11 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	parts := splitPath(path) // ["<config>", "stream"|"play"|"manifest.json", ...]
+	// /p/<ticket> exists only while tickets are on; without them it stays the 404 it always was.
+	if len(parts) == 2 && parts[0] == ticketRoute && h.tickets != nil {
+		h.handleTicketPlay(w, r, parts[1])
+		return
+	}
 	configBlob := ""
 	if len(parts) > 0 {
 		configBlob = parts[0]
@@ -481,7 +508,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 
 	switch resource {
 	case "manifest.json":
-		config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
+		config, ok := h.openConfig(configBlob)
 		if !ok {
 			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 			return
@@ -537,7 +564,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	// the same way. That is pre-existing, is bounded by the indexer limiter, and is a separate question
 	// from this branch.
 	if isDebugRequest(r) {
-		config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
+		config, ok := h.openConfig(configBlob)
 		if !ok {
 			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 			return
@@ -594,7 +621,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 
 	// Miss: decode now (#16 — a warm hit never pays decode/validate).
 	metrics.listCacheMiss.Add(1)
-	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
+	config, ok := h.openConfig(configBlob)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 		return
@@ -673,9 +700,11 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 			h.releaseRebuild(cacheKey, gen, time.Time{})
 		}
 	}()
-	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
+	config, ok := h.openConfig(configBlob)
 	if !ok {
-		return // it decoded when the entry was built; if it no longer does, serving stale is all we can do
+		// It decoded when the entry was built. If it no longer does, or the install has since been revoked,
+		// serving stale is all we can do — and a revoked install's play URLs in it are refused anyway.
+		return
 	}
 	parent := context.WithoutCancel(r.Context())
 	go func() {
@@ -912,8 +941,9 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 	}
 
 	out := make([]streamOut, 0, len(ranked))
+	playURL := h.playURLs(config, configBlob, origin)
 	for _, s := range ranked {
-		out = append(out, toStremioStream(s, sid, origin, configBlob))
+		out = append(out, toStremioStream(s, sid, playURL))
 	}
 	body, _ := json.Marshal(streamsResponse{Streams: out, Debug: dbg})
 	etag := etagFor(string(body))
@@ -1138,11 +1168,15 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// Nothing legitimate issues it: Stremio asks for the list, and Den's AVPlayer follows the 302 with a
 	// GET. What does issue HEAD is link prefetchers and unfurlers, which is precisely the traffic that
 	// must not reach a debrid account.
-	tw := &playTiming{ResponseWriter: w, start: time.Now()}
+	tw, ok := beginPlay(w, r)
+	if !ok {
+		return
+	}
 	w = tw
-	if r.Method != http.MethodGet {
-		w.Header().Set("allow", "GET")
-		writeJSON(w, http.StatusMethodNotAllowed, errBody("method_not_allowed"), noStore)
+	// While tickets are on, this route only serves stream lists cached from before them, and a client can
+	// hold one for a day on stale-if-error. LEGACY_PLAY_UNTIL is when that allowance ends.
+	if h.tickets != nil && !h.deps.LegacyPlayUntil.IsZero() && !time.Now().Before(h.deps.LegacyPlayUntil) {
+		writeJSON(w, http.StatusForbidden, errBody("legacy_play_closed"), noStore)
 		return
 	}
 	target, ok := decodePlayToken(at(parts, 2))
@@ -1150,7 +1184,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		writeJSON(w, http.StatusBadRequest, errBody("bad_token"), noStore)
 		return
 	}
-	config, ok := decodeConfig(h.deps.SealKeyring, configBlob)
+	config, ok := h.openConfig(configBlob)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 		return
@@ -1158,6 +1192,50 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	if refuseScoped(w, config) {
 		return
 	}
+	if h.tickets != nil && h.legacyPlayNoted.CompareAndSwap(false, true) {
+		log.Printf("serving a legacy /<config>/play URL while play tickets are on — a client still holds a " +
+			"stream list from before them (logged once per process)")
+	}
+	h.resolvePlay(tw, r, config, target)
+}
+
+// beginPlay is what both play routes do first: stamp Server-Timing on whatever they answer, and refuse any
+// verb but GET (see handlePlay for why HEAD is refused too).
+func beginPlay(w http.ResponseWriter, r *http.Request) (*playTiming, bool) {
+	tw := &playTiming{ResponseWriter: w, start: time.Now()}
+	if r.Method != http.MethodGet {
+		tw.Header().Set("allow", "GET")
+		writeJSON(tw, http.StatusMethodNotAllowed, errBody("method_not_allowed"), noStore)
+		return nil, false
+	}
+	return tw, true
+}
+
+// handleTicketPlay is GET /p/<ticket>. The ticket stands in for both the config segment and the token of
+// the legacy route, and what it opens to goes through the same resolve.
+func (h *handler) handleTicketPlay(w http.ResponseWriter, r *http.Request, ticket string) {
+	tw, ok := beginPlay(w, r)
+	if !ok {
+		return
+	}
+	config, target, err := h.tickets.open(ticket, time.Now())
+	if errors.Is(err, errTicketExpired) {
+		// 410, not 400: the ticket was good and has lapsed. What the client holds is an old stream list, not
+		// a wrong one, and fetching the list again gets it fresh tickets.
+		writeJSON(tw, http.StatusGone, errBody("ticket_expired"), noStore)
+		return
+	}
+	// A revoked install gets the answer a ticket that does not open gets.
+	if err != nil || !h.admitInstall(config) {
+		writeJSON(tw, http.StatusBadRequest, errBody("bad_ticket"), noStore)
+		return
+	}
+	h.resolvePlay(tw, r, config, target)
+}
+
+// resolvePlay is the play route's work once a request is admitted, whichever route admitted it.
+func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, target *PlayTarget) {
+	var w http.ResponseWriter = tw
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
 	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
 	defer cancel()
@@ -1514,15 +1592,27 @@ type streamsResponse struct {
 	Debug *rankDebug `json:"debug,omitempty"`
 }
 
-func toStremioStream(s RawStream, sid *StreamID, origin, configBlob string) streamOut {
-	token := encodePlayToken(PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)})
+func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string) streamOut {
 	return streamOut{
 		Name:          "Den Scout",
 		Title:         s.Title, // raw release name
-		URL:           origin + "/" + configBlob + "/play/" + token,
+		URL:           playURL(PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)}),
 		Attributes:    streamAttributes(s),
 		BehaviorHints: streamHints{BingeGroup: bingeGroup(strings.ToLower(s.Title), s.Title), NotWebReady: false},
 	}
+}
+
+// playURLs is how one stream list names its play URLs: a ticket per release while tickets are on, all
+// expiring together, else the legacy config segment plus token.
+//
+// Only a list build calls this, and a scoped config is refused before any list is built, so the read-only
+// config a browser holds never mints a ticket.
+func (h *handler) playURLs(config *Config, configBlob, origin string) func(PlayTarget) string {
+	if h.tickets == nil {
+		return func(t PlayTarget) string { return origin + "/" + configBlob + "/play/" + encodePlayToken(t) }
+	}
+	exp := time.Now().Add(h.deps.PlayTicketTTL)
+	return func(t PlayTarget) string { return origin + "/" + ticketRoute + "/" + h.tickets.mint(config, t, exp) }
 }
 
 func seasonPtr(sid *StreamID) *int {
@@ -1714,6 +1804,35 @@ func refuseScoped(w http.ResponseWriter, config *Config) bool {
 		return false
 	}
 	writeJSON(w, http.StatusForbidden, errBody("out_of_scope"), noStore)
+	return true
+}
+
+// openConfig is decodeConfig plus admitInstall: every route that takes a config segment opens it here, so a
+// revoked install is refused exactly as an undecodable config is.
+//
+// A warm stream-list hit opens nothing (handleStream), so for a few minutes after a revocation the install
+// can still read a list it had cached. Every play URL in that list is refused.
+func (h *handler) openConfig(blob string) (*Config, bool) {
+	config, ok := decodeConfig(h.deps.SealKeyring, blob)
+	if !ok || !h.admitInstall(config) {
+		return nil, false
+	}
+	return config, true
+}
+
+// admitInstall applies REVOKED_INSTALLS and CONFIG_EPOCH to a config, whether it came from a config segment
+// or a play ticket. The log line names the reason. A revoked id is cut to six characters, and the id of an
+// install that is not revoked is never logged.
+func (h *handler) admitInstall(config *Config) bool {
+	if config.IID != "" && h.deps.RevokedInstalls[config.IID] {
+		logLimited("install-revoked", "config refused: install revoked (iid %s…)", config.IID[:6])
+		return false
+	}
+	if config.Epoch < h.deps.ConfigEpoch {
+		logLimited("install-epoch", "config refused: install epoch too old (%d < CONFIG_EPOCH %d)",
+			config.Epoch, h.deps.ConfigEpoch)
+		return false
+	}
 	return true
 }
 

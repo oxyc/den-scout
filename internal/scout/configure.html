@@ -3478,11 +3478,24 @@ function fillForm(s) {
 
   // Ask the addon for its X25519 public key. When present we SEAL the config to it (the keys become
   // ciphertext in the URL); when absent the addon only understands legacy plaintext, so we fall back.
-  var sealPublicKey = null;
+  // The same answer carries the addon's current CONFIG_EPOCH, stamped into the config as `ep` so a link
+  // built after the operator bumps it is not refused by it.
+  var sealPublicKey = null, sealEpoch = null;
   fetch("/config-key")
     .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (j) { if (j && j.key) sealPublicKey = j.key; })
+    .then(function (j) {
+      if (j && j.key) sealPublicKey = j.key;
+      if (j && typeof j.epoch === "number") sealEpoch = j.epoch;
+    })
     .catch(function () { /* offline / no key served → plaintext fallback below */ });
+
+  // A fresh install id for every link: 16 random bytes, base64url without padding. Each link built here is
+  // its own install, so the operator can revoke one (REVOKED_INSTALLS) and leave the rest working.
+  function mintInstallID() {
+    var b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return btoa(String.fromCharCode.apply(null, b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
 
   // base64url(JSON) — the legacy plaintext segment, used only when no key is served.
   function encodePlain(config) {
@@ -3495,6 +3508,10 @@ function fillForm(s) {
   // Turn the config object into the URL path segment: sealed ciphertext when a key is served, else
   // plaintext. Records which was used so the page can show an honest "sealed / not sealed" note.
   function toSegment(config) {
+    // Stamped on a copy: the form saved in this browser must not keep the id, or every later link built
+    // from it would share one install.
+    config = Object.assign({}, config, { iid: mintInstallID() });
+    if (sealEpoch !== null) config.ep = sealEpoch;
     if (sealPublicKey && window.DenSeal) {
       try {
         var segment = window.DenSeal.denSeal(sealPublicKey, JSON.stringify(config));

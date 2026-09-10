@@ -1,6 +1,7 @@
 package scout
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"math"
 	"regexp"
@@ -148,9 +149,34 @@ type Config struct {
 	// needs the account — so the scope, and the seal around it, are what keep that token from resolving
 	// anything.
 	Scope string
+	// IID names the install the config was minted for, so REVOKED_INSTALLS can refuse that one install. ""
+	// for a config minted before installs had ids, which can only be refused by epoch.
+	IID string
+	// Epoch is the CONFIG_EPOCH the config was minted under (0 when absent). Bumping CONFIG_EPOCH past it
+	// refuses the config, which is how every install is revoked at once without rotating CONFIG_KEY.
+	Epoch int
 }
 
 const scopeAvailability = "availability"
+
+const (
+	// An install id is 16 random bytes, unpadded base64url.
+	installIDBytes = 16
+	installIDLen   = 22
+	// Ceiling on an epoch, so it always fits an int and a config cannot carry an absurd one.
+	maxConfigEpoch = math.MaxInt32
+)
+
+// validInstallID reports whether s is an install id in its one canonical spelling. Strict decoding refuses
+// the non-zero trailing bits that would let the same 16 bytes be written another way, which would slip
+// past REVOKED_INSTALLS.
+func validInstallID(s string) bool {
+	if len(s) != installIDLen {
+		return false
+	}
+	b, err := base64.RawURLEncoding.Strict().DecodeString(s)
+	return err == nil && len(b) == installIDBytes
+}
 
 // rawConfig mirrors the untrusted wire JSON before validation/clamping.
 type rawConfig struct {
@@ -171,6 +197,8 @@ type rawConfig struct {
 	CachedOnly *bool    `json:"cachedOnly"`
 	ResultCap  *float64 `json:"resultCap"`
 	Scope      *string  `json:"scope"`
+	IID        *string  `json:"iid"`
+	Epoch      *float64 `json:"ep"`
 }
 
 // decodeConfig decodes the config path segment into a validated config, or ok=false (→ 400). The segment
@@ -333,8 +361,26 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		scope = *raw.Scope
 	}
 
+	// Both fail closed, like the scope: an id that does not validate cannot be matched against the revoked
+	// list, and an epoch that does not parse cannot be compared with CONFIG_EPOCH.
+	iid := ""
+	if raw.IID != nil {
+		if !validInstallID(*raw.IID) {
+			return nil, false
+		}
+		iid = *raw.IID
+	}
+	epoch := 0
+	if raw.Epoch != nil {
+		n := nonNegInt(raw.Epoch)
+		if n == nil || *raw.Epoch > maxConfigEpoch {
+			return nil, false
+		}
+		epoch = *n
+	}
+
 	return &Config{Debrid: debrid, Indexers: idx, Filters: f, CachedOnly: cachedOnly, ResultCap: resultCap,
-		Scope: scope}, true
+		Scope: scope, IID: iid, Epoch: epoch}, true
 }
 
 func isDebridService(s string) bool {
