@@ -40,8 +40,6 @@ ENV SCOUT_CACHE_DIR=/cache
 # actual mem_limit when running with more/less headroom (the Go runtime reads GOMEMLIMIT natively).
 ENV GOMEMLIMIT=230MiB
 
-# Distroless has no shell, so the probe execs the binary itself (audit #2 — no second runtime).
-HEALTHCHECK --interval=60s --timeout=5s --start-period=5s --retries=3 \
-  CMD ["/den-scout", "-healthcheck"]
-
+# No HEALTHCHECK, deliberately: a periodic probe keeps an idle box awake. Health is checked when it
+# matters — by the deploy (den/deploy/den-update.sh), against /health and /manifest.json over HTTP.
 ENTRYPOINT ["/den-scout"]

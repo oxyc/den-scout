@@ -108,8 +108,7 @@ Env only tunes runtime behavior (see `.env.example`):
 The core is `NewHandler(Deps)` (`internal/scout/handler.go`), an `http.Handler` where `Deps` injects
 the HTTP client, cache backend, and scraper/store factories — which is also how the tests drive
 everything against fixtures with a mock `doer`. `cmd/den-scout` is a thin `main()` that wires the
-env-configured deps and calls `ListenAndServe`; `den-scout -healthcheck` probes `/health` and exits
-0/1 for the container HEALTHCHECK (no second runtime process).
+env-configured deps and serves until SIGTERM, then drains in-flight requests for up to 8s.
 
 User-supplied `excludeRegex` runs on Go's stdlib `regexp` (RE2 — linear-time, no catastrophic
 backtracking). The internal quality/season patterns that need lookaround use `dlclark/regexp2`;

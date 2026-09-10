@@ -368,7 +368,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		h.conditional(w, r, configurePage, h.configureETag, htmlType, staticCache)
 		return
 	case "/health":
-		// Stays 200 (liveness — don't trip the container HEALTHCHECK), but reports the degraded scrape
+		// Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
 		// state so a monitor sees a total-indexer outage instead of just "empty results".
 		status := map[string]any{"status": "ok"}
 		if h.scrapeFails.Load() >= scrapeFailThreshold {

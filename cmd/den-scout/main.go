@@ -1,12 +1,10 @@
 // Command den-scout serves the self-hosted Stremio stream addon.
 //
-// A single static binary. `den-scout -healthcheck` probes /health and exits 0/1 — the container
-// HEALTHCHECK uses it, so no second runtime is spawned (audit #2).
+// A single static binary.
 package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -19,11 +17,6 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
-		healthcheck()
-		return
-	}
-
 	settings := scout.SettingsFromEnv(os.Getenv)
 
 	// Pooled keep-alive client so the scrape/debrid fan-out reuses connections.
@@ -109,21 +102,4 @@ func serve(ctx context.Context, stop func(), srv *http.Server, ln net.Listener, 
 		_ = srv.Close()
 	}
 	return nil
-}
-
-func healthcheck() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://%s/health", net.JoinHostPort("127.0.0.1", port)))
-	if err != nil {
-		os.Exit(1)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		os.Exit(1)
-	}
-	os.Exit(0)
 }
