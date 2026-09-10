@@ -17,6 +17,9 @@ import (
 )
 
 func main() {
+	// One plain line per event on stderr. The systemd journal stamps and names every line, so a timestamp
+	// or a "den-scout:" prefix here would only print twice.
+	log.SetFlags(0)
 	settings := scout.SettingsFromEnv(os.Getenv)
 
 	// Pooled keep-alive client so the scrape/debrid fan-out reuses connections.
@@ -65,7 +68,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("den-scout listening on :%s", settings.Port)
+	log.Printf("listening on :%s", settings.Port)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	if err := serve(ctx, stop, srv, ln, drainGrace); err != nil {
@@ -94,11 +97,11 @@ func serve(ctx context.Context, stop func(), srv *http.Server, ln net.Listener, 
 	case <-ctx.Done():
 	}
 	stop()
-	log.Printf("den-scout: shutting down — draining in-flight requests")
+	log.Printf("shutting down — draining in-flight requests")
 	drainCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	if err := srv.Shutdown(drainCtx); err != nil {
-		log.Printf("den-scout: drain deadline (%s) reached with requests still in flight", grace)
+		log.Printf("drain deadline (%s) reached with requests still in flight", grace)
 		_ = srv.Close()
 	}
 	return nil

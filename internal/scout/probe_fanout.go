@@ -178,7 +178,7 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 func recoverBackground(what string) {
 	if rec := recover(); rec != nil {
 		metrics.backgroundPanic.Add(1)
-		log.Printf("scout: %s panicked, abandoning it: %v", what, rec)
+		log.Printf("%s panicked, abandoning it: %v", what, rec)
 	}
 }
 

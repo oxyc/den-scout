@@ -126,7 +126,7 @@ func parseSealKeyring(current, prev string) (*sealKeyring, error) {
 	// whole ring (which would silently take sealing offline for the good current key too).
 	for _, p := range strings.Split(prev, ",") {
 		if err := add(p); err != nil {
-			log.Printf("den-scout: skipping a malformed CONFIG_KEYS_PREV entry: %v", err)
+			log.Printf("skipping a malformed CONFIG_KEYS_PREV entry: %v", err)
 		}
 	}
 	return kr, nil

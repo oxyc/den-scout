@@ -56,7 +56,7 @@ func NewTieredCache(maxBytes int, dir string) *TieredCache {
 		return c
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Printf("den-scout: cache dir %s not writable (%v) — persistence disabled, memory still serving", dir, err)
+		log.Printf("cache dir %s not writable (%v) — persistence disabled, memory still serving", dir, err)
 		c.off = true
 	}
 	return c
@@ -125,7 +125,7 @@ func (c *TieredCache) Put(key, value string, ttl time.Duration) {
 	if c.noteWritten(len(body)) {
 		go func() {
 			if n := c.Sweep(); n > 0 {
-				log.Printf("den-scout: swept %d cache entries after a write burst", n)
+				log.Printf("swept %d cache entries after a write burst", n)
 			}
 		}()
 	}
@@ -218,7 +218,7 @@ func (c *TieredCache) Sweep() int {
 			removed++
 		}
 	}
-	log.Printf("den-scout: cache volume over its %d-byte budget; evicted down to %d bytes", c.maxBytes, liveBytes)
+	log.Printf("cache volume over its %d-byte budget; evicted down to %d bytes", c.maxBytes, liveBytes)
 	return removed
 }
 
@@ -274,7 +274,7 @@ func (c *TieredCache) SweepEvery(ctx context.Context, every time.Duration) {
 	// Once at startup: a redeploy is the most likely moment for the store to be holding a backlog of
 	// entries that expired while the process was not running.
 	if n := c.Sweep(); n > 0 {
-		log.Printf("den-scout: swept %d expired cache entries at startup", n)
+		log.Printf("swept %d expired cache entries at startup", n)
 	}
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -284,7 +284,7 @@ func (c *TieredCache) SweepEvery(ctx context.Context, every time.Duration) {
 			return
 		case <-ticker.C:
 			if n := c.Sweep(); n > 0 {
-				log.Printf("den-scout: swept %d expired cache entries", n)
+				log.Printf("swept %d expired cache entries", n)
 			}
 		}
 	}
@@ -314,7 +314,7 @@ func (c *TieredCache) disable(op string, err error) {
 	c.off = true
 	c.mu.Unlock()
 	c.once.Do(func() {
-		log.Printf("den-scout: cache %s failed (%v) — persistence disabled, memory still serving", op, err)
+		log.Printf("cache %s failed (%v) — persistence disabled, memory still serving", op, err)
 	})
 }
 

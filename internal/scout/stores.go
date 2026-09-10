@@ -1161,7 +1161,7 @@ func recordRefusal(cache Cache, svc DebridService, token, infoHash string, err e
 	}
 	if refusalIsAboutTheAccount(err) {
 		cache.Put(accountRefusedKey(svc, token), refusalReason(err), refusalBackoff)
-		log.Printf("scout: %s refused the account itself (%s) — check the key", svc, refusalReason(err))
+		log.Printf("%s refused the account itself (%s) — check the key", svc, refusalReason(err))
 		return
 	}
 	cache.Put(refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff)
@@ -1282,7 +1282,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 			return "", err
 		}
 		s.forgetTorrentID(t.InfoHash)
-		log.Printf("scout: torbox no longer has %s — re-adding", shortHash(t.InfoHash))
+		log.Printf("torbox no longer has %s — re-adding", shortHash(t.InfoHash))
 	}
 
 	// From here on, resolving MEANS queueing — so a caller that forbade that is answered now, before the
@@ -2096,14 +2096,14 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 		// /play rather than none, because an indeterminate answer also makes every poll escalate.
 		switch fault {
 		case listingTooManyEntries:
-			log.Printf("scout: torbox account listing holds more than %d torrents — treating it as no "+
+			log.Printf("torbox account listing holds more than %d torrents — treating it as no "+
 				"answer rather than as an empty account", maxListingEntries)
 		case listingNoUsableEntries:
-			log.Printf("scout: torbox account listing had entries but no usable infohash among them — " +
+			log.Printf("torbox account listing had entries but no usable infohash among them — " +
 				"treating it as no answer rather than as an empty account; the upstream may have renamed " +
 				"the field")
 		case listingBadEnvelope:
-			log.Printf("scout: torbox account listing was not a shape we can read — no usable data array, " +
+			log.Printf("torbox account listing was not a shape we can read — no usable data array, " +
 				"or a field of an unexpected type — treating it as no answer rather than as an empty " +
 				"account; the upstream schema may have changed")
 		}
@@ -2114,7 +2114,7 @@ func (s *torBoxStore) fetchAccountListing(ctx context.Context) (map[string]int, 
 		// holds nothing" and costs a duplicate add, with nothing anywhere saying the account simply
 		// outgrew the cap. Raising the cap moved that cliff rather than removing it, so the case still
 		// has to be named — and remembered, so it is not re-pulled on every poll.
-		log.Printf("scout: torbox account listing exceeded %d bytes and was truncated — treating it as no "+
+		log.Printf("torbox account listing exceeded %d bytes and was truncated — treating it as no "+
 			"answer rather than as an empty account", maxListingBytes)
 		return nil, false, true
 	}
@@ -3779,7 +3779,7 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 		if err == nil {
 			return link, nil
 		}
-		log.Printf("scout: %s could not resolve %s: %v", st.Service(), shortHash(t.InfoHash), err)
+		log.Printf("%s could not resolve %s: %v", st.Service(), shortHash(t.InfoHash), err)
 		// An add of ours already out for this release outranks any refusal, whichever store said what and
 		// in whichever order. It is the one answer that is about US rather than about a service: the
 		// release is being fetched right now, so 202 "downloading" is simply true.

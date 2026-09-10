@@ -247,7 +247,7 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 		streams, err, retryable := s.scrapeOnce(ctx, q)
 		if err == nil {
 			if attempt > 0 {
-				log.Printf("scout: %s indexer answered on retry %d", s.indexer, attempt)
+				log.Printf("%s indexer answered on retry %d", s.indexer, attempt)
 			}
 			return streams, nil
 		}
@@ -284,12 +284,12 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 	if err != nil {
 		// Log the indexer name + reason (never the URL — MediaFusion's carries its encrypted config) so a
 		// scrape outage is visible in the server log instead of silently becoming an empty stream list.
-		log.Printf("scout: %s indexer unreachable", s.indexer)
+		log.Printf("%s indexer unreachable", s.indexer)
 		return nil, err, true // a transport failure mid-burst is worth one more try
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("scout: %s indexer returned http %d", s.indexer, resp.StatusCode)
+		log.Printf("%s indexer returned http %d", s.indexer, resp.StatusCode)
 		return nil, fmt.Errorf("%s http %d", s.indexer, resp.StatusCode),
 			retryableScrapeStatus(resp.StatusCode)
 	}
@@ -369,7 +369,7 @@ func logIndexerSkipOnce(id Indexer, envVar string) {
 	if _, seen := indexerSkipLogged.LoadOrStore(id, true); seen {
 		return
 	}
-	log.Printf("scout: %s needs a per-install config URL and has none — not querying it. Set %s to the "+
+	log.Printf("%s needs a per-install config URL and has none — not querying it. Set %s to the "+
 		"address from that addon's /configure page.", id, envVar)
 }
 

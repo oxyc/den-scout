@@ -111,7 +111,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 func buildKeyring(current, prev string) *sealKeyring {
 	kr, err := parseSealKeyring(current, prev)
 	if err != nil {
-		log.Printf("den-scout: CONFIG_KEY invalid — sealed configs disabled: %v", err)
+		log.Printf("CONFIG_KEY invalid — sealed configs disabled: %v", err)
 		return nil
 	}
 	return kr
