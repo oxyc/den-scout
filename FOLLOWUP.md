@@ -145,12 +145,10 @@ cache/check 302 -> foreign host:  apikeyReachedForeignHost=1
 (`main.go` sets `Proxy: http.ProxyFromEnvironment`) to answer with a cross-host redirect that keeps the
 query.
 
-Left alone because the honest fix is structural rather than a guard. The rule wanted here is by URL and
-host, not by method: a debrid API call should refuse any redirect that changes host, while the probe
-client must keep following them, since reading a playback link through a CDN redirect is its entire job.
-That means splitting the single shared `http.Client` into a store client and a probe client — a change
-worth making deliberately rather than as the last edit before a tag. Revisit with that split; the guard
-that exists already covers the more expensive half.
+Closed in 0.12.0 without splitting the client: `RefuseRedirectReplay` now also refuses a redirect that
+starts on a debrid API host (`credentialQueryHosts`) and leaves it. The rule is by host, so the probe's
+CDN redirects — reading a playback link — still follow as before
+(`TestRefuseRedirectReplay_credentialQueryStaysOnTheDebridHost`).
 
 ## The test suite shares process-global state between tests
 

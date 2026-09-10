@@ -69,6 +69,33 @@ func TestRefuseRedirectReplay_anAddIsNotReplayedToTheRedirectTarget(t *testing.T
 	}
 }
 
+// A credential in the query string must not follow a redirect off the debrid's API host — Go strips the
+// Authorization header across hosts but never the query. A CDN's own redirects are untouched.
+func TestRefuseRedirectReplay_credentialQueryStaysOnTheDebridHost(t *testing.T) {
+	req := func(raw string) *http.Request {
+		r, err := http.NewRequest(http.MethodGet, raw, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	requestdl := req("https://api.torbox.app/v1/api/torrents/requestdl?token=secret&torrent_id=1")
+	if err := RefuseRedirectReplay(req("https://elsewhere.example/x?token=secret"), []*http.Request{requestdl}); err != http.ErrUseLastResponse {
+		t.Errorf("a redirect from the TorBox API to another host was followed (err %v) — the token goes with it", err)
+	}
+	if err := RefuseRedirectReplay(req("https://api.torbox.app/v1/api/other"), []*http.Request{requestdl}); err != nil {
+		t.Errorf("a same-host redirect was refused: %v", err)
+	}
+	cacheCheck := req("https://www.premiumize.me/api/cache/check?apikey=secret")
+	if err := RefuseRedirectReplay(req("https://elsewhere.example/"), []*http.Request{cacheCheck}); err != http.ErrUseLastResponse {
+		t.Errorf("a redirect from Premiumize to another host was followed (err %v) — the apikey goes with it", err)
+	}
+	playback := req("https://store-1.tb-cdn.st/dld/abc?token=link")
+	if err := RefuseRedirectReplay(req("https://store-2.tb-cdn.st/dld/abc"), []*http.Request{playback}); err != nil {
+		t.Errorf("a playback link's CDN redirect was refused: %v", err)
+	}
+}
+
 // GET and HEAD must still follow redirects: reading a playback link is exactly that, and the same
 // client does it.
 func TestRefuseRedirectReplay_readsStillFollowRedirects(t *testing.T) {

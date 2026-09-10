@@ -123,11 +123,27 @@ func SettingsFromEnv(get func(string) string) Settings {
 // Reachability is the same class as the listing OOM in FOLLOWUP.md — the API hosts are constants, so it
 // needs the debrid itself, a terminator in front of it, or the operator's own proxy to answer 307/308.
 // The cost of being wrong is a multiplied add budget, so it is guarded rather than argued about.
-func RefuseRedirectReplay(req *http.Request, _ []*http.Request) error {
-	if req.Method == http.MethodGet || req.Method == http.MethodHead {
-		return nil
+//
+// The query string is the other channel. TorBox's requestdl carries `token=` and Premiumize's cache
+// check `apikey=`, and Go never strips a query across hosts, so a GET redirect from a debrid API host to
+// anywhere else would hand the credential over. Those redirects are refused by HOST: a playback link on
+// a CDN still follows its redirects, which is the probe's whole job on the same client.
+func RefuseRedirectReplay(req *http.Request, via []*http.Request) error {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return http.ErrUseLastResponse
 	}
-	return http.ErrUseLastResponse
+	if len(via) > 0 && credentialQueryHosts[via[0].URL.Hostname()] && req.URL.Hostname() != via[0].URL.Hostname() {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
+// credentialQueryHosts are the debrid API hosts whose requests can carry the account credential in the
+// query string (see RefuseRedirectReplay).
+var credentialQueryHosts = map[string]bool{
+	"api.torbox.app":      true,
+	"www.premiumize.me":   true,
+	"api.real-debrid.com": true,
 }
 
 // BuildDeps wires the core to a concrete HTTP client + cache.
