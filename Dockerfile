@@ -27,12 +27,12 @@ COPY --from=build /den-scout /den-scout
 COPY --from=build --chown=65532:65532 /cache /cache
 EXPOSE 8080
 
-# Where the durable cache tier writes. The default (os.TempDir()) is unwritable under the documented
-# `read_only: true` container, so persistence silently disabled itself and every redeploy re-paid a
-# debrid resolve per probed release — the precise cost internal/scout/diskcache.go exists to avoid.
-# Mount a named volume here to keep the store across image pushes. Under `read_only: true` the rootfs
-# is not writable either, so a mount at this path is REQUIRED for persistence to work at all — a
-# tmpfs survives a restart but not the image push, which is the case the tier was written for.
+# Where the durable cache tier writes. The default (os.TempDir()) is unwritable under a read-only
+# rootfs — which is how the box runs it — so persistence silently disabled itself and every redeploy
+# re-paid a debrid resolve per probed release, the precise cost internal/scout/diskcache.go exists to
+# avoid. Writable storage must be mounted here for persistence to work at all (the box bind-mounts
+# /var/lib/den/scout-cache); a tmpfs survives a restart but not an image update, which is the case the
+# tier was written for.
 ENV CACHE_DIR=/cache
 
 # Soft heap ceiling under the documented 256 MiB container limit — Go's GC isn't cgroup-memory-aware,
