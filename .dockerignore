@@ -1,8 +1,8 @@
 .git
 .github
 golden
-coverage
 *.md
 !README.md
 .env
-.dev.vars
+cover.out
+/den-scout

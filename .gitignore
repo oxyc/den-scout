@@ -1,6 +1,3 @@
-node_modules/
-dist/
-coverage/
 .env
-.dev.vars
-*.log
+cover.out
+/den-scout
