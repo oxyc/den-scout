@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # docker-publish.yml calls this as its gate, so a tag cannot publish an image CI would reject.
+  workflow_call:
 
 jobs:
   test:

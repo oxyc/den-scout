@@ -1043,8 +1043,8 @@ func TestPremiumize_aReadOnlyPollRecordsAnAnsweredRefusal(t *testing.T) {
 func TestProbeAndPlay_agreeWhenTheAccountKeyIsRejected(t *testing.T) {
 	token, hash := "dead-key", repeat("0", 40)
 	cache := NewMemoryCache(1 << 20)
-	noteAddAttempt(cache, ServiceTorBox, token, hash)                    // an add of ours is out
-	recordRefusal(cache, ServiceTorBox, token, repeat("f", 40),          // ...and the key is rejected
+	noteAddAttempt(cache, ServiceTorBox, token, hash)           // an add of ours is out
+	recordRefusal(cache, ServiceTorBox, token, repeat("f", 40), // ...and the key is rejected
 		&StoreUnavailableError{Service: ServiceTorBox, Status: http.StatusUnauthorized,
 			Reason: "createtorrent http 401"})
 

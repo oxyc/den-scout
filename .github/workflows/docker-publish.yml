@@ -14,7 +14,13 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/den-scout
 
 jobs:
+  # The whole of ci.yml, run against the tagged commit. Without it a tag published whatever it pointed
+  # at: v0.7.0 shipped from a commit whose CI was red.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
