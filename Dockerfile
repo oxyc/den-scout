@@ -4,7 +4,7 @@
 
 # Build on the native builder arch, cross-compile to the target (set by `docker build --platform`;
 # the homelab publishes linux/amd64). CGO off → a fully static binary regardless of target.
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-trixie AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -22,9 +22,13 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
 RUN mkdir -p /cache
 
 # :nonroot runs as uid 65532 and carries CA certs for the outbound HTTPS scrape/debrid calls.
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM gcr.io/distroless/static-debian13:nonroot AS runtime
 COPY --from=build /den-scout /den-scout
 COPY --from=build --chown=65532:65532 /cache /cache
+# Stated rather than inherited from the :nonroot tag, so the uid the cache is chowned to above is
+# visibly the uid that runs.
+USER 65532:65532
+ENV PORT=8080
 EXPOSE 8080
 
 # Where the durable cache tier writes. The default (os.TempDir()) is unwritable under a read-only
@@ -34,6 +38,7 @@ EXPOSE 8080
 # /var/lib/den/scout-cache); a tmpfs survives a restart but not an image update, which is the case the
 # tier was written for.
 ENV CACHE_DIR=/cache
+VOLUME ["/cache"]
 
 # Soft heap ceiling under the documented 256 MiB container limit — Go's GC isn't cgroup-memory-aware,
 # so without this RSS can ~2× before a GC and the container gets OOM-killed. Override to match the
