@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-// logRequests writes one line per response — `<METHOD> <path> <status> <ms>ms` — when LOG_REQUESTS is on.
-// NewHandler only wraps the handler when it is, so with it off a request pays nothing at all.
+// logRequests writes one line per response — `<METHOD> <path> <status> <ms>ms[ rid=<id>]` — when
+// LOG_REQUESTS is on. NewHandler only wraps the handler when it is, so with it off a request pays nothing
+// at all.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -20,8 +21,28 @@ func logRequests(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK // nothing written at all is net/http's empty 200
 		}
-		log.Printf("%s %s %d %dms", r.Method, redactPath(r.URL.Path), status, time.Since(start).Milliseconds())
+		rid := ""
+		if id := requestID(r.Header.Get("X-Request-Id")); id != "" {
+			rid = " rid=" + id
+		}
+		log.Printf("%s %s %d %dms%s", r.Method, redactPath(r.URL.Path), status, time.Since(start).Milliseconds(), rid)
 	})
+}
+
+// requestID is the caller's X-Request-Id as it may be logged: the app sends one per request and logs it
+// too, so its line and this one can be joined exactly. It comes off the network, so only [A-Za-z0-9_-]
+// survives and it is cut at 32 — nothing it carries can forge a line or smuggle a credential into the log.
+func requestID(v string) string {
+	var b strings.Builder
+	for _, c := range v {
+		if b.Len() == 32 {
+			break
+		}
+		if c == '-' || c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
 }
 
 // redactPath is the path as it may be logged. The first segment of any per-install route IS the

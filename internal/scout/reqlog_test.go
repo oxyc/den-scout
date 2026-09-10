@@ -103,3 +103,28 @@ func TestRequestLog(t *testing.T) {
 		}
 	}
 }
+
+// The app's X-Request-Id ends the line, so its log and this one join exactly; a hostile value is cut down
+// to what cannot forge a line, and no header means no rid at all.
+func TestRequestLogCarriesTheRequestID(t *testing.T) {
+	out := captureLog(t)
+	h := NewHandler(testDeps(func(d *Deps) { d.LogRequests = true }))
+	do(h, "/health", map[string]string{"X-Request-Id": "a1B2-c3_d4"})
+	do(h, "/manifest.json", map[string]string{"X-Request-Id": "x y\nGET /<config>/play 200 0ms" + strings.Repeat("z", 100)})
+	do(h, "/config-key", nil)
+	do(h, "/configure", map[string]string{"X-Request-Id": " \n<>"})
+	got := out.String()
+	for _, want := range []string{
+		`(?m)^GET /health 200 \d+ms rid=a1B2-c3_d4$`,
+		`(?m)^GET /manifest\.json 200 \d+ms rid=xyGETconfigplay2000mszzzzzzzzzzz$`,
+		`(?m)^GET /config-key \d+ \d+ms$`,
+		`(?m)^GET /configure 200 \d+ms$`,
+	} {
+		if !regexp.MustCompile(want).MatchString(got) {
+			t.Errorf("no line matching %s in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "<config>/play") {
+		t.Errorf("a request id forged a line:\n%s", got)
+	}
+}
