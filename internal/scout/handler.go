@@ -1124,10 +1124,11 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// It is NOT free, and an earlier note here saying "up to three upstream calls, all reads" is no
 		// longer true of either half. Since the readiness enquiry started asking any store that holds an
 		// id — the fix for a probe that answered 404 for a release /play served — a poll against a
-		// Real-Debrid holding walks that store's whole read chain: measured 4 calls when the release is
-		// ready (info, selectFiles, info, unrestrict/link) and 3 while it is still downloading, at a
-		// two-second cadence, with a state-changing selectFiles among them and a fresh unrestricted link
-		// minted and discarded on every ready poll. /play walks the same chain on the same cadence, so
+		// Real-Debrid holding walks that store's read chain: 2 calls when the release is ready (info,
+		// unrestrict/link — it was 4 until resolveExisting stopped re-making a selection RD had already
+		// made) and 3 while it is still downloading (info, selectFiles, info), at a two-second cadence,
+		// with a state-changing selectFiles on each downloading poll and a fresh unrestricted link minted
+		// and discarded on every ready poll. /play walks the same chain on the same cadence, so
 		// this is the cost of the two routes agreeing rather than a new class of work — but it is real,
 		// and it is recorded in FOLLOWUP.md rather than left as a comment claiming otherwise.
 		//
