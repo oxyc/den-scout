@@ -481,12 +481,14 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 			// yields 304, consistent with the other cacheable routes.
 			//
 			// The epoch rides along: /configure stamps it into a new config as `ep`, so a link built after
-			// CONFIG_EPOCH is bumped is not refused by it. keyCache lets a browser keep the old answer for
-			// five minutes, so a link built within five minutes of a bump can still carry the old epoch.
+			// CONFIG_EPOCH is bumped is not refused by it. The page fetches with cache: "no-cache", so
+			// a browser revalidates (a 304 while nothing changed) rather than keeping a pre-bump epoch.
 			body, _ := json.Marshal(map[string]any{"key": pub, "epoch": h.deps.ConfigEpoch})
 			h.conditional(w, r, string(body), etagFor(string(body)), jsonType, keyCache)
 		} else {
-			writeJSON(w, http.StatusNotFound, errBody("no_key"), noStore)
+			// The epoch rides the 404 too: a plaintext link built while CONFIG_EPOCH > 0 must still carry
+			// it, or it would be refused the moment it was made. Matches den-subtitles and den-reel.
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no_key", "epoch": h.deps.ConfigEpoch}, noStore)
 		}
 		return
 	}
@@ -1583,6 +1585,10 @@ type streamOut struct {
 type streamHints struct {
 	BingeGroup  string `json:"bingeGroup"`
 	NotWebReady bool   `json:"notWebReady"`
+	// The release name, which is how a client recognises this release across resolves. A ticket URL is
+	// minted fresh on every list, so without it Den's dead-release marks and resume-to-the-same-source
+	// (both keyed by filename, then by URL) never matched a second time.
+	Filename string `json:"filename,omitempty"`
 }
 
 type streamsResponse struct {
@@ -1598,7 +1604,7 @@ func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string
 		Title:         s.Title, // raw release name
 		URL:           playURL(PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)}),
 		Attributes:    streamAttributes(s),
-		BehaviorHints: streamHints{BingeGroup: bingeGroup(strings.ToLower(s.Title), s.Title), NotWebReady: false},
+		BehaviorHints: streamHints{BingeGroup: bingeGroup(strings.ToLower(s.Title), s.Title), NotWebReady: false, Filename: s.Title},
 	}
 }
 

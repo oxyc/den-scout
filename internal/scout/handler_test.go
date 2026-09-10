@@ -141,6 +141,7 @@ func TestRoutesStream(t *testing.T) {
 			Attributes    StreamAttributes `json:"attributes"`
 			BehaviorHints struct {
 				BingeGroup string `json:"bingeGroup"`
+				Filename   string `json:"filename"`
 			} `json:"behaviorHints"`
 		} `json:"streams"`
 	}
@@ -151,6 +152,10 @@ func TestRoutesStream(t *testing.T) {
 	first := body.Streams[0]
 	if first.Name != "Den Scout" || first.Title != "Movie 2160p WEB-DL HDR" || first.BehaviorHints.BingeGroup != "den-scout|2160p|webdl|hdr|" {
 		t.Errorf("first stream: %+v", first)
+	}
+	// The release name is how Den recognises a release across resolves once play URLs are per-list tickets.
+	if first.BehaviorHints.Filename != "Movie 2160p WEB-DL HDR" {
+		t.Errorf("filename hint: %q", first.BehaviorHints.Filename)
 	}
 	if !strings.Contains(first.URL, "/"+validBlob+"/play/") || strings.Contains(first.URL, "tb-secret") {
 		t.Errorf("play url: %s", first.URL)

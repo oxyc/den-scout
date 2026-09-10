@@ -3479,10 +3479,11 @@ function fillForm(s) {
   // Ask the addon for its X25519 public key. When present we SEAL the config to it (the keys become
   // ciphertext in the URL); when absent the addon only understands legacy plaintext, so we fall back.
   // The same answer carries the addon's current CONFIG_EPOCH, stamped into the config as `ep` so a link
-  // built after the operator bumps it is not refused by it.
+  // built after the operator bumps it is not refused by it. no-cache so a just-bumped epoch isn't read
+  // from a copy the browser kept; the 404 (sealing off) carries the epoch as well.
   var sealPublicKey = null, sealEpoch = null;
-  fetch("/config-key")
-    .then(function (r) { return r.ok ? r.json() : null; })
+  fetch("/config-key", { cache: "no-cache" })
+    .then(function (r) { return r.ok || r.status === 404 ? r.json() : null; })
     .then(function (j) {
       if (j && j.key) sealPublicKey = j.key;
       if (j && typeof j.epoch === "number") sealEpoch = j.epoch;
