@@ -284,6 +284,45 @@ func TestNotFoundBody(t *testing.T) {
 	}
 }
 
+// Server-Timing names the phases a response actually paid for: a built list its scrape and cache check, a
+// cached one where it came from, a play its resolve — and each its total.
+func TestServerTiming(t *testing.T) {
+	h := NewHandler(testDeps(nil))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+
+	built := do(h, path, nil)
+	st := built.Header().Get("server-timing")
+	for _, want := range []string{"scrape;dur=", "cache-check;dur=", "total;dur="} {
+		if !strings.Contains(st, want) {
+			t.Errorf("a built list's Server-Timing %q lacks %s", st, want)
+		}
+	}
+	// testDeps sets no probe client, so no probe ran and none is claimed.
+	if strings.Contains(st, "probe") {
+		t.Errorf("a probe phase was named when none ran: %q", st)
+	}
+
+	if st := do(h, path, nil).Header().Get("server-timing"); !strings.HasPrefix(st, "cache;desc=hit, total;dur=") {
+		t.Errorf("a cached list's Server-Timing = %q", st)
+	}
+
+	var body struct {
+		Streams []struct {
+			URL string `json:"url"`
+		} `json:"streams"`
+	}
+	_ = json.Unmarshal(built.Body.Bytes(), &body)
+	if len(body.Streams) == 0 {
+		t.Fatal("no streams to build a play URL from")
+	}
+	playURL := body.Streams[0].URL
+	play := do(h, playURL[strings.Index(playURL, "/"+validBlob):], nil)
+	if st := play.Header().Get("server-timing"); play.Code != 302 ||
+		!strings.HasPrefix(st, "resolve;dur=") || !strings.Contains(st, ", total;dur=") {
+		t.Errorf("play: %d Server-Timing %q", play.Code, st)
+	}
+}
+
 // countingStore counts resolves so a test can prove a route never reached the debrid.
 type countingStore struct {
 	Store

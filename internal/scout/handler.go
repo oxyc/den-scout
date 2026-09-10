@@ -471,6 +471,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlob string, parts []string) {
+	start := time.Now()
 	typ := at(parts, 2)
 	sid, ok := parseStreamID(typ, at(parts, 3))
 	if !ok {
@@ -523,14 +524,13 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 			h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
 		v, _, _ := h.sf.Do(cacheKey+":debug", func() (any, error) {
-			value, degraded, complete := h.buildStreamList(buildCtx, config, configBlob, sid, origin,
-				cacheKey, &rankDebug{})
-			return buildResult{value: value, degraded: degraded, complete: complete}, nil
+			return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, &rankDebug{}), nil
 		})
 		res := v.(buildResult)
 		if res.degraded != "" {
 			w.Header().Set("X-Den-Degraded", res.degraded)
 		}
+		w.Header().Set("server-timing", res.timing+", total;dur="+msDur(time.Since(start)))
 		_, _, _, body := splitCached(res.value)
 		writeJSON(w, http.StatusOK, json.RawMessage(body), noStore)
 		return
@@ -543,6 +543,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		// the shortening exists to prevent, defeated one branch over.
 		complete, freshUntil, etag, body := splitCached(hit)
 		header := listCache
+		served := "cache;desc=hit"
 		metrics.listCacheHit.Add(1)
 		switch {
 		case !complete:
@@ -553,8 +554,10 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 			// COMPLETE lists get this — serving a knowingly-short one past its own expiry is the harm
 			// the branch above exists to prevent, and a longer life is the last thing it should get.
 			header = staleListCache
+			served = "cache;desc=stale"
 			h.rebuildBehind(r, configBlob, sid, origin, cacheKey)
 		}
+		w.Header().Set("server-timing", served+", total;dur="+msDur(time.Since(start)))
 		h.conditional(w, r, body, etag, jsonType, header)
 		return
 	}
@@ -573,8 +576,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		value, degraded, complete := h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil)
-		return buildResult{value: value, degraded: degraded, complete: complete}, nil
+		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil), nil
 	})
 	res := v.(buildResult)
 	// Signal a degraded build so the app can say "sources temporarily unavailable" rather than treating
@@ -582,6 +584,8 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	if res.degraded != "" {
 		w.Header().Set("X-Den-Degraded", res.degraded)
 	}
+	// A follower of a shared build reports the build it was handed — which is the work its answer cost.
+	w.Header().Set("server-timing", res.timing+", total;dur="+msDur(time.Since(start)))
 	_, _, etag, body := splitCached(res.value)
 	// A degraded build is deliberately not cached server-side, "so the next request retries instead of
 	// serving the blip for the whole TTL" — and then the same body went out with `max-age=300,
@@ -649,8 +653,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 		ctx, cancel := context.WithTimeout(parent, budget)
 		defer cancel()
 		v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-			value, degraded, complete := h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil)
-			return buildResult{value: value, degraded: degraded, complete: complete}, nil
+			return h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil), nil
 		})
 		// A degraded build caches nothing, so the entry is still stale and the next request would book
 		// another rebuild at once. Hold the key until there is some prospect of a different answer.
@@ -668,15 +671,19 @@ type buildResult struct {
 	// complete — every askable indexer answered. A partial list is real and worth caching, just not for
 	// as long, and not with a client freshness window longer than the server's own.
 	complete bool
+	// The build's phases as Server-Timing entries — scrape, cache-check, and probe when it ran.
+	timing string
 }
 
 // buildStreamList scrapes → cache-checks → ranks → serializes, caches the framed entry (see joinCached).
 //
 // dbg is nil on every normal request. When it is not, the accounting rides along in the response body and
 // the result is NOT cached — a debug build is a diagnostic, not an entry other viewers should be served.
-func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string, dbg *rankDebug) (string, string, bool) {
+func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string, dbg *rankDebug) buildResult {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
+	phase := time.Now()
 	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
+	timing := "scrape;dur=" + msDur(time.Since(phase))
 	// Recorded HERE, before anything trims it. Taken after the two filters below instead, the count read
 	// as "this is all the indexers had" while both of them had already removed releases that appear in no
 	// drop tally either — on an RD-only install that is most of the list, which is exactly the confusion
@@ -700,7 +707,9 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	for i, s := range seeds {
 		hashes[i] = s.InfoHash
 	}
+	phase = time.Now()
 	truth, truthOK := pool.CacheCheck(ctx, hashes)
+	timing += ", cache-check;dur=" + msDur(time.Since(phase))
 	for i := range seeds {
 		hash := seeds[i].InfoHash
 		seeds[i].Cached = truth.Cached(hash)
@@ -826,7 +835,10 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	}
 	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
 	// the viewer will see; before serialisation, so a cached probe rides along in this same response.
-	h.probeTop(ctx, config, ranked, sid, truth)
+	phase = time.Now()
+	if h.probeTop(ctx, config, ranked, sid, truth) {
+		timing += ", probe;dur=" + msDur(time.Since(phase))
+	}
 
 	out := make([]streamOut, 0, len(ranked))
 	for _, s := range ranked {
@@ -875,7 +887,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 		}
 		h.deps.Cache.Put(cacheKey, value, hold)
 	}
-	return value, degradedReason, scrapeComplete
+	return buildResult{value: value, degraded: degradedReason, complete: scrapeComplete, timing: timing}
 }
 
 // writeQueued — the "it's coming" answer: 202 plus whatever the store actually reported. `etaSeconds` is
@@ -1054,6 +1066,8 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	// Nothing legitimate issues it: Stremio asks for the list, and Den's AVPlayer follows the 302 with a
 	// GET. What does issue HEAD is link prefetchers and unfurlers, which is precisely the traffic that
 	// must not reach a debrid account.
+	tw := &playTiming{ResponseWriter: w, start: time.Now()}
+	w = tw
 	if r.Method != http.MethodGet {
 		w.Header().Set("allow", "GET")
 		writeJSON(w, http.StatusMethodNotAllowed, errBody("method_not_allowed"), noStore)
@@ -1221,7 +1235,9 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		checkCancel()
 		preferred = append(preferred, playTruth.HeldBy(target.InfoHash)...)
 	}
+	resolveStart := time.Now()
 	link, err := pool.ResolvePreferring(ctx, rt, preferred)
+	tw.phases = "resolve;dur=" + msDur(time.Since(resolveStart)) + ", "
 	if err != nil {
 		// Queued is not dead. An uncached release is added to the debrid by the Resolve above and then
 		// takes minutes to land; answering 404 for that made the client remember a perfectly good release
@@ -1282,6 +1298,26 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 	w.Header().Set("cache-control", noStore)
 	w.Header().Set("content-length", "0")
 	w.WriteHeader(http.StatusFound)
+}
+
+// playTiming stamps Server-Timing on whatever /play answers, as the status is written: the route has a
+// dozen exits, and setting the header at each was a dozen chances to forget one. Every exit writes its
+// status through WriteHeader, so this sees them all.
+type playTiming struct {
+	http.ResponseWriter
+	start  time.Time
+	phases string // "resolve;dur=…, " once a resolve has run
+}
+
+func (p *playTiming) WriteHeader(code int) {
+	p.Header().Set("server-timing", p.phases+"total;dur="+msDur(time.Since(p.start)))
+	p.ResponseWriter.WriteHeader(code)
+}
+
+// msDur formats a duration as Server-Timing's milliseconds, to a tenth — a warm hit takes well under one,
+// and "0" says nothing.
+func msDur(d time.Duration) string {
+	return strconv.FormatFloat(float64(d.Microseconds())/1000, 'f', 1, 64)
 }
 
 type streamOut struct {

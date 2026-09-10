@@ -36,13 +36,15 @@ const probeTTL = 720 * time.Hour
 //
 // Best-effort by construction: a release that can't be resolved, a server that ignores Range, a container
 // nobody parses — all leave the entry exactly as the indexer described it.
+//
+// It reports whether probing is on at all, so Server-Timing names the phase only when there was one.
 func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStream, sid *StreamID,
-	truth CacheTruth) {
+	truth CacheTruth) bool {
 	// Opt-in: no client, no probing. Probing costs a debrid RESOLVE per release, so it must never happen
 	// by accident — a caller that hasn't asked for it (a test, an embedder) gets the old behaviour
 	// exactly, and the stream list is built without touching the debrid account at all.
 	if h.deps.ProbeClient == nil || h.deps.MakeStores == nil {
-		return
+		return false
 	}
 	var pending []probeJob
 	for i := range streams {
@@ -99,6 +101,7 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 	if len(pending) > 0 {
 		h.probeBehind(config, pending)
 	}
+	return true
 }
 
 // probeJob is a copy, deliberately: the background work must not reach into the response's slice, which

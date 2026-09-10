@@ -86,6 +86,10 @@ A stream list that is served but cannot be trusted carries `X-Den-Degraded` — 
 answered, `cache-check` when the debrid could not be asked about a release in it — and is `no-store`, so
 the app can say "sources temporarily unavailable" instead of "nothing found".
 
+Stream and play responses carry `Server-Timing`: a built list names `scrape`, `cache-check` and (when
+probing is on) `probe`; a list served from cache says `cache;desc=hit` or `cache;desc=stale`; a play names
+`resolve` once one has run; every one ends with `total`. Durations are milliseconds.
+
 `<id>` is `tt…` (movie) or `tt…:S:E` (series episode). Scout advertises `idPrefixes: ["tt"]` because
 Den bridges TMDB → IMDb before it asks for streams.
 
