@@ -247,7 +247,7 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 		streams, err, retryable := s.scrapeOnce(ctx, q)
 		if err == nil {
 			if attempt > 0 {
-				log.Printf("%s indexer answered on retry %d", s.indexer, attempt)
+				logLimited("indexer-retry:"+string(s.indexer), "%s indexer answered on retry %d", s.indexer, attempt)
 			}
 			return streams, nil
 		}
@@ -284,12 +284,13 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 	if err != nil {
 		// Log the indexer name + reason (never the URL — MediaFusion's carries its encrypted config) so a
 		// scrape outage is visible in the server log instead of silently becoming an empty stream list.
-		log.Printf("%s indexer unreachable", s.indexer)
+		// Once a minute per indexer: an outage fails every scrape, and the line only has to say it is down.
+		logLimited("indexer-unreachable:"+string(s.indexer), "%s indexer unreachable", s.indexer)
 		return nil, err, true // a transport failure mid-burst is worth one more try
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("%s indexer returned http %d", s.indexer, resp.StatusCode)
+		logLimited("indexer-status:"+string(s.indexer), "%s indexer returned http %d", s.indexer, resp.StatusCode)
 		return nil, fmt.Errorf("%s http %d", s.indexer, resp.StatusCode),
 			retryableScrapeStatus(resp.StatusCode)
 	}

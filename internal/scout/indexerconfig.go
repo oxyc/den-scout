@@ -159,7 +159,7 @@ func indexerBaseWithConfig(ctx context.Context, id Indexer, config *Config, clie
 	mintedNow := time.Now()
 	minted[key] = mintedConfig{url: url, at: mintedNow, used: mintedNow}
 	mintedMu.Unlock()
-	log.Printf("minted a config for the %s indexer from the %s account", id, acct.Service)
+	logLimited("mint:"+string(id), "minted a config for the %s indexer from the %s account", id, acct.Service)
 	return url, false
 }
 
@@ -306,7 +306,7 @@ func mintMediaFusionURL(ctx context.Context, acct DebridAccount, client doer) st
 	req.Header.Set("user-agent", scrapeUserAgent)
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("could not mint a mediafusion config: %v", err)
+		logLimited("mint-mediafusion-unreachable", "could not mint a mediafusion config: %v", err)
 		return ""
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -321,7 +321,7 @@ func mintMediaFusionURL(ctx context.Context, acct DebridAccount, client doer) st
 	// Its own words when it refuses — "invalid user data: Invalid max_size" is the difference between a
 	// bad payload and an unreachable host, and guessing between them wastes an evening.
 	if out.Status != "success" || out.Encrypted == "" {
-		log.Printf("mediafusion refused the config: %s %s",
+		logLimited("mint-mediafusion-refused", "mediafusion refused the config: %s %s",
 			out.Status, strings.TrimSpace(out.Message))
 		return ""
 	}

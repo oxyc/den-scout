@@ -3,7 +3,6 @@ package scout
 import (
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 )
@@ -174,7 +173,7 @@ func spendAdd(svc DebridService, token, infoHash string) error {
 	if globalAddBudget.take(budgetAccount(svc, token)) {
 		return nil
 	}
-	log.Printf("%s add budget spent for the hour, refusing %s", svc, shortHash(infoHash))
+	logLimited("add-budget:"+string(svc), "%s add budget spent for the hour, refusing %s", svc, shortHash(infoHash))
 	// Wrapped so the refusal memory can tell scout's own ceiling from the service's — see errOurBudget.
 	return fmt.Errorf("%w: %w", errScoutSide,
 		&StoreUnavailableError{Service: svc, Reason: "scout's own hourly add budget for this account is spent"})

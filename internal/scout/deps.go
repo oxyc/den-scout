@@ -40,6 +40,47 @@ type Settings struct {
 	LogRequests bool
 }
 
+// StartupSummary is the one line an operator reads to confirm what this process is running with. Nothing
+// secret goes in it: an indexer URL override can carry an encrypted config segment, so overrides are named
+// by indexer, never by address, and keys and tokens appear only as on or off.
+func StartupSummary(s Settings, persistent bool) string {
+	names := func(ids []Indexer) string {
+		if len(ids) == 0 {
+			return "none"
+		}
+		out := make([]string, len(ids))
+		for i, id := range ids {
+			out[i] = string(id)
+		}
+		return strings.Join(out, ",")
+	}
+	onOff := func(b bool) string {
+		if b {
+			return "on"
+		}
+		return "off"
+	}
+	var overridden, disabled []Indexer
+	for _, id := range allIndexers {
+		if s.IndexerURLs[id] != "" {
+			overridden = append(overridden, id)
+		}
+		if _, dead := disabledIndexers[id]; dead {
+			disabled = append(disabled, id)
+		}
+	}
+	cache := s.CacheDir + " persistent"
+	if !persistent {
+		cache = s.CacheDir + " NOT persistent, memory only"
+	}
+	return "den-scout " + manifestVersion +
+		" — indexers: default " + names(defaultIndexers) + ", url overrides " + names(overridden) +
+		", disabled " + names(disabled) + ", minting " + onOff(s.MintIndexerConfigs) +
+		" — cache " + cache +
+		" — sealed configs " + onOff(s.ConfigKey != "") + ", metrics " + onOff(s.MetricsToken != "") +
+		", request log " + onOff(s.LogRequests)
+}
+
 func SettingsFromEnv(get func(string) string) Settings {
 	urls := map[Indexer]string{}
 	for _, id := range allIndexers {

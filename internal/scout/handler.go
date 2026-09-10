@@ -289,6 +289,9 @@ type handler struct {
 // After this many consecutive builds where no indexer responded, /health reports "degraded".
 const scrapeFailThreshold = 3
 
+// What /health says about that state, and what the log line marking the flip says too.
+const indexersDownDetail = "No indexer has answered the last few stream-list builds, so lists are coming back empty."
+
 // debugLimiter paces ?debug=1. A diagnostic is run by a person a handful of times in a row, so three then
 // one every ten seconds is invisible to that and puts a ceiling on the one /stream path that has neither
 // the list cache nor a shared singleflight in front of the debrid.
@@ -396,8 +399,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		// state so a monitor sees a total-indexer outage instead of just "empty results".
 		status := map[string]any{"status": "ok"}
 		if h.scrapeFails.Load() >= scrapeFailThreshold {
-			status = map[string]any{"status": "degraded", "reason": "indexers",
-				"detail": "No indexer has answered the last few stream-list builds, so lists are coming back empty."}
+			status = map[string]any{"status": "degraded", "reason": "indexers", "detail": indexersDownDetail}
 		}
 		// A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
 		// other evidence is one log line per refusal. The tightest remaining allowance is what an operator
@@ -703,7 +705,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// cap is well above any real title's stream count, so it rarely bites — but when it does it now keeps
 	// the most promising releases rather than the first ones the scrape happened to return.
 	if len(seeds) > maxSeeds {
-		log.Printf("%s %s: %d seeds capped to %d (best-scored kept)", sid.Type, sid.IMDb, len(seeds), maxSeeds)
+		logLimited("seed-cap", "%s %s: %d seeds capped to %d (best-scored kept)", sid.Type, sid.IMDb, len(seeds), maxSeeds)
 		dbg.dropN("seedCap", len(seeds)-maxSeeds)
 		seeds = capSeeds(seeds, maxSeeds)
 	}
@@ -729,11 +731,16 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
 	// misleading empty/partial list; return it for this request but don't cache it, so the next request
 	// retries instead of serving the blip for the whole TTL.
-	// Track consecutive total-scrape failures for /health (reset on any successful scrape).
+	// Track consecutive total-scrape failures for /health (reset on any successful scrape). The log marks
+	// the moment /health changes its answer, once each way, rather than every build that failed: the
+	// crossing is exactly one Add landing on the threshold, and the recovery the one Swap that finds the
+	// count at or past it.
 	if scrapeOK {
-		h.scrapeFails.Store(0)
-	} else {
-		h.scrapeFails.Add(1)
+		if h.scrapeFails.Swap(0) >= scrapeFailThreshold {
+			log.Printf("health: degraded → ok, an indexer answered again")
+		}
+	} else if h.scrapeFails.Add(1) == scrapeFailThreshold {
+		log.Printf("health: ok → degraded (indexers): %s", indexersDownDetail)
 	}
 
 	// TOTAL failure and PARTIAL failure are different states and drive different decisions, so they get
@@ -819,7 +826,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	}
 	degraded := degradedReason != ""
 	if unchecked > 0 {
-		log.Printf("%s %s: %d of %d served releases could not be cache-checked",
+		logLimited("cache-check-partial", "%s %s: %d of %d served releases could not be cache-checked",
 			sid.Type, sid.IMDb, unchecked, len(ranked))
 	}
 
@@ -834,7 +841,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// dropped" is now a counter on /metrics and an exact answer on ?debug=1; this stays for the one
 	// outcome that is genuinely worth a line in the log.
 	if len(ranked) == 0 {
-		log.Printf("%s %s: scraped %d → ranked %d (cachedOnly=%t year=%v filters: res=%v minSeed=%d maxGB=%v cam=%t hdr=%t)",
+		logLimited("empty-list", "%s %s: scraped %d → ranked %d (cachedOnly=%t year=%v filters: res=%v minSeed=%d maxGB=%v cam=%t hdr=%t)",
 			sid.Type, sid.IMDb, len(seeds), len(ranked), effCachedOnly, expectedYear,
 			config.Filters.Resolutions, config.Filters.MinSeeders, config.Filters.MaxSizeGB,
 			config.Filters.ExcludeCam, config.Filters.HDROnly)
@@ -888,7 +895,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// served — nor displace a good one.
 	if !degraded && dbg == nil {
 		if !scrapeComplete {
-			log.Printf("%s %s: an indexer did not answer; caching this list for %s only",
+			logLimited("partial-list", "%s %s: an indexer did not answer; caching this list for %s only",
 				sid.Type, sid.IMDb, ttl)
 		}
 		h.deps.Cache.Put(cacheKey, value, hold)
@@ -909,7 +916,8 @@ func writeQueued(w http.ResponseWriter, hash string, status StoreStatus) {
 	if status.ETASeconds != nil {
 		eta = fmt.Sprintf("%ds", *status.ETASeconds)
 	}
-	log.Printf("play %s → 202 downloading %.1f%% at %s, eta %s",
+	// A waiting client polls every two seconds for the whole fetch, so this is a sample, a line a minute.
+	logLimited("downloading", "play %s → 202 downloading %.1f%% at %s, eta %s",
 		shortHash(hash), status.Progress*100, rate, eta)
 	writeQueuedBody(w, status)
 }
@@ -955,7 +963,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 		readOnly.NoAdd = true
 		_, err := pool.ResolveCachedOnly(ctx, readOnly, holders)
 		if err == nil {
-			log.Printf("probe %s → 200 ready", shortHash(infoHash))
+			logLimited("probe-ready", "probe %s → 200 ready", shortHash(infoHash))
 			writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
 			return
 		}
@@ -987,7 +995,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// expired and Real-Debrid fetching, the probe answered 503 naming torbox while /play answered 202
 	// downloading. AddInFlight now applies the per-store rule per store, so both hold at once.
 	if pool.AddInFlight(infoHash) {
-		log.Printf("probe %s → 202, an add is already in flight", shortHash(infoHash))
+		logLimited("probe-add-in-flight", "probe %s → 202, an add is already in flight", shortHash(infoHash))
 		writeQueued(w, infoHash, StoreStatus{})
 		return
 	}
@@ -996,7 +1004,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// Account-level only, deliberately. The per-release backoff belongs below, where RecentRefusal reads
 	// it, because that one is an add-path guard a read-only caller is exempt from.
 	if svc, reason, refused := pool.AccountRefusal(); refused {
-		log.Printf("probe %s → 503, %s refused the account (%s)", shortHash(infoHash), svc, reason)
+		logLimited("probe-account-refused", "probe %s → 503, %s refused the account (%s)", shortHash(infoHash), svc, reason)
 		writeJSON(w, http.StatusServiceUnavailable,
 			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
 		return
@@ -1017,7 +1025,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// /play answered 503 scout_busy while ?probe=1 answered 404, for the same release at the same
 	// instant, for the rest of the rolling hour.
 	if pool.EveryAddRefusedByScout() {
-		log.Printf("probe %s → 503 (scout-side), the hourly add allowance is spent",
+		logLimited("probe-scout-busy", "probe %s → 503 (scout-side), the hourly add allowance is spent",
 			shortHash(infoHash))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"error":  "scout_busy",
@@ -1026,7 +1034,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 		return
 	}
 	if refusedUs != nil {
-		log.Printf("probe %s → 503, %s %s", shortHash(infoHash), refusedUs.Service, refusedUs.Reason)
+		logLimited("probe-refused", "probe %s → 503, %s %s", shortHash(infoHash), refusedUs.Service, refusedUs.Reason)
 		writeJSON(w, http.StatusServiceUnavailable,
 			map[string]any{"error": "store_unavailable", "service": refusedUs.Service}, noStore)
 		return
@@ -1036,7 +1044,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// condemns a perfectly good one. This still matters for a refusal recorded by an EARLIER poll, whose
 	// store the probe may not reach again.
 	if svc, reason, ok := pool.RecentRefusal(infoHash); ok {
-		log.Printf("probe %s → 503, %s %s", shortHash(infoHash), svc, reason)
+		logLimited("probe-refused", "probe %s → 503, %s %s", shortHash(infoHash), svc, reason)
 		writeJSON(w, http.StatusServiceUnavailable,
 			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
 		return
@@ -1044,7 +1052,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// With the cache check down we do not know whether anything is queued, and 404 "not_queued" is a
 	// claim, not a shrug — the client reads it as a release nobody has. Say the store could not be asked.
 	if !truthOK && hasCacheTruth(config) {
-		log.Printf("probe %s → 503, cache check unavailable", shortHash(infoHash))
+		logLimited("probe-cache-check-down", "probe %s → 503, cache check unavailable", shortHash(infoHash))
 		writeJSON(w, http.StatusServiceUnavailable, errBody("cache_check_unavailable"), noStore)
 		return
 	}
@@ -1052,11 +1060,11 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// queued. 404 here is what makes a client blacklist a release, which is the single failure this route
 	// exists to prevent, so an indeterminate read gets the "ask again" answer rather than the claim.
 	if unknown {
-		log.Printf("probe %s → 503, a store could not answer", shortHash(infoHash))
+		logLimited("probe-status-unknown", "probe %s → 503, a store could not answer", shortHash(infoHash))
 		writeJSON(w, http.StatusServiceUnavailable, errBody("status_unavailable"), noStore)
 		return
 	}
-	log.Printf("probe %s → 404 not queued", shortHash(infoHash))
+	logLimited("probe-not-queued", "probe %s → 404 not queued", shortHash(infoHash))
 	writeJSON(w, http.StatusNotFound, errBody("not_queued"), noStore)
 }
 
@@ -1181,7 +1189,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		if slowCtx, slowCancel, ok := escalatedStatusCtx(ctx); ok {
 			defer slowCancel()
 			if status, ok, _ := (&StorePool{stores: unknown}).StatusDetail(slowCtx, rt); ok {
-				log.Printf("play %s → 202, status needed longer than %s to answer",
+				logLimited("play-slow-status", "play %s → 202, status needed longer than %s to answer",
 					shortHash(target.InfoHash), statusBudget)
 				writeQueued(w, target.InfoHash, status)
 				return
@@ -1264,7 +1272,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// now. Answering 503 made the client tell the viewer their debrid was refusing AND stop trying
 		// other sources, for a release scout had queued moments earlier. 202 is simply what is true.
 		if errors.Is(err, errAddInFlight) {
-			log.Printf("play %s → 202, an add is already in flight", shortHash(target.InfoHash))
+			logLimited("play-add-in-flight", "play %s → 202, an add is already in flight", shortHash(target.InfoHash))
 			writeQueued(w, target.InfoHash, StoreStatus{})
 			return
 		}
@@ -1274,7 +1282,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// TorBox was answering perfectly well. Still a 503, because it is still "not now, try again", but
 		// named as ours.
 		if errors.Is(err, errScoutSide) {
-			log.Printf("play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
+			logLimited("play-scout-busy", "play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
 			writeJSON(w, http.StatusServiceUnavailable,
 				map[string]any{"error": "scout_busy", "detail": scoutSideReason(err)}, noStore)
 			return
@@ -1284,7 +1292,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// waited indefinitely on a download nothing had started. 503 says whose problem it is.
 		var unavailable *StoreUnavailableError
 		if errors.As(err, &unavailable) {
-			log.Printf("play %s → 503, %v", shortHash(target.InfoHash), err)
+			logLimited("play-store-unavailable", "play %s → 503, %v", shortHash(target.InfoHash), err)
 			writeJSON(w, http.StatusServiceUnavailable,
 				map[string]any{"error": "store_unavailable", "service": unavailable.Service}, noStore)
 			return
@@ -1293,7 +1301,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		// there, so it is worth saying which of the two happened: no store could add it, and no store
 		// admits to downloading it either. A wait with nothing behind it is the one case a spinner
 		// cannot distinguish from a slow release.
-		log.Printf("play %s → 404, no store resolved it and none reports a download: %v",
+		logLimited("play-dead", "play %s → 404, no store resolved it and none reports a download: %v",
 			shortHash(target.InfoHash), err)
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
 		return

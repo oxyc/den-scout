@@ -3,7 +3,6 @@ package scout
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"strconv"
 	"time"
 
@@ -181,7 +180,8 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 func recoverBackground(what string) {
 	if rec := recover(); rec != nil {
 		metrics.backgroundPanic.Add(1)
-		log.Printf("%s panicked, abandoning it: %v", what, rec)
+		// `what` is always a literal naming the job, so it is a fixed vocabulary for the limiter's key.
+		logLimited("panic:"+what, "%s panicked, abandoning it: %v", what, rec)
 	}
 }
 
