@@ -108,6 +108,33 @@ Stream and play responses carry `Server-Timing`: a built list names `scrape`, `c
 probing is on) `probe`; a list served from cache says `cache;desc=hit` or `cache;desc=stale`; a play names
 `resolve` once one has run; every one ends with `total`. Durations are milliseconds.
 
+### Stream attributes
+
+Each stream carries `attributes`: facts parsed from the release name and, once a release has been
+probed, overridden by what the file's own headers say (`probed: true`). Beside resolution, source, codec,
+HDR and audio, three fields are for browser playback:
+
+- `bitDepth`: `8` or `10`. The name supplies 10 for `10bit`/`Hi10P` and for any HDR or Dolby Vision
+  release; the probe reads `avcC`/`hvcC` (Matroska's CodecPrivate). Omitted when unknown.
+- `dvProfile`: the Dolby Vision profile (`5`, `7`, `8`, …), read from `dvcC`/`dvvC`/`dvwC` or Matroska's
+  BlockAdditionMapping. Omitted when unknown, including for a "DV" release that hasn't been probed.
+- `web`: `{ "direct": ["safari", "chrome"], "remux": "copy" | "audio" | "video" | "none" }`.
+
+`direct` lists the browsers that play the file as it is. Anything unknown counts as not playable:
+
+| | Safari | Chrome |
+|---|---|---|
+| Container | MP4 | MP4, WebM, Matroska |
+| Video | H.264 8-bit, HEVC | H.264 incl. 10-bit, HEVC (needs a hardware decoder), AV1, VP9 |
+| Dolby Vision | profiles 5 and 8; not 7 | not profile 5, which has no base layer Chrome can show |
+| Audio | AAC, MP3, FLAC, Opus | AAC, MP3, FLAC, Opus |
+
+`remux` is the work den-remux must do for Safari to play its fMP4 HLS output. Safari is the strictest
+target, so the answer holds for Chrome too, except for Dolby Vision profile 5 (check `dvProfile`). `copy`
+means only the container changes; `audio` means the video copies and the audio is re-encoded to AAC; `video`
+means Safari can't decode the video at all (Hi10P, XviD, VP9, AV1); `none` means the video codec is
+unknown. `behaviorHints.notWebReady` is the Stremio-level answer: an https URL to an MP4.
+
 `<id>` is `tt…` (movie) or `tt…:S:E` (series episode). Scout advertises `idPrefixes: ["tt"]` because
 Den bridges TMDB → IMDb before it asks for streams.
 

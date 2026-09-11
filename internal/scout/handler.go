@@ -1618,14 +1618,7 @@ func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string
 // browser decodes) went straight to a <video> that failed. The container comes from the probe when there
 // is one, else from the release name.
 func webReady(s RawStream, url string) bool {
-	if !strings.HasPrefix(url, "https://") {
-		return false
-	}
-	if s.Probe != nil && s.Probe.Container != "" {
-		return s.Probe.Container == "mp4"
-	}
-	t := strings.ToLower(s.Title)
-	return strings.HasSuffix(t, ".mp4") || strings.HasSuffix(t, ".m4v")
+	return strings.HasPrefix(url, "https://") && containerOf(s) == "mp4"
 }
 
 // playURLs is how one stream list names its play URLs: a ticket per release while tickets are on, all

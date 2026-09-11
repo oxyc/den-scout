@@ -87,9 +87,11 @@ func codecFromFourCC(cc string) string {
 	switch strings.ToLower(cc) {
 	case "xvid", "divx", "dx50", "divx5", "mp4v", "fmp4", "mp43":
 		return "mpeg4"
-	case "h264", "avc1", "x264", "davc":
+	// dva1/dvav and dvh1/dvhe are the MP4 sample entries of Dolby Vision over AVC and HEVC. Profile 5 has
+	// no other tag, so without them a DV profile 5 MP4 reported no codec at all.
+	case "h264", "avc1", "x264", "davc", "dva1", "dvav":
 		return "h264"
-	case "hevc", "hvc1", "hev1", "x265":
+	case "hevc", "hvc1", "hev1", "x265", "dvh1", "dvhe":
 		return "hevc"
 	case "av01":
 		return "av1"

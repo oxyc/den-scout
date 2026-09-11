@@ -15,6 +15,12 @@ a v1 `mdhd`, a `moov` that isn't there. A real muxer will never produce those, s
 | `sample.mp4` | A plain single-track MP4 |
 | `multi-audio.mp4` | Two audio tracks with distinct languages (swe, ita) and channel counts (5.1, 2.0) |
 | `moov-at-end.mp4` | A muxer that leaves `moov` at the end — the case a bounded head read cannot see |
+| `hevc10.mp4` | HEVC Main 10 tagged `hvc1`: the bit depth read from `hvcC` |
+| `hi10p.mkv` | H.264 High 10 in Matroska: the bit depth read from CodecPrivate (an `avcC` record) |
+
+There is no Dolby Vision fixture. ffmpeg only writes a DV configuration when it is given an RPU, which a
+test source can't provide. So the DOVIDecoderConfigurationRecord parser, and the MP4 and Matroska paths
+to it, are tested against byte slices in `attributes_web_test.go`.
 
 ## Regenerating
 
@@ -37,6 +43,29 @@ docker run --rm -v "$PWD":/out -w /out linuxserver/ffmpeg:latest \
   -map 0:v -map 1:a -c:v libx264 -preset ultrafast -c:a aac -metadata:s:a:0 language=fra \
   -y moov-at-end.mp4
 ```
+
+The two 10-bit files need an ffmpeg with libx264 and libx265 (nixpkgs' has both). The audio track is
+there because a Matroska head with no audio or subtitle track is reported as having no tracks:
+
+```sh
+cd internal/scout/testdata
+
+# hevc10.mp4 — ~14 KB
+nix shell nixpkgs#ffmpeg -c ffmpeg -f lavfi -i testsrc=size=64x64:rate=5:duration=1 \
+  -f lavfi -i sine=frequency=440:duration=1 -map 0:v -map 1:a \
+  -c:v libx265 -pix_fmt yuv420p10le -x265-params log-level=error -tag:v hvc1 \
+  -c:a aac -metadata:s:a:0 language=eng -movflags +faststart -y hevc10.mp4
+
+# hi10p.mkv — ~19 KB
+nix shell nixpkgs#ffmpeg -c ffmpeg -f lavfi -i testsrc=size=64x64:rate=5:duration=1 \
+  -f lavfi -i sine=frequency=440:duration=1 -map 0:v -map 1:a \
+  -c:v libx264 -preset ultrafast -pix_fmt yuv420p10le -profile:v high10 \
+  -c:a flac -metadata:s:a:0 language=jpn -y hi10p.mkv
+```
+
+`multi-audio.mp4` was encoded from `testsrc`'s RGB without a `-pix_fmt`, so libx264 chose 4:4:4 and
+High 4:4:4 Predictive. That profile allows either bit depth, so its depth stays unknown, and the test
+pins that too.
 
 `moov-at-end.mp4` is only useful while its `moov` stays past the truncation point the test reads
 (4 KiB). If a future ffmpeg reorders it, the test that asserts "a head-only read reports nothing" will

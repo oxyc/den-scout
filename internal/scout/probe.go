@@ -2,6 +2,7 @@ package scout
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -28,11 +29,17 @@ type Probe struct {
 	// Atmos is deliberately absent: it lives inside the E-AC-3 JOC or TrueHD substream, not in any
 	// container box, so no amount of header parsing finds it — and Den reports DELIVERED audio anyway,
 	// where TrueHD and DTS are bridged down to EAC3 5.1 regardless of what the source carried.
-	AudioChannels string   `json:"audioChannels,omitempty"` // "2.0", "5.1", "7.1"
-	HDRFormat     string   `json:"hdrFormat,omitempty"`     // "HDR10", "HLG"
-	DolbyVision   bool     `json:"dolbyVision,omitempty"`
-	Audio         []string `json:"audioLanguages"`
-	Subtitles     []string `json:"subtitleLanguages"`
+	AudioChannels string `json:"audioChannels,omitempty"` // "2.0", "5.1", "7.1"
+	HDRFormat     string `json:"hdrFormat,omitempty"`     // "HDR10", "HLG"
+	DolbyVision   bool   `json:"dolbyVision,omitempty"`
+	// Read from the video's codec configuration record (avcC/hvcC, which Matroska carries as CodecPrivate)
+	// and its Dolby Vision configuration record. 0 means the file didn't say or this couldn't read it,
+	// and that includes every probe cached before these fields existed. Those still read as the title's
+	// guess rather than being re-probed, since each re-probe costs a debrid resolve.
+	BitDepth  int      `json:"bitDepth,omitempty"`
+	DVProfile int      `json:"dvProfile,omitempty"`
+	Audio     []string `json:"audioLanguages"`
+	Subtitles []string `json:"subtitleLanguages"`
 	// How many tracks carried no language at all. A release can have audio whose language nobody wrote
 	// down, and "2 untagged audio tracks" is a different, more useful statement than "no audio".
 	UntaggedAudio     int `json:"untaggedAudioTracks"`
@@ -54,7 +61,17 @@ const (
 	idLanguageBCP  = 0x22B59D // BCP-47, preferred when present
 	trackTypeAudio = 2
 	trackTypeSub   = 17
+
+	idCodecPrivate         = 0x63A2
+	idBlockAdditionMapping = 0x41E4
+	idBlockAddIDType       = 0x41E7
+	idBlockAddIDExtraData  = 0x41ED
 )
+
+// The boxes a Dolby Vision configuration record travels in. Per Dolby's ISOBMFF spec, dvcC holds
+// profiles up to 7, dvvC 8 to 10, and dvwC anything past 10. Matroska uses the same four characters,
+// as a big-endian uint, for its BlockAddIDType.
+var dvConfigTypes = []string{"dvcC", "dvvC", "dvwC"}
 
 // probeBytes is how much of the file to read. Matroska writes SeekHead/Info/Tracks up front, and the real
 // sample measured 5 KB to the end of Tracks — a megabyte is generous cover for muxers that pad, while
@@ -381,8 +398,9 @@ func uintFrom(b []byte) uint64 {
 // release, and the track listed first is routinely the plainer one — one real file listed 5.1 ahead of
 // three 7.1 tracks.
 func readTrackFacts(entry []byte, out *Probe) {
-	var kind int
+	var kind, dvProfile int
 	var codec string
+	var private []byte
 	for pos := 0; pos < len(entry); {
 		id, idLen := readID(entry[pos:])
 		if idLen == 0 {
@@ -397,6 +415,12 @@ func readTrackFacts(entry []byte, out *Probe) {
 			kind = int(uintFrom(body))
 		case idCodecID:
 			codec = codecFromMatroskaID(string(body))
+		case idCodecPrivate:
+			private = body
+		case idBlockAdditionMapping:
+			if p := matroskaDVProfile(body); p != 0 {
+				dvProfile = p
+			}
 		case idAudio:
 			if n := int(childUint(body, idChannels)); n > channelCount(out.AudioChannels) {
 				out.AudioChannels = channelLayout(n)
@@ -407,12 +431,100 @@ func readTrackFacts(entry []byte, out *Probe) {
 	}
 	if kind == trackTypeVideo && codec != "" && out.VideoCodec == "" {
 		out.VideoCodec = codec
+		out.BitDepth = bitDepthFromConfig(codec, private)
 	}
-	// Dolby Vision rides as a block-addition mapping whose name is the configuration box. Matching the
-	// literal tag is enough to say it is present, which is all the list needs to know.
-	if kind == trackTypeVideo && (indexOfBytes(entry, []byte("dvcC")) >= 0 || indexOfBytes(entry, []byte("dvvC")) >= 0) {
+	// Dolby Vision rides as a block-addition mapping whose type is the configuration box's name. The
+	// literal tag anywhere in the entry still marks it present when the mapping is too damaged to read a
+	// profile from.
+	if kind == trackTypeVideo && (dvProfile != 0 || hasDVConfigTag(entry)) {
 		out.DolbyVision = true
+		if out.DVProfile == 0 {
+			out.DVProfile = dvProfile
+		}
 	}
+}
+
+func hasDVConfigTag(entry []byte) bool {
+	for _, tag := range dvConfigTypes {
+		if indexOfBytes(entry, []byte(tag)) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// matroskaDVProfile reads one BlockAdditionMapping. Its BlockAddIDType names a Dolby Vision configuration
+// box, and its BlockAddIDExtraData holds the record itself. That is the Matroska codec-mappings spec, and
+// what ffmpeg's matroskadec reads (mkv_parse_block_addition_mappings).
+func matroskaDVProfile(mapping []byte) int {
+	typ := childUint(mapping, idBlockAddIDType)
+	for _, tag := range dvConfigTypes {
+		if typ == uint64(binary.BigEndian.Uint32([]byte(tag))) {
+			record, _, _ := findChild(mapping, idBlockAddIDExtraData)
+			return doviProfile(record)
+		}
+	}
+	return 0
+}
+
+// doviProfile reads dv_profile from a DOVIDecoderConfigurationRecord, which starts:
+//
+//	byte 0   dv_version_major                 8 bits
+//	byte 1   dv_version_minor                 8 bits
+//	byte 2   dv_profile                       high 7 bits
+//	         dv_level                         low bit of byte 2 + high 5 bits of byte 3
+//	byte 3   rpu / el / bl_present_flag       low 3 bits
+//	byte 4   dv_bl_signal_compatibility_id    high 4 bits
+//
+// Source: Dolby, "Dolby Vision Streams Within the ISO Base Media File Format", and the same fields read
+// in the same order by ffmpeg's libavformat/dovi_isom.c (ff_isom_parse_dvcc_dvvc). MP4's dvcC/dvvC/dvwC
+// box and Matroska's BlockAddIDExtraData carry this record byte for byte. Like ffmpeg, this refuses a
+// record shorter than 4 bytes.
+func doviProfile(record []byte) int {
+	if len(record) < 4 {
+		return 0
+	}
+	return int(record[2] >> 1)
+}
+
+// bitDepthFromConfig reads the luma bit depth from the configuration record a container stores for the
+// video: MP4's avcC/hvcC box, or Matroska's CodecPrivate, which holds the same bytes. 0 when it can't tell.
+func bitDepthFromConfig(codec string, record []byte) int {
+	switch codec {
+	case "h264":
+		return avcBitDepth(record)
+	case "hevc":
+		return hevcBitDepth(record)
+	}
+	return 0
+}
+
+// avcBitDepth goes by AVCProfileIndication, byte 1 of the AVCDecoderConfigurationRecord (ISO/IEC
+// 14496-15). High 10 (110) answers 10 even for 8-bit content, because a decoder without High 10 refuses
+// the profile whatever the samples are. Baseline, Main, Extended and High (66, 77, 88, 100) are 8-bit by
+// definition. The 4:2:2 and 4:4:4 profiles allow either depth and stay unknown: reading theirs means
+// parsing the SPS, for profiles no release uses.
+func avcBitDepth(record []byte) int {
+	if len(record) < 2 {
+		return 0
+	}
+	switch record[1] {
+	case 110:
+		return 10
+	case 66, 77, 88, 100:
+		return 8
+	}
+	return 0
+}
+
+// hevcBitDepth reads bitDepthLumaMinus8, the low 3 bits of byte 17 of the HEVCDecoderConfigurationRecord
+// (ISO/IEC 14496-15). The 17 bytes before it are version (1), profile (1), compatibility flags (4),
+// constraint flags (6), level (1), min_spatial_segmentation (2), parallelismType (1) and chromaFormat (1).
+func hevcBitDepth(record []byte) int {
+	if len(record) < 18 {
+		return 0
+	}
+	return int(record[17]&0x07) + 8
 }
 
 func findChild(buf []byte, want uint32) ([]byte, int, bool) {

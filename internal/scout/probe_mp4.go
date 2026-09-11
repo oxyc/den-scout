@@ -36,9 +36,7 @@ func parseMP4(head []byte) (Probe, bool) {
 			}
 		}
 		if kind == "vide" {
-			if mp4HasDolbyVision(mdia) {
-				p.DolbyVision = true
-			}
+			mp4VideoConfig(mdia, &p)
 		}
 		switch kind {
 		case "soun":
@@ -180,18 +178,31 @@ func mp4AudioChannels(mdia []byte) int {
 	return int(binary.BigEndian.Uint16(entry[16:18]))
 }
 
-// mp4HasDolbyVision looks for the DV configuration box, whose presence is the signal.
-func mp4HasDolbyVision(mdia []byte) bool {
+// mp4VideoConfig reads the configuration boxes after the video sample entry's fixed 78-byte header:
+// avcC/hvcC for the bit depth, and dvcC/dvvC/dvwC for Dolby Vision, whose presence is the signal, and
+// its profile. The first video track's depth wins, as its codec does.
+func mp4VideoConfig(mdia []byte, p *Probe) {
 	entry, ok := firstSampleEntry(mdia)
 	if !ok || len(entry) <= 78 {
-		return false
+		return
 	}
 	for _, b := range boxes(entry[78:]) {
-		if b.typ == "dvcC" || b.typ == "dvvC" {
-			return true
+		switch b.typ {
+		case "avcC":
+			if p.BitDepth == 0 {
+				p.BitDepth = avcBitDepth(b.body)
+			}
+		case "hvcC":
+			if p.BitDepth == 0 {
+				p.BitDepth = hevcBitDepth(b.body)
+			}
+		case "dvcC", "dvvC", "dvwC":
+			p.DolbyVision = true
+			if p.DVProfile == 0 {
+				p.DVProfile = doviProfile(b.body)
+			}
 		}
 	}
-	return false
 }
 
 func firstSampleEntry(mdia []byte) ([]byte, bool) {

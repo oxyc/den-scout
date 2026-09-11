@@ -241,6 +241,8 @@ func TestFourCCAndChannelMapping(t *testing.T) {
 		"XVID": "mpeg4", "divx": "mpeg4", "DX50": "mpeg4", "mp4v": "mpeg4", "FMP4": "mpeg4",
 		"avc1": "h264", "H264": "h264", "x264": "h264",
 		"hvc1": "hevc", "HEV1": "hevc", "x265": "hevc",
+		// Dolby Vision's own sample entries: profile 5 MP4s carry no other codec tag.
+		"dvh1": "hevc", "dvhe": "hevc", "dva1": "h264", "dvav": "h264",
 		"av01": "av1", "vp09": "vp9", "VP90": "vp9",
 		// Anything unrecognised must stay empty rather than becoming a wrong tag — Den's autoPickRank
 		// demotes on the codec name, so a bad guess mis-ranks a release it can't decode.
