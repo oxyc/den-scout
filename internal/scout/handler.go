@@ -1601,13 +1601,31 @@ type streamsResponse struct {
 }
 
 func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string) streamOut {
+	url := playURL(PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)})
 	return streamOut{
-		Name:          "Den Scout",
-		Title:         s.Title, // raw release name
-		URL:           playURL(PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)}),
-		Attributes:    streamAttributes(s),
-		BehaviorHints: streamHints{BingeGroup: bingeGroup(strings.ToLower(s.Title), s.Title), NotWebReady: false, Filename: s.Title},
+		Name:       "Den Scout",
+		Title:      s.Title, // raw release name
+		URL:        url,
+		Attributes: streamAttributes(s),
+		BehaviorHints: streamHints{BingeGroup: bingeGroup(strings.ToLower(s.Title), s.Title),
+			NotWebReady: !webReady(s, url), Filename: s.Title},
 	}
+}
+
+// webReady is Stremio's `notWebReady`, inverted: the URL is https and the file is an MP4. Stremio Web plays
+// a web-ready stream in the browser's own player and sends the rest through its streaming server. Every
+// stream used to claim to be web-ready, so an MKV (which Safari can't open, and whose DTS or TrueHD no
+// browser decodes) went straight to a <video> that failed. The container comes from the probe when there
+// is one, else from the release name.
+func webReady(s RawStream, url string) bool {
+	if !strings.HasPrefix(url, "https://") {
+		return false
+	}
+	if s.Probe != nil && s.Probe.Container != "" {
+		return s.Probe.Container == "mp4"
+	}
+	t := strings.ToLower(s.Title)
+	return strings.HasSuffix(t, ".mp4") || strings.HasSuffix(t, ".m4v")
 }
 
 // playURLs is how one stream list names its play URLs: a ticket per release while tickets are on, all
