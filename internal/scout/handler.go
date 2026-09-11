@@ -248,6 +248,8 @@ type Deps struct {
 	// every config minted under an older epoch. Both reach play tickets too. See admitInstall.
 	RevokedInstalls map[string]bool
 	ConfigEpoch     int
+	// Refuse a full config with no install id (REQUIRE_INSTALL_ID); see Settings.RequireInstallID.
+	RequireInstallID bool
 	// PlayTicketTTL (PLAY_TICKET_TTL_SECS) is how long a /p/ ticket stays good; zero takes the default.
 	PlayTicketTTL time.Duration
 	// LegacyPlayUntil (LEGACY_PLAY_UNTIL) closes the /<config>/play route once passed, while tickets are on.
@@ -1837,6 +1839,12 @@ func (h *handler) admitInstall(config *Config) bool {
 	if config.Epoch < h.deps.ConfigEpoch {
 		logLimited("install-epoch", "config refused: install epoch too old (%d < CONFIG_EPOCH %d)",
 			config.Epoch, h.deps.ConfigEpoch)
+		return false
+	}
+	// A scoped (availability-only) config is exempt: it can't list or play, and it is minted separately
+	// from the install, so it may carry no id of its own.
+	if h.deps.RequireInstallID && config.IID == "" && config.Scope == "" {
+		logLimited("install-no-iid", "config refused: no install id (REQUIRE_INSTALL_ID is on)")
 		return false
 	}
 	return true

@@ -42,6 +42,10 @@ type Settings struct {
 	// REVOKED_INSTALLS; ConfigEpoch (CONFIG_EPOCH) refuses every config minted under an older epoch.
 	RevokedInstalls []string
 	ConfigEpoch     int
+	// REQUIRE_INSTALL_ID: refuse a full config that carries no install id — every link built before ids
+	// existed. The one lever for retiring those: they can't be named, and raising CONFIG_EPOCH would also
+	// refuse the links minted since, which carry the same epoch.
+	RequireInstallID bool
 	// PLAY_TICKET_TTL_SECS: how long a /p/ ticket in a stream list stays good.
 	PlayTicketTTL time.Duration
 	// LEGACY_PLAY_UNTIL: when the /<config>/play route closes, once tickets are on. Zero = never.
@@ -82,6 +86,7 @@ func StartupSummary(s Settings, persistent bool) string {
 		" — metrics=" + onOff(s.MetricsToken != "") + " log_requests=" + onOff(s.LogRequests) +
 		" sealed=" + onOff(s.ConfigKey != "") +
 		" revoked=" + strconv.Itoa(len(s.RevokedInstalls)) + " epoch=" + strconv.Itoa(s.ConfigEpoch) +
+		" require_iid=" + onOff(s.RequireInstallID) +
 		" indexers=" + names(defaultIndexers) + " overrides=" + names(overridden) +
 		" disabled=" + names(disabled) + " minting=" + onOff(s.MintIndexerConfigs) +
 		" cache=" + s.CacheDir + " cache_persistent=" + onOff(persistent)
@@ -108,10 +113,11 @@ func SettingsFromEnv(get func(string) string) Settings {
 		MetricsToken:   get("METRICS_TOKEN"),
 		MintIndexerConfigs: strings.EqualFold(get("MINT_INDEXER_CONFIGS"), "true") ||
 			get("MINT_INDEXER_CONFIGS") == "1",
-		LogRequests:     get("LOG_REQUESTS") != "" && get("LOG_REQUESTS") != "0",
-		RevokedInstalls: parseRevokedInstalls(get("REVOKED_INSTALLS")),
-		ConfigEpoch:     parseConfigEpoch(get("CONFIG_EPOCH")),
-		PlayTicketTTL:   durEnv(get("PLAY_TICKET_TTL_SECS"), time.Second, defaultPlayTicketTTL),
+		LogRequests:      get("LOG_REQUESTS") != "" && get("LOG_REQUESTS") != "0",
+		RevokedInstalls:  parseRevokedInstalls(get("REVOKED_INSTALLS")),
+		ConfigEpoch:      parseConfigEpoch(get("CONFIG_EPOCH")),
+		RequireInstallID: get("REQUIRE_INSTALL_ID") != "" && get("REQUIRE_INSTALL_ID") != "0",
+		PlayTicketTTL:    durEnv(get("PLAY_TICKET_TTL_SECS"), time.Second, defaultPlayTicketTTL),
 		// Only read with a key set: without one there are no tickets, and the legacy route is the only one.
 		LegacyPlayUntil: parseLegacyPlayUntil(get("LEGACY_PLAY_UNTIL"), get("CONFIG_KEY") != ""),
 	}
@@ -239,10 +245,11 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		MetricsToken:  settings.MetricsToken,
 		LogRequests:   settings.LogRequests,
 
-		RevokedInstalls: revoked,
-		ConfigEpoch:     settings.ConfigEpoch,
-		PlayTicketTTL:   settings.PlayTicketTTL,
-		LegacyPlayUntil: settings.LegacyPlayUntil,
+		RevokedInstalls:  revoked,
+		ConfigEpoch:      settings.ConfigEpoch,
+		RequireInstallID: settings.RequireInstallID,
+		PlayTicketTTL:    settings.PlayTicketTTL,
+		LegacyPlayUntil:  settings.LegacyPlayUntil,
 	}
 }
 

@@ -313,6 +313,31 @@ func TestConfigEpoch_refusesWhatWasMintedBeforeIt(t *testing.T) {
 	}
 }
 
+// REQUIRE_INSTALL_ID refuses every full config minted before install ids, keeps those that carry one, and
+// leaves a scoped config alone.
+func TestRequireInstallID_refusesOnlyLinksWithoutOne(t *testing.T) {
+	kr := ticketKeyring(t)
+	withID := sealedConfig(t, kr, ticketCfg+`,"iid":"`+testIID+`"}`)
+	without := sealedConfig(t, kr, ticketCfg+`}`)
+	h := NewHandler(testDeps(func(d *Deps) { d.SealKeyring = kr; d.RequireInstallID = true }))
+	for path, want := range map[string]int{
+		"/" + without + "/manifest.json":   http.StatusBadRequest,
+		"/" + validBlob + "/manifest.json": http.StatusBadRequest,
+		"/" + withID + "/manifest.json":    http.StatusOK,
+	} {
+		if rr := do(h, path, nil); rr.Code != want {
+			t.Errorf("%s: %d, want %d", strings.NewReplacer(without, "<no-iid>", withID, "<iid>").Replace(path), rr.Code, want)
+		}
+	}
+	strict := &handler{deps: Deps{RequireInstallID: true}}
+	if !strict.admitInstall(&Config{Scope: scopeAvailability}) {
+		t.Error("a scoped config was refused for having no install id")
+	}
+	if (&handler{}).admitInstall(&Config{}) != true {
+		t.Error("off by default: a config without an id must still be admitted")
+	}
+}
+
 // The install id and epoch are strictly validated; a config carrying a bad one is refused, not trimmed.
 func TestConfig_installIDAndEpoch(t *testing.T) {
 	const account = `{"debrid":[{"service":"torbox","token":"t"}],`
