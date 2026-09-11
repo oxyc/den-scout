@@ -118,9 +118,12 @@ func TestRoutesSealedConfig(t *testing.T) {
 	if rr := do(noKey, "/config-key", nil); rr.Code != 404 {
 		t.Errorf("config-key without keyring should 404: %d", rr.Code)
 	}
-	// Back-compat: legacy plaintext still resolves when a keyring IS configured.
-	if rr := do(h, "/"+validBlob+"/manifest.json", nil); rr.Code != 200 {
-		t.Errorf("legacy plaintext with keyring: %d", rr.Code)
+	// With a keyring configured, plaintext is refused: every issued install is sealed then.
+	if rr := do(h, "/"+validBlob+"/manifest.json", nil); rr.Code != 400 {
+		t.Errorf("plaintext with a keyring should 400: %d", rr.Code)
+	}
+	if rr := do(noKey, "/"+validBlob+"/manifest.json", nil); rr.Code != 200 {
+		t.Errorf("plaintext with no keyring should resolve: %d", rr.Code)
 	}
 }
 

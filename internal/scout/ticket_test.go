@@ -394,7 +394,10 @@ func TestVerdictPrefix_ignoresScopeInstallAndEpoch(t *testing.T) {
 // them it is the only play route there is.
 func TestLegacyPlay_closesAtLegacyPlayUntil(t *testing.T) {
 	kr := ticketKeyring(t)
-	path := "/" + validBlob + "/play/" + encodePlayToken(PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(0)})
+	token := "/play/" + encodePlayToken(PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(0)})
+	// With a keyring only a sealed config is an install; without one the plaintext blob is.
+	sealedPath := "/" + sealedConfig(t, kr, ticketCfg+`}`) + token
+	plainPath := "/" + validBlob + token
 	for name, c := range map[string]struct {
 		kr    *sealKeyring
 		until time.Time
@@ -405,6 +408,10 @@ func TestLegacyPlay_closesAtLegacyPlayUntil(t *testing.T) {
 		"after the deadline":           {kr, time.Now().Add(-time.Second), http.StatusForbidden},
 		"a passed deadline, no ticket": {nil, time.Now().Add(-time.Second), http.StatusFound},
 	} {
+		path := plainPath
+		if c.kr != nil {
+			path = sealedPath
+		}
 		h := NewHandler(testDeps(func(d *Deps) { d.SealKeyring = c.kr; d.LegacyPlayUntil = c.until }))
 		if rr := do(h, path, nil); rr.Code != c.want {
 			t.Errorf("%s: %d, want %d", name, rr.Code, c.want)
@@ -413,12 +420,14 @@ func TestLegacyPlay_closesAtLegacyPlayUntil(t *testing.T) {
 }
 
 func TestLegacyPlay_isLoggedOnceWhileTicketsAreOn(t *testing.T) {
-	path := "/" + validBlob + "/play/" + encodePlayToken(PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(0)})
+	kr := ticketKeyring(t)
+	token := "/play/" + encodePlayToken(PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(0)})
 	out := captureLog(t)
-	do(NewHandler(testDeps(nil)), path, nil)
-	h := NewHandler(testDeps(func(d *Deps) { d.SealKeyring = ticketKeyring(t) }))
-	do(h, path, nil)
-	do(h, path, nil)
+	do(NewHandler(testDeps(nil)), "/"+validBlob+token, nil)
+	h := NewHandler(testDeps(func(d *Deps) { d.SealKeyring = kr }))
+	sealedPath := "/" + sealedConfig(t, kr, ticketCfg+`}`) + token
+	do(h, sealedPath, nil)
+	do(h, sealedPath, nil)
 	if n := strings.Count(out.String(), "serving a legacy /<config>/play URL"); n != 1 {
 		t.Errorf("logged %d times, want once:\n%s", n, out)
 	}
