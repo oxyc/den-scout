@@ -2,7 +2,8 @@
 
 **Status:** **den-scout DONE** (`e1d7994`/`dbd257c`) + **den-subtitles DONE** (`1fe426a`) + **den-reel
 DONE** (`5e39112`). All three addons seal the config in the browser at `/configure` and resolve sealed
-URLs end-to-end; legacy plaintext still works; token never logged; tiny deps only. Interop proven every
+URLs end-to-end; plaintext works only with sealing off (refused once a key is set, oxyc/den#15); token
+never logged; tiny deps only. Interop proven every
 direction: **libsodium ↔ Go ↔ Rust** (via the fixed PyNaCl vector) and **JS (browser bundle) → Go and →
 Rust**. Activate per deployment by setting `CONFIG_KEY` in each addon's env (the same name in all three;
 base64 32-byte X25519 private key; unset = legacy, still works). den-reel additionally moved its former
@@ -43,8 +44,11 @@ for den-reel it's what lets the app inject its Keychain TMDB key so the server e
 
 ## Operator runbook — activating sealing (what to do per deployment)
 
-Sealing is **off until an env key is set**; with no key each addon keeps serving legacy plaintext URLs, so
-these steps are safe to do in any order and never break an existing install.
+Sealing is **off until an env key is set**; with no key each addon keeps serving legacy plaintext URLs.
+**Once a key is set, all three refuse plaintext configs** (a 400 and a rate-limited `plaintext config while
+sealing is on` log line): every install `/configure` issues is then sealed, and `/config-key` is public, so a
+plaintext config is one anyone could have minted. Sealing hides the secret; the refusal is what makes an
+install one this server issued. So re-add every install from `/configure` before setting the key.
 
 **1. Generate a keypair-seed per addon** (a base64 32-byte X25519 private key):
 ```

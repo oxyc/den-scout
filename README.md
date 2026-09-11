@@ -27,7 +27,8 @@ resolve to a server you control, so the app just renders what comes back.
 1. **Config in the URL** (Torrentio-style): a base64url blob — debrid service + token, indexers,
    filters — rides in the addon path. Build it at `/configure`, which **seals** it in the browser to
    the server's X25519 public key (served at `/config-key`) when one is configured, so the link
-   carries ciphertext rather than your token; legacy plaintext blobs still resolve. See
+   carries ciphertext rather than your token. With a key configured, a plaintext blob is refused:
+   `/config-key` is public, so anyone could otherwise base64 their own token into a working install. See
    [`docs/SEALED-CONFIG.md`](docs/SEALED-CONFIG.md). Sealed or not, the link remains a bearer
    credential — whoever holds it can spend the account's quota — so the Den app keeps it in the
    Keychain and never logs it.

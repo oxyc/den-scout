@@ -123,9 +123,14 @@ func TestDecodeConfigSealed(t *testing.T) {
 	if _, ok := decodeConfig(other, seg); ok {
 		t.Error("sealed to a different key must fail closed")
 	}
-	// Legacy plaintext still decodes even when a keyring is present (back-compat).
-	if _, ok := decodeConfig(kr, blob(`{"debrid":[{"service":"torbox","token":"t"}]}`)); !ok {
-		t.Error("legacy plaintext must still decode with a keyring set")
+	// With a keyring, plaintext is refused: every issued install is sealed, and /config-key is public, so a
+	// plaintext config is one anyone could have minted. Without one it is the only form, and decodes.
+	plain := blob(`{"debrid":[{"service":"torbox","token":"t"}]}`)
+	if _, ok := decodeConfig(kr, plain); ok {
+		t.Error("a plaintext config must be refused while sealing is on")
+	}
+	if _, ok := decodeConfig(nil, plain); !ok {
+		t.Error("a plaintext config must decode with sealing off")
 	}
 }
 

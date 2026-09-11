@@ -238,6 +238,13 @@ func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
 			return nil, false
 		}
 		data = pt
+	} else if kr != nil {
+		// With a key configured, every install /configure issues is sealed, so a plaintext one was not
+		// issued here: /config-key is public, and anyone could otherwise base64 their own debrid token into
+		// a working install. Sealing hides the token; this refusal is what makes an install one we issued.
+		// Without a key (local development) plaintext stays the only form there is.
+		logLimited("plaintext-refused", "config refused: plaintext config while sealing is on")
+		return nil, false
 	}
 	var raw rawConfig
 	if json.Unmarshal(data, &raw) != nil {
