@@ -91,6 +91,11 @@ Every config `/configure` builds carries two more sealed fields:
 Both are optional, and they are accepted in plaintext configs too. A config with a malformed `iid` or `ep`
 is refused.
 
+The id is shown in two places, spelled as `REVOKED_INSTALLS` takes it: `/configure` prints it under the
+link it just built, and the install's own manifest (`/<config>/manifest.json`) carries it as the
+top-level `denInstallId`, so a client holding the link can show it (Den: Settings › Plugins). A config
+without an `iid` gets no `denInstallId`.
+
 - **One install:** add its id to `REVOKED_INSTALLS=<iid>,<iid>,…` and restart. Its config segment is
   refused on every route, and so is every play ticket it already holds. The log line names the reason
   (`install revoked`) and the first six characters of the id. The id of an install that is not revoked is
@@ -107,8 +112,9 @@ What this does not cover:
 - **A debrid token that was ever in plaintext** — in a legacy URL, a screenshot or a log — can only be
   killed at the debrid. Regenerate the token in the debrid account's settings. Revoking the install
   stops *this addon* using the URL; the token itself still works against the debrid's API.
-- **There is no tool to read an `iid` back out of a sealed URL yet.** Only the addon's key can open it.
-  Until there is one, `CONFIG_EPOCH` is the practical lever for a URL whose id nobody recorded.
+- **An `iid` is read back through the addon.** Only the addon's key can open a sealed URL, so the way to
+  learn a link's id after the fact is to fetch its manifest and read `denInstallId`. A link that was
+  lost as well as leaked has no id to read; `CONFIG_EPOCH` is the lever for that one.
 - **Without `CONFIG_KEY`, `/config-key` answers 404**, so `/configure` can't learn the epoch. Raising
   `CONFIG_EPOCH` on an addon with no key refuses the plaintext links built afterwards as well.
 - **A warm stream-list hit is served without opening the config.** For a few minutes after a revocation,

@@ -70,7 +70,7 @@ GET  /metrics                            Prometheus text (bearer token; 404 unle
 GET  /config-key                         { key, epoch } — X25519 public key for sealing, current CONFIG_EPOCH (404 if unset)
 POST /validate                           { service, token } → { valid, reason } — check a debrid key
 GET  /manifest.json                      unconfigured manifest (configurationRequired)
-GET  /<config>/manifest.json             configured manifest
+GET  /<config>/manifest.json             configured manifest, + denInstallId (the install's iid, if it has one)
 GET  /<config>/stream/<movie|series>/<id>.json   ranked, clean, cached streams
 GET  /<config>/stream/…?debug=1          the same list plus per-filter drop counts and scores
 GET  /<config>/play/<token>              302 → cached debrid link
@@ -157,7 +157,7 @@ only tunes runtime behaviour; every variable is listed, commented, in `.env.exam
 | `METRICS_TOKEN` | — | bearer token for `/metrics`; unset = the route 404s (the counters reveal when the install is being watched) |
 | `CONFIG_KEY` | — | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |
 | `CONFIG_KEYS_PREV` | — | prior keys, comma-separated, so a rotation doesn't break live installs (it also means rotation is **not** revocation) |
-| `REVOKED_INSTALLS` | — | install ids (`iid`), comma-separated, refused outright, their outstanding play tickets included |
+| `REVOKED_INSTALLS` | — | install ids (`iid`), comma-separated, refused outright, their outstanding play tickets included. `/configure` shows a link's id when it builds it, and the install's manifest carries it as `denInstallId` |
 | `CONFIG_EPOCH` | `0` | refuse every config minted under a lower epoch (`ep`), to revoke all installs without rotating `CONFIG_KEY`; `/configure` stamps new links with it |
 | `REQUIRE_INSTALL_ID` | `0` | `1` = refuse a full config with no install id (every link minted before ids existed); scoped configs are exempt |
 | `REMUX_KEY` | — | den-remux's service key: a request carrying it in `X-Den-Remux-Key` may list and play with an availability-scoped config (its lists are cached apart). Unset = scoped configs never list or play |

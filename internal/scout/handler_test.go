@@ -127,6 +127,53 @@ func TestRoutesSealedConfig(t *testing.T) {
 	}
 }
 
+// The configured manifest names its install as REVOKED_INSTALLS spells it; a config without an id, and the
+// unconfigured manifest, carry no such field. The ETag is over the body, so one install's validator never
+// earns another install a 304.
+func TestManifest_namesTheInstall(t *testing.T) {
+	kr := ticketKeyring(t)
+	withID := sealedConfig(t, kr, ticketCfg+`,"iid":"`+testIID+`"}`)
+	other := sealedConfig(t, kr, ticketCfg+`,"iid":"`+otherIID+`"}`)
+	without := sealedConfig(t, kr, ticketCfg+`}`)
+	h := NewHandler(testDeps(func(d *Deps) { d.SealKeyring = kr }))
+
+	installID := func(rr *httptest.ResponseRecorder) any {
+		var m map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &m); err != nil {
+			t.Fatalf("manifest is not JSON (%d): %v", rr.Code, err)
+		}
+		return m["denInstallId"]
+	}
+	first := do(h, "/"+withID+"/manifest.json", nil)
+	if first.Code != 200 || installID(first) != testIID {
+		t.Errorf("with an iid: %d %s", first.Code, first.Body.String())
+	}
+	for name, path := range map[string]string{"no iid": "/" + without + "/manifest.json", "unconfigured": "/manifest.json"} {
+		if rr := do(h, path, nil); rr.Code != 200 || strings.Contains(rr.Body.String(), "denInstallId") {
+			t.Errorf("%s: %d %s", name, rr.Code, rr.Body.String())
+		}
+	}
+	rr := do(h, "/"+other+"/manifest.json", map[string]string{"If-None-Match": first.Header().Get("etag")})
+	if rr.Code != 200 || installID(rr) != otherIID {
+		t.Errorf("another install with the first one's ETag: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+// /configure shows the id of the link it just built, with the variable that revokes it.
+func TestConfigurePage_showsTheInstallID(t *testing.T) {
+	page := do(NewHandler(testDeps(nil)), "/configure", nil).Body.String()
+	for _, want := range []string{
+		`<code id="installId"></code>`,
+		"lastInstallID = config.iid;",
+		`$("installId").textContent = lastInstallID;`,
+		"<code>REVOKED_INSTALLS</code> to revoke just this link",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("configure page lacks %q", want)
+		}
+	}
+}
+
 func TestRoutesStream(t *testing.T) {
 	h := NewHandler(testDeps(nil))
 	rr := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil)

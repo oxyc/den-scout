@@ -45,6 +45,7 @@
   .err { color: #ff6b6b; min-height: 1.1rem; margin-top: .5rem; font-size: .85rem; }
   .foot { margin-top: 1rem; color: #8b919b; font-size: .8rem; }
   .foot a { color: #8b919b; }
+  #installId { color: #c9ccd3; font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
 </style></head><body>
 <main>
 <h1>Den Scout</h1>
@@ -112,6 +113,7 @@
   <h2>Your install link</h2>
   <textarea id="url" readonly rows="3" aria-label="Install URL"></textarea>
   <div class="row"><button id="copy" type="button">Copy link</button></div>
+  <p class="foot">Install id: <code id="installId"></code> — put this in <code>REVOKED_INSTALLS</code> to revoke just this link.</p>
   <p class="note" id="sealNote"></p>
   <p class="disclaimer" id="sealDisclaimer"></p>
   <p class="foot">In Den: Settings → Plugins → Add, paste this link. &nbsp;·&nbsp;
@@ -3505,13 +3507,15 @@ function fillForm(s) {
     return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
-  var lastBuildSealed = false;
+  var lastBuildSealed = false, lastInstallID = null;
   // Turn the config object into the URL path segment: sealed ciphertext when a key is served, else
-  // plaintext. Records which was used so the page can show an honest "sealed / not sealed" note.
+  // plaintext. Records which was used so the page can show an honest "sealed / not sealed" note, and the
+  // install id it minted so the page can show that too.
   function toSegment(config) {
     // Stamped on a copy: the form saved in this browser must not keep the id, or every later link built
     // from it would share one install.
     config = Object.assign({}, config, { iid: mintInstallID() });
+    lastInstallID = config.iid;
     if (sealEpoch !== null) config.ep = sealEpoch;
     if (sealPublicKey && window.DenSeal) {
       try {
@@ -3555,6 +3559,7 @@ function fillForm(s) {
     if (!config) return;
     saveSettings(config);
     $("url").value = location.origin + "/" + toSegment(config) + "/manifest.json";
+    $("installId").textContent = lastInstallID;
     $("out").classList.remove("hidden");
     renderSecurityNote();
     copyInstallURL(); // selects the whole URL, focuses it, and copies to the clipboard

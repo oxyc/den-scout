@@ -13,6 +13,9 @@ type manifestJSON struct {
 	IDPrefixes    []string      `json:"idPrefixes"`
 	Catalogs      []struct{}    `json:"catalogs"`
 	BehaviorHints manifestHints `json:"behaviorHints"`
+	// DenInstallID is the configured install's id, spelled as REVOKED_INSTALLS takes it, so the owner can
+	// revoke one link from what the app shows. Omitted when the config carries none.
+	DenInstallID string `json:"denInstallId,omitempty"`
 }
 
 type manifestHints struct {
@@ -20,13 +23,15 @@ type manifestHints struct {
 	ConfigurationRequired bool `json:"configurationRequired"`
 }
 
-const manifestVersion = "0.18.1"
+const manifestVersion = "0.19.0"
 
 // buildManifest returns the manifest for a config (nil = unconfigured).
 func buildManifest(config *Config) manifestJSON {
 	configured := config != nil
 	description := "Self-hosted stream aggregator for Den — configure to add your debrid token."
+	installID := ""
 	if configured {
+		installID = config.IID
 		services := make([]string, len(config.Debrid))
 		for i, d := range config.Debrid {
 			services[i] = string(d.Service)
@@ -43,5 +48,6 @@ func buildManifest(config *Config) manifestJSON {
 		IDPrefixes:    []string{"tt"},
 		Catalogs:      []struct{}{},
 		BehaviorHints: manifestHints{Configurable: true, ConfigurationRequired: !configured},
+		DenInstallID:  installID,
 	}
 }
