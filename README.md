@@ -158,6 +158,8 @@ only tunes runtime behaviour; every variable is listed, commented, in `.env.exam
 | `CONFIG_KEYS_PREV` | — | prior keys, comma-separated, so a rotation doesn't break live installs (it also means rotation is **not** revocation) |
 | `REVOKED_INSTALLS` | — | install ids (`iid`), comma-separated, refused outright, their outstanding play tickets included |
 | `CONFIG_EPOCH` | `0` | refuse every config minted under a lower epoch (`ep`), to revoke all installs without rotating `CONFIG_KEY`; `/configure` stamps new links with it |
+| `REQUIRE_INSTALL_ID` | `0` | `1` = refuse a full config with no install id (every link minted before ids existed); scoped configs are exempt |
+| `REMUX_KEY` | — | den-remux's service key: a request carrying it in `X-Den-Remux-Key` may list and play with an availability-scoped config (its lists are cached apart). Unset = scoped configs never list or play |
 | `PLAY_TICKET_TTL_SECS` | `86400` | how long a `/p/` play URL stays good (with `CONFIG_KEY` set); keep it well above 3×`LIST_TTL_SECS` |
 | `LEGACY_PLAY_UNTIL` | — | RFC 3339 moment the old `/<config>/play` route closes while tickets are on; unset = open, unparseable = closed |
 | `MINT_INDEXER_CONFIGS` | `false` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts**; an explicit `COMET_URL`/`MEDIAFUSION_URL` always wins |

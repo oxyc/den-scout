@@ -250,6 +250,8 @@ type Deps struct {
 	ConfigEpoch     int
 	// Refuse a full config with no install id (REQUIRE_INSTALL_ID); see Settings.RequireInstallID.
 	RequireInstallID bool
+	// den-remux's service key (REMUX_KEY); see Settings.RemuxKey and refuseScoped.
+	RemuxKey string
 	// PlayTicketTTL (PLAY_TICKET_TTL_SECS) is how long a /p/ ticket stays good; zero takes the default.
 	PlayTicketTTL time.Duration
 	// LegacyPlayUntil (LEGACY_PLAY_UNTIL) closes the /<config>/play route once passed, while tickets are on.
@@ -540,6 +542,11 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	origin := h.publicOrigin(r)
 	// audit #7 (collision-resistant key) + #8 (origin part) + #16 (key off the raw blob, decode later).
 	cacheKey := "list:" + keyHash(configBlob) + ":" + keyHash(origin) + ":" + streamCacheID(sid)
+	// A warm hit serves the list without opening the config, so a list den-remux built for a scoped config
+	// must never be what a request without its key hits. Its own key keeps the two apart.
+	if h.remuxAuthorized(r) {
+		cacheKey += ":remux"
+	}
 
 	// ?debug=1 — "where did this list go", answered exactly instead of guessed from a log line.
 	//
@@ -573,7 +580,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 			writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 			return
 		}
-		if refuseScoped(w, config) {
+		if h.refuseScoped(w, r, config) {
 			return
 		}
 		if !debugLimiter.allow(debugLimiterKey) {
@@ -632,7 +639,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	}
 	// Only the miss path needs this: a warm hit is keyed on the blob, and nothing builds a list for a
 	// scoped blob to hit.
-	if refuseScoped(w, config) {
+	if h.refuseScoped(w, r, config) {
 		return
 	}
 
@@ -1193,7 +1200,7 @@ func (h *handler) handlePlay(w http.ResponseWriter, r *http.Request, configBlob 
 		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
 		return
 	}
-	if refuseScoped(w, config) {
+	if h.refuseScoped(w, r, config) {
 		return
 	}
 	if h.tickets != nil && h.legacyPlayNoted.CompareAndSwap(false, true) {
@@ -1816,10 +1823,21 @@ func writeJSON(w http.ResponseWriter, status int, body any, cacheControl string)
 
 func errBody(msg string) map[string]string { return map[string]string{"error": msg} }
 
+// remuxAuthorized reports whether the request carries den-remux's service key (X-Den-Remux-Key), compared
+// in constant time. Never true while REMUX_KEY is unset.
+func (h *handler) remuxAuthorized(r *http.Request) bool {
+	key := h.deps.RemuxKey
+	got := r.Header.Get("X-Den-Remux-Key")
+	return key != "" && got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(key)) == 1
+}
+
 // refuseScoped answers 403 for a scoped config on a route outside its scope — every route that lists or
-// plays streams — and reports whether it did.
-func refuseScoped(w http.ResponseWriter, config *Config) bool {
-	if config.Scope == "" {
+// plays streams — and reports whether it did. The one exception is den-remux: with its service key, an
+// availability-scoped config may list and play, so the browser drives playback through den-remux with the
+// scoped URL it already holds and never gets a stream-capable config. The resulting tickets stay on the
+// homelab (den-remux resolves them; the browser gets only its own signed session URLs).
+func (h *handler) refuseScoped(w http.ResponseWriter, r *http.Request, config *Config) bool {
+	if config.Scope == "" || (config.Scope == scopeAvailability && h.remuxAuthorized(r)) {
 		return false
 	}
 	writeJSON(w, http.StatusForbidden, errBody("out_of_scope"), noStore)

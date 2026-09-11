@@ -46,6 +46,10 @@ type Settings struct {
 	// existed. The one lever for retiring those: they can't be named, and raising CONFIG_EPOCH would also
 	// refuse the links minted since, which carry the same epoch.
 	RequireInstallID bool
+	// REMUX_KEY: den-remux's service key. A request carrying it in X-Den-Remux-Key may list and play with a
+	// scoped (availability-only) config, so the browser's scoped URL can drive den-remux without the browser
+	// ever holding a stream-capable config. Empty = a scoped config never lists or plays.
+	RemuxKey string
 	// PLAY_TICKET_TTL_SECS: how long a /p/ ticket in a stream list stays good.
 	PlayTicketTTL time.Duration
 	// LEGACY_PLAY_UNTIL: when the /<config>/play route closes, once tickets are on. Zero = never.
@@ -86,7 +90,7 @@ func StartupSummary(s Settings, persistent bool) string {
 		" — metrics=" + onOff(s.MetricsToken != "") + " log_requests=" + onOff(s.LogRequests) +
 		" sealed=" + onOff(s.ConfigKey != "") +
 		" revoked=" + strconv.Itoa(len(s.RevokedInstalls)) + " epoch=" + strconv.Itoa(s.ConfigEpoch) +
-		" require_iid=" + onOff(s.RequireInstallID) +
+		" require_iid=" + onOff(s.RequireInstallID) + " remux=" + onOff(s.RemuxKey != "") +
 		" indexers=" + names(defaultIndexers) + " overrides=" + names(overridden) +
 		" disabled=" + names(disabled) + " minting=" + onOff(s.MintIndexerConfigs) +
 		" cache=" + s.CacheDir + " cache_persistent=" + onOff(persistent)
@@ -117,6 +121,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 		RevokedInstalls:  parseRevokedInstalls(get("REVOKED_INSTALLS")),
 		ConfigEpoch:      parseConfigEpoch(get("CONFIG_EPOCH")),
 		RequireInstallID: get("REQUIRE_INSTALL_ID") != "" && get("REQUIRE_INSTALL_ID") != "0",
+		RemuxKey:         get("REMUX_KEY"),
 		PlayTicketTTL:    durEnv(get("PLAY_TICKET_TTL_SECS"), time.Second, defaultPlayTicketTTL),
 		// Only read with a key set: without one there are no tickets, and the legacy route is the only one.
 		LegacyPlayUntil: parseLegacyPlayUntil(get("LEGACY_PLAY_UNTIL"), get("CONFIG_KEY") != ""),
@@ -248,6 +253,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		RevokedInstalls:  revoked,
 		ConfigEpoch:      settings.ConfigEpoch,
 		RequireInstallID: settings.RequireInstallID,
+		RemuxKey:         settings.RemuxKey,
 		PlayTicketTTL:    settings.PlayTicketTTL,
 		LegacyPlayUntil:  settings.LegacyPlayUntil,
 	}
