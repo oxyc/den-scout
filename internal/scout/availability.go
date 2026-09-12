@@ -109,6 +109,16 @@ func (h *handler) recordVerdict(key string, available bool) {
 	}
 }
 
+// One playable release settles availability; an empty partial list cannot settle absence. This also
+// covers a nonempty scrape whose surviving releases were all removed by the viewer's filters.
+func (h *handler) recordListVerdict(key string, list rankedList) {
+	if list.degraded != "" || (len(list.ranked) == 0 && !list.complete) {
+		h.deps.Cache.Put(key, verdictUndetermined, availabilityRetryAfter)
+		return
+	}
+	h.recordVerdict(key, len(list.ranked) > 0)
+}
+
 // checkBehind starts a background check of one movie, unless one is already running for it or the ceiling
 // is reached. Booked before the goroutine exists, so a flood of asks costs a map lookup each rather than a
 // goroutine each.
@@ -137,10 +147,6 @@ func (h *handler) checkBehind(config *Config, imdb, key string) {
 		ctx, cancel := context.WithTimeout(context.Background(), h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
 		list := h.rankList(ctx, config, &StreamID{Type: "movie", IMDb: imdb}, nil)
-		if list.degraded != "" {
-			h.deps.Cache.Put(key, verdictUndetermined, availabilityRetryAfter)
-			return
-		}
-		h.recordVerdict(key, len(list.ranked) > 0)
+		h.recordListVerdict(key, list)
 	}()
 }

@@ -759,7 +759,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 	// A movie's list answers the availability route's question too, so a title someone opened needs no
 	// check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one.
 	if sid.Type == "movie" && list.degraded == "" && dbg == nil {
-		h.recordVerdict(verdictPrefix(config)+sid.IMDb, len(list.ranked) > 0)
+		h.recordListVerdict(verdictPrefix(config)+sid.IMDb, list)
 	}
 	return h.finishStreamList(ctx, config, configBlob, sid, origin, cacheKey, dbg, list)
 }
@@ -1870,8 +1870,8 @@ func (h *handler) admitInstall(config *Config) bool {
 			config.Epoch, h.deps.ConfigEpoch)
 		return false
 	}
-	// A scoped (availability-only) config is exempt: it can't list or play, and it is minted separately
-	// from the install, so it may carry no id of its own.
+	// A scoped config is minted separately from the install and may carry no id. Tickets den-remux is
+	// authorized to mint from it preserve that provenance; epoch and named revocation still apply above.
 	if h.deps.RequireInstallID && config.IID == "" && config.Scope == "" {
 		logLimited("install-no-iid", "config refused: no install id (REQUIRE_INSTALL_ID is on)")
 		return false

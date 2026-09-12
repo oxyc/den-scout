@@ -110,6 +110,58 @@ func TestAvailability_aStreamListRecordsTheVerdict(t *testing.T) {
 	}
 }
 
+// A nonempty partial scrape may become empty after filtering. The missing indexer could still have
+// a playable release, so neither the stream route nor the background checker may record absence.
+func TestAvailability_partialFilteredListStaysUnknown(t *testing.T) {
+	for _, fromStream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", fromStream), func(t *testing.T) {
+			var scrapes atomic.Int32
+			deps := testDeps(func(d *Deps) {
+				d.MakeScrapers = func(*Config) []scraper {
+					return []scraper{
+						fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+							scrapes.Add(1)
+							return testSeeds()[2:], nil // only the CAM survives this indexer
+						}},
+						fakeScraper{"comet", func(context.Context) ([]RawStream, error) {
+							return nil, errors.New("temporary outage")
+						}},
+					}
+				}
+			})
+			h := NewHandler(deps)
+			if fromStream {
+				if rr := do(h, "/"+validBlob+"/stream/movie/tt1234567.json", nil); rr.Code != http.StatusOK {
+					t.Fatalf("stream: %d", rr.Code)
+				}
+			} else {
+				availabilityOf(t, h, validBlob, "tt1234567")
+			}
+			config, _ := decodeConfig(nil, validBlob)
+			key := verdictPrefix(config) + "tt1234567"
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				if verdict, ok := deps.Cache.Get(key); ok {
+					if verdict != verdictUndetermined {
+						t.Fatalf("partial filtered list verdict = %q", verdict)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("background check never recorded its result")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if got := availabilityOf(t, h, validBlob, "tt1234567"); got != "unknown" {
+				t.Errorf("availability = %q", got)
+			}
+			if n := scrapes.Load(); n != 1 {
+				t.Errorf("scrapes = %d; unknown should retain the retry backoff", n)
+			}
+		})
+	}
+}
+
 // The scoped config answers availability — reading the verdicts the full config wrote — and its manifest,
 // and nothing that lists or plays streams. A scope on a plaintext config, or an unknown one, is refused.
 func TestAvailability_theScopedConfig(t *testing.T) {

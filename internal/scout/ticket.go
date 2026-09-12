@@ -64,20 +64,22 @@ func newTicketKeys(kr *sealKeyring) *ticketKeys {
 
 // ticketWire is a ticket's payload: the target a legacy token names, the accounts the resolve uses, the
 // expiry, and the install id and epoch revocation checks. Nothing else of the config goes in — no filters,
-// indexers or scope — because the play route reads none of it.
+// indexers. Scope records the admission provenance: availability configs may legitimately lack an
+// install id, including when den-remux is authorized to mint tickets for them.
 type ticketWire struct {
 	playWire             // h, f, s, e
 	D        [][2]string `json:"d"` // [service, token] per account, in config order
 	X        int64       `json:"x"` // expiry, unix seconds
 	I        string      `json:"i,omitempty"`
 	P        int         `json:"p,omitempty"`
+	Scope    string      `json:"scope,omitempty"`
 }
 
 // mint seals a ticket for one release of this config, good until exp.
 func (t *ticketKeys) mint(config *Config, target PlayTarget, exp time.Time) string {
 	w := ticketWire{
 		playWire: playWire{H: target.InfoHash, F: target.FileIdx, S: target.Season, E: target.Episode},
-		X:        exp.Unix(), I: config.IID, P: config.Epoch,
+		X:        exp.Unix(), I: config.IID, P: config.Epoch, Scope: config.Scope,
 	}
 	for _, d := range config.Debrid {
 		w.D = append(w.D, [2]string{string(d.Service), d.Token})
@@ -124,7 +126,10 @@ func (t *ticketKeys) open(ticket string, now time.Time) (*Config, *PlayTarget, e
 	if !infoHashRe.MatchString(h) {
 		return nil, nil, errTicketBad
 	}
-	config := &Config{IID: w.I, Epoch: w.P}
+	if w.Scope != "" && w.Scope != scopeAvailability {
+		return nil, nil, errTicketBad
+	}
+	config := &Config{IID: w.I, Epoch: w.P, Scope: w.Scope}
 	for _, d := range w.D {
 		if !isDebridService(d[0]) || d[1] == "" {
 			return nil, nil, errTicketBad
