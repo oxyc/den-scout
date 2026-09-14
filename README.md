@@ -166,7 +166,7 @@ only tunes runtime behaviour; every variable is listed, commented, in `.env.exam
 | `MINT_INDEXER_CONFIGS` | `false` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts**; an explicit `COMET_URL`/`MEDIAFUSION_URL` always wins |
 | `TORRENTIO_URL` | `https://torrentio.strem.fun` | indexer base-URL override |
 | `COMET_URL` | `https://comet.elfhosted.com` | indexer base-URL override, including its per-install config segment |
-| `MEDIAFUSION_URL` | `https://mediafusion.elfhosted.com` | indexer base-URL override, including its encrypted-config segment (it 401s without one) |
+| `MEDIAFUSION_URL` | `https://mediafusion.elfhosted.com` | indexer base-URL override, including its encrypted-config segment (it 401s without one); the `…/manifest.json` link its configure page gives works too |
 | `TORZ_URL` | `https://torz.strem.fun` | indexer base-URL override |
 
 The image also sets `GOMEMLIMIT=230MiB`, read by the Go runtime, to sit under the 256 MiB container cap

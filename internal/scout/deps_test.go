@@ -19,7 +19,7 @@ func TestSettingsFromEnv(t *testing.T) {
 		"SCRAPE_TIMEOUT_SECS":  "5",
 		"LIST_TTL_SECS":        "60",
 		"PUBLIC_BASE_URL":      "https://scout.example",
-		"MEDIAFUSION_URL":      "https://mf.self/CONFIG",
+		"MEDIAFUSION_URL":      "https://mf.self/CONFIG/manifest.json",
 		"MEMORY_CACHE_BYTES":   "1048576",
 		"CACHE_DIR":            "/cache",
 		"CINEMETA_URL":         "https://cinemeta.self",

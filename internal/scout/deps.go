@@ -99,7 +99,9 @@ func StartupSummary(s Settings, persistent bool) string {
 func SettingsFromEnv(get func(string) string) Settings {
 	urls := map[Indexer]string{}
 	for _, id := range allIndexers {
-		if v := get(strings.ToUpper(string(id)) + "_URL"); v != "" {
+		// The link an indexer's own configure page hands out is its manifest; the streams live beside it, so
+		// `…/manifest.json/stream/…` would 404 on every scrape.
+		if v := strings.TrimSuffix(get(strings.ToUpper(string(id))+"_URL"), "/manifest.json"); v != "" {
 			urls[id] = v
 		}
 	}
