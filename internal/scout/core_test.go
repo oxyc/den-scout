@@ -444,17 +444,23 @@ func TestDecodeConfig_boundsWhatOneRequestCanRetain(t *testing.T) {
 
 	// The margin that matters is against the largest LEGITIMATE config the field caps admit, not against
 	// a hand-picked typical one. maxDebridAccounts accounts each carrying a 512-character token (the
-	// per-token cap), all four indexers, every filter set, and a 256-character excludeRegex.
-	var accts []string
+	// per-token cap), all four indexers, maxSources household sources at the link cap, every filter set,
+	// and a 256-character excludeRegex.
+	var accts, sources []string
 	for i := 0; i < maxDebridAccounts; i++ {
 		accts = append(accts, `{"service":"torbox","token":"`+repeat("t", 512)+`"}`)
 	}
+	for i := 0; i < maxSources; i++ {
+		prefix := "https://source" + string(rune('a'+i)) + ".example/"
+		sources = append(sources, `"`+prefix+repeat("c", maxSourceURL-len(prefix))+`"`)
+	}
 	worstLegit := blob(`{"debrid":[` + strings.Join(accts, ",") + `],` +
 		`"indexers":["torrentio","comet","mediafusion","torz"],` +
+		`"sources":[` + strings.Join(sources, ",") + `],` +
 		`"filters":{"excludeCam":true,"hdrOnly":true,"resolutions":["2160p","1080p","720p","480p"],` +
 		`"preferResolution":"1080p","minSeeders":3,"maxSizeGB":40,"excludeRegex":"` + repeat("a", 256) + `"},` +
 		`"cachedOnly":true,"resultCap":20}`)
-	if _, ok := decodeConfig(nil, worstLegit); !ok {
+	if c, ok := decodeConfig(nil, worstLegit); !ok || len(c.Sources) != maxSources {
 		t.Errorf("the largest config the field caps admit (%d bytes) does not fit the %d cap",
 			len(worstLegit), maxConfigBlob)
 	}
@@ -467,7 +473,7 @@ func TestDecodeConfig_boundsWhatOneRequestCanRetain(t *testing.T) {
 		t.Errorf("the largest legitimate config SEALED (%d bytes) does not fit the %d cap",
 			len(sealedSeg), maxConfigBlob)
 	}
-	// Recorded rather than asserted loosely: 81% of the cap is reachable legitimately, so the cap cannot
+	// Recorded rather than asserted loosely: 90% of the cap is reachable legitimately, so the cap cannot
 	// come down without lowering maxDebridAccounts or the per-token cap with it.
 	t.Logf("largest legitimate segment: %d plain, %d sealed, against a %d cap",
 		len(worstLegit), len(sealedSeg), maxConfigBlob)

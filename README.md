@@ -33,7 +33,10 @@ resolve to a server you control, so the app just renders what comes back.
    credential — whoever holds it can spend the account's quota — so the Den app keeps it in the
    Keychain and never logs it.
 2. **Scrape** the configured indexers concurrently (Torrentio, Comet, MediaFusion, Torz), each under
-   its own timeout — a slow indexer never blocks the rest. Dedupe by infohash.
+   its own timeout — a slow indexer never blocks the rest — plus up to three stream addons the household
+   added at `/configure` (its own MediaFusion or Comet with its debrid account, say). Those links ride
+   sealed in the config, are fetched only over https to public addresses, and a debrid playback link's
+   infohash is read out of its path. Dedupe by infohash.
 3. **Cache-check** the debrid store(s). TorBox has a real batched cache API and is the default;
    Real-Debrid and Premiumize are also supported (Premiumize also has a real cache API; RD has no
    usable one, so a hash cached on TorBox still wins for an RD+TorBox user).

@@ -3,6 +3,7 @@ package scout
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -51,6 +52,7 @@ type wireStream struct {
 	Title         string `json:"title"`
 	Description   string `json:"description"`
 	InfoHash      string `json:"infoHash"`
+	URL           string `json:"url"`
 	FileIdx       *int   `json:"fileIdx"`
 	BehaviorHints *struct {
 		Filename  string `json:"filename"`
@@ -105,6 +107,27 @@ func normalizeHash(h string) (string, bool) {
 	return h, hashNorm.MatchString(h)
 }
 
+// hashInPath finds the infohash in a debrid playback link. An addon configured with a debrid account
+// answers with links to its own resolver instead of an `infoHash` — MediaFusion's
+// `/streaming_provider/<secret>/playback/<provider>/<hash>`, Comet's `/<config>/playback/<hash>/…`,
+// Torrentio's `/resolve/<service>/<key>/<hash>/…` — and the hash is all scout needs to check its own
+// debrid. Only a whole path segment of 40 hex characters counts, and only in the path: the query is where a
+// link would carry a key.
+func hashInPath(link string) (string, bool) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return "", false
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if len(seg) == 40 && hexHash.MatchString(seg) {
+			return strings.ToLower(seg), true
+		}
+	}
+	return "", false
+}
+
+var hexHash = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
+
 func firstMeaningfulLine(text string) string {
 	var lines []string
 	for _, l := range strings.Split(text, "\n") {
@@ -137,6 +160,9 @@ func parseStremioStreams(body []byte, source string) []RawStream {
 			continue // tolerate a non-object element
 		}
 		hash, ok := normalizeHash(s.InfoHash)
+		if !ok && s.InfoHash == "" {
+			hash, ok = hashInPath(s.URL)
+		}
 		if !ok {
 			continue
 		}
@@ -192,9 +218,20 @@ type stremioScraper struct {
 	indexer Indexer
 	baseURL string
 	client  doer
+	// label names the scraper in log lines when its indexer id is shared — a household source's host.
+	label string
+	// limiter paces the scraper; nil is indexerLimiter.
+	limiter *hostLimiter
 }
 
 func (s *stremioScraper) id() Indexer { return s.indexer }
+
+func (s *stremioScraper) name() string {
+	if s.label != "" {
+		return string(s.indexer) + " source " + s.label
+	}
+	return string(s.indexer)
+}
 
 // A shed request is not an answer.
 //
@@ -231,8 +268,12 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 	// spent the extra two exactly when the host was already shedding — so the limiter throttled hardest
 	// during the one failure it exists for, and each abandoned wait left its token spent, deepening the
 	// debt for the next caller. The jittered backoff below already paces the retries.
+	limiter := s.limiter
+	if limiter == nil {
+		limiter = indexerLimiter
+	}
 	if parsed, perr := url.Parse(strings.TrimRight(s.baseURL, "/")); perr == nil {
-		indexerLimiter.wait(ctx, parsed.Host)
+		limiter.wait(ctx, parsed.Host)
 	}
 	// The limiter returns two different ways — the token arrived, or the caller's deadline passed — and
 	// only one of them means "go ahead". Falling through on the second sends a request that cannot
@@ -240,14 +281,14 @@ func (s *stremioScraper) scrape(ctx context.Context, q scrapeQuery) ([]RawStream
 	// counted as the upstream's outage. The caller still learns nothing came back, which is true and is
 	// what keeps an empty result non-authoritative; it just stops learning it as a lie about the indexer.
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("%s: queued past the scrape budget: %w", s.indexer, err)
+		return nil, fmt.Errorf("%s: queued past the scrape budget: %w", s.name(), err)
 	}
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		streams, err, retryable := s.scrapeOnce(ctx, q)
 		if err == nil {
 			if attempt > 0 {
-				logLimited("indexer-retry:"+string(s.indexer), "%s indexer answered on retry %d", s.indexer, attempt)
+				logLimited("indexer-retry:"+string(s.indexer), "%s indexer answered on retry %d", s.name(), attempt)
 			}
 			return streams, nil
 		}
@@ -289,13 +330,14 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 		// Log the indexer name + reason (never the URL — MediaFusion's carries its encrypted config) so a
 		// scrape outage is visible in the server log instead of silently becoming an empty stream list.
 		// Once a minute per indexer: an outage fails every scrape, and the line only has to say it is down.
-		logLimited("indexer-unreachable:"+string(s.indexer), "%s indexer unreachable", s.indexer)
-		return nil, err, true // a transport failure mid-burst is worth one more try
+		logLimited("indexer-unreachable:"+string(s.indexer), "%s indexer unreachable", s.name())
+		// A refused address will be refused again; a retry would only spend the budget.
+		return nil, err, !errors.Is(err, errNotPublic)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		logLimited("indexer-status:"+string(s.indexer), "%s indexer returned http %d", s.indexer, resp.StatusCode)
-		return nil, fmt.Errorf("%s http %d", s.indexer, resp.StatusCode),
+		logLimited("indexer-status:"+string(s.indexer), "%s indexer returned http %d", s.name(), resp.StatusCode)
+		return nil, fmt.Errorf("%s http %d", s.name(), resp.StatusCode),
 			retryableScrapeStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeBytes))
@@ -314,8 +356,15 @@ var defaultIndexerURLs = map[Indexer]string{
 	"torz":        "https://torz.strem.fun",
 }
 
-func makeScrapers(config *Config, client doer, urls map[Indexer]string) []scraper {
-	out := make([]scraper, 0, len(config.Indexers))
+func makeScrapers(config *Config, client, sourceClient doer, urls map[Indexer]string) []scraper {
+	out := make([]scraper, 0, len(config.Indexers)+len(config.Sources))
+	// Household sources are asked like any indexer, and count in the quorum like one: the household chose
+	// them, so a silent one leaves the list incomplete. Fetched only through sourceClient, which refuses to
+	// connect anywhere but the public internet.
+	for _, base := range config.Sources {
+		out = append(out, &stremioScraper{indexer: ownSources, baseURL: base, client: sourceClient,
+			label: sourceHost(base), limiter: sourceLimiter})
+	}
 	for _, id := range config.Indexers {
 		// An indexer that needs a per-install config segment and hasn't been given one is not asked. It
 		// cannot answer usefully, and its failure is silent in the worst way: mediafusion returns 200

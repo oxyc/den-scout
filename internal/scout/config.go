@@ -60,7 +60,7 @@ var validResolutions = map[string]bool{"2160p": true, "1080p": true, "720p": tru
 
 const (
 	// Ceiling on the base64 config path segment. See decodeConfig.
-	maxConfigBlob = 8 << 10
+	maxConfigBlob = 16 << 10
 	// Ceiling on accounts in one config. There are three services; more than a handful of accounts is
 	// not a configuration, it is a way to make one request retain a large slice for a whole scrape.
 	maxDebridAccounts = 8
@@ -76,6 +76,10 @@ const (
 	// bytes sealed, i.e. 80% of the 8 KiB already. So the multiplier is what gives. Fifty is well past
 	// what anybody scrolls — the default is twenty, and the ranking exists precisely so the answer is
 	// near the top — and it cuts the worst body fourfold.
+	//
+	// The segment ceiling has since doubled to hold household sources, which puts the worst keyless body at
+	// 16 KiB x 50, still under half of that measurement. With CONFIG_KEY set a list carries play tickets,
+	// which hold no sources, rather than the segment.
 	maxResultCap = 50
 )
 
@@ -138,8 +142,10 @@ type Filters struct {
 }
 
 type Config struct {
-	Debrid     []DebridAccount
-	Indexers   []Indexer
+	Debrid   []DebridAccount
+	Indexers []Indexer
+	// Sources are the household's own stream addons (sources.go), as base URLs, scraped beside Indexers.
+	Sources    []string
 	Filters    Filters
 	CachedOnly bool
 	ResultCap  int
@@ -185,6 +191,7 @@ type rawConfig struct {
 		Token   string `json:"token"`
 	} `json:"debrid"`
 	Indexers []string `json:"indexers"`
+	Sources  []string `json:"sources"`
 	Filters  *struct {
 		ExcludeCam       *bool    `json:"excludeCam"`
 		Resolutions      []string `json:"resolutions"`
@@ -213,11 +220,13 @@ func decodeConfig(kr *sealKeyring, blob string) (*Config, bool) {
 	// in-flight request, with distinct blobs defeating both the cache and the singleflight: 150 concurrent
 	// misses measured 207 MiB inside a 230 MiB GOMEMLIMIT.
 	//
-	// 8 KiB, and the margin is thinner than it looks: the largest config the FIELD caps admit —
-	// maxDebridAccounts accounts each with a 512-character token, all four indexers, every filter, a
-	// 256-character regex — measures 6,498 bytes plain and 6,563 sealed, so 80% of this is legitimately
-	// reachable. Those two numbers are computed by the test rather than trusted here. It cannot come down without lowering those caps too, which is why the response-side
-	// multiplier is bounded by maxResultCap instead. A config from /configure is ~1 KB.
+	// 16 KiB, and the margin is thinner than it looks: the largest config the FIELD caps admit —
+	// maxDebridAccounts accounts each with a 512-character token, all four indexers, maxSources household
+	// sources at maxSourceURL, every filter, a 256-character regex — measures 14,718 bytes plain and 14,783
+	// sealed, so 90% of this is legitimately reachable. Those two numbers are computed by the test rather than
+	// trusted here. It was 8 KiB until household sources, whose links carry their own config segments. It
+	// cannot come down without lowering those caps too, which is why the response-side multiplier is bounded
+	// by maxResultCap instead. A config from /configure is ~1 KB, and ~2 KB with one source.
 	//
 	// This bounds the segment, NOT what a request retains: the reply embeds a copy of the segment per
 	// stream, so see maxResultCap for the other half.
@@ -386,8 +395,8 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		epoch = *n
 	}
 
-	return &Config{Debrid: debrid, Indexers: idx, Filters: f, CachedOnly: cachedOnly, ResultCap: resultCap,
-		Scope: scope, IID: iid, Epoch: epoch}, true
+	return &Config{Debrid: debrid, Indexers: idx, Sources: normalizeSources(raw.Sources), Filters: f,
+		CachedOnly: cachedOnly, ResultCap: resultCap, Scope: scope, IID: iid, Epoch: epoch}, true
 }
 
 func isDebridService(s string) bool {

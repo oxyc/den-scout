@@ -148,7 +148,7 @@ func TestScrape_retriesAShedRequestButNotARefusal(t *testing.T) {
 // the same machine. Nothing is lost — rankStreams drops cam/scr itself and applies its own ordering.
 func TestMakeScrapersTorrentioUsesBarePath(t *testing.T) {
 	cfg := &Config{Indexers: []Indexer{"torrentio", "mediafusion"}, Filters: Filters{ExcludeCam: true}}
-	got := makeScrapers(cfg, mockDoer{}, map[Indexer]string{"mediafusion": "https://mf.self/CONFIG"})
+	got := makeScrapers(cfg, mockDoer{}, mockDoer{}, map[Indexer]string{"mediafusion": "https://mf.self/CONFIG"})
 	tor := got[0].(*stremioScraper)
 	if tor.baseURL != "https://torrentio.strem.fun" {
 		t.Errorf("torrentio base: %s", tor.baseURL)
@@ -158,12 +158,12 @@ func TestMakeScrapersTorrentioUsesBarePath(t *testing.T) {
 		t.Errorf("mediafusion override: %s", mf.baseURL)
 	}
 	// The filter setting must not change the URL at all — that coupling was the whole defect.
-	off := makeScrapers(&Config{Indexers: []Indexer{"torrentio"}, Filters: Filters{ExcludeCam: false}}, mockDoer{}, nil)
+	off := makeScrapers(&Config{Indexers: []Indexer{"torrentio"}, Filters: Filters{ExcludeCam: false}}, mockDoer{}, mockDoer{}, nil)
 	if off[0].(*stremioScraper).baseURL != "https://torrentio.strem.fun" {
 		t.Errorf("excludeCam off: %s", off[0].(*stremioScraper).baseURL)
 	}
 	// An operator override still wins, so a self-hosted torrentio can be pointed at.
-	custom := makeScrapers(cfg, mockDoer{}, map[Indexer]string{"torrentio": "https://tor.self/opts"})
+	custom := makeScrapers(cfg, mockDoer{}, mockDoer{}, map[Indexer]string{"torrentio": "https://tor.self/opts"})
 	if custom[0].(*stremioScraper).baseURL != "https://tor.self/opts" {
 		t.Errorf("override: %s", custom[0].(*stremioScraper).baseURL)
 	}

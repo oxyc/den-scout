@@ -127,7 +127,7 @@ With `CONFIG_KEY` set, a stream list names its play URLs `/p/<ticket>` instead o
 - `ticket = base64url(nonce(24) ‖ XChaCha20-Poly1305(K_play, payload))`, where
   `K_play = HKDF-SHA256(CONFIG_KEY, info "den-scout/play/v1")`.
 - The payload is only what one resolve reads: the debrid accounts, the infohash, the file index,
-  season/episode, the expiry, `iid` and `ep`. There are no filters, indexers or scope.
+  season/episode, the expiry, `iid` and `ep`. There are no filters, indexers, sources or scope.
 - It is stateless. Keys derived from `CONFIG_KEYS_PREV` still open tickets minted before a rotation.
 - A scoped (`availability`) config never lists streams, so it never mints a ticket.
 

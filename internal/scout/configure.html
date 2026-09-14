@@ -14,10 +14,11 @@
   h2 { font-size: .78rem; color: #9aa0aa; text-transform: uppercase; letter-spacing: .06em;
        margin: 1.75rem 0 .7rem; }
   label { display: block; font-weight: 600; margin: 0 0 .35rem; color: #c9ccd3; }
-  input[type=text], input[type=password], input[type=number], select {
+  input[type=text], input[type=password], input[type=number], select, textarea#sources {
     width: 100%; padding: .65rem .7rem; border-radius: 9px; border: 1px solid #2a2f38;
     background: #161a20; color: inherit; font: inherit; outline: none; }
-  input:focus, select:focus { border-color: #5b8cff; }
+  input:focus, select:focus, textarea#sources:focus { border-color: #5b8cff; }
+  textarea#sources { resize: vertical; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
   .field { margin-top: .9rem; }
   .hint { color: #8b919b; font-size: .82rem; margin-top: .3rem; }
   .hint a { color: #7fb0ff; }
@@ -62,6 +63,14 @@
   <label for="token">API token</label>
   <input id="token" type="password" autocomplete="off" placeholder="paste your debrid API key">
 </div>
+<h2>Your own addons <span class="optional">(optional)</span></h2>
+<label for="sources">Stream addon links <span class="optional">(one per line, up to 3)</span></label>
+<textarea id="sources" rows="3" autocomplete="off" spellcheck="false"
+  placeholder="https://mediafusion.elfhosted.com/…/manifest.json"></textarea>
+<p class="hint">Stremio stream addons you set up yourself — MediaFusion, Comet or Torrentio with your debrid
+  account — asked alongside the indexers. Their links carry your settings, so they are sealed into this link
+  with your token.</p>
+<p class="note" id="sourcesResult"></p>
 <h2>Sources</h2>
 <label class="chk"><input type="checkbox" id="useDefaults" checked> Use Den Scout's defaults</label>
 <p class="optional" id="defaultsNote">Your link carries only your debrid account, so everything else
@@ -3381,6 +3390,48 @@ var PRODUCT = "Den Scout";
 var ALL_INDEXERS = ["torrentio", "comet", "mediafusion", "torz"];
 var STORE_KEY = "den-scout.configure";
 var $ = function (id) { return document.getElementById(id); };
+// Kept in step with maxSources / maxSourceURL in internal/scout/sources.go, which drops what exceeds them.
+var MAX_SOURCES = 3, MAX_SOURCE_URL = 2048;
+
+// The addon links as the server keeps them: an install button's stremio:// read as https, and the
+// /manifest.json a configure page hands out dropped. { error } when a line can't be used.
+function parseSources() {
+  var out = [], lines = $("sources").value.split(/\s+/);
+  for (var i = 0; i < lines.length; i++) {
+    var s = lines[i].trim();
+    if (!s) continue;
+    s = s.replace(/^stremio:\/\//i, "https://").replace(/\/manifest\.json$/, "").replace(/\/+$/, "");
+    if (!/^https:\/\/[^\/?#]+/i.test(s) || /[?#]/.test(s)) return { error: "Each addon link has to be an https:// (or stremio://) link." };
+    if (s.length > MAX_SOURCE_URL) return { error: "An addon link is longer than " + MAX_SOURCE_URL + " characters." };
+    if (out.indexOf(s) < 0) out.push(s);
+  }
+  if (out.length > MAX_SOURCES) return { error: "Up to " + MAX_SOURCES + " addon links." };
+  return { sources: out };
+}
+
+// Read each addon's manifest from this browser, which is where the links already are, and say whether it
+// serves streams. Stremio addons answer cross-origin, since Stremio's web player needs them to.
+function checkSources() {
+  var out = $("sourcesResult"), parsed = parseSources();
+  out.className = "note";
+  if (parsed.error) { out.textContent = parsed.error; out.className = "note unsealed"; return; }
+  if (!parsed.sources.length) { out.textContent = ""; return; }
+  out.textContent = "Checking…";
+  Promise.all(parsed.sources.map(function (base) {
+    var host = base.replace(/^https:\/\//i, "").split("/")[0];
+    return fetch(base + "/manifest.json")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (m) {
+        var streams = (m.resources || []).some(function (r) { return r === "stream" || (r && r.name === "stream"); });
+        return { ok: streams, text: (streams ? "✓ " : "✗ ") + (m.name || host) + (streams ? "" : " serves no streams") };
+      })
+      .catch(function () { return { ok: false, text: "? " + host + ": couldn't read its manifest" }; });
+  })).then(function (results) {
+    out.textContent = results.map(function (r) { return r.text; }).join("  ·  ");
+    out.className = results.every(function (r) { return r.ok; }) ? "note sealed" : "note unsealed";
+  });
+}
+$("sources").addEventListener("change", checkSources);
 
 function checkedVals(name) {
   return Array.prototype.slice
@@ -3409,12 +3460,16 @@ function collectConfig() {
   var err = $("err");
   var token = $("token").value.trim();
   if (!token) { err.textContent = "Enter your debrid API token."; $("token").focus(); return null; }
+  var parsed = parseSources();
+  if (parsed.error) { err.textContent = parsed.error; $("sources").focus(); return null; }
   err.textContent = "";
   // Defaults means the link carries ONLY the account: no indexers, no filters, no cap. The config token
   // is a snapshot, so anything written into it is frozen for the life of that link — leaving a field out
   // is the only way a link can follow a default that changes later. Untick and every field below is
   // pinned instead, which is what someone who went to the trouble of setting them expects.
   var config = { debrid: [{ service: $("service").value, token: token }] };
+  // The household's own addons are not a default the server could supply, so they go in either way.
+  if (parsed.sources.length) config.sources = parsed.sources;
   if (!$("useDefaults").checked) {
     config.indexers = checkedVals("indexer");
     config.resultCap = clampedNumVal("resultCap") || 20;
@@ -3455,6 +3510,7 @@ function fillForm(s) {
     if (s.debrid[0].service) $("service").value = s.debrid[0].service;
     if (s.debrid[0].token) $("token").value = s.debrid[0].token;
   }
+  if (s.sources && s.sources.length) $("sources").value = s.sources.join("\n");
   // No indexer list means "all", which is how the page shows it too.
   setChecks("indexer", s.indexers && s.indexers.length ? s.indexers : ALL_INDEXERS);
   // A link carrying nothing but the account opted into the defaults; show it that way rather than

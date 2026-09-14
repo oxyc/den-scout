@@ -24,6 +24,9 @@ type hostLimiter struct {
 	buckets map[string]*bucket
 	every   time.Duration
 	burst   int
+	// maxKeys, when set, is how many hosts the limiter remembers. Past it every bucket is forgotten at once:
+	// a host then starts again with a full burst, which costs a little pacing and nothing else.
+	maxKeys int
 }
 
 type bucket struct {
@@ -44,6 +47,13 @@ func newHostLimiter(every time.Duration, burst int) *hostLimiter {
 	return &hostLimiter{buckets: map[string]*bucket{}, every: every, burst: burst}
 }
 
+// newBoundedHostLimiter is a hostLimiter for hosts a caller chooses, which remembers at most maxKeys of them.
+func newBoundedHostLimiter(every time.Duration, burst, maxKeys int) *hostLimiter {
+	l := newHostLimiter(every, burst)
+	l.maxKeys = maxKeys
+	return l
+}
+
 // wait blocks until this host may be asked again, or the context ends. It never returns an error of its
 // own: a cancelled context is the caller's deadline, not a refusal, and the caller already handles that.
 func (l *hostLimiter) wait(ctx context.Context, host string) {
@@ -53,6 +63,9 @@ func (l *hostLimiter) wait(ctx context.Context, host string) {
 	l.mu.Lock()
 	b := l.buckets[host]
 	if b == nil {
+		if l.maxKeys > 0 && len(l.buckets) >= l.maxKeys {
+			l.buckets = map[string]*bucket{}
+		}
 		b = &bucket{tokens: float64(l.burst), last: time.Now()}
 		l.buckets[host] = b
 	}

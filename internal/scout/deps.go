@@ -239,18 +239,21 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 		log.Printf("PLAY_TICKET_TTL_SECS (%s) is not above 3×LIST_TTL_SECS (%s) — a stream list's play URLs "+
 			"can expire before the client uses them", settings.PlayTicketTTL, 3*settings.ListTTL)
 	}
+	sourceClient := newSourceClient()
 	return Deps{
 		Cache:         cache,
 		ProbeClient:   client,
 		ScrapeTimeout: settings.ScrapeTimeout,
 		ListTTL:       settings.ListTTL,
 		PublicURL:     settings.PublicURL,
-		MakeScrapers:  func(c *Config) []scraper { return makeScrapers(c, client, settings.IndexerURLs) },
-		MakeStores:    func(c *Config) []Store { return buildStores(c, client, cache) },
-		Meta:          cinemetaMeta(client, settings.CinemetaURL),
-		SealKeyring:   buildKeyring(settings.ConfigKey, settings.ConfigKeysPrev),
-		MetricsToken:  settings.MetricsToken,
-		LogRequests:   settings.LogRequests,
+		MakeScrapers: func(c *Config) []scraper {
+			return makeScrapers(c, client, sourceClient, settings.IndexerURLs)
+		},
+		MakeStores:   func(c *Config) []Store { return buildStores(c, client, cache) },
+		Meta:         cinemetaMeta(client, settings.CinemetaURL),
+		SealKeyring:  buildKeyring(settings.ConfigKey, settings.ConfigKeysPrev),
+		MetricsToken: settings.MetricsToken,
+		LogRequests:  settings.LogRequests,
 
 		RevokedInstalls:  revoked,
 		ConfigEpoch:      settings.ConfigEpoch,

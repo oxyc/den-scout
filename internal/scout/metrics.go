@@ -20,6 +20,10 @@ import (
 // contend.
 var metrics = newMetricSet()
 
+// metricIndexers are the indexer series: every built-in indexer, and one for every household's own sources
+// together — their hosts are chosen per install, so they are never a label.
+var metricIndexers = append(append([]Indexer(nil), allIndexers...), ownSources)
+
 type metricSet struct {
 	listCacheHit   atomic.Int64
 	listCacheStale atomic.Int64
@@ -46,10 +50,10 @@ type metricSet struct {
 
 func newMetricSet() *metricSet {
 	m := &metricSet{
-		indexerRequests: make(map[Indexer]*atomic.Int64, len(allIndexers)),
-		indexerFailures: make(map[Indexer]*atomic.Int64, len(allIndexers)),
+		indexerRequests: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
+		indexerFailures: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
 	}
-	for _, id := range allIndexers {
+	for _, id := range metricIndexers {
 		m.indexerRequests[id] = new(atomic.Int64)
 		m.indexerFailures[id] = new(atomic.Int64)
 	}
@@ -116,9 +120,9 @@ func (m *metricSet) render(cachePersistent int) string {
 	counter(&b, "scout_background_panics_total", "Panics recovered on a background goroutine (probe fan-out, stale list rebuild, account listing fetch).",
 		[][2]string{{"", num(m.backgroundPanic.Load())}})
 
-	reqs := make([][2]string, 0, len(allIndexers))
-	fails := make([][2]string, 0, len(allIndexers))
-	for _, id := range allIndexers {
+	reqs := make([][2]string, 0, len(metricIndexers))
+	fails := make([][2]string, 0, len(metricIndexers))
+	for _, id := range metricIndexers {
 		label := `indexer="` + string(id) + `"`
 		reqs = append(reqs, [2]string{label, num(m.indexerRequests[id].Load())})
 		fails = append(fails, [2]string{label, num(m.indexerFailures[id].Load())})
