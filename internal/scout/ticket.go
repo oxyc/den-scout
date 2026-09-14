@@ -73,13 +73,16 @@ type ticketWire struct {
 	I        string      `json:"i,omitempty"`
 	P        int         `json:"p,omitempty"`
 	Scope    string      `json:"scope,omitempty"`
+	// The indexer's release size in bytes. Absent from tickets minted before it existed, and from releases
+	// whose size no indexer stated; both open with a size of 0, which the link check reads as unknown.
+	Z int64 `json:"z,omitempty"`
 }
 
 // mint seals a ticket for one release of this config, good until exp.
 func (t *ticketKeys) mint(config *Config, target PlayTarget, exp time.Time) string {
 	w := ticketWire{
 		playWire: playWire{H: target.InfoHash, F: target.FileIdx, S: target.Season, E: target.Episode},
-		X:        exp.Unix(), I: config.IID, P: config.Epoch, Scope: config.Scope,
+		X:        exp.Unix(), I: config.IID, P: config.Epoch, Scope: config.Scope, Z: target.ReleaseSize,
 	}
 	for _, d := range config.Debrid {
 		w.D = append(w.D, [2]string{string(d.Service), d.Token})
@@ -139,5 +142,5 @@ func (t *ticketKeys) open(ticket string, now time.Time) (*Config, *PlayTarget, e
 	if len(config.Debrid) == 0 {
 		return nil, nil, errTicketBad
 	}
-	return config, &PlayTarget{InfoHash: h, FileIdx: w.F, Season: w.S, Episode: w.E}, nil
+	return config, &PlayTarget{InfoHash: h, FileIdx: w.F, Season: w.S, Episode: w.E, ReleaseSize: max(w.Z, 0)}, nil
 }

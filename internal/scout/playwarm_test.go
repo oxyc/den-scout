@@ -8,7 +8,9 @@ import (
 
 // heldTorBoxPlay is a handler whose one store is a real TorBox store already holding `hash` as torrent 42,
 // answering upstream through `reply`. Every upstream call is recorded by its endpoint name, in order.
-func heldTorBoxPlay(hash string, reply func(r *http.Request) *http.Response) (http.Handler, *[]string) {
+// `over` adjusts the handler's deps further, after the store is wired.
+func heldTorBoxPlay(hash string, reply func(r *http.Request) *http.Response,
+	over ...func(*Deps)) (http.Handler, *[]string) {
 	var calls []string
 	cache := NewMemoryCache(1 << 20)
 	cache.Put(torrentIDKey("tb-secret", hash), "42", resolveCacheTTL)
@@ -20,6 +22,9 @@ func heldTorBoxPlay(hash string, reply func(r *http.Request) *http.Response) (ht
 	h := NewHandler(testDeps(func(d *Deps) {
 		d.Cache = cache
 		d.MakeStores = func(*Config) []Store { return []Store{store} }
+		for _, o := range over {
+			o(d)
+		}
 	}))
 	return h, &calls
 }

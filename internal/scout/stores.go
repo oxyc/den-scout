@@ -125,6 +125,14 @@ type ResolveTarget struct {
 	// what TORBOX has, not what this ACCOUNT has. "Held" was never the same as "already added". Only the
 	// store can enforce this, so the caller states the requirement and the store obeys it.
 	NoAdd bool
+	// ReleaseSize is the indexer's size for the release, 0 when unknown. Stores do not read it; the link
+	// check does, for a movie whose file size no store knows.
+	ReleaseSize int64
+	// ListFiles asks TorBox to list the torrent's files even for a movie, so the indexer's fileIdx — a
+	// position in the torrent — is mapped through the list rather than sent raw as TorBox's file id. /play
+	// sets it only after a movie link served a file far smaller than the release. Real-Debrid and
+	// Premiumize always pick from a list already and ignore it.
+	ListFiles bool
 }
 
 // errWouldAdd — a NoAdd target could only be resolved by queueing the torrent, so it was not resolved.
@@ -1203,7 +1211,10 @@ type torboxResolveEntry struct {
 func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
 	// List the pack's files for any series episode (even when a fileIdx is present) so we can name-match
 	// the episode — Torrentio's fileIdx and TorBox's file ids/order aren't guaranteed to agree.
-	needFiles := t.Season != nil && t.Episode != nil
+	// A movie normally resolves without a list: nearly every one carries fileIdx 0, and listing on every
+	// play would put a mylist call in front of each warm link. ListFiles is /play's way back when a movie's
+	// raw position turned out to name another file.
+	needFiles := (t.Season != nil && t.Episode != nil) || t.ListFiles
 	// Scope by the debrid token: the cached value is a TorBox torrent_id, which is account-scoped.
 	// Every per-install store shares one process-global cache, so an infohash-only key would let one
 	// user's cached torrent_id be used with another user's token (→ wrong/other-account content).
@@ -2673,7 +2684,16 @@ func selectFileID(files []TorrentFile, t ResolveTarget) (*int, error) {
 	}
 	if t.FileIdx != nil {
 		if *t.FileIdx >= 0 && *t.FileIdx < len(files) {
-			return &files[*t.FileIdx].Index, nil
+			picked := files[*t.FileIdx]
+			// A movie's position can land on the wrong file when TorBox lists the torrent in another order.
+			// The feature is a video and the size of one, so a position naming anything else — an extra, a
+			// sample, an .nfo — gives way to the largest video. A collection's films are alike in size, so
+			// the position still picks between them.
+			if t.Season == nil && !isFeatureSized(files, picked) {
+				idx := largestPlayable(files).Index
+				return &idx, nil
+			}
+			return &picked.Index, nil
 		}
 		return t.FileIdx, nil
 	}

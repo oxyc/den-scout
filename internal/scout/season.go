@@ -506,6 +506,17 @@ func largestEpisodeCandidate(files []TorrentFile) TorrentFile {
 	return largestPlayable(files)
 }
 
+// isFeatureSized — whether `f` could be a torrent's feature: a video (when the list has any) at least half
+// the size of its largest video. A file whose size is unknown is given the benefit of the doubt.
+func isFeatureSized(files []TorrentFile, f TorrentFile) bool {
+	pool := episodeFilePool(files)
+	if len(pool) < len(files) && !videoExtRe.match(strings.ToLower(f.Name)) {
+		return false
+	}
+	size, top := intOr(f.SizeBytes, 0), intOr(largest(pool).SizeBytes, 0)
+	return f.SizeBytes == nil || top == 0 || size*2 >= top
+}
+
 // largestPlayable is largest() over the files that could be the feature — the same video-only pool
 // pickEpisodeFile picks from, so a store falling back on its own reaches the same kind of answer. Picking
 // over every file instead served a pack's `.iso` or `.rar` as the episode: a 302, no error, no video.

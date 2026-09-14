@@ -427,6 +427,28 @@ func TestPickFileID_realDebridMapsPositionToItsOwnId(t *testing.T) {
 	wantPick(t, got, err, 33, "position 2 is RD's file id 33, not the number 2")
 }
 
+// A movie's fileIdx that lands on something other than the feature — TorBox listing the torrent in another
+// order — gives way to the largest video. A collection's films are alike in size, so there it still decides.
+func TestSelectFileID_torBoxMoviePositionOnAnExtra(t *testing.T) {
+	remux := []TorrentFile{
+		file(40, "Movie/Movie.2012.2160p.mkv", 16_000_000),
+		file(41, "Movie/Movie.nfo", 5),
+		file(42, "Movie/Sample/sample.mkv", 522),
+	}
+	got, err := selectFileID(remux, ResolveTarget{InfoHash: H, FileIdx: idx(2)})
+	wantPick(t, got, err, 40, "a position on the sample serves the feature")
+	got, err = selectFileID(remux, ResolveTarget{InfoHash: H, FileIdx: idx(1)})
+	wantPick(t, got, err, 40, "a position on the .nfo serves the feature")
+
+	trilogy := []TorrentFile{
+		file(50, "Trilogy/Part.1.mkv", 9_000),
+		file(51, "Trilogy/Part.2.mkv", 10_000),
+		file(52, "Trilogy/Part.3.mkv", 11_000),
+	}
+	got, err = selectFileID(trilogy, ResolveTarget{InfoHash: H, FileIdx: idx(0)})
+	wantPick(t, got, err, 50, "in a collection the position still picks the film")
+}
+
 // The same gap on the other two, so the three are pinned alike.
 func TestPickers_mapPositionToTheStoresOwnId(t *testing.T) {
 	files := []TorrentFile{file(11, "a.mkv", 10), file(22, "b.mkv", 20), file(33, "c.mkv", 15)}

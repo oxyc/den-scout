@@ -1250,7 +1250,8 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
 	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
 	defer cancel()
-	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode}
+	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode,
+		ReleaseSize: target.ReleaseSize}
 
 	// ?probe=1 — answer, don't act. Asking /play for an uncached release is what QUEUES it, so a client
 	// polling this URL to render a progress bar was adding the torrent again on every poll. TorBox allows
@@ -1305,7 +1306,7 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		if !hit.checked {
 			verdict = h.verifyLink(r.Context(), pool, rt, hit.link)
 		}
-		if verdict != linkBroken {
+		if verdict == linkPlayable || verdict == linkUnverified {
 			if verdict == linkPlayable {
 				h.links.markChecked(memoKey, hit.link)
 			}
@@ -1540,9 +1541,21 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 // The check runs on the REQUEST's context rather than the resolve clock. A resolve that took most of its
 // budget would otherwise leave the check nothing, and a check with no time is a check that cannot answer;
 // linkCheckTimeout bounds it on its own.
+//
+// A movie link that serves a file far smaller than the release gets one more try: see relistMovie. What that
+// try mints is served only if it passes its own check. Otherwise the first link is served as it was before
+// the release size was known — a collection's film, or a store with no file list to pick from, is still
+// the file that was asked for, and a size alone is not proof enough to refuse it.
 func (h *handler) servePlayLink(w http.ResponseWriter, r *http.Request, pool *StorePool, rt ResolveTarget,
 	memoKey, link string) {
 	verdict := h.verifyLink(r.Context(), pool, rt, link)
+	if verdict == linkWrongFile {
+		h.links.forget(memoKey)
+		verdict = linkUnverified
+		if relisted, v := h.relistMovie(r, pool, rt); v == linkPlayable || v == linkUnverified {
+			link, verdict = relisted, v
+		}
+	}
 	if verdict == linkBroken {
 		h.links.forget(memoKey)
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
@@ -1550,6 +1563,47 @@ func (h *handler) servePlayLink(w http.ResponseWriter, r *http.Request, pool *St
 	}
 	h.links.put(memoKey, link, verdict == linkPlayable, time.Now())
 	writePlayRedirect(w, link)
+}
+
+// relistMovie re-resolves a movie whose link served another file in the release, this time with the
+// torrent's file list, and checks what that mints.
+//
+// TorBox resolves a movie without listing files, so the indexer's fileIdx — a position in the torrent — goes
+// out raw as TorBox's file id, and on a torrent TorBox lists in another order that id names a sample or an
+// extra: a 522 KB file for a 16 GB remux, with a 302 and no error. Listing on every movie play would cost a
+// mylist call in front of each warm link, and nearly every movie carries fileIdx 0, so the list is fetched
+// only here, once the check has shown the raw position was wrong. selectFileID then maps the position
+// through the list, with its guard against a position that lands on something not feature-sized.
+//
+// Read-only (NoAdd) and only against the stores that hold the torrent: the link that failed came from one,
+// and nothing about a wrong file is a reason to buy the torrent again. The list lands in TorBox's resolve
+// entry, so later plain resolves of this hash take the fast path with it and pick the right file without
+// listing again — and the file's size is known from it, which is what lets the check below judge a
+// collection's film against its own listed size rather than against the whole pack's.
+//
+// On its own slice of the REQUEST's context, not the resolve clock: this runs after a resolve that may have
+// spent most of that clock, and a re-resolve on an expired context fails instantly and turns a playable
+// release into a 404. statusBudget is the same ceiling the other single-torrent reads on this route use; one
+// mylist and one requestdl fit well inside it.
+//
+// Any failure is linkBroken, on which servePlayLink serves the first link as it did before this existed.
+func (h *handler) relistMovie(r *http.Request, pool *StorePool, rt ResolveTarget) (string, linkVerdict) {
+	listed := rt
+	listed.NoAdd, listed.ListFiles = true, true
+	ctx, cancel := context.WithTimeout(r.Context(), statusBudget)
+	defer cancel()
+	link, err := pool.ResolveCachedOnly(ctx, listed, pool.HoldingServices(rt))
+	if err != nil {
+		logLimited("play-relist-failed", "play %s: the re-resolve with a file list could not serve (%v)",
+			shortHash(rt.InfoHash), err)
+		return "", linkBroken
+	}
+	verdict := h.verifyLink(r.Context(), pool, rt, link)
+	if verdict == linkPlayable || verdict == linkUnverified {
+		logLimited("play-relist-served", "play %s: the re-resolve with a file list picked another file",
+			shortHash(rt.InfoHash))
+	}
+	return link, verdict
 }
 
 // writePlayRedirect is /play's success answer.
@@ -1608,7 +1662,11 @@ type streamsResponse struct {
 }
 
 func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string) streamOut {
-	url := playURL(PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)})
+	target := PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)}
+	if s.SizeBytes != nil && *s.SizeBytes > 0 {
+		target.ReleaseSize = int64(*s.SizeBytes)
+	}
+	url := playURL(target)
 	return streamOut{
 		Name:       "Den Scout",
 		Title:      s.Title, // raw release name

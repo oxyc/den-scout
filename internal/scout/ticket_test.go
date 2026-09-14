@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 var (
@@ -97,6 +99,32 @@ func TestPlayTicket_roundTrip(t *testing.T) {
 	}
 }
 
+// A ticket carries the indexer's release size when the list had one, and opens with 0 when it did not —
+// including a ticket minted before the field existed, whose payload has no `z` at all.
+func TestPlayTicket_carriesTheReleaseSize(t *testing.T) {
+	tk := newTicketKeys(ticketKeyring(t))
+	config := &Config{Debrid: []DebridAccount{{ServiceTorBox, "tb"}}}
+	exp := time.Now().Add(time.Hour)
+	for _, want := range []int64{16_000_000_000, 0} {
+		target := PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(0), ReleaseSize: want}
+		_, got, err := tk.open(tk.mint(config, target, exp), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(*got, target) {
+			t.Errorf("size %d: got %+v, want %+v", want, *got, target)
+		}
+	}
+
+	old, _ := json.Marshal(map[string]any{"h": repeat("a", 40), "f": 0, "d": [][2]string{{"torbox", "tb"}},
+		"x": exp.Unix()})
+	nonce := make([]byte, chacha20poly1305.NonceSizeX)
+	_, got, err := tk.open(b64urlEncode(tk.aeads[0].Seal(nonce, nonce, old, nil)), time.Now())
+	if err != nil || got.ReleaseSize != 0 || got.FileIdx == nil || *got.FileIdx != 0 {
+		t.Errorf("a ticket from before the size: %+v err=%v", got, err)
+	}
+}
+
 // Anything that is not a ticket this addon minted, unaltered, is refused.
 func TestPlayTicket_refusesWhatDoesNotOpen(t *testing.T) {
 	tk := newTicketKeys(ticketKeyring(t))
@@ -164,7 +192,8 @@ func TestPlayTicket_theLargestConfigFits(t *testing.T) {
 	}
 	tk := newTicketKeys(ticketKeyring(t))
 	ticket := tk.mint(&Config{Debrid: accounts, IID: testIID, Epoch: maxConfigEpoch},
-		PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(9999), Season: intp(99), Episode: intp(999)},
+		PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(9999), Season: intp(99), Episode: intp(999),
+			ReleaseSize: 1 << 50},
 		time.Now().Add(time.Hour))
 	if _, _, err := tk.open(ticket, time.Now()); err != nil {
 		t.Errorf("the largest legitimate ticket (%d bytes) does not open under the %d cap: %v",

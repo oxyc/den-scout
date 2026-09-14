@@ -15,6 +15,10 @@ type PlayTarget struct {
 	FileIdx  *int
 	Season   *int
 	Episode  *int
+	// ReleaseSize is the size the indexer reported for this release, 0 when unknown. Only a ticket carries
+	// it — the legacy token's encoding is pinned — and /play uses it to notice a movie link that serves a
+	// file far smaller than the release (see verifyLink).
+	ReleaseSize int64
 }
 
 // playWire fixes field order (h,f,s,e) + omitempty so the encoded token matches the TS encoder.

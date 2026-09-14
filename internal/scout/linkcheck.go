@@ -31,6 +31,11 @@ const (
 	linkPlayable
 	// The link answered, and the answer was not the file.
 	linkBroken
+	// A movie link that serves a file under half the size of the release, where no store knew the file's own
+	// size to compare against. The release is very likely fine and the store picked another file out of it —
+	// TorBox taking the indexer's position in the torrent as its own file id — so /play re-resolves once
+	// with a file list before calling it dead.
+	linkWrongFile
 )
 
 // checkLink asks a freshly minted link for its first byte and judges the answer.
@@ -45,7 +50,12 @@ const (
 // getting an answer, and treating that as a dead link would turn a slow CDN into a blacklisted release —
 // the exact confusion StoreUnavailableError exists to keep out of this route. The same goes for 429 and
 // 5xx: the CDN declining to answer right now, not saying the link is wrong.
-func checkLink(ctx context.Context, client *http.Client, link string, wantSize int64) (linkVerdict, string) {
+//
+// wantSize is the file's size as a store listed it. releaseSize is the indexer's size for the whole
+// release, consulted only when wantSize is unknown, and only as a floor: a served total under half of it is
+// linkWrongFile. Half, because a collection's film is legitimately smaller than the pack an indexer may
+// report, while the failure this exists for is a sample or an .nfo — kilobytes against gigabytes.
+func checkLink(ctx context.Context, client *http.Client, link string, wantSize, releaseSize int64) (linkVerdict, string) {
 	ctx, cancel := context.WithTimeout(ctx, linkCheckTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
@@ -77,6 +87,10 @@ func checkLink(ctx context.Context, client *http.Client, link string, wantSize i
 			math.Abs(float64(total-wantSize)) > linkSizeTolerance*float64(wantSize) {
 			return linkBroken, fmt.Sprintf("serves %d bytes, the debrid listed %d", total, wantSize)
 		}
+	} else if releaseSize > 0 {
+		if total, ok := contentRangeTotal(resp.Header.Get("content-range")); ok && total*2 < releaseSize {
+			return linkWrongFile, fmt.Sprintf("serves %d bytes of a %d-byte release", total, releaseSize)
+		}
 	}
 	return linkPlayable, ""
 }
@@ -95,15 +109,26 @@ func contentRangeTotal(v string) (int64, bool) {
 //
 // No probe client wired means no check, the same opt-in the probe fan-out uses: a caller that has not
 // provided one (a test, an embedder) gets the old behaviour exactly.
+//
+// The release size is passed for a movie only. An episode's file is one of many in a pack, so a size for
+// the whole release says nothing about it — and a pack's episode always has its size known from the list
+// it was picked from anyway.
 func (h *handler) verifyLink(ctx context.Context, pool *StorePool, rt ResolveTarget, link string) linkVerdict {
 	if h.deps.ProbeClient == nil {
 		return linkUnverified
 	}
 	size, _ := pool.KnownFileSize(rt)
-	verdict, reason := checkLink(ctx, h.deps.ProbeClient, link, size)
+	var release int64
+	if rt.Season == nil && rt.Episode == nil {
+		release = rt.ReleaseSize
+	}
+	verdict, reason := checkLink(ctx, h.deps.ProbeClient, link, size, release)
 	switch verdict {
 	case linkBroken:
 		logLimited("play-link-rejected", "play %s: the minted link failed its check (%s)",
+			shortHash(rt.InfoHash), reason)
+	case linkWrongFile:
+		logLimited("play-link-wrong-file", "play %s: the minted link names another file in the release (%s)",
 			shortHash(rt.InfoHash), reason)
 	case linkUnverified:
 		logLimited("play-link-unverified", "play %s: could not check the minted link (%s), serving it anyway",
