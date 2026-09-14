@@ -23,6 +23,8 @@ import (
 
 const (
 	staticCache = "public, max-age=3600, stale-while-revalidate=600"
+	// A configured manifest's URL is the install credential, so no shared cache may keep a copy keyed on it.
+	configuredManifestCache = "private, max-age=3600, stale-while-revalidate=600"
 	// The sealing key can rotate, so keep its freshness window short — the ETag is the primary
 	// correctness mechanism (a rotated key changes the body hash and busts any stale cache).
 	keyCache       = "public, max-age=300"
@@ -49,15 +51,20 @@ const (
 	// scrape plus a debrid cache-check fan-out, with a perfectly good list sitting in memory.
 	//
 	// Two minutes, not another full TTL. The window only has to cover the moment of expiry — a rebuild
-	// finishes well inside it — and every second added here is a second every cached list occupies memory
-	// and disk. It also bounds how wrong a served list may be: torrent availability moves, and a list
-	// stale by an hour is not a kindness.
+	// finishes well inside it. It also bounds how wrong a list served as current may be: torrent
+	// availability moves, and a list stale by an hour is not a kindness. Past this window the entry is kept
+	// only as a last resort for an indexer outage (maxStaleIfError), and is served then with a degraded header.
 	//
 	// A CEILING, not the value: staleWindowFor caps it at the configured TTL as well. Left absolute, an
 	// operator who set LIST_TTL_SECS=30 got a 30-second freshness followed by a two-minute stale
 	// window — an entry spending 80% of its life stale, which is not what "briefly serve the old one
 	// while it refreshes" means.
 	maxStaleServeWindow = 2 * time.Minute
+	// How long past its freshness a COMPLETE list may still be used when nothing better can be had: by a
+	// client, as stale-if-error, and by the server, as the answer to a rebuild in which no indexer answered
+	// (X-Den-Degraded: stale_list). A CEILING: staleIfErrorFor also keeps it inside the life of the play
+	// tickets the list carries.
+	maxStaleIfError = time.Hour
 )
 
 // statusBudget bounds a status read: one upstream question, asked on the client's poll cadence, so it
@@ -153,6 +160,34 @@ const maxConcurrentRebuilds = 8
 type rebuildLease struct {
 	until time.Time
 	gen   uint64
+	// outage — the last build for this key found no indexer answering. Until the lease ends, a request past the
+	// stale window is answered from the held list without scraping again (see lastResort).
+	outage bool
+}
+
+// markOutage holds a key for a cool-off after a build in which no indexer answered, so the requests behind it
+// are answered from the held list instead of each paying for a scrape that will fail the same way.
+func (h *handler) markOutage(key string, now, until time.Time) {
+	h.rebuildMu.Lock()
+	defer h.rebuildMu.Unlock()
+	if h.rebuilds == nil {
+		h.rebuilds = map[string]rebuildLease{}
+	}
+	for k, l := range h.rebuilds {
+		if !now.Before(l.until) {
+			delete(h.rebuilds, k)
+		}
+	}
+	h.rebuildGen++
+	h.rebuilds[key] = rebuildLease{until: until, gen: h.rebuildGen, outage: true}
+}
+
+// inOutage reports whether a recent build for this key found no indexer answering.
+func (h *handler) inOutage(key string, now time.Time) bool {
+	h.rebuildMu.Lock()
+	defer h.rebuildMu.Unlock()
+	l, held := h.rebuilds[key]
+	return held && l.outage && now.Before(l.until)
 }
 
 // bookRebuild reserves the right to rebuild this key in the background, returning the lease's generation.
@@ -217,6 +252,14 @@ func staleWindowFor(ttl time.Duration) time.Duration {
 		return ttl
 	}
 	return maxStaleServeWindow
+}
+
+// staleIfErrorFor is how long past freshness a complete list may still be used, bounded so that no use of it
+// holds a lapsed ticket. A list's tickets are minted when it is built, and the list stays fresh for one TTL
+// on the server and one more as max-age on the device; the third TTL is room to press play. Zero when the
+// tickets are too short-lived to allow any.
+func staleIfErrorFor(listTTL, ticketTTL time.Duration) time.Duration {
+	return max(0, min(maxStaleIfError, ticketTTL-3*listTTL))
 }
 
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
@@ -312,6 +355,8 @@ type handler struct {
 	listCache        string
 	partialListCache string
 	staleListCache   string
+	// staleIfErrorFor(ListTTL, PlayTicketTTL), fixed once both are known.
+	staleIfError time.Duration
 }
 
 // After this many consecutive builds where no indexer responded, /health reports "degraded".
@@ -354,7 +399,14 @@ func NewHandler(deps Deps) http.Handler {
 	ttlSec := int(deps.ListTTL.Seconds())
 	// Private, every list: its play URLs are bearer tickets good for a day, so no shared cache between the client
 	// and scout (a CDN in front of den-edge, a corporate proxy) may keep a copy to hand to someone else.
-	h.listCache = fmt.Sprintf("private, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
+	//
+	// stale-if-error is bounded by the tickets' life (staleIfErrorFor): a list a device falls back to during an
+	// outage must still play. It was a flat day, as long as the tickets themselves.
+	h.staleIfError = staleIfErrorFor(deps.ListTTL, deps.PlayTicketTTL)
+	h.listCache = fmt.Sprintf("private, max-age=%d, stale-while-revalidate=%d", ttlSec, ttlSec)
+	if sie := int(h.staleIfError.Seconds()); sie > 0 {
+		h.listCache += fmt.Sprintf(", stale-if-error=%d", sie)
+	}
 	// A short list and a stale one must never be held LONGER than a complete fresh one. Both windows are
 	// therefore capped by the configured TTL, not just written as the 60s that suits the default: at
 	// LIST_TTL_SECS=30 a knowingly-short list was being advertised as fresh for 60s and usable
@@ -523,7 +575,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		body, _ := json.Marshal(buildManifest(config))
-		h.conditional(w, r, string(body), "", jsonType, staticCache)
+		h.conditional(w, r, string(body), "", jsonType, configuredManifestCache)
 	case "stream":
 		h.handleStream(w, r, configBlob, parts)
 	case "play":
@@ -613,6 +665,13 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		// to hold a knowingly-short list for five minutes and a day on stale-if-error, which is the harm
 		// the shortening exists to prevent, defeated one branch over.
 		complete, freshUntil, etag, body := splitCached(hit)
+		// Past the stale window a complete list is held only as a last resort: rebuild in the foreground, as on
+		// a miss, and fall back to it only if no indexer answers.
+		if complete && freshUntil > 0 && time.Now().Unix() >= freshUntil+int64(staleWindowFor(h.deps.ListTTL)/time.Second) {
+			metrics.listCacheMiss.Add(1)
+			h.lastResort(w, r, start, configBlob, sid, origin, cacheKey, freshUntil, etag, body)
+			return
+		}
 		header := listCache
 		served := "cache;desc=hit"
 		metrics.listCacheHit.Add(1)
@@ -654,7 +713,54 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
 		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil), nil
 	})
+	h.writeBuilt(w, r, start, v.(buildResult))
+}
+
+// lastResort answers a request for a complete list that is past its stale window: a foreground build, as on
+// a miss, unless no indexer answers it — then the held list, marked X-Den-Degraded: stale_list and kept by
+// the client for a minute. An empty list in an outage reads as "nothing to play"; the last good one plays.
+//
+// Only within staleIfError of the list's freshness, which keeps every ticket in it inside its life. After
+// such a build the key cools off for rebuildCooloff, during which the held list is served without scraping.
+func (h *handler) lastResort(w http.ResponseWriter, r *http.Request, start time.Time, configBlob string, sid *StreamID,
+	origin, cacheKey string, freshUntil int64, etag, body string) {
+	config, ok := h.openConfig(configBlob)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
+		return
+	}
+	if h.refuseScoped(w, r, config) {
+		return
+	}
+	now := time.Now()
+	usable := now.Before(time.Unix(freshUntil, 0).Add(h.staleIfError))
+	serveHeld := func(timing string) {
+		logLimited("stale-list", "%s %s: no indexer answered; serving the last complete list, %s past its freshness",
+			sid.Type, sid.IMDb, now.Sub(time.Unix(freshUntil, 0)).Truncate(time.Second))
+		w.Header().Set("X-Den-Degraded", "stale_list")
+		w.Header().Set("server-timing", timing+"cache;desc=stale_list, total;dur="+msDur(time.Since(start)))
+		h.conditional(w, r, body, etag, jsonType, h.staleListCache)
+	}
+	if usable && h.inOutage(cacheKey, now) {
+		serveHeld("")
+		return
+	}
+	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
+	defer cancel()
+	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
+		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil), nil
+	})
 	res := v.(buildResult)
+	if res.degraded == "indexers" && usable {
+		h.markOutage(cacheKey, now, now.Add(rebuildCooloff))
+		serveHeld(res.timing + ", ")
+		return
+	}
+	h.writeBuilt(w, r, start, res)
+}
+
+// writeBuilt answers with a list built for this request (or for the build it joined).
+func (h *handler) writeBuilt(w http.ResponseWriter, r *http.Request, start time.Time, res buildResult) {
 	// Signal a degraded build so the app can say "sources temporarily unavailable" rather than treating
 	// an empty list as "no results" (a total indexer/cache-check outage otherwise looks identical).
 	if res.degraded != "" {
@@ -668,7 +774,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	// stale-if-error=86400`, which URLSession's shared cache honours. The guard was defeated one layer
 	// down, on the only client that matters: an outage's empty list stuck on the device for five minutes,
 	// and up to a day on any later error.
-	cacheHeader := listCache
+	cacheHeader := h.listCache
 	switch {
 	case res.degraded != "":
 		cacheHeader = noStore
@@ -676,7 +782,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		// The SAME lesson one line up, for the partial case: the server held this list for a minute and
 		// then told the client to keep it for five, with stale-if-error for a day. A list knowingly
 		// missing an indexer's releases must not outlive its short server-side life on the device.
-		cacheHeader = partialListCache
+		cacheHeader = h.partialListCache
 	}
 	h.conditional(w, r, body, etag, jsonType, cacheHeader)
 }
@@ -974,15 +1080,16 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 			ttl = h.deps.ListTTL
 		}
 	}
-	// The entry outlives its freshness by staleWindowFor(ttl) so the hit path can answer from it while a
-	// rebuild runs — but only when it is COMPLETE. A partial list expires exactly when it says it does:
-	// it is already knowingly short, and the one thing it must not get is a longer life.
+	// The entry outlives its freshness so the hit path can answer from it while a rebuild runs, and fall back
+	// to it through an indexer outage (lastResort) — but only when it is COMPLETE. A partial list expires
+	// exactly when it says it does: it is already knowingly short, and the one thing it must not get is a
+	// longer life.
 	now := time.Now()
 	freshUntil := int64(0)
 	hold := ttl
 	if scrapeComplete {
 		freshUntil = now.Add(ttl).Unix()
-		hold = ttl + staleWindowFor(ttl)
+		hold = ttl + max(staleWindowFor(ttl), h.staleIfError)
 	}
 	value := joinCached(scrapeComplete, freshUntil, etag, string(body))
 	switch {

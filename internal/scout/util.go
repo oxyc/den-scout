@@ -9,11 +9,13 @@ import (
 	"strings"
 )
 
-// etagHex is an 8-hex FNV-1a-32 of s — matches the TS ETag format ("[0-9a-f]{8}").
+// etagHex is a 16-hex FNV-1a-64 of s. 64 bits, because the ETag is the only thing standing between a
+// revalidating client and a 304 for a body it does not hold; at 32 bits a collision between two versions of
+// a list is within reach of an ordinary cache's lifetime.
 func etagHex(s string) string {
-	h := fnv.New32a()
+	h := fnv.New64a()
 	_, _ = h.Write([]byte(s))
-	return fmt.Sprintf("%08x", h.Sum32())
+	return fmt.Sprintf("%016x", h.Sum64())
 }
 
 // keyHash is a collision-resistant digest for cache keys (audit #7 — the key gates cross-config

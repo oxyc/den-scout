@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Cinemeta (the public Stremio metadata addon) maps an IMDb id → title/year. den-scout uses those to drop
@@ -45,46 +48,86 @@ type cineMeta struct {
 	Year  int
 }
 
-// cinemetaMeta builds the Meta dependency against a Cinemeta-compatible base URL.
-func cinemetaMeta(client doer, base string) func(context.Context, string, string) (cineMeta, bool) {
+// How long a lookup is remembered. A film's title and year do not change, so an answer is kept for a week; a
+// failure only for ten minutes, so a Cinemeta outage or a title it has not indexed yet is asked about again
+// soon. Every movie list build asks, so without this each one paid a round trip to Cinemeta.
+const (
+	cinemetaHitTTL  = 7 * 24 * time.Hour
+	cinemetaMissTTL = 10 * time.Minute
+	// The cached value for a lookup that found nothing usable.
+	cinemetaMissValue = "-"
+)
+
+// Concurrent builds of one film (several installs, or a list and its rebuild) share one lookup.
+var cinemetaFlight singleflight.Group
+
+// cinemetaMeta builds the Meta dependency against a Cinemeta-compatible base URL, with lookups cached in cache.
+func cinemetaMeta(client doer, base string, cache Cache) func(context.Context, string, string) (cineMeta, bool) {
 	base = strings.TrimRight(base, "/")
 	return func(ctx context.Context, typ, imdb string) (cineMeta, bool) {
 		if typ != "movie" {
 			return cineMeta{}, false
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/meta/movie/%s.json", base, imdb), nil)
-		if err != nil {
+		key := "cinemeta:movie:" + imdb
+		if v, ok := cache.Get(key); ok {
+			var m cineMeta
+			if v != cinemetaMissValue && json.Unmarshal([]byte(v), &m) == nil {
+				return m, true
+			}
 			return cineMeta{}, false
 		}
-		req.Header.Set("accept", "application/json")
-		req.Header.Set("user-agent", scrapeUserAgent)
-		resp, err := client.Do(req)
-		if err != nil {
-			return cineMeta{}, false
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode != http.StatusOK {
-			return cineMeta{}, false
-		}
-		var body struct {
-			Meta struct {
-				Name        string `json:"name"`
-				Year        string `json:"year"`
-				ReleaseInfo string `json:"releaseInfo"`
-			} `json:"meta"`
-		}
-		if json.NewDecoder(io.LimitReader(resp.Body, maxScrapeBytes)).Decode(&body) != nil {
-			return cineMeta{}, false
-		}
-		m := cineMeta{Title: strings.TrimSpace(body.Meta.Name)}
-		if y := firstYear(body.Meta.Year); y != 0 {
-			m.Year = y
-		} else {
-			m.Year = firstYear(body.Meta.ReleaseInfo)
-		}
-		// Usable only if we learned at least one signal.
+		v, _, _ := cinemetaFlight.Do(key, func() (any, error) {
+			m, ok := fetchCinemeta(ctx, client, base, imdb)
+			switch {
+			case ok:
+				b, _ := json.Marshal(m)
+				cache.Put(key, string(b), cinemetaHitTTL)
+			case ctx.Err() == nil:
+				// A lookup cut short by the build's own deadline says nothing about Cinemeta, so only a failure
+				// that ran its course is remembered.
+				cache.Put(key, cinemetaMissValue, cinemetaMissTTL)
+			}
+			return m, nil
+		})
+		m := v.(cineMeta)
 		return m, m.Year != 0 || m.Title != ""
 	}
+}
+
+// fetchCinemeta asks Cinemeta for one film.
+func fetchCinemeta(ctx context.Context, client doer, base, imdb string) (cineMeta, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/meta/movie/%s.json", base, imdb), nil)
+	if err != nil {
+		return cineMeta{}, false
+	}
+	req.Header.Set("accept", "application/json")
+	req.Header.Set("user-agent", scrapeUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return cineMeta{}, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return cineMeta{}, false
+	}
+	var body struct {
+		Meta struct {
+			Name        string `json:"name"`
+			Year        string `json:"year"`
+			ReleaseInfo string `json:"releaseInfo"`
+		} `json:"meta"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxScrapeBytes)).Decode(&body) != nil {
+		return cineMeta{}, false
+	}
+	m := cineMeta{Title: strings.TrimSpace(body.Meta.Name)}
+	if y := firstYear(body.Meta.Year); y != 0 {
+		m.Year = y
+	} else {
+		m.Year = firstYear(body.Meta.ReleaseInfo)
+	}
+	// Usable only if we learned at least one signal.
+	return m, m.Year != 0 || m.Title != ""
 }
 
 // firstYear pulls the first plausible 4-digit year out of a string like "2026" or "2019–2023".

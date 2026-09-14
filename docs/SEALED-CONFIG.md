@@ -138,9 +138,10 @@ outlast two things:
   `stale-while-revalidate`, one TTL each.
 - **The viewing session:** the player may ask the same URL again.
 
-The addon warns at startup when the TTL is not above 3×`LIST_TTL_SECS`. A list the device holds only
-through `stale-if-error` (up to a day) can outlive its tickets. That is acceptable, because it only
-happens while `/stream` is erroring. An expired ticket answers **410**, meaning: fetch the list again.
+The addon warns at startup when the TTL is not above 3×`LIST_TTL_SECS`. A list used past its freshness —
+by the device through `stale-if-error`, or by the addon as its `stale_list` answer when no indexer
+responds — is held to at most an hour and to what is left of 3×`LIST_TTL_SECS` below the ticket TTL, so it
+never carries a lapsed ticket. An expired ticket answers **410**, meaning: fetch the list again.
 
 **Rollout.** The legacy `/<config>/play` route keeps working, because clients hold cached stream lists
 (for up to a day on `stale-if-error`). The route also honours `REVOKED_INSTALLS` and `CONFIG_EPOCH`, and

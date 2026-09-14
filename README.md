@@ -106,10 +106,19 @@ preflight. An unknown path — and `/metrics` without its token — is `404` wit
 
 A stream list that is served but cannot be trusted carries `X-Den-Degraded` — `indexers` when no indexer
 answered, `cache-check` when the debrid could not be asked about a release in it — and is `no-store`, so
-the app can say "sources temporarily unavailable" instead of "nothing found".
+the app can say "sources temporarily unavailable" instead of "nothing found". When no indexer answers a
+rebuild of a title whose last complete list is under an hour past its freshness, that list is served
+instead, with `X-Den-Degraded: stale_list` and `Cache-Control: private, max-age=60`; for the next minute
+the title is answered that way without scraping again.
+
+Stream lists are `private` (their play URLs are credentials). A complete list is `max-age` and
+`stale-while-revalidate` of `LIST_TTL_SECS`, plus `stale-if-error` of an hour at most, less when
+`PLAY_TICKET_TTL_SECS` is under 3×`LIST_TTL_SECS` plus an hour, so a list a device falls back to still
+plays. A configured manifest is `private` too; `/manifest.json`, `/configure` and `/config-key` are `public`.
 
 Stream and play responses carry `Server-Timing`: a built list names `scrape`, `cache-check` and (when
-probing is on) `probe`; a list served from cache says `cache;desc=hit` or `cache;desc=stale`; a play names
+probing is on) `probe`; a list served from cache says `cache;desc=hit`, `cache;desc=stale` or
+`cache;desc=stale_list`; a play names
 `resolve` once one has run; every one ends with `total`. Durations are milliseconds.
 
 ### Stream attributes

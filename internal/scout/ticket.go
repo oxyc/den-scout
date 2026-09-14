@@ -33,6 +33,8 @@ const (
 	// which a client may first use up to 3×LIST_TTL_SECS after the list was built (a hit served just before
 	// the server's freshness ends, then max-age plus stale-while-revalidate on the device), and then the
 	// longest viewing session, during which the player may ask the URL again. A day covers both with room.
+	// A list used past its freshness (stale-if-error, or the server's stale_list fallback) is held inside this
+	// life by staleIfErrorFor.
 	defaultPlayTicketTTL = 24 * time.Hour
 )
 

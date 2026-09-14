@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestParseTitleIsReleaseNotIndexerLabel(t *testing.T) {
@@ -95,7 +98,7 @@ func TestTitleTokens_wouldEmptyRealSeries(t *testing.T) {
 func TestCinemetaMeta(t *testing.T) {
 	ok := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) {
 		return resp(200, `{"meta":{"id":"tt1","name":"Disclosure Day","year":"2026"}}`), nil
-	}}, "https://cinemeta.example")
+	}}, "https://cinemeta.example", NewMemoryCache(1<<20))
 	if m, found := ok(context.Background(), "movie", "tt15047880"); !found || m.Year != 2026 || m.Title != "Disclosure Day" {
 		t.Errorf("movie meta: %+v found=%v", m, found)
 	}
@@ -106,7 +109,7 @@ func TestCinemetaMeta(t *testing.T) {
 	series := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) {
 		asked = true
 		return resp(200, `{"meta":{"id":"tt1","name":"The Bear","releaseInfo":"2022–2025"}}`), nil
-	}}, "https://cinemeta.example")
+	}}, "https://cinemeta.example", NewMemoryCache(1<<20))
 	if _, found := series(context.Background(), "series", "tt1"); found {
 		t.Error("series should return found=false")
 	}
@@ -114,9 +117,70 @@ func TestCinemetaMeta(t *testing.T) {
 		t.Error("a series was looked up — the result cannot be used, so the request is waste")
 	}
 	// upstream failure → found=false (list served unfiltered)
-	bad := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(500, ""), nil }}, "x")
+	bad := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(500, ""), nil }}, "x", NewMemoryCache(1<<20))
 	if _, found := bad(context.Background(), "movie", "tt1"); found {
 		t.Error("cinemeta failure should return found=false")
+	}
+}
+
+// ttlCache records the TTL each key was last written with.
+type ttlCache struct {
+	Cache
+	mu   sync.Mutex
+	ttls map[string]time.Duration
+}
+
+func (c *ttlCache) Put(key, value string, ttl time.Duration) {
+	c.mu.Lock()
+	c.ttls[key] = ttl
+	c.mu.Unlock()
+	c.Cache.Put(key, value, ttl)
+}
+
+// Every movie list build asks Cinemeta, so an answer is remembered for a week and a failure for ten minutes;
+// a lookup cut short by its caller's deadline is not remembered at all.
+func TestCinemetaMeta_cachesAnswersAndFailures(t *testing.T) {
+	var asked atomic.Int32
+	status := 200
+	cache := &ttlCache{Cache: NewMemoryCache(1 << 20), ttls: map[string]time.Duration{}}
+	meta := cinemetaMeta(mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		asked.Add(1)
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		return resp(status, `{"meta":{"name":"Disclosure Day","year":"2026"}}`), nil
+	}}, "https://cinemeta.example", cache)
+
+	for i := 0; i < 3; i++ {
+		if m, found := meta(context.Background(), "movie", "tt100"); !found || m.Year != 2026 || m.Title != "Disclosure Day" {
+			t.Fatalf("lookup %d: %+v found=%v", i, m, found)
+		}
+	}
+	if n := asked.Load(); n != 1 {
+		t.Errorf("asked Cinemeta %d times for one film, want 1", n)
+	}
+	if ttl := cache.ttls["cinemeta:movie:tt100"]; ttl != cinemetaHitTTL {
+		t.Errorf("an answer is kept for %s, want %s", ttl, cinemetaHitTTL)
+	}
+
+	status = 404
+	for i := 0; i < 3; i++ {
+		if _, found := meta(context.Background(), "movie", "tt200"); found {
+			t.Fatal("a film Cinemeta does not have was found")
+		}
+	}
+	if n := asked.Load(); n != 2 {
+		t.Errorf("asked Cinemeta %d times in all, want a failure to be remembered too", n)
+	}
+	if ttl := cache.ttls["cinemeta:movie:tt200"]; ttl != cinemetaMissTTL {
+		t.Errorf("a failure is kept for %s, want %s", ttl, cinemetaMissTTL)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	meta(ctx, "movie", "tt300")
+	if _, kept := cache.ttls["cinemeta:movie:tt300"]; kept {
+		t.Error("a lookup its caller cancelled was remembered as a failure")
 	}
 }
 

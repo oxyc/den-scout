@@ -250,7 +250,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 			return makeScrapers(c, client, sourceClient, settings.IndexerURLs)
 		},
 		MakeStores:   func(c *Config) []Store { return buildStores(c, client, cache) },
-		Meta:         cinemetaMeta(client, settings.CinemetaURL),
+		Meta:         cinemetaMeta(client, settings.CinemetaURL, cache),
 		SealKeyring:  buildKeyring(settings.ConfigKey, settings.ConfigKeysPrev),
 		MetricsToken: settings.MetricsToken,
 		LogRequests:  settings.LogRequests,

@@ -159,6 +159,39 @@ func TestManifest_namesTheInstall(t *testing.T) {
 	}
 }
 
+// A configured manifest's URL is the install credential, so it is never cached where anyone else could be
+// handed it; the config-less routes stay publicly cacheable.
+func TestManifest_configuredIsPrivateAndTheRestPublic(t *testing.T) {
+	h := NewHandler(testDeps(nil))
+	for path, want := range map[string]string{
+		"/" + validBlob + "/manifest.json": "private, max-age=3600, stale-while-revalidate=600",
+		"/manifest.json":                   "public, max-age=3600, stale-while-revalidate=600",
+		"/configure":                       "public, max-age=3600, stale-while-revalidate=600",
+	} {
+		rr := do(h, path, nil)
+		if cc := rr.Header().Get("cache-control"); rr.Code != 200 || cc != want {
+			t.Errorf("%s: %d cache-control %q, want %q", path, rr.Code, cc, want)
+		}
+		// A revalidation answers with the same header.
+		if cc := do(h, path, map[string]string{"If-None-Match": rr.Header().Get("etag")}).Header().Get("cache-control"); cc != want {
+			t.Errorf("%s 304: cache-control %q, want %q", path, cc, want)
+		}
+	}
+}
+
+// ETags are 64-bit: sixteen hex digits, quoted.
+func TestETag_is64Bit(t *testing.T) {
+	for _, body := range []string{"", `{"streams":[]}`} {
+		tag := etagFor(body)
+		if len(tag) != 18 || tag[0] != '"' || tag[17] != '"' || strings.Trim(tag[1:17], "0123456789abcdef") != "" {
+			t.Errorf("etag for %q = %s, want 16 lowercase hex digits in quotes", body, tag)
+		}
+	}
+	if etagFor("a") == etagFor("b") {
+		t.Error("two bodies share an etag")
+	}
+}
+
 // /configure shows the id of the link it just built, with the variable that revokes it.
 func TestConfigurePage_showsTheInstallID(t *testing.T) {
 	page := do(NewHandler(testDeps(nil)), "/configure", nil).Body.String()
@@ -1314,6 +1347,104 @@ func TestStreamList_staleWindowScalesWithTheTTL(t *testing.T) {
 	// The stale reply must never claim a longer freshness than the operator configured.
 	if cc := do(h, path, nil).Header().Get("cache-control"); cc != "private, max-age=30" {
 		t.Errorf("stale cache-control = %q, want max-age capped at the 30s TTL", cc)
+	}
+}
+
+// A complete list's stale-if-error never outlives the tickets in it.
+func TestStreamList_staleIfErrorStaysInsideTicketLife(t *testing.T) {
+	for _, c := range []struct {
+		list, ticket, want time.Duration
+	}{
+		{5 * time.Minute, 24 * time.Hour, time.Hour},
+		{5 * time.Minute, time.Hour, 45 * time.Minute},
+		{5 * time.Minute, 10 * time.Minute, 0},
+	} {
+		if got := staleIfErrorFor(c.list, c.ticket); got != c.want {
+			t.Errorf("list %s, ticket %s: stale-if-error %s, want %s", c.list, c.ticket, got, c.want)
+		}
+	}
+
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+	if cc := do(NewHandler(testDeps(nil)), path, nil).Header().Get("cache-control"); cc != "private, max-age=300, stale-while-revalidate=300, stale-if-error=3600" {
+		t.Errorf("default cache-control = %q", cc)
+	}
+	short := NewHandler(testDeps(func(d *Deps) { d.PlayTicketTTL = 10 * time.Minute }))
+	if cc := do(short, path, nil).Header().Get("cache-control"); cc != "private, max-age=300, stale-while-revalidate=300" {
+		t.Errorf("with ten-minute tickets cache-control = %q, want no stale-if-error", cc)
+	}
+}
+
+// When no indexer answers, a title whose last complete list is past its stale window gets that list back —
+// marked stale_list and held by the client for a minute — rather than an empty "nothing to play". Within the
+// cool-off after such a build the list is served without scraping again. Past stale-if-error, or when a
+// rebuild succeeds, the answer is the build's own.
+func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) {
+	var down atomic.Bool
+	var scrapes atomic.Int32
+	cache := &recordingCache{Cache: NewMemoryCache(1 << 20)}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.Cache = cache
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) {
+				scrapes.Add(1)
+				if down.Load() {
+					return nil, errors.New("indexer down")
+				}
+				return testSeeds(), nil
+			}}}
+		}
+	}))
+	path := "/" + validBlob + "/stream/movie/tt1234567.json"
+	if rr := do(h, path, nil); rr.Code != 200 {
+		t.Fatalf("cold build: %d", rr.Code)
+	}
+	key := cache.lastKey()
+	held, _ := cache.Get(key)
+	complete, _, etag, body := splitCached(held)
+	age := func(past time.Duration) {
+		cache.Put(key, joinCached(complete, time.Now().Add(-past).Unix(), etag, body), 2*time.Hour)
+	}
+
+	// A healthy rebuild past the stale window answers with the new list, not the held one.
+	age(5 * time.Minute)
+	rebuilt := do(h, path, nil)
+	if got := rebuilt.Header().Get("X-Den-Degraded"); got != "" || !strings.Contains(rebuilt.Header().Get("cache-control"), "max-age=300") {
+		t.Errorf("healthy rebuild: degraded %q, cache-control %q", got, rebuilt.Header().Get("cache-control"))
+	}
+
+	down.Store(true)
+	age(5 * time.Minute)
+	before := scrapes.Load()
+	stale := do(h, path, nil)
+	if stale.Code != 200 || stale.Body.String() != body {
+		t.Fatalf("outage: %d, served the held list: %v", stale.Code, stale.Body.String() == body)
+	}
+	if got := stale.Header().Get("X-Den-Degraded"); got != "stale_list" {
+		t.Errorf("X-Den-Degraded = %q, want stale_list", got)
+	}
+	if cc := stale.Header().Get("cache-control"); cc != "private, max-age=60" {
+		t.Errorf("cache-control = %q, want private, max-age=60", cc)
+	}
+	if scrapes.Load() != before+1 {
+		t.Errorf("scraped %d times for the outage answer, want 1", scrapes.Load()-before)
+	}
+
+	again := do(h, path, nil)
+	if again.Header().Get("X-Den-Degraded") != "stale_list" || again.Body.String() != body {
+		t.Errorf("inside the cool-off: degraded %q", again.Header().Get("X-Den-Degraded"))
+	}
+	if scrapes.Load() != before+1 {
+		t.Error("a request inside the cool-off scraped again")
+	}
+
+	// Past stale-if-error the held list is not served, whatever the cool-off says.
+	age(2 * time.Hour)
+	late := do(h, path, nil)
+	if got := late.Header().Get("X-Den-Degraded"); got != "indexers" {
+		t.Errorf("past stale-if-error: X-Den-Degraded = %q, want indexers", got)
+	}
+	if late.Body.String() == body {
+		t.Error("past stale-if-error the held list was served")
 	}
 }
 
