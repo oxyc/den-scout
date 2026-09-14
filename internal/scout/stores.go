@@ -862,6 +862,30 @@ func scoutBudgetSpent(svc DebridService, token string) bool {
 	return globalAddBudget.remaining(budgetAccount(svc, token)) <= 0
 }
 
+// ScoutBusyFor is how long until any of the pool's accounts may add again, for the Retry-After of a scout_busy
+// answer; zero when one already may, or none reports a budget.
+func (p *StorePool) ScoutBusyFor() time.Duration {
+	var soonest time.Duration
+	for _, st := range p.stores {
+		account, ok := st.(interface{ budgetAccount() string })
+		if !ok {
+			continue
+		}
+		wait := globalAddBudget.freesIn(account.budgetAccount())
+		if wait == 0 {
+			return 0
+		}
+		if soonest == 0 || wait < soonest {
+			soonest = wait
+		}
+	}
+	return soonest
+}
+
+func (s *torBoxStore) budgetAccount() string     { return budgetAccount(ServiceTorBox, s.token) }
+func (s *realDebridStore) budgetAccount() string { return budgetAccount(ServiceRealDebrid, s.token) }
+func (s *premiumizeStore) budgetAccount() string { return budgetAccount(ServicePremiumize, s.token) }
+
 func (s *torBoxStore) ScoutBudgetSpent() bool { return scoutBudgetSpent(ServiceTorBox, s.token) }
 func (s *realDebridStore) ScoutBudgetSpent() bool {
 	return scoutBudgetSpent(ServiceRealDebrid, s.token)

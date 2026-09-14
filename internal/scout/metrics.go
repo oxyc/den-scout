@@ -46,25 +46,32 @@ type metricSet struct {
 	// a counter that appears only after the first request is a counter you cannot alert on.
 	indexerRequests map[Indexer]*atomic.Int64
 	indexerFailures map[Indexer]*atomic.Int64
+	// Releases each indexer answered with, before dedupe: whether one that answers is also one that adds anything.
+	indexerReleases map[Indexer]*atomic.Int64
 }
 
 func newMetricSet() *metricSet {
 	m := &metricSet{
 		indexerRequests: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
 		indexerFailures: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
+		indexerReleases: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
 	}
 	for _, id := range metricIndexers {
 		m.indexerRequests[id] = new(atomic.Int64)
 		m.indexerFailures[id] = new(atomic.Int64)
+		m.indexerReleases[id] = new(atomic.Int64)
 	}
 	return m
 }
 
-// indexerResult records one scrape attempt. An indexer that is not in the fixed set is ignored rather
-// than added, so a caller cannot grow this map at runtime and race the readers.
-func (m *metricSet) indexerResult(id Indexer, ok bool) {
+// indexerResult records one scrape attempt and the releases it returned. An indexer that is not in the fixed set is
+// ignored rather than added, so a caller cannot grow this map at runtime and race the readers.
+func (m *metricSet) indexerResult(id Indexer, ok bool, releases int) {
 	if c := m.indexerRequests[id]; c != nil {
 		c.Add(1)
+	}
+	if c := m.indexerReleases[id]; c != nil {
+		c.Add(int64(releases))
 	}
 	if !ok {
 		if c := m.indexerFailures[id]; c != nil {
@@ -122,13 +129,16 @@ func (m *metricSet) render(cachePersistent int) string {
 
 	reqs := make([][2]string, 0, len(metricIndexers))
 	fails := make([][2]string, 0, len(metricIndexers))
+	releases := make([][2]string, 0, len(metricIndexers))
 	for _, id := range metricIndexers {
 		label := `indexer="` + string(id) + `"`
 		reqs = append(reqs, [2]string{label, num(m.indexerRequests[id].Load())})
 		fails = append(fails, [2]string{label, num(m.indexerFailures[id].Load())})
+		releases = append(releases, [2]string{label, num(m.indexerReleases[id].Load())})
 	}
 	counter(&b, "scout_indexer_requests_total", "Scrape attempts per indexer.", reqs)
 	counter(&b, "scout_indexer_failures_total", "Scrape attempts that did not answer, per indexer.", fails)
+	counter(&b, "scout_indexer_releases_total", "Releases each indexer answered with, before dedupe.", releases)
 
 	// The tightest remaining debrid add allowance, aggregated across accounts exactly as /health reports
 	// it. -1 when nothing has been spent yet, which is distinct from 0 (spent out).

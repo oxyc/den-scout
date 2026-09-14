@@ -28,13 +28,15 @@ func main() {
 		// A redirect must never replay a request that carries a body: an add is charged once and would
 		// otherwise be SENT up to ten times. See RefuseRedirectReplay for the measurements.
 		CheckRedirect: scout.RefuseRedirectReplay,
-		Transport: &http.Transport{
+		// An upstream that answers 429 (or 503 with Retry-After) is left alone by every request for as long as it
+		// asked, not only by the one it answered. See PauseOnRefusal.
+		Transport: scout.PauseOnRefusal(&http.Transport{
 			Proxy:               http.ProxyFromEnvironment,
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 32, // several users can resolve via the same debrid host at once
 			IdleConnTimeout:     90 * time.Second,
 			ForceAttemptHTTP2:   true,
-		},
+		}),
 	}
 	cache := scout.NewTieredCache(settings.CacheBytes, settings.CacheDir)
 	// Expiry on the disk tier is enforced on READ, so a key nobody asks for again never dies on its own.

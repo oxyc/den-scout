@@ -131,14 +131,14 @@ func newSourceClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: refusePrivateDial}
 	return &http.Client{
 		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
+		Transport: PauseOnRefusal(&http.Transport{
 			DialContext:         dialer.DialContext,
 			ForceAttemptHTTP2:   true,
 			MaxIdleConns:        32,
 			MaxIdleConnsPerHost: 4,
 			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
-		},
+		}),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if req.URL.Scheme != "https" || len(via) >= 3 {
 				return http.ErrUseLastResponse

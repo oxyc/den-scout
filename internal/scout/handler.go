@@ -352,7 +352,9 @@ func NewHandler(deps Deps) http.Handler {
 	}
 	h := &handler{deps: deps, tickets: newTicketKeys(deps.SealKeyring)}
 	ttlSec := int(deps.ListTTL.Seconds())
-	h.listCache = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
+	// Private, every list: its play URLs are bearer tickets good for a day, so no shared cache between the client
+	// and scout (a CDN in front of den-edge, a corporate proxy) may keep a copy to hand to someone else.
+	h.listCache = fmt.Sprintf("private, max-age=%d, stale-while-revalidate=%d, stale-if-error=86400", ttlSec, ttlSec)
 	// A short list and a stale one must never be held LONGER than a complete fresh one. Both windows are
 	// therefore capped by the configured TTL, not just written as the 60s that suits the default: at
 	// LIST_TTL_SECS=30 a knowingly-short list was being advertised as fresh for 60s and usable
@@ -362,10 +364,10 @@ func NewHandler(deps Deps) http.Handler {
 	if ttlSec < shortSec {
 		shortSec = ttlSec
 	}
-	h.partialListCache = fmt.Sprintf("public, max-age=%d, stale-while-revalidate=%d", shortSec, shortSec)
+	h.partialListCache = fmt.Sprintf("private, max-age=%d, stale-while-revalidate=%d", shortSec, shortSec)
 	// No stale-if-error on a stale body: the client should come back once the rebuild this response
 	// booked has landed, not hold the old list for a day on the next error.
-	h.staleListCache = fmt.Sprintf("public, max-age=%d", shortSec)
+	h.staleListCache = fmt.Sprintf("private, max-age=%d", shortSec)
 	b, _ := json.Marshal(buildManifest(nil))
 	h.manifestUnconf = string(b)
 	h.manifestUnconfETag = etagFor(h.manifestUnconf)
@@ -393,7 +395,8 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("access-control-allow-origin", "*")
 	// The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
 	// Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
-	w.Header().Set("access-control-expose-headers", "Server-Timing, X-Den-Degraded")
+	// Retry-After and ETag too, or a browser client can neither wait as asked nor revalidate.
+	w.Header().Set("access-control-expose-headers", "Server-Timing, X-Den-Degraded, Retry-After, ETag")
 	w.Header().Set("timing-allow-origin", "*")
 	// A CORS preflight is answered on EVERY path, ahead of the method gate below, which would otherwise
 	// refuse it with a 405 and fail the preflight — /validate's JSON POST is one a browser preflights. It
@@ -1104,8 +1107,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// it, because that one is an add-path guard a read-only caller is exempt from.
 	if svc, reason, refused := pool.AccountRefusal(); refused {
 		logLimited("probe-account-refused", "probe %s → 503, %s refused the account (%s)", shortHash(infoHash), svc, reason)
-		writeJSON(w, http.StatusServiceUnavailable,
-			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
+		writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": svc})
 		return
 	}
 	// A refusal SCOUT made, above the store refusals below because it is ours rather than a service's.
@@ -1126,16 +1128,15 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	if pool.EveryAddRefusedByScout() {
 		logLimited("probe-scout-busy", "probe %s → 503 (scout-side), the hourly add allowance is spent",
 			shortHash(infoHash))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		writeUnavailable(w, pool.ScoutBusyFor(), map[string]any{
 			"error":  "scout_busy",
 			"detail": "scout's own hourly add budget for this account is spent",
-		}, noStore)
+		})
 		return
 	}
 	if refusedUs != nil {
 		logLimited("probe-refused", "probe %s → 503, %s %s", shortHash(infoHash), refusedUs.Service, refusedUs.Reason)
-		writeJSON(w, http.StatusServiceUnavailable,
-			map[string]any{"error": "store_unavailable", "service": refusedUs.Service}, noStore)
+		writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": refusedUs.Service})
 		return
 	}
 	// A refusal the store recorded moments ago outranks "nothing queued". Without this the probe reports
@@ -1144,15 +1145,14 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// store the probe may not reach again.
 	if svc, reason, ok := pool.RecentRefusal(infoHash); ok {
 		logLimited("probe-refused", "probe %s → 503, %s %s", shortHash(infoHash), svc, reason)
-		writeJSON(w, http.StatusServiceUnavailable,
-			map[string]any{"error": "store_unavailable", "service": svc}, noStore)
+		writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": svc})
 		return
 	}
 	// With the cache check down we do not know whether anything is queued, and 404 "not_queued" is a
 	// claim, not a shrug — the client reads it as a release nobody has. Say the store could not be asked.
 	if !truthOK && hasCacheTruth(config) {
 		logLimited("probe-cache-check-down", "probe %s → 503, cache check unavailable", shortHash(infoHash))
-		writeJSON(w, http.StatusServiceUnavailable, errBody("cache_check_unavailable"), noStore)
+		writeUnavailable(w, storeUnansweredWait, errBody("cache_check_unavailable"))
 		return
 	}
 	// Same rule one step further out: a store that could not answer is not a store saying nothing is
@@ -1160,7 +1160,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// exists to prevent, so an indeterminate read gets the "ask again" answer rather than the claim.
 	if unknown {
 		logLimited("probe-status-unknown", "probe %s → 503, a store could not answer", shortHash(infoHash))
-		writeJSON(w, http.StatusServiceUnavailable, errBody("status_unavailable"), noStore)
+		writeUnavailable(w, storeUnansweredWait, errBody("status_unavailable"))
 		return
 	}
 	logLimited("probe-not-queued", "probe %s → 404 not queued", shortHash(infoHash))
@@ -1505,8 +1505,8 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// named as ours.
 		if errors.Is(err, errScoutSide) {
 			logLimited("play-scout-busy", "play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
-			writeJSON(w, http.StatusServiceUnavailable,
-				map[string]any{"error": "scout_busy", "detail": scoutSideReason(err)}, noStore)
+			writeUnavailable(w, pool.ScoutBusyFor(),
+				map[string]any{"error": "scout_busy", "detail": scoutSideReason(err)})
 			return
 		}
 		// A debrid that throttled or faulted is not a dead release, and answering 404 made the two
@@ -1515,8 +1515,8 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		var unavailable *StoreUnavailableError
 		if errors.As(err, &unavailable) {
 			logLimited("play-store-unavailable", "play %s → 503, %v", shortHash(target.InfoHash), err)
-			writeJSON(w, http.StatusServiceUnavailable,
-				map[string]any{"error": "store_unavailable", "service": unavailable.Service}, noStore)
+			writeUnavailable(w, storeRefusalWait,
+				map[string]any{"error": "store_unavailable", "service": unavailable.Service})
 			return
 		}
 		// The client reads this 404 as "still fetching" and polls for as long as the viewer will sit
@@ -1822,6 +1822,22 @@ func writeJSON(w http.ResponseWriter, status int, body any, cacheControl string)
 }
 
 func errBody(msg string) map[string]string { return map[string]string{"error": msg} }
+
+const (
+	// How long a client is asked to wait after a debrid refused: the refusal memory holds a store back about this
+	// long, so asking sooner is answered the same way.
+	storeRefusalWait = time.Minute
+	// After a store could not be asked at all: short, since that is usually one slow answer, not a limit.
+	storeUnansweredWait = 10 * time.Second
+)
+
+// writeUnavailable answers 503 with a Retry-After of at least a second, so a client that honours it waits as long as
+// the refusal behind the answer lasts instead of polling into it.
+func writeUnavailable(w http.ResponseWriter, wait time.Duration, body any) {
+	secs := int64((wait + time.Second - 1) / time.Second)
+	w.Header().Set("retry-after", strconv.FormatInt(max(secs, 1), 10))
+	writeJSON(w, http.StatusServiceUnavailable, body, noStore)
+}
 
 // remuxAuthorized reports whether the request carries den-remux's service key (X-Den-Remux-Key), compared
 // in constant time. Never true while REMUX_KEY is unset.

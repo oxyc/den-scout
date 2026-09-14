@@ -239,8 +239,13 @@ func (s *stremioScraper) name() string {
 // torrentio answers 502 to some of them. Treated as a result, that turns into "no source found for this
 // episode" for a release the same indexer serves 50 of a second later. These statuses are the indexer
 // declining to answer right now, so the request is made again rather than reported as an outcome.
+//
+// Not a 429. That is the indexer saying it is rate limiting, and asking again inside the same second only spends
+// more of the limit; the transport pauses the host instead, for as long as it asked (upstreampause.go). The same
+// goes for a shed request carrying a Retry-After: the transport has paused the host, so a retry would be answered
+// by that pause.
 func retryableScrapeStatus(status int) bool {
-	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500
+	return status == http.StatusRequestTimeout || status >= 500
 }
 
 // Short and jittered: the whole scrape is under an 8 s budget shared with three other indexers, so this
@@ -464,7 +469,7 @@ func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout t
 			// Counted here because this is where the answer is already known. An unaskable scraper is
 			// counted too: "asked nobody, so nobody answered" is a state worth being able to see, and
 			// its failure ratio being exactly 1 is how it looks.
-			metrics.indexerResult(sc.id(), err == nil)
+			metrics.indexerResult(sc.id(), err == nil, len(r))
 			return nil // never fail the group — gather what responded
 		})
 	}

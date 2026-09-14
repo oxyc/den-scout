@@ -180,7 +180,7 @@ func TestRoutesStream(t *testing.T) {
 	if rr.Code != 200 {
 		t.Fatalf("stream: %d", rr.Code)
 	}
-	if !strings.HasPrefix(rr.Header().Get("cache-control"), "public, max-age=300, stale-while-revalidate=300") {
+	if !strings.HasPrefix(rr.Header().Get("cache-control"), "private, max-age=300, stale-while-revalidate=300") {
 		t.Errorf("stream cache-control: %q", rr.Header().Get("cache-control"))
 	}
 	var body struct {
@@ -1213,7 +1213,7 @@ func TestStreamList_servesStaleWhileRebuilding(t *testing.T) {
 	}
 	// Told to come back soon, and NOT given stale-if-error: holding a stale list for the full TTL, and a
 	// day on any later error, is the harm being fixed rather than something to pass on to the device.
-	if cc := stale.Header().Get("cache-control"); cc != "public, max-age=60" {
+	if cc := stale.Header().Get("cache-control"); cc != "private, max-age=60" {
 		t.Errorf("stale cache-control = %q", cc)
 	}
 	select {
@@ -1312,7 +1312,7 @@ func TestStreamList_staleWindowScalesWithTheTTL(t *testing.T) {
 	complete, _, etag, body := splitCached(held)
 	cache.Put(cache.lastKey(), joinCached(complete, time.Now().Add(-time.Second).Unix(), etag, body), time.Minute)
 	// The stale reply must never claim a longer freshness than the operator configured.
-	if cc := do(h, path, nil).Header().Get("cache-control"); cc != "public, max-age=30" {
+	if cc := do(h, path, nil).Header().Get("cache-control"); cc != "private, max-age=30" {
 		t.Errorf("stale cache-control = %q, want max-age capped at the 30s TTL", cc)
 	}
 }

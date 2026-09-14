@@ -124,6 +124,32 @@ func (b *addBudget) remaining(account string) int {
 	return 0
 }
 
+// freesIn is how long until the account may add again: zero while it has allowance left, else until its oldest
+// charge in the window drains. What a spent budget's Retry-After says.
+func (b *addBudget) freesIn(account string) time.Duration {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	cutoff := now.Add(-b.window)
+	var live []time.Time
+	for _, t := range b.spent[account] {
+		if t.After(cutoff) {
+			live = append(live, t)
+		}
+	}
+	if b.limit <= 0 {
+		return b.window // no allowance ever frees; a window is the honest "not soon"
+	}
+	if len(live) < b.limit {
+		return 0
+	}
+	// Append-only in time order: the charge that must drain for one to free is the one `limit` from the newest.
+	return live[len(live)-b.limit].Add(b.window).Sub(now)
+}
+
 // lowest reports the smallest remaining allowance across all accounts, and how many accounts have spent
 // anything. For /health, which is the point: an operator needs to know the ceiling is being approached,
 // and a monitor needs one number to alert on.

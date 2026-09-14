@@ -103,11 +103,12 @@ func TestScrape_retriesAShedRequestButNotARefusal(t *testing.T) {
 		wantStream bool
 	}{
 		// Shedding: the indexer is declining to answer right now, so ask again.
-		{"429 too many requests", http.StatusTooManyRequests, 2, true},
 		{"408 request timeout", http.StatusRequestTimeout, 2, true},
 		{"502 bad gateway", http.StatusBadGateway, 2, true},
 		// A refusal is an answer. Retrying it spends someone else's share of the 8s budget to be told
 		// the same thing, and 403 is what an unconfigured indexer returns for every request it gets.
+		// A rate limit is waited out by the transport's pause, not asked again inside the same budget.
+		{"429 too many requests", http.StatusTooManyRequests, 1, false},
 		{"403 forbidden", http.StatusForbidden, 1, false},
 		{"404 not found", http.StatusNotFound, 1, false},
 	} {
