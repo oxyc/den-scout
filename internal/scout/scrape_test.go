@@ -71,7 +71,9 @@ func TestScraperURL(t *testing.T) {
 	}
 	sc2 := &stremioScraper{indexer: "comet", baseURL: "https://comet.example/", client: client}
 	_, _ = sc2.scrape(context.Background(), scrapeQuery{Type: "series", IMDb: "tt99", Season: 2, Episode: 5, HasEp: true})
-	if seenURL != "https://comet.example/stream/series/tt99%3A2%3A5.json" {
+	// Colons as Stremio clients send them, not %3A: an encoded id is a different URL to torrentio's CDN, which
+	// serves only the URL everyone requests while its origin is down.
+	if seenURL != "https://comet.example/stream/series/tt99:2:5.json" {
 		t.Errorf("series url: %s", seenURL)
 	}
 	// non-200 → error (fan-out treats as no result)

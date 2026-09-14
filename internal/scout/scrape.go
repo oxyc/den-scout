@@ -271,7 +271,11 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 	if q.HasEp {
 		stremID = fmt.Sprintf("%s:%d:%d", q.IMDb, q.Season, q.Episode)
 	}
-	u := strings.TrimRight(s.baseURL, "/") + "/stream/" + q.Type + "/" + url.QueryEscape(stremID) + ".json"
+	// The id goes in as Stremio clients send it, colons and all (`tt123:2:1`), not percent-encoded. It needs no
+	// escaping — an IMDb id and two numbers — and the encoded form is a different URL to a CDN: with torrentio's
+	// origin down, Cloudflare answers from `stale-if-error` only for the URL the whole world requests, so every
+	// series episode came back 521 while the same `tt24022296:2:1` served five releases to a plain curl.
+	u := strings.TrimRight(s.baseURL, "/") + "/stream/" + q.Type + "/" + stremID + ".json"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err, false // a malformed request will be malformed again
