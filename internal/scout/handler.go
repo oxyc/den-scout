@@ -396,7 +396,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	// The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
 	// Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
 	// Retry-After and ETag too, or a browser client can neither wait as asked nor revalidate.
-	w.Header().Set("access-control-expose-headers", "Server-Timing, X-Den-Degraded, Retry-After, ETag")
+	w.Header().Set("access-control-expose-headers", "Server-Timing, X-Den-Degraded, Retry-After, ETag, RateLimit, RateLimit-Policy")
 	w.Header().Set("timing-allow-origin", "*")
 	// A CORS preflight is answered on EVERY path, ahead of the method gate below, which would otherwise
 	// refuse it with a 405 and fail the preflight — /validate's JSON POST is one a browser preflights. It
@@ -1128,7 +1128,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	if pool.EveryAddRefusedByScout() {
 		logLimited("probe-scout-busy", "probe %s → 503 (scout-side), the hourly add allowance is spent",
 			shortHash(infoHash))
-		writeUnavailable(w, pool.ScoutBusyFor(), map[string]any{
+		writeAddBudgetSpent(w, pool.ScoutBusyFor(), map[string]any{
 			"error":  "scout_busy",
 			"detail": "scout's own hourly add budget for this account is spent",
 		})
@@ -1505,7 +1505,7 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// named as ours.
 		if errors.Is(err, errScoutSide) {
 			logLimited("play-scout-busy", "play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
-			writeUnavailable(w, pool.ScoutBusyFor(),
+			writeAddBudgetSpent(w, pool.ScoutBusyFor(),
 				map[string]any{"error": "scout_busy", "detail": scoutSideReason(err)})
 			return
 		}
@@ -1833,6 +1833,15 @@ const (
 
 // writeUnavailable answers 503 with a Retry-After of at least a second, so a client that honours it waits as long as
 // the refusal behind the answer lasts instead of polling into it.
+// writeAddBudgetSpent answers scout_busy with the add budget's limit and window as the IETF draft RateLimit headers,
+// beside Retry-After: nothing is left, and the budget frees in `wait`.
+func writeAddBudgetSpent(w http.ResponseWriter, wait time.Duration, body any) {
+	secs := int64((wait + time.Second - 1) / time.Second)
+	w.Header().Set("ratelimit-policy", fmt.Sprintf(`"adds";q=%d;w=%d`, addBudgetLimit, int64(addBudgetWindow/time.Second)))
+	w.Header().Set("ratelimit", fmt.Sprintf(`"adds";r=0;t=%d`, max(secs, 1)))
+	writeUnavailable(w, wait, body)
+}
+
 func writeUnavailable(w http.ResponseWriter, wait time.Duration, body any) {
 	secs := int64((wait + time.Second - 1) / time.Second)
 	w.Header().Set("retry-after", strconv.FormatInt(max(secs, 1), 10))

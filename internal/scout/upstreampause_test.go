@@ -3,6 +3,7 @@ package scout
 import (
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -131,6 +132,35 @@ func TestRetryAfter_readsSecondsAndDatesAndCapsThem(t *testing.T) {
 		if _, ok := retryAfter(http.Header{"Retry-After": {value}}, now); ok {
 			t.Errorf("Retry-After %q read as a wait", value)
 		}
+	}
+}
+
+// An answer that says the allowance is spent pauses the upstream until its reset, before any 429.
+func TestPauseOnRefusal_waitsOutAnAllowanceAnAnswerSaysIsSpent(t *testing.T) {
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	for name, header := range map[string]http.Header{
+		"draft":  {"Ratelimit": {`"hourly";r=0;t=90`}},
+		"older":  {"Ratelimit-Remaining": {"0"}, "Ratelimit-Reset": {"90"}},
+		"legacy": {"X-Ratelimit-Remaining": {"0"}, "X-Ratelimit-Reset": {strconv.FormatInt(now.Add(90*time.Second).Unix(), 10)}},
+	} {
+		if wait, spent := exhaustedFor(header, now); !spent || wait != 90*time.Second {
+			t.Errorf("%s: %v %v, want 90s", name, wait, spent)
+		}
+	}
+	for name, header := range map[string]http.Header{
+		"requests left": {"Ratelimit": {`"hourly";r=4;t=90`}, "X-Ratelimit-Remaining": {"4"}},
+		"nothing said":  {},
+	} {
+		if _, spent := exhaustedFor(header, now); spent {
+			t.Errorf("%s read as spent", name)
+		}
+	}
+
+	next := &countingTransport{answer: answering(http.StatusOK, http.Header{"X-Ratelimit-Remaining": {"0"}, "X-Ratelimit-Reset": {"60"}})}
+	rt := PauseOnRefusal(next)
+	get(t, rt, "https://api.torbox.example/v1/api/user/me", nil)
+	if resp := get(t, rt, "https://api.torbox.example/v1/api/user/me", nil); resp.StatusCode != http.StatusTooManyRequests || next.calls != 1 {
+		t.Errorf("asked a spent upstream again: %d, %d calls", resp.StatusCode, next.calls)
 	}
 }
 

@@ -72,9 +72,54 @@ func (t *pausingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		logLimited("upstream-paused", "%s answered %d — leaving it alone for %s", req.URL.Hostname(),
 			resp.StatusCode, pause.Round(time.Second))
 	case resp.StatusCode < 400:
-		t.answered(key)
+		// An answer that also says the allowance is spent is waited out from here, rather than found out by a 429.
+		if wait, spent := exhaustedFor(resp.Header, t.now()); spent {
+			pause := t.refused(key, wait, true)
+			logLimited("upstream-exhausted", "%s says its allowance is spent — leaving it alone for %s",
+				req.URL.Hostname(), pause.Round(time.Second))
+		} else {
+			t.answered(key)
+		}
 	}
 	return resp, nil
+}
+
+// exhaustedFor reports how long until an upstream's allowance comes back, when its answer says none is left: the IETF
+// draft `RateLimit: "policy";r=0;t=30`, its older `RateLimit-Remaining` / `RateLimit-Reset`, or the common
+// `X-RateLimit-Remaining` / `X-RateLimit-Reset`. A reset over a billion is a Unix time, not seconds to wait.
+func exhaustedFor(h http.Header, now time.Time) (time.Duration, bool) {
+	number := func(v string) (int64, bool) {
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return n, err == nil && n >= 0
+	}
+	wait := func(reset int64) time.Duration {
+		d := time.Duration(reset) * time.Second
+		if reset > 1_000_000_000 {
+			d = time.Unix(reset, 0).Sub(now)
+		}
+		return max(0, min(d, maxRetryAfter))
+	}
+	if field := h.Get("RateLimit"); field != "" {
+		param := func(key string) (int64, bool) {
+			for _, part := range strings.Split(field, ";") {
+				if v, ok := strings.CutPrefix(strings.TrimSpace(part), key+"="); ok {
+					return number(v)
+				}
+			}
+			return 0, false
+		}
+		if r, ok := param("r"); ok && r == 0 {
+			t, _ := param("t")
+			return wait(t), true
+		}
+	}
+	for _, names := range [][2]string{{"RateLimit-Remaining", "RateLimit-Reset"}, {"X-RateLimit-Remaining", "X-RateLimit-Reset"}} {
+		if r, ok := number(h.Get(names[0])); ok && h.Get(names[0]) != "" && r == 0 {
+			reset, _ := number(h.Get(names[1]))
+			return wait(reset), true
+		}
+	}
+	return 0, false
 }
 
 func (t *pausingTransport) left(key string) time.Duration {
