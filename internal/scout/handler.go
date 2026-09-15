@@ -602,6 +602,12 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	if h.remuxAuthorized(r) {
 		cacheKey += ":remux"
 	}
+	// A list ranked for a browser's report is another list: cached apart, and the response says it varies.
+	client, clientKey := clientPlayable(r)
+	if clientKey != "" {
+		cacheKey += ":playable:" + clientKey
+	}
+	w.Header().Add("vary", playableHeader)
 
 	// ?debug=1 — "where did this list go", answered exactly instead of guessed from a log line.
 	//
@@ -647,7 +653,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 			h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
 		v, _, _ := h.sf.Do(cacheKey+":debug", func() (any, error) {
-			return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, &rankDebug{}), nil
+			return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, &rankDebug{}, client), nil
 		})
 		res := v.(buildResult)
 		if res.degraded != "" {
@@ -711,7 +717,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil), nil
+		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil, client), nil
 	})
 	h.writeBuilt(w, r, start, v.(buildResult))
 }
@@ -747,8 +753,9 @@ func (h *handler) lastResort(w http.ResponseWriter, r *http.Request, start time.
 	}
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
+	client, _ := clientPlayable(r)
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil), nil
+		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil, client), nil
 	})
 	res := v.(buildResult)
 	if res.degraded == "indexers" && usable {
@@ -827,6 +834,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 		return
 	}
 	parent := context.WithoutCancel(r.Context())
+	client, _ := clientPlayable(r)
 	go func() {
 		// The same lesson as the probe fan-out: this is a background goroutine, so the recover() on the
 		// request goroutine cannot see a panic raised here, and an unrecovered one takes the process down.
@@ -837,7 +845,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 		ctx, cancel := context.WithTimeout(parent, budget)
 		defer cancel()
 		v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-			return h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil), nil
+			return h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil, client), nil
 		})
 		// A degraded build caches nothing, so the entry is still stale and the next request would book
 		// another rebuild at once. Hold the key until there is some prospect of a different answer.
@@ -863,11 +871,13 @@ type buildResult struct {
 //
 // dbg is nil on every normal request. When it is not, the accounting rides along in the response body and
 // the result is NOT cached — a debug build is a diagnostic, not an entry other viewers should be served.
-func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin, cacheKey string, dbg *rankDebug) buildResult {
-	list := h.rankList(ctx, config, sid, dbg)
+func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin,
+	cacheKey string, dbg *rankDebug, client *ClientPlayable) buildResult {
+	list := h.rankList(ctx, config, sid, dbg, client)
 	// A movie's list answers the availability route's question too, so a title someone opened needs no
-	// check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one.
-	if sid.Type == "movie" && list.degraded == "" && dbg == nil {
+	// check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one, nor
+	// one ranked for a browser, whose cap may have kept different releases.
+	if sid.Type == "movie" && list.degraded == "" && dbg == nil && client == nil {
 		h.recordListVerdict(verdictPrefix(config)+sid.IMDb, list)
 	}
 	return h.finishStreamList(ctx, config, configBlob, sid, origin, cacheKey, dbg, list)
@@ -884,12 +894,15 @@ type rankedList struct {
 	timing   string
 }
 
-// rankList scrapes, cache-checks and ranks. Nothing here changes anything on the debrid: the cache check
-// is a read.
-func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, dbg *rankDebug) rankedList {
+// rankList scrapes, cache-checks and ranks — for client, when a browser reported what it plays. Nothing here
+// changes anything on the debrid: the cache check is a read. Both answers are cached on their own (each
+// indexer's in scrapeAllCached, each held release in the stores), so ranking the same title another way asks
+// nobody again.
+func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, dbg *rankDebug, client *ClientPlayable) rankedList {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	phase := time.Now()
-	seeds, scrapeOK, scrapeComplete := scrapeAll(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout)
+	seeds, scrapeOK, scrapeComplete := scrapeAllCached(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout,
+		h.deps.Cache, h.deps.ListTTL)
 	timing := "scrape;dur=" + msDur(time.Since(phase))
 	// Recorded HERE, before anything trims it. Taken after the two filters below instead, the count read
 	// as "this is all the indexers had" while both of them had already removed releases that appear in no
@@ -1000,6 +1013,7 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 		ResultCap:           config.ResultCap,
 		ExpectedYear:        expectedYear,
 		ExpectedTitleTokens: expectedTitleTokens,
+		Client:              client,
 		Debug:               dbg,
 	})
 

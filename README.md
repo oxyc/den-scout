@@ -41,7 +41,10 @@ resolve to a server you control, so the app just renders what comes back.
    Real-Debrid and Premiumize are also supported (Premiumize also has a real cache API; RD has no
    usable one, so a hash cached on TorBox still wins for an RD+TorBox user).
 4. **Rank** (`internal/scout/rank.go`) — sink CAM/TS/screeners far below any legit source, cached above uncached,
-   then resolution/source/HDR/audio/size. Return the top N as clean `https` streams.
+   then resolution/source/HDR/audio/size. Return the top N as clean `https` streams. A request carrying
+   `X-Den-Playable` — den-remux passing on what a browser reported it plays — is ranked for that browser
+   instead: releases it plays as they are first, then those den-remux has to convert, then those it can't
+   play at all. Without the header the list is ranked for the Apple TV.
 5. **`/play`** decodes the opaque token → `store.resolve` → **302** to the freshly-minted cached
    link. Dead link → 404 so the client falls through to the next stream. Season packs map `tt…:S:E`
    to the exact file index.
@@ -58,6 +61,11 @@ durable disk tier at `CACHE_DIR`. The disk tier holds stream lists and 30-day tr
 costs a debrid resolve to rebuild — and has a real ceiling: expired entries are swept hourly, and the
 sweep also enforces a 256 MiB budget, evicting oldest-first. A second replica would need a shared cache;
 the `Cache` interface in `internal/scout/cache.go` is the seam.
+
+What upstreams answered is cached apart from the lists built out of it: each indexer's answer to a title for
+`LIST_TTL_SECS` (keyed by the indexer's URL, so installs on the same indexer share it), a debrid store's "held"
+for a minute, a title's Cinemeta metadata for a week, a probe for 30 days. Ranking a title for another client
+or filter re-ranks those answers rather than asking anyone again.
 
 User-supplied `excludeRegex` runs on Go's stdlib `regexp` (RE2 — linear-time, no catastrophic
 backtracking). The internal quality/season patterns that need lookaround use `dlclark/regexp2`;
@@ -125,28 +133,33 @@ probing is on) `probe`; a list served from cache says `cache;desc=hit`, `cache;d
 
 Each stream carries `attributes`: facts parsed from the release name and, once a release has been
 probed, overridden by what the file's own headers say (`probed: true`). Beside resolution, source, codec,
-HDR and audio, three fields are for browser playback:
+HDR and audio, two fields are for browser playback:
 
 - `bitDepth`: `8` or `10`. The name supplies 10 for `10bit`/`Hi10P` and for any HDR or Dolby Vision
   release; the probe reads `avcC`/`hvcC` (Matroska's CodecPrivate). Omitted when unknown.
 - `dvProfile`: the Dolby Vision profile (`5`, `7`, `8`, …), read from `dvcC`/`dvvC`/`dvwC` or Matroska's
   BlockAdditionMapping. Omitted when unknown, including for a "DV" release that hasn't been probed.
-- `web`: `{ "direct": ["safari", "chrome"], "remux": "copy" | "audio" | "video" | "none" }`.
 
-`direct` lists the browsers that play the file as it is. Anything unknown counts as not playable:
+`behaviorHints.notWebReady` is the Stremio-level answer: an https URL to an MP4.
 
-| | Safari | Chrome |
+### Ranked for a browser
+
+`X-Den-Playable` carries Den Web's capability report (den-edge `web/src/lib/playable.ts`), as JSON: the
+highest H.264, High 10, HEVC Main, Main 10 and High-tier and AV1 levels it decodes, and whether it takes
+HDR, AV1 HDR, E-AC-3, 5.1 AAC and Dolby Vision profiles 5 and 8. With it each release is costed by what
+den-remux will do for it, by the same rules den-remux applies (`internal/scout/client.go`):
+
+| den-remux | Cost | When |
 |---|---|---|
-| Container | MP4 | MP4, WebM, Matroska |
-| Video | H.264 8-bit, HEVC | H.264 incl. 10-bit, HEVC (needs a hardware decoder), AV1, VP9 |
-| Dolby Vision | profiles 5 and 8; not 7 | not profile 5, which has no base layer Chrome can show |
-| Audio | AAC, MP3, FLAC, Opus | AAC, MP3, FLAC, Opus |
+| copies it | 0 | the browser decodes the video at its level, HDR included, and the audio is AAC, or E-AC-3/AC-3 it plays |
+| converts the audio | 300 | any other audio; also a release whose video codec nobody named, which the probe settles |
+| transcodes the video | 6000 | HEVC over the browser's level, 10-bit or HDR it can't take |
+| can't play it | 60000 | H.264 or AV1 beyond it, Dolby Vision 5 it doesn't show, VP9, XviD, VC-1, MPEG-2, 3D, AVI/TS/WebM and other containers den-remux doesn't open |
 
-`remux` is the work den-remux must do for Safari to play its fMP4 HLS output. Safari is the strictest
-target, so the answer holds for Chrome too, except for Dolby Vision profile 5 (check `dvProfile`). `copy`
-means only the container changes; `audio` means the video copies and the audio is re-encoded to AAC; `video`
-means Safari can't decode the video at all (Hi10P, XviD, VP9, AV1); `none` means the video codec is
-unknown. `behaviorHints.notWebReady` is the Stremio-level answer: an https URL to an MP4.
+6000 is more than quality alone ever separates two releases, so every release that plays as it is ranks
+above every one that has to be transcoded; it is less than the cached bonus, so a cached transcode still
+ranks above a download. A list ranked for a browser is cached apart from the TV's, per distinct report, and
+every list response says `Vary: X-Den-Playable`. A header that doesn't parse is ignored.
 
 `<id>` is `tt…` (movie) or `tt…:S:E` (series episode). Scout advertises `idPrefixes: ["tt"]` because
 Den bridges TMDB → IMDb before it asks for streams.

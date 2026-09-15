@@ -146,7 +146,7 @@ func (h *handler) checkBehind(config *Config, imdb, key string) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
-		list := h.rankList(ctx, config, &StreamID{Type: "movie", IMDb: imdb}, nil)
+		list := h.rankList(ctx, config, &StreamID{Type: "movie", IMDb: imdb}, nil, nil)
 		h.recordListVerdict(key, list)
 	}()
 }

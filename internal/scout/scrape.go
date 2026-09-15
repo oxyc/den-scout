@@ -453,18 +453,79 @@ func baseURLFor(id Indexer, config *Config, urls map[Indexer]string) string {
 // answered. The last is not the same question as the second: a partial non-empty list is worth serving
 // and worth caching, just for less time.
 func scrapeAll(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration) ([]RawStream, bool, bool) {
+	return scrapeAllCached(ctx, scrapers, q, timeout, nil, 0)
+}
+
+// An indexer's answer to one question, kept apart from every list built from it.
+//
+// Every install that asks torrentio about a title asks the same URL and gets the same answer, and a list ranked
+// for a browser rather than the TV, or filtered differently, is built from those same answers again. So each is
+// cached on its own, keyed by what was asked: the indexer's URL, hashed because a MediaFusion URL carries its
+// encrypted config, and the title. Answers only, never a failure, and for as long as a list stays fresh.
+type cacheableScraper interface{ answerKey() string }
+
+func (s *stremioScraper) answerKey() string { return keyHash(strings.TrimRight(s.baseURL, "/")) }
+
+func answerCacheKey(sc scraper, q scrapeQuery) (string, bool) {
+	c, ok := sc.(cacheableScraper)
+	if !ok {
+		return "", false
+	}
+	id := q.IMDb
+	if q.HasEp {
+		id = fmt.Sprintf("%s:%d:%d", q.IMDb, q.Season, q.Episode)
+	}
+	return "answer:v1:" + c.answerKey() + ":" + q.Type + ":" + id, true
+}
+
+func keptAnswer(cache Cache, sc scraper, q scrapeQuery) ([]RawStream, bool) {
+	key, ok := answerCacheKey(sc, q)
+	if !ok || cache == nil {
+		return nil, false
+	}
+	raw, hit := cache.Get(key)
+	if !hit {
+		return nil, false
+	}
+	var r []RawStream
+	if json.Unmarshal([]byte(raw), &r) != nil {
+		return nil, false
+	}
+	return r, true
+}
+
+func keepAnswer(cache Cache, ttl time.Duration, sc scraper, q scrapeQuery, r []RawStream) {
+	key, ok := answerCacheKey(sc, q)
+	if !ok || cache == nil || ttl <= 0 {
+		return
+	}
+	if b, err := json.Marshal(r); err == nil {
+		cache.Put(key, string(b), ttl)
+	}
+}
+
+// scrapeAllCached is scrapeAll answering from each indexer's kept answer where there is one, and keeping
+// each new one for ttl.
+func scrapeAllCached(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration, cache Cache,
+	ttl time.Duration) ([]RawStream, bool, bool) {
 	results := make([][]RawStream, len(scrapers))
 	respok := make([]bool, len(scrapers))
 	g, gctx := errgroup.WithContext(ctx)
 	for i, sc := range scrapers {
 		i, sc := i, sc
 		g.Go(func() error {
+			// Not counted in the indexer metrics below: nothing was asked.
+			if r, ok := keptAnswer(cache, sc, q); ok {
+				results[i], respok[i] = r, true
+				return nil
+			}
 			cctx, cancel := context.WithTimeout(gctx, timeout)
 			defer cancel()
 			r, err := sc.scrape(cctx, q)
 			if err == nil {
 				results[i] = r
 				respok[i] = true
+				keepAnswer(cache, ttl, sc, q, r)
 			}
 			// Counted here because this is where the answer is already known. An unaskable scraper is
 			// counted too: "asked nobody, so nobody answered" is a state worth being able to see, and

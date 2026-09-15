@@ -2,44 +2,35 @@ package scout
 
 import (
 	"encoding/json"
-	"reflect"
 	"testing"
 )
 
-// Release names as indexers actually spell them, through the whole title path: codec, audio family, bit
-// depth and the web hint they add up to. The container comes from the name's extension, as it does for
-// an unprobed release.
-func TestStreamAttributes_webFromRealisticTitles(t *testing.T) {
+// Release names as indexers actually spell them, through the whole title path: codec, audio family and bit
+// depth.
+func TestStreamAttributes_fromRealisticTitles(t *testing.T) {
 	for _, c := range []struct {
 		title        string
 		codec, audio string
 		depth        int
-		direct       []string
-		remux        string
 	}{
-		{"The.Movie.2023.1080p.WEB-DL.DDP5.1.H.264-FLUX", "h264", "eac3", 0, []string{}, "audio"},
-		{"Movie.2019.1080p.BluRay.DTS-HD.MA.5.1.x264-GRP.mkv", "h264", "dtshdma", 0, []string{}, "audio"},
-		{"Movie.2021.2160p.UHD.BluRay.REMUX.HEVC.DV.HDR.TrueHD.Atmos.7.1-GRP.mkv", "hevc", "truehd", 10, []string{}, "audio"},
-		{"Movie.2020.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4", "h264", "aac", 0, []string{"safari", "chrome"}, "copy"},
-		{"Show.S01E01.1080p.WEB-DL.x265.10bit.AAC5.1-GRP.mkv", "hevc", "aac", 10, []string{"chrome"}, "copy"},
-		{"Movie.2022.1080p.WEBRip.x265.10bit.Opus.5.1-GRP.mkv", "hevc", "opus", 10, []string{"chrome"}, "audio"},
-		// Hi10P names no codec but is H.264 High 10 by definition, which no Safari decodes.
-		{"[Group] Anime - 01 [BD 1080p Hi10P FLAC].mkv", "h264", "flac", 10, []string{"chrome"}, "video"},
-		// DV with no HDR10 named is read as profile 5: no base layer Chrome can show.
-		{"Movie.2023.2160p.WEB-DL.DV.HEVC.AAC.mp4", "hevc", "aac", 10, []string{"safari"}, "copy"},
-		{"Movie.2023.2160p.WEB-DL.DV.HDR10.HEVC.AAC.mp4", "hevc", "aac", 10, []string{"safari", "chrome"}, "copy"},
-		{"Movie.2024.1080p.WEB-DL.AV1.Opus.webm", "av1", "opus", 0, []string{"chrome"}, "video"},
-		// The title path doesn't name XviD, so there is no codec to answer from.
-		{"Movie.2005.DVDRip.XviD-MP3.avi", "", "mp3", 0, []string{}, "none"},
+		{"The.Movie.2023.1080p.WEB-DL.DDP5.1.H.264-FLUX", "h264", "eac3", 0},
+		{"Movie.2019.1080p.BluRay.DTS-HD.MA.5.1.x264-GRP.mkv", "h264", "dtshdma", 0},
+		{"Movie.2021.2160p.UHD.BluRay.REMUX.HEVC.DV.HDR.TrueHD.Atmos.7.1-GRP.mkv", "hevc", "truehd", 10},
+		{"Movie.2020.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4", "h264", "aac", 0},
+		{"Show.S01E01.1080p.WEB-DL.x265.10bit.AAC5.1-GRP.mkv", "hevc", "aac", 10},
+		{"Movie.2022.1080p.WEBRip.x265.10bit.Opus.5.1-GRP.mkv", "hevc", "opus", 10},
+		// Hi10P names no codec but is H.264 High 10 by definition.
+		{"[Group] Anime - 01 [BD 1080p Hi10P FLAC].mkv", "h264", "flac", 10},
+		{"Movie.2023.2160p.WEB-DL.DV.HEVC.AAC.mp4", "hevc", "aac", 10},
+		{"Movie.2024.1080p.WEB-DL.AV1.Opus.webm", "av1", "opus", 0},
+		// The title path doesn't name XviD.
+		{"Movie.2005.DVDRip.XviD-MP3.avi", "", "mp3", 0},
 	} {
 		t.Run(c.title, func(t *testing.T) {
 			a := streamAttributes(RawStream{Title: c.title})
 			if deref(a.Codec) != c.codec || deref(a.AudioCodec) != c.audio || a.BitDepth != c.depth {
 				t.Errorf("codec/audio/depth = %q/%q/%d, want %q/%q/%d",
 					deref(a.Codec), deref(a.AudioCodec), a.BitDepth, c.codec, c.audio, c.depth)
-			}
-			if !reflect.DeepEqual(a.Web.Direct, c.direct) || a.Web.Remux != c.remux {
-				t.Errorf("web = %+v, want direct=%v remux=%q", a.Web, c.direct, c.remux)
 			}
 		})
 	}
@@ -87,38 +78,25 @@ func TestDetectBitDepth(t *testing.T) {
 	}
 }
 
-// What the file says replaces what the title guessed, in both directions, and the web hint follows it.
-func TestWebHint_followsTheProbe(t *testing.T) {
+// What the file says replaces what the title guessed, in both directions.
+func TestStreamAttributes_followTheProbe(t *testing.T) {
 	for _, c := range []struct {
-		name   string
-		title  string
-		probe  Probe
-		direct []string
-		remux  string
+		name  string
+		title string
+		probe Probe
 	}{
-		{"High 10 in MP4, named plain x264", "Movie 1080p x264 AAC", Probe{Container: "mp4", VideoCodec: "h264", BitDepth: 10},
-			[]string{"chrome"}, "video"},
-		{"8-bit probe beats an HDR title's 10", "Movie 1080p HDR x264 AAC", Probe{Container: "mp4", VideoCodec: "h264", BitDepth: 8},
-			[]string{"safari", "chrome"}, "copy"},
-		{"DV profile 5 in Matroska", "Movie 2160p AAC", Probe{Container: "matroska", VideoCodec: "hevc", DolbyVision: true, DVProfile: 5},
-			[]string{}, "copy"},
-		{"DV profile 5 in MP4", "Movie 2160p AAC", Probe{Container: "mp4", VideoCodec: "hevc", DolbyVision: true, DVProfile: 5},
-			[]string{"safari"}, "copy"},
-		// A profile read from the file is trusted over the "no HDR10 named" guess.
-		{"DV profile 8, title says only DV", "Movie 2160p DV AAC", Probe{Container: "mp4", VideoCodec: "hevc", DolbyVision: true, DVProfile: 8},
-			[]string{"safari", "chrome"}, "copy"},
-		{"DV profile 7 in MP4", "Movie 2160p AAC", Probe{Container: "mp4", VideoCodec: "hevc", DolbyVision: true, DVProfile: 7},
-			[]string{"chrome"}, "copy"},
-		{"XviD in AVI", "Movie DVDRip MP3", Probe{Container: "avi", VideoCodec: "mpeg4"}, []string{}, "video"},
-		{"VP9 in Matroska", "Movie 1080p WEB-DL Opus", Probe{Container: "matroska", VideoCodec: "vp9"}, []string{"chrome"}, "video"},
-		{"MP4 named as MKV", "Movie.1080p.x264.AAC.mkv", Probe{Container: "mp4"}, []string{"safari", "chrome"}, "copy"},
-		{"audio the title doesn't name", "Movie 1080p x264", Probe{Container: "mp4"}, []string{}, "audio"},
+		{"High 10 in MP4, named plain x264", "Movie 1080p x264 AAC", Probe{Container: "mp4", VideoCodec: "h264", BitDepth: 10}},
+		{"8-bit probe beats an HDR title's 10", "Movie 1080p HDR x264 AAC", Probe{Container: "mp4", VideoCodec: "h264", BitDepth: 8}},
+		{"DV profile 5 in Matroska", "Movie 2160p AAC", Probe{Container: "matroska", VideoCodec: "hevc", DolbyVision: true, DVProfile: 5}},
+		{"DV profile 8, title says only DV", "Movie 2160p DV AAC", Probe{Container: "mp4", VideoCodec: "hevc", DolbyVision: true, DVProfile: 8}},
+		{"DV profile 7 in MP4", "Movie 2160p AAC", Probe{Container: "mp4", VideoCodec: "hevc", DolbyVision: true, DVProfile: 7}},
+		{"VP9 in Matroska", "Movie 1080p WEB-DL Opus", Probe{Container: "matroska", VideoCodec: "vp9"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			p := c.probe
 			a := streamAttributes(RawStream{Title: c.title, Probe: &p})
-			if !reflect.DeepEqual(a.Web.Direct, c.direct) || a.Web.Remux != c.remux {
-				t.Errorf("web = %+v, want direct=%v remux=%q", a.Web, c.direct, c.remux)
+			if p.VideoCodec != "" && deref(a.Codec) != p.VideoCodec {
+				t.Errorf("codec = %q, the probe said %q", deref(a.Codec), p.VideoCodec)
 			}
 			if p.BitDepth != 0 && a.BitDepth != p.BitDepth {
 				t.Errorf("bitDepth = %d, the probe said %d", a.BitDepth, p.BitDepth)
@@ -130,9 +108,8 @@ func TestWebHint_followsTheProbe(t *testing.T) {
 	}
 }
 
-// The new fields only ADD to the wire: unknown depth and profile are omitted, and `direct` is an empty
-// list rather than null, so a client can test membership without a nil check.
-func TestStreamAttributes_webWireShape(t *testing.T) {
+// Unknown depth and profile are omitted from the wire rather than sent as 0.
+func TestStreamAttributes_wireShape(t *testing.T) {
 	body, err := json.Marshal(streamAttributes(RawStream{Title: "Movie 1080p"}))
 	if err != nil {
 		t.Fatal(err)
@@ -146,10 +123,6 @@ func TestStreamAttributes_webWireShape(t *testing.T) {
 	}
 	if _, ok := got["dvProfile"]; ok {
 		t.Error("an unknown DV profile must be omitted, not sent as 0")
-	}
-	web, _ := got["web"].(map[string]any)
-	if d, ok := web["direct"].([]any); !ok || len(d) != 0 || web["remux"] != "none" {
-		t.Errorf("web = %v, want {direct: [], remux: none}", got["web"])
 	}
 }
 

@@ -375,6 +375,8 @@ type rankFilters struct {
 	// real releases, while keeping foreign-language releases (which carry the year, or a name/number
 	// token). Empty = no title filter (best-effort; a Cinemeta lookup failure serves unfiltered).
 	ExpectedTitleTokens map[string]bool
+	// Client is the browser a list is ranked for (X-Den-Playable), nil for the Apple TV. See ClientPlayable.cost.
+	Client *ClientPlayable
 	// Debug collects drop counts and scores when ?debug=1 asked for them. nil on every normal request.
 	Debug *rankDebug
 }
@@ -592,6 +594,9 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 			continue
 		}
 		score := qualityScoreLower(lower, s, junk)
+		if f.Client != nil {
+			score -= f.Client.cost(s, streamAttributes(s))
+		}
 		// A release whose resolution could not be read is NOT sunk, matching every hard filter here: the
 		// resolution whitelist keeps untagged releases, minSeeders keeps unknown seeder counts, maxSizeGB
 		// keeps unknown sizes. Punishing an unknown would be asserting something nobody measured.
