@@ -133,12 +133,20 @@ probing is on) `probe`; a list served from cache says `cache;desc=hit`, `cache;d
 
 Each stream carries `attributes`: facts parsed from the release name and, once a release has been
 probed, overridden by what the file's own headers say (`probed: true`). Beside resolution, source, codec,
-HDR and audio, two fields are for browser playback:
+HDR and audio, these are for browser playback:
 
 - `bitDepth`: `8` or `10`. The name supplies 10 for `10bit`/`Hi10P` and for any HDR or Dolby Vision
-  release; the probe reads `avcC`/`hvcC` (Matroska's CodecPrivate). Omitted when unknown.
+  release; the probe reads `avcC`/`hvcC`/`av1C` (Matroska's CodecPrivate). Omitted when unknown.
 - `dvProfile`: the Dolby Vision profile (`5`, `7`, `8`, …), read from `dvcC`/`dvvC`/`dvwC` or Matroska's
   BlockAdditionMapping. Omitted when unknown, including for a "DV" release that hasn't been probed.
+- `dvProfileGuess`: for a Dolby Vision release nobody has probed, the profile its name points to — `7` for a
+  Blu-ray remux, `8` for a Blu-ray re-encode, a `HYBRID` or a name that also gives an HDR10-family base, `5` for
+  a web release that names none. Omitted when the name points nowhere and once `dvProfile` is known.
+- `videoLevel`, `highTier`, `width`, `height`, `frameRate`: read by the probe from the codec's configuration
+  record (H.264 `level_idc`, HEVC `general_level_idc` and tier flag, AV1 `seq_level_idx` and tier) and the
+  track header (Matroska's Video element and DefaultDuration; MP4's sample entry, `mdhd` and `stts`). A probe
+  also fills `hdrFormat` from the container's transfer characteristics (Matroska Colour, MP4 `colr`), and
+  `resolution` from the width, so a 3840 × 1608 scope film is `2160p`. Omitted until a release is probed.
 
 `behaviorHints.notWebReady` is the Stremio-level answer: an https URL to an MP4.
 
@@ -146,15 +154,17 @@ HDR and audio, two fields are for browser playback:
 
 `X-Den-Playable` carries Den Web's capability report (den-edge `web/src/lib/playable.ts`), as JSON: the
 highest H.264, High 10, HEVC Main, Main 10 and High-tier and AV1 levels it decodes, and whether it takes
-HDR, AV1 HDR, E-AC-3, 5.1 AAC and Dolby Vision profiles 5 and 8. With it each release is costed by what
-den-remux will do for it, by the same rules den-remux applies (`internal/scout/client.go`):
+HDR, AV1 HDR, E-AC-3, 5.1 and 7.1 AAC, FLAC, VP9 profiles 0 and 2 and Dolby Vision profiles 5 and 8. With it
+each release is costed by what den-remux will do for it, by the same rules den-remux applies
+(`internal/scout/client.go`). A probed release is judged by its own level, tier and HDR; an unprobed one by its
+name, where 2160p stands for the least level that size needs:
 
 | den-remux | Cost | When |
 |---|---|---|
-| copies it | 0 | the browser decodes the video at its level, HDR included, and the audio is AAC, or E-AC-3/AC-3 it plays |
+| copies it | 0 | the browser decodes the video at its level and tier, HDR included, and the audio is AAC, E-AC-3/AC-3 or FLAC it plays |
 | converts the audio | 300 | any other audio; also a release whose video codec nobody named, which the probe settles |
-| transcodes the video | 6000 | HEVC over the browser's level, 10-bit or HDR it can't take |
-| can't play it | 60000 | H.264 or AV1 beyond it, Dolby Vision 5 it doesn't show, VP9, XviD, VC-1, MPEG-2, 3D, AVI/TS/WebM and other containers den-remux doesn't open |
+| transcodes the video | 6000 | HEVC over the browser's level or tier, 10-bit or HDR it can't take; also a Dolby Vision release whose name suggests profile 5 to a browser without it |
+| can't play it | 60000 | H.264, AV1 or VP9 the browser doesn't take, AV1 high tier, Dolby Vision 5 (read from the file) it doesn't show, XviD, VC-1, MPEG-2, 3D, AVI/TS/WebM and other containers den-remux doesn't open |
 
 6000 is more than quality alone ever separates two releases, so every release that plays as it is ranks
 above every one that has to be transcoded; it is less than the cached bonus, so a cached transcode still

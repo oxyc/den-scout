@@ -29,6 +29,12 @@ type ClientPlayable struct {
 	AV1       int  `json:"av1"`
 	AV1Main10 int  `json:"av1Main10"`
 	AV1HDR    bool `json:"av1Hdr"`
+	// FLAC in fMP4, and VP9 profile 0 and 2: what den-remux copies rather than converts or skips for a browser that
+	// plays them. den-remux clears the VP9 pair for a session in Safari's own player, which refuses VP9.
+	FLAC        bool `json:"flac"`
+	AAC71       bool `json:"aac71"`
+	VP9         bool `json:"vp9"`
+	VP9Profile2 bool `json:"vp9Profile2"`
 }
 
 const playableHeader = "X-Den-Playable"
@@ -84,9 +90,22 @@ func (p *ClientPlayable) cost(s RawStream, a StreamAttributes) int {
 	if a.DVProfile == 5 && !p.DolbyVision.P5 {
 		return neverPlaysCost
 	}
+	cost := 0
+	// A profile 5 the name only suggests weighs like a transcode: most likely it won't play here, but the probe
+	// has the last word, so it stays in the list.
+	if a.DVProfile == 0 && a.DVProfileGuess == 5 && !p.DolbyVision.P5 {
+		cost += videoConvertedCost
+	}
 	uhd := deref(a.Resolution) == "2160p"
 	tenBit := a.BitDepth >= 10
-	cost := 0
+	// beyond answers whether the video is past what the decoder takes: by the level the probe read, else by
+	// the level a 3840 × 2160 picture needs at least.
+	beyond := func(most, uhdLevel int) bool {
+		if a.VideoLevel > 0 {
+			return a.VideoLevel > most
+		}
+		return uhd && most < uhdLevel
+	}
 	switch deref(a.Codec) {
 	case "h264":
 		// A 10 the name inferred from "HDR" is no evidence of High 10: H.264 releases are not HDR.
@@ -94,8 +113,8 @@ func (p *ClientPlayable) cost(s RawStream, a StreamAttributes) int {
 		if tenBit && (a.Probed || !a.HDR) {
 			most = p.H264High10
 		}
-		// Nothing on the box makes H.264 smaller, and 3840 × 2160 needs level 5.1.
-		if most == 0 || (uhd && most < 51) {
+		// Nothing on the box makes H.264 smaller.
+		if most == 0 || beyond(most, 51) {
 			return neverPlaysCost
 		}
 	case "hevc":
@@ -103,29 +122,44 @@ func (p *ClientPlayable) cost(s RawStream, a StreamAttributes) int {
 		if !tenBit {
 			most = max(most, p.HEVCMain)
 		}
-		// 3840 × 2160 needs level 5.0.
-		if most == 0 || (uhd && most < 150) || (a.HDR && !p.HDR) {
-			cost = videoConvertedCost
+		if a.HighTier {
+			most = p.HEVCHighTier
+		}
+		if most == 0 || beyond(most, 150) || (a.HDR && !p.HDR) {
+			cost += videoConvertedCost
 		}
 	case "av1":
 		most := p.AV1Main10
 		if !tenBit {
 			most = max(most, p.AV1)
 		}
-		// Nothing converts AV1.
-		if most == 0 || (uhd && most < 12) || (a.HDR && !p.AV1HDR) {
+		// Nothing converts AV1, and a browser is only asked about its Main tier.
+		if most == 0 || a.HighTier || beyond(most, 12) || (a.HDR && !p.AV1HDR) {
+			return neverPlaysCost
+		}
+	case "vp9":
+		// Nothing converts VP9 either. Profile 2 is its 10-bit profile.
+		takes := p.VP9
+		if tenBit {
+			takes = p.VP9Profile2
+		}
+		if !takes {
 			return neverPlaysCost
 		}
 	case "":
-		cost = videoUnnamedCost
+		cost += videoUnnamedCost
 	default:
-		// VP9, MPEG-4 Part 2, VC-1, MPEG-2: den-remux converts none of them.
+		// MPEG-4 Part 2, VC-1, MPEG-2: den-remux converts none of them.
 		return neverPlaysCost
 	}
 	switch deref(a.AudioCodec) {
 	case "aac":
 	case "eac3", "ac3":
 		if !p.EAC3 {
+			cost += audioConvertedCost
+		}
+	case "flac":
+		if !p.FLAC {
 			cost += audioConvertedCost
 		}
 	default:

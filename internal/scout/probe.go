@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -36,10 +37,21 @@ type Probe struct {
 	// and its Dolby Vision configuration record. 0 means the file didn't say or this couldn't read it,
 	// and that includes every probe cached before these fields existed. Those still read as the title's
 	// guess rather than being re-probed, since each re-probe costs a debrid resolve.
-	BitDepth  int      `json:"bitDepth,omitempty"`
-	DVProfile int      `json:"dvProfile,omitempty"`
-	Audio     []string `json:"audioLanguages"`
-	Subtitles []string `json:"subtitleLanguages"`
+	BitDepth  int `json:"bitDepth,omitempty"`
+	DVProfile int `json:"dvProfile,omitempty"`
+	// The video's shape, from the same records and the track header: the codec's profile and level (H.264
+	// profile_idc and level_idc, HEVC general_profile_idc and general_level_idc, AV1 seq_profile and
+	// seq_level_idx), whether HEVC or AV1 is high tier, the picture size, and frames per second. A browser's
+	// decoder refuses a stream by level and tier, so knowing them before a release is opened lets its ranking
+	// say so. 0 where the file didn't say, as for every probe cached before these existed.
+	VideoProfile int      `json:"videoProfile,omitempty"`
+	VideoLevel   int      `json:"videoLevel,omitempty"`
+	HighTier     bool     `json:"highTier,omitempty"`
+	Width        int      `json:"width,omitempty"`
+	Height       int      `json:"height,omitempty"`
+	FrameRate    float64  `json:"frameRate,omitempty"`
+	Audio        []string `json:"audioLanguages"`
+	Subtitles    []string `json:"subtitleLanguages"`
 	// How many tracks carried no language at all. A release can have audio whose language nobody wrote
 	// down, and "2 untagged audio tracks" is a different, more useful statement than "no audio".
 	UntaggedAudio     int `json:"untaggedAudioTracks"`
@@ -66,6 +78,12 @@ const (
 	idBlockAdditionMapping = 0x41E4
 	idBlockAddIDType       = 0x41E7
 	idBlockAddIDExtraData  = 0x41ED
+
+	idDefaultDuration         = 0x23E383 // nanoseconds per frame
+	idPixelWidth              = 0xB0
+	idPixelHeight             = 0xBA
+	idColour                  = 0x55B0
+	idTransferCharacteristics = 0x55BA
 )
 
 // The boxes a Dolby Vision configuration record travels in. Per Dolby's ISOBMFF spec, dvcC holds
@@ -398,9 +416,10 @@ func uintFrom(b []byte) uint64 {
 // release, and the track listed first is routinely the plainer one — one real file listed 5.1 ahead of
 // three 7.1 tracks.
 func readTrackFacts(entry []byte, out *Probe) {
-	var kind, dvProfile int
+	var kind, dvProfile, width, height, transfer int
 	var codec string
 	var private []byte
+	var frameDuration uint64
 	for pos := 0; pos < len(entry); {
 		id, idLen := readID(entry[pos:])
 		if idLen == 0 {
@@ -425,13 +444,25 @@ func readTrackFacts(entry []byte, out *Probe) {
 			if n := int(childUint(body, idChannels)); n > channelCount(out.AudioChannels) {
 				out.AudioChannels = channelLayout(n)
 			}
-
+		case idDefaultDuration:
+			frameDuration = uintFrom(body)
+		case idVideo:
+			width, height = int(childUint(body, idPixelWidth)), int(childUint(body, idPixelHeight))
+			if colour, _, ok := findChild(body, idColour); ok {
+				transfer = int(childUint(colour, idTransferCharacteristics))
+			}
 		}
 		pos = next
 	}
 	if kind == trackTypeVideo && codec != "" && out.VideoCodec == "" {
 		out.VideoCodec = codec
 		out.BitDepth = bitDepthFromConfig(codec, private)
+		out.VideoProfile, out.VideoLevel, out.HighTier = videoShape(codec, private)
+		out.Width, out.Height = width, height
+		if frameDuration > 0 {
+			out.FrameRate = roundRate(1e9 / float64(frameDuration))
+		}
+		out.HDRFormat = hdrFromTransfer(transfer)
 	}
 	// Dolby Vision rides as a block-addition mapping whose type is the configuration box's name. The
 	// literal tag anywhere in the entry still marks it present when the mapping is too damaged to read a
@@ -495,9 +526,70 @@ func bitDepthFromConfig(codec string, record []byte) int {
 		return avcBitDepth(record)
 	case "hevc":
 		return hevcBitDepth(record)
+	case "av1":
+		return av1BitDepth(record)
 	}
 	return 0
 }
+
+// videoShape reads the profile, level and tier from the same configuration record, laid out as ISO/IEC 14496-15
+// and the AV1 ISOBMFF binding specify:
+//
+//	avcC  byte 1  AVCProfileIndication                byte 3  AVCLevelIndication
+//	hvcC  byte 1  general_profile_space (2 bits), general_tier_flag (1), general_profile_idc (5)
+//	      byte 12 general_level_idc
+//	av1C  byte 0  marker (1) and version (7), 0x81    byte 1  seq_profile (3), seq_level_idx_0 (5)
+//	      byte 2  seq_tier_0 (1), high_bitdepth (1), twelve_bit (1), …
+//
+// Zeros where the record is too short or isn't the codec's.
+func videoShape(codec string, record []byte) (profile, level int, highTier bool) {
+	switch codec {
+	case "h264":
+		if len(record) >= 4 {
+			return int(record[1]), int(record[3]), false
+		}
+	case "hevc":
+		if len(record) >= 13 {
+			return int(record[1] & 0x1F), int(record[12]), record[1]&0x20 != 0
+		}
+	case "av1":
+		if len(record) >= 3 && record[0] == 0x81 {
+			return int(record[1] >> 5), int(record[1] & 0x1F), record[2]&0x80 != 0
+		}
+	}
+	return 0, 0, false
+}
+
+// av1BitDepth reads high_bitdepth and twelve_bit from byte 2 of the AV1CodecConfigurationRecord: 10 bits takes the
+// first, 12 both.
+func av1BitDepth(record []byte) int {
+	switch {
+	case len(record) < 3 || record[0] != 0x81:
+		return 0
+	case record[2]&0x40 == 0:
+		return 8
+	case record[2]&0x20 != 0:
+		return 12
+	}
+	return 10
+}
+
+// hdrFromTransfer names the HDR a transfer characteristic implies, in the ITU-T H.273 numbering that MP4's nclx
+// colour box and Matroska's Colour element both use: 16 is SMPTE ST 2084, the PQ that releases call HDR10, and 18
+// is HLG. "" for anything else, including a container that doesn't say — an HEVC file whose colours are only in
+// its SPS reads as nothing here, and den-remux's probe reads the SPS when it opens one.
+func hdrFromTransfer(tc int) string {
+	switch tc {
+	case 16:
+		return "HDR10"
+	case 18:
+		return "HLG"
+	}
+	return ""
+}
+
+// roundRate keeps three decimals, so 24000/1001 reads 23.976 rather than a float's tail.
+func roundRate(r float64) float64 { return math.Round(r*1000) / 1000 }
 
 // avcBitDepth goes by AVCProfileIndication, byte 1 of the AVCDecoderConfigurationRecord (ISO/IEC
 // 14496-15). High 10 (110) answers 10 even for 8-bit content, because a decoder without High 10 refuses

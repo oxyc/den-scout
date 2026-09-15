@@ -186,15 +186,28 @@ func mp4VideoConfig(mdia []byte, p *Probe) {
 	if !ok || len(entry) <= 78 {
 		return
 	}
+	// The first video track's shape, as its codec is.
+	first := p.Width == 0 && p.VideoLevel == 0
+	if first {
+		// The visual sample entry's fixed header: 6 bytes reserved, 2 data-reference index, 16 pre-defined and
+		// reserved, then width and height.
+		p.Width, p.Height = int(binary.BigEndian.Uint16(entry[24:26])), int(binary.BigEndian.Uint16(entry[26:28]))
+		p.FrameRate = mp4FrameRate(mdia)
+	}
 	for _, b := range boxes(entry[78:]) {
 		switch b.typ {
-		case "avcC":
+		case "avcC", "hvcC", "av1C":
+			codec := map[string]string{"avcC": "h264", "hvcC": "hevc", "av1C": "av1"}[b.typ]
 			if p.BitDepth == 0 {
-				p.BitDepth = avcBitDepth(b.body)
+				p.BitDepth = bitDepthFromConfig(codec, b.body)
 			}
-		case "hvcC":
-			if p.BitDepth == 0 {
-				p.BitDepth = hevcBitDepth(b.body)
+			if first {
+				p.VideoProfile, p.VideoLevel, p.HighTier = videoShape(codec, b.body)
+			}
+		case "colr":
+			// An nclx colour box: its type, then colour primaries, transfer characteristics and matrix, 16 bits each.
+			if first && len(b.body) >= 8 && string(b.body[:4]) == "nclx" {
+				p.HDRFormat = hdrFromTransfer(int(binary.BigEndian.Uint16(b.body[6:8])))
 			}
 		case "dvcC", "dvvC", "dvwC":
 			p.DolbyVision = true
@@ -203,6 +216,48 @@ func mp4VideoConfig(mdia []byte, p *Probe) {
 			}
 		}
 	}
+}
+
+// mp4FrameRate is frames per second over the whole track: stts's sample counts over their total duration, in
+// mdhd's timescale. The first entry alone misreads a track whose opening samples are timed differently. 0 when
+// either box is missing.
+func mp4FrameRate(mdia []byte) float64 {
+	mdhd, ok := findBox(mdia, "mdhd")
+	if !ok || len(mdhd) < 24 {
+		return 0
+	}
+	off := 12 // v0: version+flags(4) + created(4) + modified(4)
+	if mdhd[0] == 1 {
+		off = 20 // v1 widens created/modified to 64-bit
+	}
+	if off+4 > len(mdhd) {
+		return 0
+	}
+	timescale := binary.BigEndian.Uint32(mdhd[off : off+4])
+	minf, ok := findBox(mdia, "minf")
+	if !ok {
+		return 0
+	}
+	stbl, ok := findBox(minf, "stbl")
+	if !ok {
+		return 0
+	}
+	stts, ok := findBox(stbl, "stts")
+	if !ok || len(stts) < 8 || timescale == 0 {
+		return 0
+	}
+	// version+flags(4), entry count(4), then sample count and sample delta, 32 bits each, per entry.
+	count := int(binary.BigEndian.Uint32(stts[4:8]))
+	var samples, ticks uint64
+	for i, at := 0, 8; i < count && at+8 <= len(stts); i, at = i+1, at+8 {
+		n := uint64(binary.BigEndian.Uint32(stts[at : at+4]))
+		samples += n
+		ticks += n * uint64(binary.BigEndian.Uint32(stts[at+4:at+8]))
+	}
+	if ticks == 0 {
+		return 0
+	}
+	return roundRate(float64(samples) * float64(timescale) / float64(ticks))
 }
 
 func firstSampleEntry(mdia []byte) ([]byte, bool) {

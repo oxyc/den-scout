@@ -51,6 +51,18 @@ type StreamAttributes struct {
 	// probe replaces that with what the codec's configuration record says.
 	BitDepth  int `json:"bitDepth,omitempty"`
 	DVProfile int `json:"dvProfile,omitempty"`
+	// The Dolby Vision profile the release name points to while nobody has read the real one: 7 for a Blu-ray
+	// remux, which keeps the disc's dual layer; 8 for a Blu-ray re-encode, a HYBRID, or a name that also gives an
+	// HDR10-family base; 5 for a web release that names none. 0 when the name points nowhere, and omitted once
+	// dvProfile is known. A guess, so a browser's ranking weighs it but never rules a release out on it.
+	DVProfileGuess int `json:"dvProfileGuess,omitempty"`
+	// The video's shape as the probe read it (see Probe): the codec's level (H.264 level_idc, HEVC level × 30,
+	// AV1 seq_level_idx), whether it is high tier, its size and frame rate. Omitted until a release is probed.
+	VideoLevel int     `json:"videoLevel,omitempty"`
+	HighTier   bool    `json:"highTier,omitempty"`
+	Width      int     `json:"width,omitempty"`
+	Height     int     `json:"height,omitempty"`
+	FrameRate  float64 `json:"frameRate,omitempty"`
 }
 
 var (
@@ -240,7 +252,30 @@ func streamAttributes(s RawStream) StreamAttributes {
 		Label:         cleanLabelLower(t, s), // reuse the title we already lowercased
 		BitDepth:      detectBitDepth(t, hdr),
 	}
-	return withProbe(attrs, s.Probe)
+	attrs = withProbe(attrs, s.Probe)
+	if attrs.DolbyVision && attrs.DVProfile == 0 {
+		attrs.DVProfileGuess = guessDVProfile(t, attrs.HDRFormat != nil)
+	}
+	return attrs
+}
+
+var reHybrid = mustRE2(`\bhybrid\b`)
+
+// guessDVProfile reads a Dolby Vision release's likely profile off its name, for when no probe has read the real
+// one. A UHD Blu-ray carries profile 7, and a remux keeps it. Re-encoding can't keep profile 7's enhancement
+// layer, so an encode from Blu-ray is converted to 8.1, as is a HYBRID that grafts DV metadata onto an HDR10
+// source — and a name that also gives an HDR10-family base names the base layer profile 8 has and 5 lacks. A web
+// release naming no base is taken as a streaming service's profile 5. Nothing else is guessed.
+func guessDVProfile(t string, namesHDRBase bool) int {
+	switch {
+	case reRemux.match(t):
+		return 7
+	case namesHDRBase || reHybrid.match(t) || reBluray.match(t) || reBrRip.match(t):
+		return 8
+	case reWebDL.match(t) || reWebRip.match(t) || reWeb.match(t):
+		return 5
+	}
+	return 0
 }
 
 // withProbe lets the FILE override the title wherever it has something to say. The title is what an
@@ -273,7 +308,30 @@ func withProbe(attrs StreamAttributes, p *Probe) StreamAttributes {
 	if p.DVProfile != 0 {
 		attrs.DVProfile = p.DVProfile
 	}
+	if p.HDRFormat != "" {
+		attrs.HDRFormat = strPtr(p.HDRFormat)
+		attrs.HDR = true
+	}
+	if p.Width != 0 {
+		attrs.Resolution = strPtr(resolutionOfWidth(p.Width))
+	}
+	attrs.VideoLevel, attrs.HighTier = p.VideoLevel, p.HighTier
+	attrs.Width, attrs.Height, attrs.FrameRate = p.Width, p.Height, p.FrameRate
 	return attrs
+}
+
+// resolutionOfWidth buckets a probed picture as the release names do. By width, not height: a scope film at
+// 3840 × 1608 is a 2160p release.
+func resolutionOfWidth(w int) string {
+	switch {
+	case w >= 3200:
+		return "2160p"
+	case w >= 1700:
+		return "1080p"
+	case w >= 1100:
+		return "720p"
+	}
+	return "480p"
 }
 
 // containerOf names the file's container: the probe's when the file was read, else the release name's
