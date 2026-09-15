@@ -30,7 +30,7 @@ type ClientPlayable struct {
 	AV1Main10 int  `json:"av1Main10"`
 	AV1HDR    bool `json:"av1Hdr"`
 	// FLAC in fMP4, and VP9 profile 0 and 2: what den-remux copies rather than converts or skips for a browser that
-	// plays them. den-remux clears the VP9 pair for a session in Safari's own player, which refuses VP9.
+	// plays them. den-remux clears VP9 profile 2 for a session in Safari's own player, where 10-bit VP9 is unmeasured.
 	FLAC        bool `json:"flac"`
 	AAC71       bool `json:"aac71"`
 	VP9         bool `json:"vp9"`
