@@ -24,6 +24,18 @@ var metrics = newMetricSet()
 // together — their hosts are chosen per install, so they are never a label.
 var metricIndexers = append(append([]Indexer(nil), allIndexers...), ownSources)
 
+// The attribute values released streams are counted under. Fixed, for the same reason the indexer series are:
+// a label that appears only once something matches it is a label nobody can alert on or divide by. "unknown"
+// is one of the values rather than a gap — an unprobed release is most of a real population, and leaving it
+// out would flatter every share computed from these.
+var (
+	metricCodecs      = []string{"h264", "hevc", "av1", "unknown"}
+	metricResolutions = []string{"2160p", "1080p", "720p", "480p", "unknown"}
+	metricAudioCodecs = []string{
+		"eac3", "ac3", "truehd", "dts", "dtshd", "dtshdma", "dtsx", "flac", "aac", "opus", "mp3", "unknown",
+	}
+)
+
 type metricSet struct {
 	listCacheHit   atomic.Int64
 	listCacheStale atomic.Int64
@@ -48,6 +60,20 @@ type metricSet struct {
 	indexerFailures map[Indexer]*atomic.Int64
 	// Releases each indexer answered with, before dedupe: whether one that answers is also one that adds anything.
 	indexerReleases map[Indexer]*atomic.Int64
+
+	// Streams as they are SERVED, by the attributes a client ranks on. oxyc/den#26's "practical upshot"
+	// table estimates what a modern debrid cache holds and says plainly that it is an estimate — nothing
+	// in these repos sampled it. This is that sample, and it is deliberately taken at the point of
+	// delivery rather than at the scrape: what matters is the population Den actually offers a viewer,
+	// after dedupe and ranking, not the one an indexer happens to hold.
+	releaseCodec      map[string]*atomic.Int64
+	releaseResolution map[string]*atomic.Int64
+	releaseAudio      map[string]*atomic.Int64
+
+	releaseTotal       atomic.Int64
+	releaseHDR         atomic.Int64
+	releaseDolbyVision atomic.Int64
+	releaseCached      atomic.Int64
 }
 
 func newMetricSet() *metricSet {
@@ -61,7 +87,19 @@ func newMetricSet() *metricSet {
 		m.indexerFailures[id] = new(atomic.Int64)
 		m.indexerReleases[id] = new(atomic.Int64)
 	}
+	m.releaseCodec = fixedSeries(metricCodecs)
+	m.releaseResolution = fixedSeries(metricResolutions)
+	m.releaseAudio = fixedSeries(metricAudioCodecs)
 	return m
+}
+
+// fixedSeries is one counter per value, built once so the request path only ever reads this map.
+func fixedSeries(values []string) map[string]*atomic.Int64 {
+	series := make(map[string]*atomic.Int64, len(values))
+	for _, v := range values {
+		series[v] = new(atomic.Int64)
+	}
+	return series
 }
 
 // indexerResult records one scrape attempt and the releases it returned. An indexer that is not in the fixed set is
@@ -140,6 +178,20 @@ func (m *metricSet) render(cachePersistent int) string {
 	counter(&b, "scout_indexer_failures_total", "Scrape attempts that did not answer, per indexer.", fails)
 	counter(&b, "scout_indexer_releases_total", "Releases each indexer answered with, before dedupe.", releases)
 
+	counter(&b, "scout_released_streams_total", "Streams served to a client, the denominator for the shares below.",
+		[][2]string{{"", num(m.releaseTotal.Load())}})
+	counter(&b, "scout_released_video_codec_total", "Streams served, by video codec.", series(m.releaseCodec, metricCodecs, "codec"))
+	counter(&b, "scout_released_resolution_total", "Streams served, by resolution.",
+		series(m.releaseResolution, metricResolutions, "resolution"))
+	counter(&b, "scout_released_audio_codec_total", "Streams served, by source audio codec.",
+		series(m.releaseAudio, metricAudioCodecs, "codec"))
+	counter(&b, "scout_released_feature_total", "Streams served carrying a feature, as a share of scout_released_streams_total.",
+		[][2]string{
+			{`feature="hdr"`, num(m.releaseHDR.Load())},
+			{`feature="dolby_vision"`, num(m.releaseDolbyVision.Load())},
+			{`feature="cached"`, num(m.releaseCached.Load())},
+		})
+
 	// The tightest remaining debrid add allowance, aggregated across accounts exactly as /health reports
 	// it. -1 when nothing has been spent yet, which is distinct from 0 (spent out).
 	left, accounts := globalAddBudget.lowest()
@@ -155,6 +207,47 @@ func (m *metricSet) render(cachePersistent int) string {
 	b.WriteString("scout_cache_persistent " + num(int64(cachePersistent)) + "\n")
 
 	return b.String()
+}
+
+// series renders one fixed set of counters in a stable order, so a scrape's output does not reorder between
+// reads the way a map's iteration would.
+func series(counters map[string]*atomic.Int64, values []string, label string) [][2]string {
+	out := make([][2]string, 0, len(values))
+	for _, v := range values {
+		out = append(out, [2]string{label + `="` + v + `"`, num(counters[v].Load())})
+	}
+	return out
+}
+
+// release records one stream as it goes out. Called per stream on the response path, so it only reads the
+// fixed maps and adds to atomics — no allocation, no lock, nothing that can grow at runtime.
+func (m *metricSet) release(a StreamAttributes) {
+	m.releaseTotal.Add(1)
+	bump(m.releaseCodec, deref(a.Codec))
+	bump(m.releaseResolution, deref(a.Resolution))
+	bump(m.releaseAudio, deref(a.AudioCodec))
+	if a.HDR {
+		m.releaseHDR.Add(1)
+	}
+	if a.DolbyVision {
+		m.releaseDolbyVision.Add(1)
+	}
+	// Three answers, and only one of them counts: a nil Cached means nobody could ask, which is not "no".
+	if a.Cached != nil && *a.Cached {
+		m.releaseCached.Add(1)
+	}
+}
+
+// bump counts a value against its series, or against "unknown" when the value is empty or not one this
+// build knows — so a spelling nobody anticipated lands somewhere visible instead of vanishing.
+func bump(counters map[string]*atomic.Int64, value string) {
+	if c := counters[value]; c != nil {
+		c.Add(1)
+		return
+	}
+	if c := counters["unknown"]; c != nil {
+		c.Add(1)
+	}
 }
 
 // persistenceReporter is the optional half of the Cache seam: a backend that has a durable tier can say

@@ -1788,11 +1788,15 @@ func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string
 		target.ReleaseSize = int64(*s.SizeBytes)
 	}
 	url := playURL(target)
+	attrs := streamAttributes(s)
+	// Counted here rather than at the scrape: this is the one place every stream a client is actually
+	// offered passes through, which is the population oxyc/den#26 estimates and nothing measures.
+	metrics.release(attrs)
 	return streamOut{
 		Name:       "Den Scout",
 		Title:      s.Title, // raw release name
 		URL:        url,
-		Attributes: streamAttributes(s),
+		Attributes: attrs,
 		BehaviorHints: streamHints{BingeGroup: bingeGroup(strings.ToLower(s.Title), s.Title),
 			NotWebReady: !webReady(s, url), Filename: s.Title},
 	}
