@@ -85,6 +85,11 @@ func TestClientPlayable_cost(t *testing.T) {
 		streamAttributes(RawStream{Title: "Film.1080p.WEB-DL.H.264.DDP5.1.mkv"})); got != 0 {
 		t.Errorf("E-AC-3 for a player that plays it costs %d, want 0: it is copied", got)
 	}
+	dv5 := streamAttributes(RawStream{Title: "Film.2160p.WEB-DL.DV.HEVC.AAC.mkv"})
+	dv5.DVProfile, dv5.DVProfileGuess = 5, 0
+	if got := p.cost(RawStream{Title: "Film.2160p.WEB-DL.DV.HEVC.AAC.mkv"}, dv5); got != videoConvertedCost*2 {
+		t.Errorf("probed Profile 5 costs %d, want %d: keep it last but available for den-remux's definitive probe", got, videoConvertedCost*2)
+	}
 }
 
 func TestStreamList_rankedForTheBrowserThatAsked(t *testing.T) {
