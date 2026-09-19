@@ -86,11 +86,13 @@ func (p *ClientPlayable) cost(s RawStream, a StreamAttributes) int {
 	if a.ThreeD || !remuxOpens(s) {
 		return neverPlaysCost
 	}
-	// Dolby Vision profile 5 has no base layer: stripped or converted, its picture is green and purple.
-	if a.DVProfile == 5 && !p.DolbyVision.P5 {
-		return neverPlaysCost
-	}
 	cost := 0
+	// Most Profile 5 has no base layer, but a malformed class has a P5 container record over a regular HDR base.
+	// Keep proven P5 near the end so den-remux can inspect the HEVC VUI/RPU and either refuse genuine P5 or strip
+	// the false record. Treating it as impossible here prevented that definitive probe from ever running.
+	if a.DVProfile == 5 && !p.DolbyVision.P5 {
+		cost += videoConvertedCost * 2
+	}
 	// A profile 5 the name only suggests weighs like a transcode: most likely it won't play here, but the probe
 	// has the last word, so it stays in the list.
 	if a.DVProfile == 0 && a.DVProfileGuess == 5 && !p.DolbyVision.P5 {
