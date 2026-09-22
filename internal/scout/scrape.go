@@ -342,7 +342,7 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		logLimited("indexer-status:"+string(s.indexer), "%s indexer returned http %d", s.name(), resp.StatusCode)
-		return nil, fmt.Errorf("%s http %d", s.name(), resp.StatusCode),
+		return nil, &httpStatusError{name: s.name(), code: resp.StatusCode},
 			retryableScrapeStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeBytes))
@@ -351,6 +351,15 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 	}
 	return parseStremioStreams(body, string(s.indexer)), nil, false
 }
+
+// httpStatusError is an indexer answering with a status other than 200, kept typed so coverage can tell a
+// refusal from an outage.
+type httpStatusError struct {
+	name string
+	code int
+}
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("%s http %d", e.name, e.code) }
 
 // --- fan-out + dedupe ---
 
@@ -508,23 +517,47 @@ func keepAnswer(cache Cache, ttl time.Duration, sc scraper, q scrapeQuery, r []R
 // each new one for ttl.
 func scrapeAllCached(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration, cache Cache,
 	ttl time.Duration) ([]RawStream, bool, bool) {
+	res := scrapeCovered(ctx, scrapers, q, timeout, cache, ttl)
+	return res.seeds, res.anyOK, res.complete
+}
+
+// scrapeResult is one pass over every scraper: the deduped releases, whether an empty list may be trusted,
+// whether every askable source answered, and what each source did, in scraper order.
+type scrapeResult struct {
+	seeds    []RawStream
+	anyOK    bool
+	complete bool
+	sources  []sourceReport
+}
+
+// scrapeCovered is scrapeAllCached keeping each source's report.
+func scrapeCovered(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration, cache Cache,
+	ttl time.Duration) scrapeResult {
 	results := make([][]RawStream, len(scrapers))
-	respok := make([]bool, len(scrapers))
+	reports := make([]sourceReport, len(scrapers))
 	g, gctx := errgroup.WithContext(ctx)
 	for i, sc := range scrapers {
 		i, sc := i, sc
+		reports[i] = reportFor(sc)
 		g.Go(func() error {
 			// Not counted in the indexer metrics below: nothing was asked.
 			if r, ok := keptAnswer(cache, sc, q); ok {
-				results[i], respok[i] = r, true
+				results[i] = r
+				reports[i].Outcome, reports[i].Items, reports[i].Cached = outcomeAnswered, len(r), true
 				return nil
 			}
 			cctx, cancel := context.WithTimeout(gctx, timeout)
 			defer cancel()
+			start := time.Now()
 			r, err := sc.scrape(cctx, q)
+			reports[i].Outcome = classifyScrape(sc, err)
+			if _, unasked := sc.(unaskableScraper); !unasked {
+				reports[i].LatencyMS = time.Since(start).Milliseconds()
+				reports[i].ObservedAt = time.Now().UTC().Truncate(time.Millisecond)
+			}
 			if err == nil {
 				results[i] = r
-				respok[i] = true
+				reports[i].Items = len(r)
 				keepAnswer(cache, ttl, sc, q, r)
 			}
 			// Counted here because this is where the answer is already known. An unaskable scraper is
@@ -544,7 +577,7 @@ func scrapeAllCached(ctx context.Context, scrapers []scraper, q scrapeQuery, tim
 	anyOK := false
 	for i, r := range results {
 		all = append(all, r...)
-		if respok[i] {
+		if reports[i].Outcome == outcomeAnswered {
 			anyOK = true
 		}
 	}
@@ -566,13 +599,13 @@ func scrapeAllCached(ctx context.Context, scrapers []scraper, q scrapeQuery, tim
 	// list. That is a worse answer than the one it was fixing. The list is served AND cached; `complete`
 	// carries the incompleteness so the caller can hold it for a shorter time instead.
 	complete := true
-	for i, ok := range respok {
+	for _, rep := range reports {
 		// Only a PERMANENTLY unaskable indexer is excused. One whose config could not be minted this
 		// minute is an outage: it would have voted, and we do not know how.
-		if u, unaskable := scrapers[i].(unaskableScraper); unaskable && !u.transient {
+		if excusedFromQuorum(rep.Outcome) {
 			continue
 		}
-		if !ok {
+		if rep.Outcome != outcomeAnswered {
 			complete = false
 			if len(all) == 0 {
 				anyOK = false // an EMPTY list is only authoritative when everyone answered
@@ -580,7 +613,7 @@ func scrapeAllCached(ctx context.Context, scrapers []scraper, q scrapeQuery, tim
 			break
 		}
 	}
-	return dedupe(all), anyOK, complete
+	return scrapeResult{seeds: dedupe(all), anyOK: anyOK, complete: complete, sources: reports}
 }
 
 // dedupe by infohash, merging the richest facts (fill missing fileIdx/size, max seeders); first-seen

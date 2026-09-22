@@ -161,6 +161,10 @@ type Config struct {
 	// Epoch is the CONFIG_EPOCH the config was minted under (0 when absent). Bumping CONFIG_EPOCH past it
 	// refuses the config, which is how every install is revoked at once without rotating CONFIG_KEY.
 	Epoch int
+	// Quarantined are the indexers the config names that disabledIndexers removed. They are never asked, and
+	// are listed in a stream list's coverage so the config's own choice does not silently vanish. Not
+	// serialised: verdictPrefix hashes the config, and a verdict does not depend on what was not asked.
+	Quarantined []Indexer `json:"-"`
 }
 
 const scopeAvailability = "availability"
@@ -293,10 +297,12 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 		}
 	}
 	idx = dedupeIndexers(idx) // audit #10
-	var kept []Indexer
+	var kept, quarantined []Indexer
 	for _, i := range idx {
 		if _, dead := disabledIndexers[i]; !dead {
 			kept = append(kept, i)
+		} else {
+			quarantined = append(quarantined, i)
 		}
 	}
 	idx = kept
@@ -396,7 +402,7 @@ func validateConfig(raw *rawConfig) (*Config, bool) {
 	}
 
 	return &Config{Debrid: debrid, Indexers: idx, Sources: normalizeSources(raw.Sources), Filters: f,
-		CachedOnly: cachedOnly, ResultCap: resultCap, Scope: scope, IID: iid, Epoch: epoch}, true
+		CachedOnly: cachedOnly, ResultCap: resultCap, Scope: scope, IID: iid, Epoch: epoch, Quarantined: quarantined}, true
 }
 
 func isDebridService(s string) bool {

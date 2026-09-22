@@ -1416,11 +1416,21 @@ func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) 
 	age(5 * time.Minute)
 	before := scrapes.Load()
 	stale := do(h, path, nil)
-	if stale.Code != 200 || stale.Body.String() != body {
-		t.Fatalf("outage: %d, served the held list: %v", stale.Code, stale.Body.String() == body)
+	heldStreams, heldEnv := envelopeOf(t, body)
+	servedStreams, servedEnv := envelopeOf(t, stale.Body.String())
+	if stale.Code != 200 || string(servedStreams) != string(heldStreams) {
+		t.Fatalf("outage: %d, served the held list: %v", stale.Code, string(servedStreams) == string(heldStreams))
 	}
 	if got := stale.Header().Get("X-Den-Degraded"); got != "stale_list" {
 		t.Errorf("X-Den-Degraded = %q, want stale_list", got)
+	}
+	// The body says the same as the header, and keeps the time the list was built.
+	if servedEnv.AnswerKind != answerStale || servedEnv.Degraded != "stale_list" ||
+		!servedEnv.GeneratedAt.Equal(heldEnv.GeneratedAt) {
+		t.Errorf("held list's envelope = %+v, want stale, stale_list, built %v", servedEnv, heldEnv.GeneratedAt)
+	}
+	if stale.Header().Get("etag") == etag {
+		t.Error("the relabelled body kept the fresh list's ETag")
 	}
 	if cc := stale.Header().Get("cache-control"); cc != "private, max-age=60" {
 		t.Errorf("cache-control = %q, want private, max-age=60", cc)
@@ -1430,7 +1440,7 @@ func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) 
 	}
 
 	again := do(h, path, nil)
-	if again.Header().Get("X-Den-Degraded") != "stale_list" || again.Body.String() != body {
+	if again.Header().Get("X-Den-Degraded") != "stale_list" || again.Body.String() != stale.Body.String() {
 		t.Errorf("inside the cool-off: degraded %q", again.Header().Get("X-Den-Degraded"))
 	}
 	if scrapes.Load() != before+1 {
@@ -1443,8 +1453,10 @@ func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) 
 	if got := late.Header().Get("X-Den-Degraded"); got != "indexers" {
 		t.Errorf("past stale-if-error: X-Den-Degraded = %q, want indexers", got)
 	}
-	if late.Body.String() == body {
-		t.Error("past stale-if-error the held list was served")
+	if lateStreams, lateEnv := envelopeOf(t, late.Body.String()); string(lateStreams) == string(heldStreams) ||
+		lateEnv.AnswerKind != answerUnknown {
+		t.Errorf("past stale-if-error: the held list was served, or the empty answer is %q, not unknown",
+			lateEnv.AnswerKind)
 	}
 }
 
