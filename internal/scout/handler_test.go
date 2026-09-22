@@ -1437,6 +1437,22 @@ func TestStreamList_staleIfErrorStaysInsideTicketLife(t *testing.T) {
 	}
 }
 
+// The server holds a complete list for an outage far longer than a device may keep its own copy, but always
+// leaves the list's tickets a viewing's worth of life, and never less than the device's window.
+func TestStreamList_outageHoldLeavesTicketsAViewing(t *testing.T) {
+	for _, c := range []struct {
+		list, ticket, want time.Duration
+	}{
+		{5 * time.Minute, 24 * time.Hour, 24*time.Hour - 15*time.Minute - outageViewingRoom},
+		{5 * time.Minute, 4 * time.Hour, time.Hour},
+		{5 * time.Minute, 10 * time.Minute, 0},
+	} {
+		if got := outageHoldFor(c.list, c.ticket); got != c.want {
+			t.Errorf("list %s, ticket %s: outage hold %s, want %s", c.list, c.ticket, got, c.want)
+		}
+	}
+}
+
 // When no indexer answers, a title whose last complete list is past its stale window gets that list back —
 // marked stale_list and held by the client for a minute — rather than an empty "nothing to play". Within the
 // cool-off after such a build the list is served without scraping again. Past stale-if-error, or when a
@@ -1465,7 +1481,7 @@ func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) 
 	held, _ := cache.Get(key)
 	complete, _, etag, body := splitCached(held)
 	age := func(past time.Duration) {
-		cache.Put(key, joinCached(complete, time.Now().Add(-past).Unix(), etag, body), 2*time.Hour)
+		cache.Put(key, joinCached(complete, time.Now().Add(-past).Unix(), etag, body), 24*time.Hour)
 	}
 
 	// A healthy rebuild past the stale window answers with the new list, not the held one.
@@ -1510,15 +1526,26 @@ func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) 
 		t.Error("a request inside the cool-off scraped again")
 	}
 
-	// Past stale-if-error the held list is not served, whatever the cool-off says.
-	age(2 * time.Hour)
+	// Indexers down for a few hours: a list built before they went is still the answer, well past the hour a
+	// device may keep its own copy.
+	age(3 * time.Hour)
+	hours := do(h, path, nil)
+	if got := hours.Header().Get("X-Den-Degraded"); got != "stale_list" {
+		t.Errorf("three hours into an outage: X-Den-Degraded = %q, want stale_list", got)
+	}
+	if hoursStreams, _ := envelopeOf(t, hours.Body.String()); string(hoursStreams) != string(heldStreams) {
+		t.Error("three hours into an outage: the held list was not served")
+	}
+
+	// Past the outage hold the held list is not served, whatever the cool-off says.
+	age(outageHoldFor(defaultListTTL, defaultPlayTicketTTL) + 2*time.Minute)
 	late := do(h, path, nil)
 	if got := late.Header().Get("X-Den-Degraded"); got != "indexers" {
-		t.Errorf("past stale-if-error: X-Den-Degraded = %q, want indexers", got)
+		t.Errorf("past the outage hold: X-Den-Degraded = %q, want indexers", got)
 	}
 	if lateStreams, lateEnv := envelopeOf(t, late.Body.String()); string(lateStreams) == string(heldStreams) ||
 		lateEnv.AnswerKind != answerUnknown {
-		t.Errorf("past stale-if-error: the held list was served, or the empty answer is %q, not unknown",
+		t.Errorf("past the outage hold: the held list was served, or the empty answer is %q, not unknown",
 			lateEnv.AnswerKind)
 	}
 }

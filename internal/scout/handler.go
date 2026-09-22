@@ -53,18 +53,22 @@ const (
 	// Two minutes, not another full TTL. The window only has to cover the moment of expiry — a rebuild
 	// finishes well inside it. It also bounds how wrong a list served as current may be: torrent
 	// availability moves, and a list stale by an hour is not a kindness. Past this window the entry is kept
-	// only as a last resort for an indexer outage (maxStaleIfError), and is served then with a degraded header.
+	// only as a last resort for an indexer outage (outageHoldFor), and is served then with a degraded header.
 	//
 	// A CEILING, not the value: staleWindowFor caps it at the configured TTL as well. Left absolute, an
 	// operator who set LIST_TTL_SECS=30 got a 30-second freshness followed by a two-minute stale
 	// window — an entry spending 80% of its life stale, which is not what "briefly serve the old one
 	// while it refreshes" means.
 	maxStaleServeWindow = 2 * time.Minute
-	// How long past its freshness a COMPLETE list may still be used when nothing better can be had: by a
-	// client, as stale-if-error, and by the server, as the answer to a rebuild in which no indexer answered
-	// (X-Den-Degraded: stale_list). A CEILING: staleIfErrorFor also keeps it inside the life of the play
-	// tickets the list carries.
+	// How long past its freshness a device may keep using a COMPLETE list on its own, as stale-if-error. Short,
+	// because a device reusing its copy cannot say how old it is. A CEILING: staleIfErrorFor also keeps it
+	// inside the life of the play tickets the list carries.
 	maxStaleIfError = time.Hour
+	// What a held list's tickets must still have left when the server serves it in an outage (stale_list): the
+	// viewing it starts, during which the player may ask the URL again. The server's own hold (outageHoldFor)
+	// is the ticket life less this and the list's normal reach, so indexers down for a few hours still leave
+	// anything opened that day playable — served marked stale, with the time it was built.
+	outageViewingRoom = 6 * time.Hour
 )
 
 // statusBudget bounds a status read: one upstream question, asked on the client's poll cadence, so it
@@ -262,6 +266,12 @@ func staleIfErrorFor(listTTL, ticketTTL time.Duration) time.Duration {
 	return max(0, min(maxStaleIfError, ticketTTL-3*listTTL))
 }
 
+// outageHoldFor is how long past freshness the server keeps a complete list to serve when no indexer answers:
+// as long as its tickets allow with outageViewingRoom to spare, and never less than a device may keep it.
+func outageHoldFor(listTTL, ticketTTL time.Duration) time.Duration {
+	return max(staleIfErrorFor(listTTL, ticketTTL), ticketTTL-3*listTTL-outageViewingRoom)
+}
+
 // Deps injects the environment: the cache, timeouts, public origin, and the scraper/store factories
 // (mocked in tests).
 type Deps struct {
@@ -361,6 +371,8 @@ type handler struct {
 	staleListCache   string
 	// staleIfErrorFor(ListTTL, PlayTicketTTL), fixed once both are known.
 	staleIfError time.Duration
+	// outageHoldFor(ListTTL, PlayTicketTTL): how long a complete list is kept for the stale_list fallback.
+	outageHold time.Duration
 }
 
 // After this many consecutive builds where no indexer responded, /health reports "degraded".
@@ -410,6 +422,7 @@ func NewHandler(deps Deps) http.Handler {
 	// stale-if-error is bounded by the tickets' life (staleIfErrorFor): a list a device falls back to during an
 	// outage must still play. It was a flat day, as long as the tickets themselves.
 	h.staleIfError = staleIfErrorFor(deps.ListTTL, deps.PlayTicketTTL)
+	h.outageHold = outageHoldFor(deps.ListTTL, deps.PlayTicketTTL)
 	h.listCache = fmt.Sprintf("private, max-age=%d, stale-while-revalidate=%d", ttlSec, ttlSec)
 	if sie := int(h.staleIfError.Seconds()); sie > 0 {
 		h.listCache += fmt.Sprintf(", stale-if-error=%d", sie)
@@ -740,7 +753,7 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 // a miss, unless no indexer answers it — then the held list, marked X-Den-Degraded: stale_list and kept by
 // the client for a minute. An empty list in an outage reads as "nothing to play"; the last good one plays.
 //
-// Only within staleIfError of the list's freshness, which keeps every ticket in it inside its life. After
+// Only within outageHold of the list's freshness, which keeps every ticket in it alive for a viewing. After
 // such a build the key cools off for rebuildCooloff, during which the held list is served without scraping.
 func (h *handler) lastResort(w http.ResponseWriter, r *http.Request, start time.Time, configBlob string, sid *StreamID,
 	origin, cacheKey string, freshUntil int64, etag, body string) {
@@ -753,7 +766,7 @@ func (h *handler) lastResort(w http.ResponseWriter, r *http.Request, start time.
 		return
 	}
 	now := time.Now()
-	usable := now.Before(time.Unix(freshUntil, 0).Add(h.staleIfError))
+	usable := now.Before(time.Unix(freshUntil, 0).Add(h.outageHold))
 	serveHeld := func(timing string) {
 		logLimited("stale-list", "%s %s: no indexer answered; serving the last complete list, %s past its freshness",
 			sid.Type, sid.IMDb, now.Sub(time.Unix(freshUntil, 0)).Truncate(time.Second))
@@ -1132,7 +1145,7 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 	hold := ttl
 	if scrapeComplete {
 		freshUntil = now.Add(ttl).Unix()
-		hold = ttl + max(staleWindowFor(ttl), h.staleIfError)
+		hold = ttl + max(staleWindowFor(ttl), h.outageHold)
 	}
 	cached := !degraded && dbg == nil
 	env := &answerEnvelope{

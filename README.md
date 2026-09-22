@@ -115,9 +115,11 @@ preflight. An unknown path — and `/metrics` without its token — is `404` wit
 A stream list that is served but cannot be trusted carries `X-Den-Degraded` — `indexers` when no indexer
 answered, `cache-check` when the debrid could not be asked about a release in it — and is `no-store`, so
 the app can say "sources temporarily unavailable" instead of "nothing found". When no indexer answers a
-rebuild of a title whose last complete list is under an hour past its freshness, that list is served
-instead, with `X-Den-Degraded: stale_list` and `Cache-Control: private, max-age=60`; for the next minute
-the title is answered that way without scraping again.
+rebuild of a title whose last complete list is still held, that list is served instead, with
+`X-Den-Degraded: stale_list` and `Cache-Control: private, max-age=60`; for the next minute the title is
+answered that way without scraping again. A complete list is held that way for the play tickets' life less
+three `LIST_TTL_SECS` and six hours for the viewing it starts (about 17¾ h at the defaults), so indexers
+down for a few hours leave anything opened that day playable. A device's own `stale-if-error` stays an hour.
 
 Beside `streams`, a list carries `den`, its account of itself (Stremio clients ignore it):
 
