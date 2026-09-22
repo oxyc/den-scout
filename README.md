@@ -76,7 +76,7 @@ user input is never routed through it.
 ```
 GET  /                                   configure page
 GET  /configure                          configure page
-GET  /health                             always 200: { status: "ok" } | { status: "degraded", reason, detail }
+GET  /health                             always 200: { status: "ok", coverage: "complete" | "partial" (+ detail) } | { status: "degraded", reason, detail }
 GET  /metrics                            Prometheus text (bearer token; 404 unless METRICS_TOKEN is set)
 GET  /config-key                         { key, epoch } — X25519 public key for sealing, current CONFIG_EPOCH (404 if unset)
 POST /validate                           { service, token } → { valid, reason } — check a debrid key
@@ -118,6 +118,29 @@ the app can say "sources temporarily unavailable" instead of "nothing found". Wh
 rebuild of a title whose last complete list is under an hour past its freshness, that list is served
 instead, with `X-Den-Degraded: stale_list` and `Cache-Control: private, max-age=60`; for the next minute
 the title is answered that way without scraping again.
+
+Beside `streams`, a list carries `den`, its account of itself (Stremio clients ignore it):
+
+```json
+{ "streams": [ … ],
+  "den": { "v": 1, "answerKind": "partial", "generatedAt": "2026-09-22T14:00:00Z", "expiresAt": "2026-09-22T14:01:00Z",
+           "coverage": { "complete": false, "sources": [
+             { "id": "torrentio", "outcome": "answered", "items": 42, "latencyMs": 310, "observedAt": "…" },
+             { "id": "comet", "outcome": "timeout", "items": 0, "latencyMs": 8000, "observedAt": "…" },
+             { "id": "mediafusion", "outcome": "skipped_misconfigured", "items": 0 } ] } } }
+```
+
+`answerKind` is `live` (every source answered), `partial` (releases, but a source did not answer),
+`empty`, `unknown` or `stale` (a list served past its freshness: inside the stale window while it is rebuilt,
+or the `stale_list` answer above; `generatedAt` and `coverage` stay those of the original build). **`empty` is the only kind that says a title has
+nothing**, and it needs every source to have answered with nothing degraded; an empty list any source missed
+is `unknown`. `degraded` repeats `X-Den-Degraded` when there is one, and `expiresAt` is absent on a list that
+is not cached. `coverage.sources` lists every configured indexer and household source, including those not
+asked: `outcome` is `answered`, `unreachable`, `refused`, `timeout`, `skipped_misconfigured` (needs a config
+URL it lacks) or `quarantined` (an indexer this release has disabled). The last two never hold `complete`
+back; `cached: true` marks an answer reused from the indexer answer cache. `/metrics` counts the same outcomes
+as `scout_source_coverage_total{indexer,outcome}`. `/health` says only `coverage: "partial"` once a source has
+missed three builds in a row — no source name and no count, since it is unauthenticated.
 
 Stream lists are `private` (their play URLs are credentials). A complete list is `max-age` and
 `stale-while-revalidate` of `LIST_TTL_SECS`, plus `stale-if-error` of an hour at most, less when

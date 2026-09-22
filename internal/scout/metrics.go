@@ -60,6 +60,10 @@ type metricSet struct {
 	indexerFailures map[Indexer]*atomic.Int64
 	// Releases each indexer answered with, before dedupe: whether one that answers is also one that adds anything.
 	indexerReleases map[Indexer]*atomic.Int64
+	// How each configured source figured in a list build's coverage, by outcome. Unlike the request counters
+	// this includes the sources that were never asked (misconfigured, quarantined) and answers reused from the
+	// indexer answer cache, because coverage does.
+	sourceCoverage map[Indexer]map[string]*atomic.Int64
 
 	// Streams as they are SERVED, by the attributes a client ranks on. oxyc/den#26's "practical upshot"
 	// table estimates what a modern debrid cache holds and says plainly that it is an estimate — nothing
@@ -81,11 +85,13 @@ func newMetricSet() *metricSet {
 		indexerRequests: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
 		indexerFailures: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
 		indexerReleases: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
+		sourceCoverage:  make(map[Indexer]map[string]*atomic.Int64, len(metricIndexers)),
 	}
 	for _, id := range metricIndexers {
 		m.indexerRequests[id] = new(atomic.Int64)
 		m.indexerFailures[id] = new(atomic.Int64)
 		m.indexerReleases[id] = new(atomic.Int64)
+		m.sourceCoverage[id] = fixedSeries(sourceOutcomes)
 	}
 	m.releaseCodec = fixedSeries(metricCodecs)
 	m.releaseResolution = fixedSeries(metricResolutions)
@@ -113,6 +119,15 @@ func (m *metricSet) indexerResult(id Indexer, ok bool, releases int) {
 	}
 	if !ok {
 		if c := m.indexerFailures[id]; c != nil {
+			c.Add(1)
+		}
+	}
+}
+
+// coverage records one build's source reports. Ids and outcomes outside the fixed sets are ignored.
+func (m *metricSet) coverage(sources []sourceReport) {
+	for _, s := range sources {
+		if c := m.sourceCoverage[Indexer(s.ID)][s.Outcome]; c != nil {
 			c.Add(1)
 		}
 	}
@@ -177,6 +192,15 @@ func (m *metricSet) render(cachePersistent int) string {
 	counter(&b, "scout_indexer_requests_total", "Scrape attempts per indexer.", reqs)
 	counter(&b, "scout_indexer_failures_total", "Scrape attempts that did not answer, per indexer.", fails)
 	counter(&b, "scout_indexer_releases_total", "Releases each indexer answered with, before dedupe.", releases)
+
+	cov := make([][2]string, 0, len(metricIndexers)*len(sourceOutcomes))
+	for _, id := range metricIndexers {
+		for _, outcome := range sourceOutcomes {
+			cov = append(cov, [2]string{`indexer="` + string(id) + `",outcome="` + outcome + `"`,
+				num(m.sourceCoverage[id][outcome].Load())})
+		}
+	}
+	counter(&b, "scout_source_coverage_total", "Configured sources in each list build's coverage, by outcome.", cov)
 
 	counter(&b, "scout_released_streams_total", "Streams served to a client, the denominator for the shares below.",
 		[][2]string{{"", num(m.releaseTotal.Load())}})

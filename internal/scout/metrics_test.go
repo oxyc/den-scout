@@ -82,6 +82,7 @@ func TestMetrics_reportsWhatWasPreviouslyLogOnly(t *testing.T) {
 		{`scout_list_cache_total{result="hit"}`, 1},
 		{`scout_list_builds_total{result="ok"}`, 1},
 		{`scout_indexer_requests_total{indexer="torrentio"}`, 1},
+		{`scout_source_coverage_total{indexer="torrentio",outcome="answered"}`, 1},
 	} {
 		got := sampleValue(t, after, want.series) - sampleValue(t, before, want.series)
 		if got != want.delta {

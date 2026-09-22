@@ -328,6 +328,10 @@ type handler struct {
 	// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
 	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
 	scrapeFails atomic.Int32
+	// Consecutive builds a source missed (coverage incomplete), total failures included. Surfaced on /health
+	// as a state, never a count: a count that rises per build is a timeline of when the household browses,
+	// which is why the build counters live behind /metrics' token.
+	partialBuilds atomic.Int32
 
 	// Availability checks running behind replies, by verdict key — never more than maxAvailabilityChecks,
 	// so the map holds only live checks.
@@ -364,6 +368,9 @@ const scrapeFailThreshold = 3
 
 // What /health says about that state, and what the log line marking the flip says too.
 const indexersDownDetail = "No indexer has answered the last few stream-list builds, so lists are coming back empty."
+
+// What /health says once a source has missed scrapeFailThreshold builds in a row while others answered.
+const sourcesMissingDetail = "A source has missed the last few stream-list builds, so lists may be short; /metrics names it."
 
 // debugLimiter paces ?debug=1. A diagnostic is run by a person a handful of times in a row, so three then
 // one every ten seconds is invisible to that and puts a ceiling on the one /stream path that has neither
@@ -493,9 +500,13 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	case "/health":
 		// Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
 		// state so a monitor sees a total-indexer outage instead of just "empty results".
-		status := map[string]any{"status": "ok"}
-		if h.scrapeFails.Load() >= scrapeFailThreshold {
+		status := map[string]any{"status": "ok", "coverage": "complete"}
+		switch {
+		case h.scrapeFails.Load() >= scrapeFailThreshold:
 			status = map[string]any{"status": "degraded", "reason": "indexers", "detail": indexersDownDetail}
+		case h.partialBuilds.Load() >= scrapeFailThreshold:
+			// Which source is withheld: naming it says which indexers this install uses.
+			status["coverage"], status["detail"] = "partial", sourcesMissingDetail
 		}
 		// A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
 		// other evidence is one log line per refusal. The tightest remaining allowance is what an operator
@@ -692,6 +703,9 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 			header = staleListCache
 			served = "cache;desc=stale"
 			h.rebuildBehind(r, configBlob, sid, origin, cacheKey)
+			if relabelled, ok := staleBody(body, ""); ok {
+				body, etag = relabelled, etagFor(relabelled)
+			}
 		}
 		w.Header().Set("server-timing", served+", total;dur="+msDur(time.Since(start)))
 		h.conditional(w, r, body, etag, jsonType, header)
@@ -745,7 +759,13 @@ func (h *handler) lastResort(w http.ResponseWriter, r *http.Request, start time.
 			sid.Type, sid.IMDb, now.Sub(time.Unix(freshUntil, 0)).Truncate(time.Second))
 		w.Header().Set("X-Den-Degraded", "stale_list")
 		w.Header().Set("server-timing", timing+"cache;desc=stale_list, total;dur="+msDur(time.Since(start)))
-		h.conditional(w, r, body, etag, jsonType, h.staleListCache)
+		// The held body says what it was when built; served now, it is stale, and says so. A new body is a new
+		// ETag, so a client revalidating the fresh list is not told its copy still stands.
+		held, heldETag := body, etag
+		if relabelled, ok := staleBody(body, "stale_list"); ok {
+			held, heldETag = relabelled, etagFor(relabelled)
+		}
+		h.conditional(w, r, held, heldETag, jsonType, h.staleListCache)
 	}
 	if usable && h.inOutage(cacheKey, now) {
 		serveHeld("")
@@ -891,6 +911,7 @@ type rankedList struct {
 	// degraded — why the list cannot be trusted, "" when it can (buildResult's vocabulary).
 	degraded string
 	complete bool
+	coverage coverage
 	timing   string
 }
 
@@ -901,8 +922,10 @@ type rankedList struct {
 func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, dbg *rankDebug, client *ClientPlayable) rankedList {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	phase := time.Now()
-	seeds, scrapeOK, scrapeComplete := scrapeAllCached(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout,
-		h.deps.Cache, h.deps.ListTTL)
+	scraped := scrapeCovered(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout, h.deps.Cache, h.deps.ListTTL)
+	seeds, scrapeOK, scrapeComplete := scraped.seeds, scraped.anyOK, scraped.complete
+	cov := coverage{Complete: scrapeComplete, Sources: append(scraped.sources, quarantinedReports(config)...)}
+	metrics.coverage(cov.Sources)
 	timing := "scrape;dur=" + msDur(time.Since(phase))
 	// Recorded HERE, before anything trims it. Taken after the two filters below instead, the count read
 	// as "this is all the indexers had" while both of them had already removed releases that appear in no
@@ -953,6 +976,13 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 		}
 	} else if h.scrapeFails.Add(1) == scrapeFailThreshold {
 		log.Printf("health: ok → degraded (indexers): %s", indexersDownDetail)
+	}
+	if scrapeComplete {
+		if h.partialBuilds.Swap(0) >= scrapeFailThreshold {
+			log.Printf("health: coverage partial → complete, every source answered again")
+		}
+	} else if h.partialBuilds.Add(1) == scrapeFailThreshold {
+		log.Printf("health: coverage complete → partial: %s", sourcesMissingDetail)
 	}
 
 	// TOTAL failure and PARTIAL failure are different states and drive different decisions, so they get
@@ -1058,7 +1088,8 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 			config.Filters.Resolutions, config.Filters.MinSeeders, config.Filters.MaxSizeGB,
 			config.Filters.ExcludeCam, config.Filters.HDROnly)
 	}
-	return rankedList{ranked: ranked, truth: truth, degraded: degradedReason, complete: scrapeComplete, timing: timing}
+	return rankedList{ranked: ranked, truth: truth, degraded: degradedReason, complete: scrapeComplete, coverage: cov,
+		timing: timing}
 }
 
 // finishStreamList probes the top of a ranked list, serialises it and caches it — the half of a build only a
@@ -1079,8 +1110,6 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 	for _, s := range ranked {
 		out = append(out, toStremioStream(s, sid, playURL))
 	}
-	body, _ := json.Marshal(streamsResponse{Streams: out, Debug: dbg})
-	etag := etagFor(string(body))
 	// A list missing one indexer's releases is worth serving and worth caching — just not for as long
 	// as a complete one. Refusing to cache it at all put the full scrape and a fresh debrid fan-out on
 	// every single request whenever one upstream was flaky, which is a worse answer than the slightly
@@ -1105,6 +1134,19 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 		freshUntil = now.Add(ttl).Unix()
 		hold = ttl + max(staleWindowFor(ttl), h.staleIfError)
 	}
+	cached := !degraded && dbg == nil
+	env := &answerEnvelope{
+		V:           answerEnvelopeVersion,
+		AnswerKind:  decideAnswerKind(len(out), scrapeComplete, degradedReason),
+		Degraded:    degradedReason,
+		GeneratedAt: now.UTC().Truncate(time.Second),
+		Coverage:    list.coverage,
+	}
+	if cached {
+		env.ExpiresAt = now.Add(ttl).UTC().Truncate(time.Second)
+	}
+	body, _ := json.Marshal(streamsResponse{Streams: out, Debug: dbg, Den: env})
+	etag := etagFor(string(body))
 	value := joinCached(scrapeComplete, freshUntil, etag, string(body))
 	switch {
 	case degraded:
@@ -1116,7 +1158,7 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 	}
 	// A debug build carries accounting in its body and must not become the entry every other viewer is
 	// served — nor displace a good one.
-	if !degraded && dbg == nil {
+	if cached {
 		if !scrapeComplete {
 			logLimited("partial-list", "%s %s: an indexer did not answer; caching this list for %s only",
 				sid.Type, sid.IMDb, ttl)
@@ -1780,6 +1822,8 @@ type streamsResponse struct {
 	// Present only for ?debug=1. omitempty on a nil pointer, so a normal response is byte-identical to
 	// what it was before this existed — which matters, because the ETag is a hash of it.
 	Debug *rankDebug `json:"debug,omitempty"`
+	// The list's account of itself (coverage.go). Stremio ignores it; `streams` is unchanged by it.
+	Den *answerEnvelope `json:"den,omitempty"`
 }
 
 func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string) streamOut {
