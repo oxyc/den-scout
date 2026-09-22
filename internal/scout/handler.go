@@ -328,6 +328,10 @@ type handler struct {
 	// Consecutive fully-degraded builds (every indexer failed). Surfaced on /health so a scrape outage
 	// — which otherwise looks like empty stream lists — is visible to an uptime monitor.
 	scrapeFails atomic.Int32
+	// Consecutive builds a source missed (coverage incomplete), total failures included. Surfaced on /health
+	// as a state, never a count: a count that rises per build is a timeline of when the household browses,
+	// which is why the build counters live behind /metrics' token.
+	partialBuilds atomic.Int32
 
 	// Availability checks running behind replies, by verdict key — never more than maxAvailabilityChecks,
 	// so the map holds only live checks.
@@ -364,6 +368,9 @@ const scrapeFailThreshold = 3
 
 // What /health says about that state, and what the log line marking the flip says too.
 const indexersDownDetail = "No indexer has answered the last few stream-list builds, so lists are coming back empty."
+
+// What /health says once a source has missed scrapeFailThreshold builds in a row while others answered.
+const sourcesMissingDetail = "A source has missed the last few stream-list builds, so lists may be short; /metrics names it."
 
 // debugLimiter paces ?debug=1. A diagnostic is run by a person a handful of times in a row, so three then
 // one every ten seconds is invisible to that and puts a ceiling on the one /stream path that has neither
@@ -493,9 +500,13 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	case "/health":
 		// Stays 200 (liveness — the addon itself is up), but reports the degraded scrape
 		// state so a monitor sees a total-indexer outage instead of just "empty results".
-		status := map[string]any{"status": "ok"}
-		if h.scrapeFails.Load() >= scrapeFailThreshold {
+		status := map[string]any{"status": "ok", "coverage": "complete"}
+		switch {
+		case h.scrapeFails.Load() >= scrapeFailThreshold:
 			status = map[string]any{"status": "degraded", "reason": "indexers", "detail": indexersDownDetail}
+		case h.partialBuilds.Load() >= scrapeFailThreshold:
+			// Which source is withheld: naming it says which indexers this install uses.
+			status["coverage"], status["detail"] = "partial", sourcesMissingDetail
 		}
 		// A spent add budget refuses every play with the same 503 a throttled debrid gives, and the only
 		// other evidence is one log line per refusal. The tightest remaining allowance is what an operator
@@ -965,6 +976,13 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 		}
 	} else if h.scrapeFails.Add(1) == scrapeFailThreshold {
 		log.Printf("health: ok → degraded (indexers): %s", indexersDownDetail)
+	}
+	if scrapeComplete {
+		if h.partialBuilds.Swap(0) >= scrapeFailThreshold {
+			log.Printf("health: coverage partial → complete, every source answered again")
+		}
+	} else if h.partialBuilds.Add(1) == scrapeFailThreshold {
+		log.Printf("health: coverage complete → partial: %s", sourcesMissingDetail)
 	}
 
 	// TOTAL failure and PARTIAL failure are different states and drive different decisions, so they get

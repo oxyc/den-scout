@@ -660,6 +660,49 @@ func TestHealthDegradedOnScrapeOutage(t *testing.T) {
 	}
 }
 
+// A source that keeps missing while another answers turns /health's coverage partial — a state, not a count,
+// and without naming the source — and one complete build turns it back.
+func TestHealthCoveragePartialWhileASourceKeepsMissing(t *testing.T) {
+	var cometDown atomic.Bool
+	cometDown.Store(true)
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = func(*Config) []scraper {
+			return []scraper{
+				fakeScraper{"torrentio", func(context.Context) ([]RawStream, error) { return testSeeds(), nil }},
+				fakeScraper{"comet", func(context.Context) ([]RawStream, error) {
+					if cometDown.Load() {
+						return nil, context.DeadlineExceeded
+					}
+					return nil, nil
+				}},
+			}
+		}
+	}))
+	health := func() (body struct{ Status, Coverage, Detail string }, raw string) {
+		rr := do(h, "/health", nil)
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		return body, rr.Body.String()
+	}
+	if b, raw := health(); b.Status != "ok" || b.Coverage != "complete" {
+		t.Fatalf("health should start ok and complete: %s", raw)
+	}
+	for i := 0; i < scrapeFailThreshold; i++ {
+		do(h, "/"+validBlob+"/stream/movie/tt"+string(rune('0'+i))+".json", nil)
+	}
+	b, raw := health()
+	if b.Status != "ok" || b.Coverage != "partial" || b.Detail == "" {
+		t.Errorf("health after %d partial builds = %s, want ok/partial with a detail", scrapeFailThreshold, raw)
+	}
+	if strings.Contains(raw, "comet") || strings.Contains(raw, "torrentio") {
+		t.Errorf("/health names a source: %s", raw)
+	}
+	cometDown.Store(false)
+	do(h, "/"+validBlob+"/stream/movie/tt9.json", nil)
+	if b, raw := health(); b.Coverage != "complete" {
+		t.Errorf("one complete build should restore coverage: %s", raw)
+	}
+}
+
 func TestRoutesDegradedScrapeNotCached(t *testing.T) {
 	// When every indexer fails, the empty list must NOT be cached — a later healthy request rebuilds.
 	var healthy int32

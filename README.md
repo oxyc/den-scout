@@ -76,7 +76,7 @@ user input is never routed through it.
 ```
 GET  /                                   configure page
 GET  /configure                          configure page
-GET  /health                             always 200: { status: "ok" } | { status: "degraded", reason, detail }
+GET  /health                             always 200: { status: "ok", coverage: "complete" | "partial" (+ detail) } | { status: "degraded", reason, detail }
 GET  /metrics                            Prometheus text (bearer token; 404 unless METRICS_TOKEN is set)
 GET  /config-key                         { key, epoch } — X25519 public key for sealing, current CONFIG_EPOCH (404 if unset)
 POST /validate                           { service, token } → { valid, reason } — check a debrid key
@@ -139,7 +139,8 @@ is not cached. `coverage.sources` lists every configured indexer and household s
 asked: `outcome` is `answered`, `unreachable`, `refused`, `timeout`, `skipped_misconfigured` (needs a config
 URL it lacks) or `quarantined` (an indexer this release has disabled). The last two never hold `complete`
 back; `cached: true` marks an answer reused from the indexer answer cache. `/metrics` counts the same outcomes
-as `scout_source_coverage_total{indexer,outcome}`.
+as `scout_source_coverage_total{indexer,outcome}`. `/health` says only `coverage: "partial"` once a source has
+missed three builds in a row — no source name and no count, since it is unauthenticated.
 
 Stream lists are `private` (their play URLs are credentials). A complete list is `max-age` and
 `stale-while-revalidate` of `LIST_TTL_SECS`, plus `stale-if-error` of an hour at most, less when
