@@ -131,7 +131,8 @@ Beside `streams`, a list carries `den`, its account of itself (Stremio clients i
 ```
 
 `answerKind` is `live` (every source answered), `partial` (releases, but a source did not answer),
-`empty`, `unknown` or `stale` (the `stale_list` answer above). **`empty` is the only kind that says a title has
+`empty`, `unknown` or `stale` (a list served past its freshness: inside the stale window while it is rebuilt,
+or the `stale_list` answer above; `generatedAt` and `coverage` stay those of the original build). **`empty` is the only kind that says a title has
 nothing**, and it needs every source to have answered with nothing degraded; an empty list any source missed
 is `unknown`. `degraded` repeats `X-Den-Degraded` when there is one, and `expiresAt` is absent on a list that
 is not cached. `coverage.sources` lists every configured indexer and household source, including those not

@@ -157,10 +157,11 @@ func quarantinedReports(config *Config) []sourceReport {
 	return out
 }
 
-// staleBody relabels a held list served in place of a failed build: `stale`, with the degraded reason the
-// response carries. The build time and coverage stay those of the list, which is what makes its age readable.
-// A body written before the envelope existed is returned unchanged.
-func staleBody(body string) (string, bool) {
+// staleBody relabels a list served past its freshness — inside the stale window while a rebuild runs behind the
+// reply, or in place of a failed build — as `stale`, with the degraded reason the response carries ("" when
+// none). The build time and coverage stay those of the list, which is what makes its age readable. A body
+// written before the envelope existed is returned unchanged.
+func staleBody(body, degraded string) (string, bool) {
 	var held struct {
 		Streams json.RawMessage `json:"streams"`
 		Den     *answerEnvelope `json:"den,omitempty"`
@@ -169,7 +170,7 @@ func staleBody(body string) (string, bool) {
 		return body, false
 	}
 	held.Den.AnswerKind = answerStale
-	held.Den.Degraded = "stale_list"
+	held.Den.Degraded = degraded
 	b, err := json.Marshal(held)
 	if err != nil {
 		return body, false

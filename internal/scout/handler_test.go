@@ -1241,8 +1241,28 @@ func TestStreamList_servesStaleWhileRebuilding(t *testing.T) {
 	if stale.Code != 200 {
 		t.Fatalf("stale hit: %d", stale.Code)
 	}
-	if stale.Body.String() != body {
-		t.Error("the stale hit did not serve the cached body")
+	var cached, served struct {
+		Streams json.RawMessage `json:"streams"`
+		Den     answerEnvelope  `json:"den"`
+	}
+	if err := json.Unmarshal([]byte(body), &cached); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(stale.Body.Bytes(), &served); err != nil {
+		t.Fatal(err)
+	}
+	if string(served.Streams) != string(cached.Streams) {
+		t.Error("the stale hit did not serve the cached streams")
+	}
+	// Past its freshness the list says so, without claiming a degradation no header reports.
+	if served.Den.AnswerKind != answerStale || served.Den.Degraded != "" {
+		t.Errorf("stale hit den = %q/%q, want stale with no degraded reason", served.Den.AnswerKind, served.Den.Degraded)
+	}
+	if !served.Den.GeneratedAt.Equal(cached.Den.GeneratedAt) {
+		t.Error("the stale hit lost the list's build time")
+	}
+	if stale.Header().Get("etag") == etag {
+		t.Error("the relabelled body kept the fresh list's ETag")
 	}
 	// Told to come back soon, and NOT given stale-if-error: holding a stale list for the full TTL, and a
 	// day on any later error, is the harm being fixed rather than something to pass on to the device.

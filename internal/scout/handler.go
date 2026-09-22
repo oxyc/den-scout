@@ -692,6 +692,9 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 			header = staleListCache
 			served = "cache;desc=stale"
 			h.rebuildBehind(r, configBlob, sid, origin, cacheKey)
+			if relabelled, ok := staleBody(body, ""); ok {
+				body, etag = relabelled, etagFor(relabelled)
+			}
 		}
 		w.Header().Set("server-timing", served+", total;dur="+msDur(time.Since(start)))
 		h.conditional(w, r, body, etag, jsonType, header)
@@ -748,7 +751,7 @@ func (h *handler) lastResort(w http.ResponseWriter, r *http.Request, start time.
 		// The held body says what it was when built; served now, it is stale, and says so. A new body is a new
 		// ETag, so a client revalidating the fresh list is not told its copy still stands.
 		held, heldETag := body, etag
-		if relabelled, ok := staleBody(body); ok {
+		if relabelled, ok := staleBody(body, "stale_list"); ok {
 			held, heldETag = relabelled, etagFor(relabelled)
 		}
 		h.conditional(w, r, held, heldETag, jsonType, h.staleListCache)
