@@ -125,6 +125,10 @@ type ResolveTarget struct {
 	// what TORBOX has, not what this ACCOUNT has. "Held" was never the same as "already added". Only the
 	// store can enforce this, so the caller states the requirement and the store obeys it.
 	NoAdd bool
+	// Prefetch marks an add nobody is waiting on (/play?prefetch=1: the binge read-ahead, a queued
+	// download). The budget keeps its last few adds from it for a viewer pressing Play — see
+	// defaultPlayReserve. Unset is a viewer waiting, which is what every older client sends.
+	Prefetch bool
 	// ReleaseSize is the indexer's size for the release, 0 when unknown. Stores do not read it; the link
 	// check does, for a movie whose file size no store knows.
 	ReleaseSize int64
@@ -870,16 +874,16 @@ func scoutBudgetSpent(svc DebridService, token string) bool {
 	return globalAddBudget.remaining(budgetAccount(svc, token)) <= 0
 }
 
-// ScoutBusyFor is how long until any of the pool's accounts may add again, for the Retry-After of a scout_busy
-// answer; zero when one already may, or none reports a budget.
-func (p *StorePool) ScoutBusyFor() time.Duration {
+// ScoutBusyFor is how long until any of the pool's accounts may add again for this intent, for the Retry-After
+// of a scout_busy or reserved_for_play answer; zero when one already may, or none reports a budget.
+func (p *StorePool) ScoutBusyFor(prefetch bool) time.Duration {
 	var soonest time.Duration
 	for _, st := range p.stores {
 		account, ok := st.(interface{ budgetAccount() string })
 		if !ok {
 			continue
 		}
-		wait := globalAddBudget.freesIn(account.budgetAccount())
+		wait := globalAddBudget.freesIn(account.budgetAccount(), prefetch)
 		if wait == 0 {
 			return 0
 		}
@@ -1342,7 +1346,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 			return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 		}
 	}
-	torrentID, err := s.addMagnet(ctx, t.InfoHash)
+	torrentID, err := s.addMagnet(ctx, t.InfoHash, t.Prefetch)
 	if err != nil {
 		// Every refused add backs off, not only a 429. The refusal that caused the incident was a 400 —
 		// TorBox's answer for an account at its download limit — which is a `DeadLinkError`, so keying the
@@ -1488,7 +1492,7 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	return link, err
 }
 
-func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, error) {
+func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch bool) (int, error) {
 	// An add we already sent and never heard back about must not be sent again — see addAttemptKey.
 	if err := addInFlight(s.cache, ServiceTorBox, s.token, infoHash); err != nil {
 		return 0, err
@@ -1496,7 +1500,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string) (int, erro
 	if err := addWouldMissTheClock(ctx, ServiceTorBox); err != nil {
 		return 0, err
 	}
-	if err := spendAdd(ServiceTorBox, s.token, infoHash); err != nil {
+	if err := spendAdd(ServiceTorBox, s.token, infoHash, prefetch); err != nil {
 		return 0, err
 	}
 	form := url.Values{"magnet": {magnetFor(infoHash)}, "seed": {"3"}, "allow_zip": {"false"}}
@@ -2848,7 +2852,7 @@ func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 	if err := addWouldMissTheClock(ctx, ServiceRealDebrid); err != nil {
 		return "", err
 	}
-	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash); err != nil {
+	if err := spendAdd(ServiceRealDebrid, s.token, t.InfoHash, t.Prefetch); err != nil {
 		return "", err
 	}
 	noteAddAttempt(s.cache, ServiceRealDebrid, s.token, t.InfoHash)
@@ -3414,7 +3418,7 @@ func (s *premiumizeStore) Resolve(ctx context.Context, t ResolveTarget) (string,
 		if err := addWouldMissTheClock(ctx, ServicePremiumize); err != nil {
 			return "", err
 		}
-		if err := spendAdd(ServicePremiumize, s.token, t.InfoHash); err != nil {
+		if err := spendAdd(ServicePremiumize, s.token, t.InfoHash, t.Prefetch); err != nil {
 			return "", err
 		}
 	}

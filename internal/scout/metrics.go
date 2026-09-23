@@ -53,6 +53,11 @@ type metricSet struct {
 	// for a parser crash.
 	backgroundPanic atomic.Int64
 
+	// Adds scout's own budget refused, by intent: a viewer waiting (the budget spent) or a prefetch (held
+	// back by the reserve kept for Play).
+	addRefusedPlay     atomic.Int64
+	addRefusedPrefetch atomic.Int64
+
 	// Fixed keys, populated once at construction and never written again, so concurrent reads need no
 	// lock. Every indexer this build knows about gets an entry whether or not any install names it —
 	// a counter that appears only after the first request is a counter you cannot alert on.
@@ -225,6 +230,22 @@ func (m *metricSet) render(cachePersistent int) string {
 	b.WriteString("# HELP scout_add_budget_remaining Smallest remaining hourly add allowance across accounts (-1 = none spent).\n")
 	b.WriteString("# TYPE scout_add_budget_remaining gauge\n")
 	b.WriteString("scout_add_budget_remaining " + num(int64(left)) + "\n")
+
+	// The same allowance as each intent sees it: a prefetch stops the reserve short of zero.
+	prefetchLeft := left
+	if left >= 0 {
+		prefetchLeft = max(left-globalAddBudget.playReserve(), 0)
+	}
+	b.WriteString("# HELP scout_add_budget_remaining_by_intent Smallest remaining hourly add allowance across accounts, " +
+		"as a viewer waiting (play) and a prefetch see it (-1 = none spent).\n")
+	b.WriteString("# TYPE scout_add_budget_remaining_by_intent gauge\n")
+	b.WriteString(`scout_add_budget_remaining_by_intent{intent="play"} ` + num(int64(left)) + "\n")
+	b.WriteString(`scout_add_budget_remaining_by_intent{intent="prefetch"} ` + num(int64(prefetchLeft)) + "\n")
+	counter(&b, "scout_add_budget_refusals_total", "Adds scout's own hourly budget refused, by intent.",
+		[][2]string{
+			{`intent="play"`, num(m.addRefusedPlay.Load())},
+			{`intent="prefetch"`, num(m.addRefusedPrefetch.Load())},
+		})
 
 	b.WriteString("# HELP scout_cache_persistent Durable cache tier writing (1), disabled (0), not reported (-1).\n")
 	b.WriteString("# TYPE scout_cache_persistent gauge\n")

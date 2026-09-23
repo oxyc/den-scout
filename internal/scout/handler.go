@@ -1304,7 +1304,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	if pool.EveryAddRefusedByScout() {
 		logLimited("probe-scout-busy", "probe %s → 503 (scout-side), the hourly add allowance is spent",
 			shortHash(infoHash))
-		writeAddBudgetSpent(w, pool.ScoutBusyFor(), map[string]any{
+		writeAddBudgetSpent(w, pool.ScoutBusyFor(false), map[string]any{
 			"error":  "scout_busy",
 			"detail": "scout's own hourly add budget for this account is spent",
 		})
@@ -1427,7 +1427,9 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
 	defer cancel()
 	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode,
-		ReleaseSize: target.ReleaseSize}
+		ReleaseSize: target.ReleaseSize,
+		// ?prefetch=1 — nobody is waiting on this add, so it may not spend the adds kept for Play.
+		Prefetch: r.URL.Query().Get("prefetch") == "1"}
 
 	// ?probe=1 — answer, don't act. Asking /play for an uncached release is what QUEUES it, so a client
 	// polling this URL to render a progress bar was adding the torrent again on every poll. TorBox allows
@@ -1680,9 +1682,18 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// route went on saying "torbox" anyway: the app told the viewer the debrid was refusing while
 		// TorBox was answering perfectly well. Still a 503, because it is still "not now, try again", but
 		// named as ours.
+		// A prefetch held back so a viewer pressing Play still has adds. Its own code, because the client
+		// treats it differently from a spent budget: a queued download pauses until Retry-After and resumes,
+		// and nothing about the release is held against it.
+		if errors.Is(err, errPlayReserve) {
+			logLimited("play-reserved", "play %s → 503 (scout-side), prefetch refused: %v", shortHash(target.InfoHash), err)
+			writeUnavailable(w, pool.ScoutBusyFor(true),
+				map[string]any{"error": "reserved_for_play", "detail": scoutSideReason(err)})
+			return
+		}
 		if errors.Is(err, errScoutSide) {
 			logLimited("play-scout-busy", "play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
-			writeAddBudgetSpent(w, pool.ScoutBusyFor(),
+			writeAddBudgetSpent(w, pool.ScoutBusyFor(false),
 				map[string]any{"error": "scout_busy", "detail": scoutSideReason(err)})
 			return
 		}

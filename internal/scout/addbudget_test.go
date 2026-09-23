@@ -18,11 +18,11 @@ import (
 func TestAddBudget_refusesPastTheLimit(t *testing.T) {
 	b := newAddBudget(time.Hour, 3)
 	for i := 0; i < 3; i++ {
-		if !b.take("acct") {
+		if !b.take("acct", false) {
 			t.Fatalf("refused add %d of an allowance of 3", i+1)
 		}
 	}
-	if b.take("acct") {
+	if b.take("acct", false) {
 		t.Error("a fourth add was allowed against an allowance of 3")
 	}
 	if got := b.remaining("acct"); got != 0 {
@@ -33,10 +33,10 @@ func TestAddBudget_refusesPastTheLimit(t *testing.T) {
 // Per ACCOUNT. One install's spending must not refuse another's, and the token is the identity.
 func TestAddBudget_isPerAccount(t *testing.T) {
 	b := newAddBudget(time.Hour, 1)
-	if !b.take("a") || !b.take("b") {
+	if !b.take("a", false) || !b.take("b", false) {
 		t.Fatal("two accounts each have their own first add")
 	}
-	if b.take("a") {
+	if b.take("a", false) {
 		t.Error("account a's allowance was not its own")
 	}
 	if got := b.remaining("b"); got != 0 {
@@ -53,24 +53,24 @@ func TestAddBudget_windowRollsRatherThanResetting(t *testing.T) {
 
 	// Staggered, so the two adds age out at different times — that is what makes the window a rolling
 	// one rather than a bucket that empties all at once.
-	if !b.take("acct") {
+	if !b.take("acct", false) {
 		t.Fatal("the first add is within the allowance")
 	}
 	now = now.Add(30 * time.Minute)
-	if !b.take("acct") {
+	if !b.take("acct", false) {
 		t.Fatal("the second add is within the allowance")
 	}
 	// 10:59 — both are still inside the hour.
 	now = now.Add(29 * time.Minute)
-	if b.take("acct") {
+	if b.take("acct", false) {
 		t.Error("an add while the allowance is still spent must be refused")
 	}
 	// 11:01 — the 10:00 add has aged out; the 10:30 one has not, so exactly one slot is free.
 	now = now.Add(2 * time.Minute)
-	if !b.take("acct") {
+	if !b.take("acct", false) {
 		t.Error("the oldest add aged out; one slot should be free")
 	}
-	if b.take("acct") {
+	if b.take("acct", false) {
 		t.Error("only one add had aged out, but two slots were granted")
 	}
 }
@@ -81,15 +81,15 @@ func TestAddBudget_aRefusalCostsNothing(t *testing.T) {
 	b := newAddBudget(time.Hour, 1)
 	b.now = func() time.Time { return now }
 
-	b.take("acct")
+	b.take("acct", false)
 	for i := 0; i < 50; i++ { // a poll loop, hammering while refused
 		now = now.Add(time.Second)
-		b.take("acct")
+		b.take("acct", false)
 	}
 	// The single spent add is ~50s old; once it ages out the next caller is served, and the 50 refusals
 	// must not have pushed the window forward.
 	now = now.Add(time.Hour)
-	if !b.take("acct") {
+	if !b.take("acct", false) {
 		t.Error("refusals extended the window — a polling client would never recover")
 	}
 }
@@ -105,7 +105,7 @@ func TestAddBudget_concurrentCallersCannotOverspend(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if b.take("acct") {
+			if b.take("acct", false) {
 				mu.Lock()
 				granted++
 				mu.Unlock()
@@ -121,7 +121,7 @@ func TestAddBudget_concurrentCallersCannotOverspend(t *testing.T) {
 // A nil budget is a no-op, so a store built without one is never silently blocked.
 func TestAddBudget_nilAllowsEverything(t *testing.T) {
 	var b *addBudget
-	if !b.take("acct") {
+	if !b.take("acct", false) {
 		t.Error("a nil budget must not refuse")
 	}
 	if b.remaining("acct") != -1 {
@@ -140,14 +140,14 @@ func TestSpendAdd_isPerServiceAndAccount(t *testing.T) {
 	defer func() { globalAddBudget = prev }()
 
 	for _, svc := range []DebridService{ServiceTorBox, ServiceRealDebrid, ServicePremiumize} {
-		if err := spendAdd(svc, "tok", H); err != nil {
+		if err := spendAdd(svc, "tok", H, false); err != nil {
 			t.Errorf("%s: first add refused: %v", svc, err)
 		}
-		if err := spendAdd(svc, "tok", H); err == nil {
+		if err := spendAdd(svc, "tok", H, false); err == nil {
 			t.Errorf("%s: second add allowed against an allowance of 1", svc)
 		}
 		// A different account on the same service has its own allowance.
-		if err := spendAdd(svc, "other-tok", H); err != nil {
+		if err := spendAdd(svc, "other-tok", H, false); err != nil {
 			t.Errorf("%s: another account's allowance was consumed: %v", svc, err)
 		}
 	}
@@ -159,7 +159,7 @@ func TestSpendAdd_refusalNamesTheService(t *testing.T) {
 	globalAddBudget = newAddBudget(time.Hour, 0)
 	defer func() { globalAddBudget = prev }()
 
-	err := spendAdd(ServiceRealDebrid, "tok", H)
+	err := spendAdd(ServiceRealDebrid, "tok", H, false)
 	var unavailable *StoreUnavailableError
 	if !errors.As(err, &unavailable) || unavailable.Service != ServiceRealDebrid {
 		t.Fatalf("want a realdebrid StoreUnavailableError, got %v", err)
@@ -239,7 +239,7 @@ func TestAddBudget_aCancelStormCostsOneAdd(t *testing.T) {
 		t.Errorf("remaining = %d, want 49 — the add that WAS sent must be counted", left)
 	}
 	// Other titles are unaffected: one stuck release must not close the hour.
-	if err := spendAdd(ServiceTorBox, "tok", repeat("c", 40)); err != nil {
+	if err := spendAdd(ServiceTorBox, "tok", repeat("c", 40), false); err != nil {
 		t.Errorf("another title was refused: %v", err)
 	}
 }
@@ -370,7 +370,7 @@ func TestRefundAdd_onlyForARequestThatWasNeverSent(t *testing.T) {
 	defer func() { globalAddBudget = prev }()
 	acct := budgetAccount(ServiceTorBox, "tok")
 
-	globalAddBudget.take(acct)
+	globalAddBudget.take(acct, false)
 	refundAdd(ServiceTorBox, "tok", context.Canceled)
 	if left := globalAddBudget.remaining(acct); left != 9 {
 		t.Errorf("a cancelled add was refunded (remaining %d) — it had already reached the service", left)
@@ -396,7 +396,7 @@ func TestSpendAdd_ourCeilingIsNotTheStoresRefusal(t *testing.T) {
 	defer func() { globalAddBudget = prev }()
 
 	cache := NewMemoryCache(1 << 20)
-	err := spendAdd(ServiceTorBox, "tok", H)
+	err := spendAdd(ServiceTorBox, "tok", H, false)
 	recordRefusal(cache, ServiceTorBox, "tok", H, err)
 	if _, remembered := backedOff(cache, ServiceTorBox, "tok", H); remembered {
 		t.Error("scout's own budget was written into the store's refusal memory")
@@ -417,7 +417,7 @@ func TestHealth_reportsTheBudgetWithoutNamingAccounts(t *testing.T) {
 	prev := globalAddBudget
 	globalAddBudget = newAddBudget(time.Hour, 10)
 	defer func() { globalAddBudget = prev }()
-	globalAddBudget.take(budgetAccount(ServiceTorBox, "secret-token"))
+	globalAddBudget.take(budgetAccount(ServiceTorBox, "secret-token"), false)
 
 	rec := httptest.NewRecorder()
 	NewHandler(Deps{Cache: NewMemoryCache(1 << 20)}).ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
@@ -2853,14 +2853,14 @@ func TestAddBudget_forgetsAccountsWhoseWindowHasDrained(t *testing.T) {
 	b := newAddBudget(time.Hour, 50)
 	b.now = func() time.Time { return now }
 	for i := 0; i < 5000; i++ {
-		b.take(fmt.Sprintf("torbox:%d", i))
+		b.take(fmt.Sprintf("torbox:%d", i), false)
 	}
 	if len(b.spent) != 5000 {
 		t.Fatalf("setup: %d accounts", len(b.spent))
 	}
 	// An hour later every one of those windows has drained; the next caller must not inherit them.
 	now = now.Add(2 * time.Hour)
-	b.take("torbox:live")
+	b.take("torbox:live", false)
 	if len(b.spent) != 1 {
 		t.Errorf("map holds %d accounts, want just the live one", len(b.spent))
 	}

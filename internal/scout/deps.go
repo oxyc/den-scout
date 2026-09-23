@@ -54,6 +54,9 @@ type Settings struct {
 	PlayTicketTTL time.Duration
 	// LEGACY_PLAY_UNTIL: when the /<config>/play route closes, once tickets are on. Zero = never.
 	LegacyPlayUntil time.Time
+	// PLAY_RESERVE_ADDS: how many of the hourly adds a prefetch (/play?prefetch=1) may not spend, so a viewer
+	// pressing Play still has them. 0 turns the reserve off.
+	PlayReserveAdds int
 }
 
 // StartupSummary is the one line an operator reads to confirm what this process is running with. Nothing
@@ -93,6 +96,7 @@ func StartupSummary(s Settings, persistent bool) string {
 		" require_iid=" + onOff(s.RequireInstallID) + " remux=" + onOff(s.RemuxKey != "") +
 		" indexers=" + names(defaultIndexers) + " overrides=" + names(overridden) +
 		" disabled=" + names(disabled) + " minting=" + onOff(s.MintIndexerConfigs) +
+		" play_reserve=" + strconv.Itoa(s.PlayReserveAdds) +
 		" cache=" + s.CacheDir + " cache_persistent=" + onOff(persistent)
 }
 
@@ -127,7 +131,24 @@ func SettingsFromEnv(get func(string) string) Settings {
 		PlayTicketTTL:    durEnv(get("PLAY_TICKET_TTL_SECS"), time.Second, defaultPlayTicketTTL),
 		// Only read with a key set: without one there are no tickets, and the legacy route is the only one.
 		LegacyPlayUntil: parseLegacyPlayUntil(get("LEGACY_PLAY_UNTIL"), get("CONFIG_KEY") != ""),
+		PlayReserveAdds: parsePlayReserve(get("PLAY_RESERVE_ADDS")),
 	}
+}
+
+// parsePlayReserve reads PLAY_RESERVE_ADDS. Zero is a real value (no reserve), so unlike intEnv it is kept;
+// anything that does not parse, or that would leave a prefetch no adds at all, is said and read as the default.
+func parsePlayReserve(v string) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return defaultPlayReserve
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n >= addBudgetLimit {
+		log.Printf("PLAY_RESERVE_ADDS=%q is not an integer from 0 to %d — using the default of %d",
+			v, addBudgetLimit-1, defaultPlayReserve)
+		return defaultPlayReserve
+	}
+	return n
 }
 
 // parseRevokedInstalls reads REVOKED_INSTALLS, a comma-separated list of install ids. A malformed entry is
@@ -229,6 +250,7 @@ var credentialQueryHosts = map[string]bool{
 func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 	// Decided once, at startup, from the operator's environment — never from a request.
 	EnableIndexerConfigMinting(settings.MintIndexerConfigs)
+	SetPlayReserve(settings.PlayReserveAdds)
 	revoked := make(map[string]bool, len(settings.RevokedInstalls))
 	for _, iid := range settings.RevokedInstalls {
 		revoked[iid] = true

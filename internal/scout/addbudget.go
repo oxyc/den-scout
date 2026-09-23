@@ -24,6 +24,13 @@ import (
 const (
 	addBudgetWindow = time.Hour
 	addBudgetLimit  = 50
+	// defaultPlayReserve is how many of the window's adds a prefetch may not spend (PLAY_RESERVE_ADDS). The
+	// budget used not to care WHY an add was made, so a season download running in the background could
+	// spend the whole hour and the viewer who then pressed Play was refused. A prefetch — the binge
+	// read-ahead, a queued download — stops this many short of the ceiling; a viewer waiting spends down to
+	// zero. Small and fixed rather than a share of the allowance: a season pass should still fetch the whole
+	// season, it just must not take the last few adds a Play needs.
+	defaultPlayReserve = 5
 )
 
 // addBudget is a rolling-window counter, per account. Rolling rather than a fixed hourly bucket because
@@ -34,21 +41,50 @@ type addBudget struct {
 	spent  map[string][]time.Time
 	window time.Duration
 	limit  int
-	now    func() time.Time // injectable, so the tests do not sleep for an hour
+	// reserve is how many adds of the window only a viewer waiting may spend; a prefetch is refused once
+	// the account's remaining allowance is at or below it.
+	reserve int
+	now     func() time.Time // injectable, so the tests do not sleep for an hour
 }
 
 func newAddBudget(window time.Duration, limit int) *addBudget {
 	return &addBudget{
-		spent:  map[string][]time.Time{},
-		window: window,
-		limit:  limit,
-		now:    time.Now,
+		spent:   map[string][]time.Time{},
+		window:  window,
+		limit:   limit,
+		reserve: defaultPlayReserve,
+		now:     time.Now,
 	}
 }
 
+// SetPlayReserve sets how many adds of the hour a prefetch may not spend. Called once at startup, from
+// PLAY_RESERVE_ADDS.
+func SetPlayReserve(n int) {
+	globalAddBudget.mu.Lock()
+	defer globalAddBudget.mu.Unlock()
+	globalAddBudget.reserve = n
+}
+
+// playReserve is the reserve in force, for /metrics.
+func (b *addBudget) playReserve() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reserve
+}
+
+// ceiling is how many adds the window may hold for this intent: the whole limit for a viewer waiting, the
+// limit less the reserve for a prefetch.
+func (b *addBudget) ceiling(prefetch bool) int {
+	if prefetch {
+		return b.limit - b.reserve
+	}
+	return b.limit
+}
+
 // take records an add against the account and reports whether it is allowed. A refusal spends nothing,
-// so the window drains normally and the next caller after it expires is served.
-func (b *addBudget) take(account string) bool {
+// so the window drains normally and the next caller after it expires is served. A prefetch is refused
+// while the reserve is all that is left; a viewer waiting spends down to zero.
+func (b *addBudget) take(account string, prefetch bool) bool {
 	if b == nil {
 		return true
 	}
@@ -63,7 +99,7 @@ func (b *addBudget) take(account string) bool {
 			kept = append(kept, t)
 		}
 	}
-	if len(kept) >= b.limit {
+	if len(kept) >= b.ceiling(prefetch) {
 		b.spent[account] = kept
 		return false
 	}
@@ -124,9 +160,10 @@ func (b *addBudget) remaining(account string) int {
 	return 0
 }
 
-// freesIn is how long until the account may add again: zero while it has allowance left, else until its oldest
-// charge in the window drains. What a spent budget's Retry-After says.
-func (b *addBudget) freesIn(account string) time.Duration {
+// freesIn is how long until the account may add again for this intent: zero while it has allowance left,
+// else until the charge holding it at its ceiling drains. What a spent budget's (or a held reserve's)
+// Retry-After says.
+func (b *addBudget) freesIn(account string, prefetch bool) time.Duration {
 	if b == nil {
 		return 0
 	}
@@ -140,14 +177,15 @@ func (b *addBudget) freesIn(account string) time.Duration {
 			live = append(live, t)
 		}
 	}
-	if b.limit <= 0 {
+	ceiling := b.ceiling(prefetch)
+	if ceiling <= 0 {
 		return b.window // no allowance ever frees; a window is the honest "not soon"
 	}
-	if len(live) < b.limit {
+	if len(live) < ceiling {
 		return 0
 	}
-	// Append-only in time order: the charge that must drain for one to free is the one `limit` from the newest.
-	return live[len(live)-b.limit].Add(b.window).Sub(now)
+	// Append-only in time order: the charge that must drain for one to free is the one `ceiling` from the newest.
+	return live[len(live)-ceiling].Add(b.window).Sub(now)
 }
 
 // lowest reports the smallest remaining allowance across all accounts, and how many accounts have spent
@@ -195,10 +233,21 @@ var globalAddBudget = newAddBudget(addBudgetWindow, addBudgetLimit)
 // Per service AND account: TorBox's ceiling is TorBox's. Counting them together would let a busy
 // Real-Debrid close TorBox's budget, and a service with no published limit would still be worth bounding
 // — an unbounded add loop is a bug wherever it points.
-func spendAdd(svc DebridService, token, infoHash string) error {
-	if globalAddBudget.take(budgetAccount(svc, token)) {
+//
+// `prefetch` is the caller's intent (ResolveTarget.Prefetch): a prefetch is refused while only the reserve
+// is left, with errPlayReserve so the route can say so apart from a spent budget.
+func spendAdd(svc DebridService, token, infoHash string, prefetch bool) error {
+	if globalAddBudget.take(budgetAccount(svc, token), prefetch) {
 		return nil
 	}
+	if prefetch {
+		metrics.addRefusedPrefetch.Add(1)
+		logLimited("add-reserve:"+string(svc), "%s add allowance is down to the reserve kept for Play, refusing prefetch %s",
+			svc, shortHash(infoHash))
+		return fmt.Errorf("%w: %w: %w", errScoutSide, errPlayReserve,
+			&StoreUnavailableError{Service: svc, Reason: "the rest of scout's hourly add budget is kept for Play"})
+	}
+	metrics.addRefusedPlay.Add(1)
 	logLimited("add-budget:"+string(svc), "%s add budget spent for the hour, refusing %s", svc, shortHash(infoHash))
 	// Wrapped so the refusal memory can tell scout's own ceiling from the service's — see errOurBudget.
 	return fmt.Errorf("%w: %w", errScoutSide,
@@ -230,6 +279,11 @@ func refundAdd(svc DebridService, token string, err error) {
 func refundUnusedAdd(svc DebridService, token string) {
 	globalAddBudget.refund(budgetAccount(svc, token))
 }
+
+// errPlayReserve marks a prefetch refused because what is left of the hour is kept for a viewer waiting.
+// Not a spent budget and not the service refusing: /play answers it as "reserved_for_play", and the client
+// retries after Retry-After without holding it against the release.
+var errPlayReserve = errors.New("prefetch refused: the rest of the add allowance is reserved for Play")
 
 // errRequestNotSent marks the one case where nothing reached the service: the request could not even be
 // constructed. Everything past that point may have been received.

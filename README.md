@@ -86,6 +86,7 @@ GET  /<config>/stream/<movie|series>/<id>.json   ranked, clean, cached streams
 GET  /<config>/stream/…?debug=1          the same list plus per-filter drop counts and scores
 GET  /<config>/play/<token>              302 → cached debrid link
 GET  /<config>/play/<token>?probe=1      "can this play yet?" — reports, starts nothing
+GET  /<config>/play/<token>?prefetch=1   the same as /play, for an add nobody is waiting on (see below)
 GET  /p/<ticket>                         the same as /play, for one release (CONFIG_KEY set); 410 once expired
 POST /<config>/availability              { ids: ["tt…"] } → { availability: { "tt…": available|unavailable|unknown } }
 ```
@@ -96,9 +97,17 @@ is what *adds* an uncached release, so a prefetcher's `HEAD` is refused rather t
 With `CONFIG_KEY` set, a stream list's URLs are `/p/<ticket>` rather than `/<config>/play/<token>`. A
 ticket is encrypted to the addon and carries only what one resolve needs: the debrid accounts, one
 release, an expiry, and the install id and epoch. So a leaked stream URL plays that release until
-`PLAY_TICKET_TTL_SECS` runs out; it is not the whole install. `?probe=1` and `?fresh=1` work on it as on
-`/play`. An expired ticket is `410`: fetch the list again. The legacy route keeps serving lists cached
+`PLAY_TICKET_TTL_SECS` runs out; it is not the whole install. `?probe=1`, `?fresh=1` and `?prefetch=1`
+work on it as on `/play`. An expired ticket is `410`: fetch the list again. The legacy route keeps serving lists cached
 before the upgrade until `LEGACY_PLAY_UNTIL`, and then answers `403`.
+
+Scout counts debrid adds per account, 50 in a rolling hour, and answers `503 scout_busy` with a
+`Retry-After` once they are spent. `?prefetch=1` marks an add nobody is waiting on — a binge read-ahead, a
+queued download — and such an add may not spend the last `PLAY_RESERVE_ADDS` (5) of the hour, so a viewer
+pressing Play still has them. A prefetch held back that way answers `503 reserved_for_play` with a
+`Retry-After` for when a prefetch may add again; it says nothing about the release. A request without the
+flag spends down to zero, as before. `/metrics` reports the allowance each intent sees and the refusals per
+intent.
 
 `/availability` answers a page of movies (at most 100) at once, from verdicts cached for 30 days
 ("available") or 10 minutes ("unavailable") — the same lifetimes the Den TV app uses. A title with no
@@ -223,6 +232,7 @@ only tunes runtime behaviour; every variable is listed, commented, in `.env.exam
 | `REMUX_KEY` | — | den-remux's service key: a request carrying it in `X-Den-Remux-Key` may list and play with an availability-scoped config (its lists are cached apart). Unset = scoped configs never list or play |
 | `PLAY_TICKET_TTL_SECS` | `86400` | how long a `/p/` play URL stays good (with `CONFIG_KEY` set); keep it well above 3×`LIST_TTL_SECS` |
 | `LEGACY_PLAY_UNTIL` | — | RFC 3339 moment the old `/<config>/play` route closes while tickets are on; unset = open, unparseable = closed |
+| `PLAY_RESERVE_ADDS` | `5` | adds of the hourly allowance a `?prefetch=1` request may not spend, kept for Play; `0` = no reserve |
 | `MINT_INDEXER_CONFIGS` | `false` | let scout build comet/mediafusion config segments from the debrid token. **This sends the token to those hosts**; an explicit `COMET_URL`/`MEDIAFUSION_URL` always wins |
 | `TORRENTIO_URL` | `https://torrentio.strem.fun` | indexer base-URL override |
 | `COMET_URL` | `https://comet.elfhosted.com` | indexer base-URL override, including its per-install config segment |
