@@ -23,7 +23,7 @@ type manifestHints struct {
 	ConfigurationRequired bool `json:"configurationRequired"`
 }
 
-const manifestVersion = "0.26.0"
+const manifestVersion = "0.27.0"
 
 // buildManifest returns the manifest for a config (nil = unconfigured).
 func buildManifest(config *Config) manifestJSON {
