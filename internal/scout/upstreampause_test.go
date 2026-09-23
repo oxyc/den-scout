@@ -168,13 +168,13 @@ func TestAddBudget_freesInWhenItsOldestChargeDrains(t *testing.T) {
 	b := newAddBudget(time.Hour, 2)
 	clock := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	b.now = func() time.Time { return clock }
-	b.take("acct")
-	if b.freesIn("acct") != 0 {
+	b.take("acct", false)
+	if b.freesIn("acct", false) != 0 {
 		t.Error("an account with allowance left must not be told to wait")
 	}
 	clock = clock.Add(10 * time.Minute)
-	b.take("acct")
-	if got := b.freesIn("acct"); got != 50*time.Minute {
+	b.take("acct", false)
+	if got := b.freesIn("acct", false); got != 50*time.Minute {
 		t.Errorf("freesIn = %v, want the first charge's 50 minutes left", got)
 	}
 }

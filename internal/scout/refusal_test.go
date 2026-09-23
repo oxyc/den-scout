@@ -760,7 +760,7 @@ func TestHoldingServices_asksEveryStoreAndKeysEpisodesCorrectly(t *testing.T) {
 func TestEveryAddRefusedByScout_needsEveryAccountSpent(t *testing.T) {
 	spent, healthy := "spent-"+t.Name(), "healthy-"+t.Name()
 	for i := 0; i < addBudgetLimit; i++ {
-		globalAddBudget.take(budgetAccount(ServiceTorBox, spent))
+		globalAddBudget.take(budgetAccount(ServiceTorBox, spent), false)
 	}
 	cache := NewMemoryCache(1 << 20)
 
@@ -1446,7 +1446,7 @@ func TestProbeAndPlay_agreeWhenScoutsOwnBudgetIsSpent(t *testing.T) {
 	token, hash := "budget-"+t.Name(), repeat("4", 40)
 	// Spend the account's allowance the way a busy hour does.
 	for i := 0; i < addBudgetLimit; i++ {
-		globalAddBudget.take(budgetAccount(ServiceTorBox, token))
+		globalAddBudget.take(budgetAccount(ServiceTorBox, token), false)
 	}
 
 	cache := NewMemoryCache(1 << 20)
