@@ -53,6 +53,15 @@ var torboxStatusFlights singleflight.Group
 var torboxCheckFlights singleflight.Group
 var torboxStatusSlots = make(chan struct{}, 128)
 
+// One process-wide ceiling for every TorBox request, including the microbatch overflow path. The
+// coordinators bound how much work they retain, but their old overflow fallback called the API directly:
+// once the demand channels filled, the exact traffic spike they were meant to absorb became unbounded
+// outbound concurrency. Waiting here preserves truth (a caller that runs out of context gets "unknown",
+// never a fabricated miss) while preventing an outage from being amplified by more sockets and requests.
+const maxTorboxOutbound = 64
+
+var torboxOutboundSlots = make(chan struct{}, maxTorboxOutbound)
+
 const (
 	torboxDemandWindow = 7 * time.Millisecond
 	maxTorboxBatchers  = 64
@@ -84,12 +93,12 @@ type cachedStatusAnswer struct {
 	Answer statusAnswer `json:"answer"`
 }
 
-func torboxStatusKey(token, infoHash string) string {
-	return "torbox:status:" + keyHash(token) + ":" + strings.ToLower(infoHash)
+func torboxStatusKey(api, token, infoHash string) string {
+	return "torbox:status:" + keyHash(api) + ":" + keyHash(token) + ":" + strings.ToLower(infoHash)
 }
 
-func clearTorboxStatus(cache Cache, token, infoHash string) {
-	cachePut(cache, torboxStatusKey(token, infoHash), "", time.Nanosecond, CacheVolatile)
+func clearTorboxStatus(cache Cache, api, token, infoHash string) {
+	cachePut(cache, torboxStatusKey(api, token, infoHash), "", time.Nanosecond, CacheVolatile)
 }
 
 // maxListingEntries bounds what the listing RETAINS, which the byte cap does not: the map holds one
@@ -363,10 +372,41 @@ func (s *torBoxStore) get(ctx context.Context, u string) (*http.Response, error)
 	}
 	req.Header.Set("authorization", "Bearer "+s.token)
 	req.Header.Set("accept", "application/json")
-	resp, err := s.client.Do(req)
+	resp, err := s.do(ctx, req)
 	endpoint := torboxEndpoint(req.URL)
 	metrics.torboxCall(endpoint, err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
 	return resp, err
+}
+
+func (s *torBoxStore) do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	select {
+	case torboxOutboundSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	release := func() { <-torboxOutboundSlots }
+	resp, err := s.client.Do(req)
+	if err != nil || resp == nil || resp.Body == nil {
+		release()
+		return resp, err
+	}
+	// A request is still consuming an upstream connection while its body is being read. Releasing at
+	// headers would bound only dial/header latency and let slow or hostile bodies accumulate without a
+	// ceiling. Every caller already closes its response; couple the slot to that lifetime.
+	resp.Body = &torboxSlotBody{ReadCloser: resp.Body, release: release}
+	return resp, nil
+}
+
+type torboxSlotBody struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (b *torboxSlotBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
 }
 
 func torboxEndpoint(u *url.URL) string {
@@ -484,7 +524,7 @@ func (s *torBoxStore) checkCachedBatch(ctx context.Context, hashes []string) (ma
 		set[i] = strings.ToLower(set[i])
 	}
 	sort.Strings(set)
-	key := keyHash(s.token) + ":" + keyHash(strings.Join(set, ","))
+	key := keyHash(s.api) + ":" + keyHash(s.token) + ":" + keyHash(strings.Join(set, ","))
 	ch := torboxCheckFlights.DoChan(key, func() (any, error) {
 		return s.demandCheckCached(set), nil
 	})
@@ -1635,7 +1675,7 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 			// just handed us, so the next poll knew of no torrent and bought another one.
 			if s.cache != nil {
 				s.cache.Put(torrentIDKey(s.token, t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
-				clearTorboxStatus(s.cache, s.token, t.InfoHash)
+				clearTorboxStatus(s.cache, s.api, s.token, t.InfoHash)
 			}
 			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
 			return "", err
@@ -1652,7 +1692,7 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	// what makes an episode's first /play look "dead" instead of "downloading".
 	if s.cache != nil {
 		s.cache.Put(torrentIDKey(s.token, t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
-		clearTorboxStatus(s.cache, s.token, t.InfoHash)
+		clearTorboxStatus(s.cache, s.api, s.token, t.InfoHash)
 	}
 	// No list, and an episode to pick out of a pack: refuse rather than guess — but only after the id
 	// above is remembered, or a just-queued episode stops reporting as "downloading" and reads as dead.
@@ -1721,7 +1761,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 	req.Header.Set("authorization", "Bearer "+s.token)
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	noteAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
-	resp, err := s.client.Do(req)
+	resp, err := s.do(ctx, req)
 	metrics.torboxCall("createtorrent", err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
 	if err != nil {
 		// No response, so the outcome is genuinely unknown: the marker STAYS, and the next poll finds it
@@ -1811,7 +1851,7 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 }
 
 func (s *torBoxStore) StatusAnswer(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer) {
-	key := torboxStatusKey(s.token, t.InfoHash)
+	key := torboxStatusKey(s.api, s.token, t.InfoHash)
 	if s.cache != nil {
 		if raw, ok := s.cache.Get(key); ok {
 			var hit cachedStatusAnswer
@@ -1995,7 +2035,7 @@ func (s *torBoxStore) forgetTorrentID(infoHash string) {
 	}
 	s.cache.Put(torrentIDKey(s.token, infoHash), "", time.Nanosecond)
 	s.cache.Put(resolveKey(s.token, infoHash), "", time.Nanosecond)
-	clearTorboxStatus(s.cache, s.token, infoHash)
+	clearTorboxStatus(s.cache, s.api, s.token, infoHash)
 }
 
 // torrentID finds the account's torrent id for an infohash: from the cache Resolve wrote, and failing

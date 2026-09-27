@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,6 +43,59 @@ func TestTieredCache_volatileEntriesNeverReachDisk(t *testing.T) {
 	}
 	if _, ok := NewTieredCache(1<<20, dir).Get("status:499"); ok {
 		t.Fatal("volatile coordination state survived a restart")
+	}
+}
+
+// Changing a key from durable to volatile is a state transition, not a second independent cache tier.
+// Once the new value expires, is evicted, or the process restarts, the superseded durable value must not
+// come back from disk.
+func TestTieredCache_volatileOverwriteRetiresDurableValue(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		afterOverwrite func(t *testing.T, c *TieredCache, dir string) *TieredCache
+	}{
+		{"expiry", func(t *testing.T, c *TieredCache, _ string) *TieredCache {
+			t.Helper()
+			time.Sleep(10 * time.Millisecond)
+			return c
+		}},
+		{"memory eviction", func(t *testing.T, c *TieredCache, _ string) *TieredCache {
+			t.Helper()
+			c.PutClass("large-enough-to-evict", strings.Repeat("x", 128), time.Hour, CacheVolatile)
+			return c
+		}},
+		{"restart", func(t *testing.T, _ *TieredCache, dir string) *TieredCache {
+			t.Helper()
+			return NewTieredCache(64, dir)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			c := NewTieredCache(64, dir)
+			c.Put("transition", "old-durable", time.Hour)
+			c.PutClass("transition", "new-volatile", time.Millisecond, CacheVolatile)
+			c = tc.afterOverwrite(t, c, dir)
+			if got, ok := c.Get("transition"); ok {
+				t.Fatalf("superseded durable value resurfaced: %q", got)
+			}
+		})
+	}
+}
+
+// hydrateProbeFacts may ask about every raw indexer result before ranking. Keep the real filesystem-miss
+// cost visible so a negative memo is added only if those local misses become material next to the network
+// scrape, rather than growing another cache from intuition alone.
+func BenchmarkTieredCache_500DiskMisses(b *testing.B) {
+	c := NewTieredCache(1<<20, b.TempDir())
+	keys := make([]string, 500)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("probe:v1:%040x", i)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, key := range keys {
+			_, _ = c.Get(key)
+		}
 	}
 }
 

@@ -66,6 +66,35 @@ func TestTorBoxCacheCheck_batchesConcurrentDemandAcrossRequests(t *testing.T) {
 	}
 }
 
+func TestTorBoxCacheCheck_singleflightIncludesAPIIdentity(t *testing.T) {
+	const token = "same-token-different-api"
+	var calls atomic.Int32
+	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		return resp(200, `{"data":{}}`), nil
+	}}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, api := range []string{"https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"} {
+		api := api
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store := &torBoxStore{token: token, client: client, cache: NewMemoryCache(1 << 20), api: api}
+			if _, err := store.CacheCheck(context.Background(), []string{H}); err != nil {
+				t.Errorf("%s: %v", api, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("two API identities shared one checkcached flight: %d calls, want 2", got)
+	}
+}
+
 // A batch that failed leaves its hashes OUT of the map rather than marking them uncached.
 //
 // Checks go out in batches of 100 and up to 500 hashes are checked, so one timed-out batch used to
@@ -1153,6 +1182,86 @@ func TestTorBoxStatusAnswer_coalescesViewersAndReusesSnapshot(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("warm snapshot made another call: %d", got)
+	}
+}
+
+func TestTorBoxStatusAnswer_coordinationIncludesAPIIdentity(t *testing.T) {
+	const token = "same-status-token-different-api"
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey(token, H), "77", time.Hour)
+	var calls atomic.Int32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, api := range []string{"https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"} {
+		api := api
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store := &torBoxStore{token: token, api: api, cache: cache,
+				client: mockDoer{func(*http.Request) (*http.Response, error) {
+					calls.Add(1)
+					time.Sleep(20 * time.Millisecond)
+					return resp(200, `{"data":{"progress":0.5,"download_finished":false}}`), nil
+				}}}
+			if _, answer := store.StatusAnswer(context.Background(), ResolveTarget{InfoHash: H}); answer != statusDownloading {
+				t.Errorf("%s answer = %v, want downloading", api, answer)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("two API identities shared status coordination: %d calls, want 2", got)
+	}
+}
+
+func TestTorBoxOutboundConcurrencyIsBoundedWithoutInventingMisses(t *testing.T) {
+	var active atomic.Int32
+	var peak atomic.Int32
+	gate := make(chan struct{})
+	client := mockDoer{func(*http.Request) (*http.Response, error) {
+		now := active.Add(1)
+		for old := peak.Load(); now > old && !peak.CompareAndSwap(old, now); old = peak.Load() {
+		}
+		defer active.Add(-1)
+		<-gate
+		return resp(200, `{"data":{}}`), nil
+	}}
+	store := &torBoxStore{token: "bounded-outbound", api: torboxAPI, client: client}
+	const extra = 20
+	results := make(chan bool, maxTorboxOutbound+extra)
+	for i := 0; i < maxTorboxOutbound+extra; i++ {
+		go func(i int) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			results <- store.fetchCached(ctx, []string{fmt.Sprintf("%040x", i)}).ok
+		}(i)
+	}
+	// Other package tests legitimately leave short background reads draining while this test begins, so
+	// do not assume every process-wide slot is idle. Reach enough overlap to prove this burst is being
+	// held back, then verify the hard ceiling itself and that every waiter eventually gets a real answer.
+	deadline := time.Now().Add(2 * time.Second)
+	for active.Load() < maxTorboxOutbound/2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := active.Load(); got < maxTorboxOutbound/2 {
+		close(gate)
+		t.Fatalf("only %d calls overlapped; the saturation test did not reach the limiter", got)
+	}
+	if got := active.Load(); got >= maxTorboxOutbound+extra {
+		close(gate)
+		t.Fatalf("all %d calls entered at once; outbound work was not backpressured", got)
+	}
+	close(gate)
+	for i := 0; i < maxTorboxOutbound+extra; i++ {
+		if !<-results {
+			t.Fatal("backpressure turned a successful answer into an unknown result")
+		}
+	}
+	if got := peak.Load(); got > maxTorboxOutbound {
+		t.Fatalf("peak outbound concurrency = %d, limit %d", got, maxTorboxOutbound)
 	}
 }
 

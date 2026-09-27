@@ -62,7 +62,8 @@ costs a debrid resolve to rebuild — and has a real ceiling: expired entries ar
 sweep also enforces a 256 MiB budget, evicting oldest-first. A second replica would need a shared cache;
 the `Cache` interface in `internal/scout/cache.go` is the seam. Long-lived facts use the durable class;
 short-lived status, refusal, miss and in-flight coordination stays in the bounded memory tier and never
-creates disk files.
+creates disk files. Moving a key to the volatile class retires any older durable copy, so expiry, eviction
+or restart cannot resurrect superseded state.
 
 What upstreams answered is cached apart from the lists built out of it: each indexer's answer to a title for
 `LIST_TTL_SECS` (keyed by the indexer's URL, so installs on the same indexer share it), a debrid store's "held"
@@ -72,7 +73,9 @@ or filter re-ranks those answers rather than asking anyone again.
 TorBox `checkcached` reads share exact-set singleflight and a 7 ms account-scoped demand window (100 hashes
 per upstream call). Status reads share a five-second per-account/per-target snapshot, so polling is bounded
 at 12 calls/minute for a target regardless of viewer count. Coordinators are bounded and exist only while
-requests are active. `/metrics` exposes fixed endpoint/outcome and avoided-call series, never account labels.
+requests are active. A shared 64-request TorBox ceiling backpressures every endpoint, including overflow
+from the demand batcher; a caller whose context expires remains unknown rather than becoming a false miss.
+`/metrics` exposes fixed endpoint/outcome and avoided-call series, never account labels.
 
 Cached track-probe facts are hydrated before client-aware ranking. A browser schedules missing probes only
 for the first three compatibility contenders; Apple TV keeps a six-release validation window. Probe work is
