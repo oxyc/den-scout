@@ -24,6 +24,27 @@ func TestTieredCache_survivesRestart(t *testing.T) {
 	}
 }
 
+func TestTieredCache_volatileEntriesNeverReachDisk(t *testing.T) {
+	dir := t.TempDir()
+	first := NewTieredCache(1<<20, dir)
+	for i := 0; i < 500; i++ {
+		first.PutClass(fmt.Sprintf("status:%d", i), "pending", time.Minute, CacheVolatile)
+	}
+	if got, ok := first.Get("status:499"); !ok || got != "pending" {
+		t.Fatalf("volatile entry missing from memory: %q ok=%v", got, ok)
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("volatile burst wrote %d disk files, want zero", len(files))
+	}
+	if _, ok := NewTieredCache(1<<20, dir).Get("status:499"); ok {
+		t.Fatal("volatile coordination state survived a restart")
+	}
+}
+
 // Expiry is wall-clock on disk: a monotonic deadline means nothing to the process that reads the file.
 func TestTieredCache_expiredOnDiskIsNotServed(t *testing.T) {
 	dir := t.TempDir()

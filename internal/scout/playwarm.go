@@ -20,6 +20,6 @@ func warmResolveBudget() time.Duration { return statusBudget / 2 }
 
 // writePlayQueued is /play's 202, noting that this file is being waited on.
 func (h *handler) writePlayQueued(w http.ResponseWriter, pendingKey, hash string, status StoreStatus) {
-	h.deps.Cache.Put(pendingKey, "1", playPendingTTL)
+	cachePut(h.deps.Cache, pendingKey, "1", playPendingTTL, CacheVolatile)
 	writeQueued(w, hash, status)
 }

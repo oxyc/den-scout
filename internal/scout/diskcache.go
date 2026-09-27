@@ -93,8 +93,12 @@ func (c *TieredCache) Get(key string) (string, bool) {
 }
 
 func (c *TieredCache) Put(key, value string, ttl time.Duration) {
+	c.PutClass(key, value, ttl, CacheDurable)
+}
+
+func (c *TieredCache) PutClass(key, value string, ttl time.Duration, class CacheClass) {
 	c.mem.Put(key, value, ttl)
-	if c.disabled() {
+	if class == CacheVolatile || c.disabled() {
 		return
 	}
 	body := strconv.FormatInt(time.Now().Add(ttl).Unix(), 10) + "\n" + value

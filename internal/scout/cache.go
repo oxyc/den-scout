@@ -14,6 +14,31 @@ type Cache interface {
 	Put(key, value string, ttl time.Duration)
 }
 
+// CacheClass separates facts worth surviving a deploy from coordination state that is useful only to
+// this process. Cache implementations that do not understand classes retain the old write-through
+// behaviour; TieredCache keeps volatile entries exclusively in its bounded memory tier.
+type CacheClass uint8
+
+const (
+	CacheDurable CacheClass = iota
+	CacheVolatile
+)
+
+type classifiedCache interface {
+	PutClass(key, value string, ttl time.Duration, class CacheClass)
+}
+
+func cachePut(cache Cache, key, value string, ttl time.Duration, class CacheClass) {
+	if cache == nil {
+		return
+	}
+	if c, ok := cache.(classifiedCache); ok {
+		c.PutClass(key, value, ttl, class)
+		return
+	}
+	cache.Put(key, value, ttl)
+}
+
 type cacheEntry struct {
 	key     string
 	value   string
