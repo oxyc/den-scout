@@ -290,5 +290,5 @@ var errPlayReserve = errors.New("prefetch refused: the rest of the add allowance
 var errRequestNotSent = errors.New("request was not sent")
 
 func budgetAccount(svc DebridService, token string) string {
-	return string(svc) + ":" + keyHash(token)
+	return string(svc) + ":" + keyHash(serviceAccountIdentity(svc, token))
 }

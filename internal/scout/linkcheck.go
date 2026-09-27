@@ -162,7 +162,7 @@ func (s *torBoxStore) KnownFileSize(t ResolveTarget) (int64, bool) {
 	if s.cache == nil {
 		return 0, false
 	}
-	raw, ok := s.cache.Get(resolveKey(s.token, t.InfoHash))
+	raw, ok := s.cache.Get(resolveKey(s.accountIdentity(), t.InfoHash))
 	if !ok {
 		return 0, false
 	}
