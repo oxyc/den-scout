@@ -60,12 +60,26 @@ The cache is a `TieredCache` (`internal/scout/diskcache.go`): a byte-bounded in-
 durable disk tier at `CACHE_DIR`. The disk tier holds stream lists and 30-day track probes — a probe
 costs a debrid resolve to rebuild — and has a real ceiling: expired entries are swept hourly, and the
 sweep also enforces a 256 MiB budget, evicting oldest-first. A second replica would need a shared cache;
-the `Cache` interface in `internal/scout/cache.go` is the seam.
+the `Cache` interface in `internal/scout/cache.go` is the seam. Long-lived facts use the durable class;
+short-lived status, refusal, miss and in-flight coordination stays in the bounded memory tier and never
+creates disk files. Moving a key to the volatile class retires any older durable copy, so expiry, eviction
+or restart cannot resurrect superseded state.
 
 What upstreams answered is cached apart from the lists built out of it: each indexer's answer to a title for
 `LIST_TTL_SECS` (keyed by the indexer's URL, so installs on the same indexer share it), a debrid store's "held"
 for a minute, a title's Cinemeta metadata for a week, a probe for 30 days. Ranking a title for another client
 or filter re-ranks those answers rather than asking anyone again.
+
+TorBox `checkcached` reads share exact-set singleflight and a 7 ms account-scoped demand window (100 hashes
+per upstream call). Status reads share a five-second per-account/per-target snapshot, so polling is bounded
+at 12 calls/minute for a target regardless of viewer count. Coordinators are bounded and exist only while
+requests are active. A shared 64-request TorBox ceiling backpressures every endpoint, including overflow
+from the demand batcher; a caller whose context expires remains unknown rather than becoming a false miss.
+`/metrics` exposes fixed endpoint/outcome and avoided-call series, never account labels.
+
+Cached track-probe facts are hydrated before client-aware ranking. A browser schedules missing probes only
+for the first three compatibility contenders; Apple TV keeps a six-release validation window. Probe work is
+read-only (`NoAdd`), detached from the response, deduplicated, and its results remain durable for 30 days.
 
 User-supplied `excludeRegex` runs on Go's stdlib `regexp` (RE2 — linear-time, no catastrophic
 backtracking). The internal quality/season patterns that need lookaround use `dlclark/regexp2`;
@@ -112,7 +126,9 @@ intent.
 `/availability` answers a page of movies (at most 100) at once, from verdicts cached for 30 days
 ("available") or 10 minutes ("unavailable") — the same lifetimes the Den TV app uses. A title with no
 verdict comes back `unknown` and is checked in the background (four at a time), so ask again for those.
-A stream list scout builds records its title's verdict too. `unknown` never means "nothing to play".
+A stream list scout builds records its title's verdict too. Default availability needs only a filtered
+indexer result and makes no debrid cache call. For a `cachedOnly` install, normal filters run first and
+cache checks stop at the first held batch. `unknown` never means "nothing to play".
 
 A config sealed with `"scope":"availability"` is the read-only one a browser may hold: it answers
 `/availability` and its manifest, and `/stream` and `/play` refuse it with `403`. It shares the full
@@ -124,7 +140,8 @@ preflight. An unknown path — and `/metrics` without its token — is `404` wit
 A stream list that is served but cannot be trusted carries `X-Den-Degraded` — `indexers` when no indexer
 answered, `cache-check` when the debrid could not be asked about a release in it — and is `no-store`, so
 the app can say "sources temporarily unavailable" instead of "nothing found". When no indexer answers a
-rebuild of a title whose last complete list is still held, that list is served instead, with
+rebuild of a title whose last complete nonempty list is still held, that list is served immediately while
+one shared rebuild runs behind it, with
 `X-Den-Degraded: stale_list` and `Cache-Control: private, max-age=60`; for the next minute the title is
 answered that way without scraping again. A complete list is held that way for the play tickets' life less
 three `LIST_TTL_SECS` and six hours for the viewing it starts (about 17¾ h at the defaults), so indexers

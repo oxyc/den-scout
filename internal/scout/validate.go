@@ -114,6 +114,9 @@ func validateDebridToken(ctx context.Context, client doer, svc DebridService, to
 		return validateResult{Reason: "timed out"}
 	}
 	resp, err := client.Do(req)
+	if svc == ServiceTorBox {
+		metrics.torboxCall("user", err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
+	}
 	if err != nil {
 		// The indexer scrapers log the service name and never the URL, because MediaFusion's carries an
 		// encrypted config. Same rule here for a different reason: the URL would be fine, the token

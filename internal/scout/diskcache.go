@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -93,7 +94,31 @@ func (c *TieredCache) Get(key string) (string, bool) {
 }
 
 func (c *TieredCache) Put(key, value string, ttl time.Duration) {
+	c.PutClass(key, value, ttl, CacheDurable)
+}
+
+func (c *TieredCache) PutClass(key, value string, ttl time.Duration, class CacheClass) {
 	c.mem.Put(key, value, ttl)
+	if class == CacheVolatile {
+		// A volatile value supersedes every older value for this key, including one written through by
+		// an earlier release. Merely leaving the durable file alone makes it reappear as soon as the
+		// volatile entry expires or is evicted, and again after every restart. That is particularly bad
+		// for state transitions: a Premiumize "no longer held" marker could uncover the old six-hour
+		// "held" fact and authorize another read-only resolve as though the account still owned it.
+		//
+		// Removal is best-effort like the disk tier itself. Do it even after persistence has disabled
+		// writes: an existing stale file can still be readable, and removing it is the only operation
+		// needed here. os.Remove is also deliberately used rather than an expired tombstone, so ordinary
+		// volatile coordination never creates disk entries of its own.
+		if c.dir != "" {
+			if err := os.Remove(c.path(key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				// Do not uncover the stale file again in this process. As with a failed durable write,
+				// memory keeps serving while persistence becomes visibly unhealthy.
+				c.disable("retire durable entry", err)
+			}
+		}
+		return
+	}
 	if c.disabled() {
 		return
 	}

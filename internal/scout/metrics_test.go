@@ -179,6 +179,23 @@ func TestMetrics_carriesNoAccountOrServiceDetail(t *testing.T) {
 	}
 }
 
+func TestMetrics_debridSeriesHaveFixedCardinality(t *testing.T) {
+	out := newMetricSet().render(-1)
+	for _, endpoint := range metricTorboxEndpoints {
+		for _, outcome := range metricTorboxOutcomes {
+			want := `scout_debrid_calls_total{endpoint="` + endpoint + `",outcome="` + outcome + `"} 0`
+			if !strings.Contains(out, want) {
+				t.Errorf("missing fixed series %q", want)
+			}
+		}
+	}
+	for _, reason := range metricTorboxAvoided {
+		if want := `scout_debrid_calls_avoided_total{reason="` + reason + `"} 0`; !strings.Contains(out, want) {
+			t.Errorf("missing fixed series %q", want)
+		}
+	}
+}
+
 // The disk tier disables itself silently — one log line, then memory keeps serving — so the gauge is the
 // only thing that separates "persisting" from "quietly re-paying a debrid resolve per probe on every
 // redeploy". Three states, because "the backend does not report" is not the same as "it is off".

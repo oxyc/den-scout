@@ -40,7 +40,7 @@ func TestRecentRefusal_readsWhatTheQueueingPathWrote(t *testing.T) {
 		t.Error("nothing was refused, so nothing should be reported")
 	}
 
-	cache.Put(refusedKey(ServiceTorBox, "tok", "hash-refused"), "createtorrent http 429", time.Minute)
+	cache.Put(refusedKey(ServiceTorBox, store.accountIdentity(), "hash-refused"), "createtorrent http 429", time.Minute)
 	svc, reason, ok := pool.RecentRefusal("hash-refused")
 	if !ok || svc != ServiceTorBox || !strings.Contains(reason, "429") {
 		t.Errorf("refusal not reported: %v %q %v", svc, reason, ok)
@@ -161,9 +161,9 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 	// Recently refused → 503, naming the service. Never 404: the account was turned away, which says
 	// nothing at all about whether the release exists.
 	cache := NewMemoryCache(1 << 20)
-	cache.Put(refusedKey(ServiceTorBox, "tok", "abc"), "createtorrent http 429", time.Minute)
 	refusedStore := &torBoxStore{token: "tok", cache: cache, api: "https://api.example",
 		client: &stubDoer{status: 200, body: `{"data":[]}`}}
+	cache.Put(refusedKey(ServiceTorBox, refusedStore.accountIdentity(), "abc"), "createtorrent http 429", time.Minute)
 	h := &handler{deps: Deps{Cache: NewMemoryCache(1 << 20),
 		MakeStores: func(*Config) []Store { return []Store{refusedStore} }}}
 	rec := httptest.NewRecorder()

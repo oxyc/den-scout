@@ -35,6 +35,121 @@ func TestTorBoxCacheCheck(t *testing.T) {
 	}
 }
 
+func TestTorBoxCacheCheck_batchesConcurrentDemandAcrossRequests(t *testing.T) {
+	var calls atomic.Int32
+	client := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return resp(200, `{"data":{}}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	const token = "demand-batch-test"
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			hash := fmt.Sprintf("%040x", i+1)
+			store := &torBoxStore{token: token, client: client, cache: cache, api: torboxAPI}
+			answer, err := store.CacheCheck(context.Background(), []string{hash})
+			if err != nil || len(answer) != 1 {
+				t.Errorf("answer=%v err=%v", answer, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("20 overlapping checks made %d API calls, want 1", got)
+	}
+}
+
+func TestTorBoxCacheCheck_singleflightIncludesAPIIdentity(t *testing.T) {
+	const token = "same-token-different-api"
+	var calls atomic.Int32
+	client := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		return resp(200, `{"data":{}}`), nil
+	}}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, api := range []string{"https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"} {
+		api := api
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store := &torBoxStore{token: token, client: client, cache: NewMemoryCache(1 << 20), api: api}
+			if _, err := store.CacheCheck(context.Background(), []string{H}); err != nil {
+				t.Errorf("%s: %v", api, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("two API identities shared one checkcached flight: %d calls, want 2", got)
+	}
+}
+
+func TestTorBoxAccountStateIsIsolatedByAPIAndToken(t *testing.T) {
+	const token = "shared-token"
+	cache := NewMemoryCache(1 << 20)
+	var calls atomic.Int32
+	client := mockDoer{func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		id := 11
+		if strings.Contains(r.URL.Host, "torbox-b") {
+			id = 22
+		}
+		return resp(200, fmt.Sprintf(`{"success":true,"data":[{"id":%d,"hash":"%s"}]}`, id, H)), nil
+	}}
+	a := &torBoxStore{token: token, api: "https://torbox-a.invalid/v1", cache: cache, client: client}
+	b := &torBoxStore{token: token, api: "https://torbox-b.invalid/v1", cache: cache, client: client}
+
+	// The whole-account listing memo and its singleflight must not hand endpoint B endpoint A's ids.
+	idsA, okA := a.accountListing(context.Background())
+	idsB, okB := b.accountListing(context.Background())
+	if !okA || !okB || idsA[H] != 11 || idsB[H] != 22 {
+		t.Fatalf("cross-API listings: a=%v/%v b=%v/%v", idsA, okA, idsB, okB)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("two API accounts made %d listing calls, want 2", got)
+	}
+
+	// Per-hash ids and resolve/file facts are account data, not facts about the token string itself.
+	cache.Put(torrentIDKey(a.accountIdentity(), H), "11", time.Hour)
+	if id, held := b.knownTorrentID(H); held {
+		t.Fatalf("endpoint B accepted endpoint A's torrent id %d", id)
+	}
+	cache.Put(resolveKey(a.accountIdentity(), H),
+		`{"torrentId":11,"files":[{"Index":0,"Name":"Movie.mkv","SizeBytes":123}]}`, time.Hour)
+	if _, ok := b.KnownFileSize(ResolveTarget{InfoHash: H}); ok {
+		t.Fatal("endpoint B accepted endpoint A's resolve/file fact")
+	}
+
+	// A positive cache check is scoped the same way. Reusing one would skip B's checkcached call and may
+	// claim that an account holds a release merely because another endpoint does.
+	cache.Put(cachedKey(ServiceTorBox, a.accountIdentity(), H), "1", cachedTTL)
+	if known, ask := knownCached(cache, ServiceTorBox, b.accountIdentity(), []string{H}); known[H] || len(ask) != 1 {
+		t.Fatalf("endpoint B reused endpoint A's positive: known=%v ask=%v", known, ask)
+	}
+
+	// Migration is fail-cold: a pre-v2 token-only file is never accepted under either arbitrary API.
+	cache.Put("torbox:torrent:"+keyHash(token)+":"+H, "99", time.Hour)
+	if _, held := a.knownTorrentID(H); !held { // A still has its correctly scoped id above.
+		t.Fatal("endpoint A lost its canonical torrent id")
+	}
+	otherHash := strings.Repeat("b", 40)
+	cache.Put("torbox:torrent:"+keyHash(token)+":"+otherHash, "99", time.Hour)
+	if _, held := a.knownTorrentID(otherHash); held {
+		t.Fatal("accepted a legacy token-only TorBox fact")
+	}
+}
+
 // A batch that failed leaves its hashes OUT of the map rather than marking them uncached.
 //
 // Checks go out in batches of 100 and up to 500 hashes are checked, so one timed-out batch used to
@@ -1086,6 +1201,122 @@ func TestTorBoxStatusAnswer_takesItsDoubtFromTheLookupItAlreadyDid(t *testing.T)
 				t.Errorf("listed the account %d times over two polls, want %d", fetches, tc.wantFetches)
 			}
 		})
+	}
+}
+
+func TestTorBoxStatusAnswer_coalescesViewersAndReusesSnapshot(t *testing.T) {
+	const token = "status-coordination-test"
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey(token, H), "77", time.Hour)
+	var calls atomic.Int32
+	store := &torBoxStore{token: token, api: torboxAPI, cache: cache,
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			time.Sleep(20 * time.Millisecond)
+			return resp(200, `{"data":{"progress":0.5,"download_finished":false}}`), nil
+		}}}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, answer := store.StatusAnswer(context.Background(), ResolveTarget{InfoHash: H}); answer != statusDownloading {
+				t.Errorf("answer = %v, want downloading", answer)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("20 concurrent viewers made %d status calls, want 1", got)
+	}
+	if _, answer := store.StatusAnswer(context.Background(), ResolveTarget{InfoHash: H}); answer != statusDownloading {
+		t.Fatalf("snapshot answer = %v", answer)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("warm snapshot made another call: %d", got)
+	}
+}
+
+func TestTorBoxStatusAnswer_coordinationIncludesAPIIdentity(t *testing.T) {
+	const token = "same-status-token-different-api"
+	cache := NewMemoryCache(1 << 20)
+	var calls atomic.Int32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, api := range []string{"https://torbox-a.invalid/v1", "https://torbox-b.invalid/v1"} {
+		api := api
+		cache.Put(torrentIDKey(torboxAccountIdentity(api, token), H), "77", time.Hour)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store := &torBoxStore{token: token, api: api, cache: cache,
+				client: mockDoer{func(*http.Request) (*http.Response, error) {
+					calls.Add(1)
+					time.Sleep(20 * time.Millisecond)
+					return resp(200, `{"data":{"progress":0.5,"download_finished":false}}`), nil
+				}}}
+			if _, answer := store.StatusAnswer(context.Background(), ResolveTarget{InfoHash: H}); answer != statusDownloading {
+				t.Errorf("%s answer = %v, want downloading", api, answer)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("two API identities shared status coordination: %d calls, want 2", got)
+	}
+}
+
+func TestTorBoxOutboundConcurrencyIsBoundedWithoutInventingMisses(t *testing.T) {
+	var active atomic.Int32
+	var peak atomic.Int32
+	gate := make(chan struct{})
+	client := mockDoer{func(*http.Request) (*http.Response, error) {
+		now := active.Add(1)
+		for old := peak.Load(); now > old && !peak.CompareAndSwap(old, now); old = peak.Load() {
+		}
+		defer active.Add(-1)
+		<-gate
+		return resp(200, `{"data":{}}`), nil
+	}}
+	store := &torBoxStore{token: "bounded-outbound", api: torboxAPI, client: client}
+	const extra = 20
+	results := make(chan bool, maxTorboxOutbound+extra)
+	for i := 0; i < maxTorboxOutbound+extra; i++ {
+		go func(i int) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			results <- store.fetchCached(ctx, []string{fmt.Sprintf("%040x", i)}).ok
+		}(i)
+	}
+	// Other package tests legitimately leave short background reads draining while this test begins, so
+	// do not assume every process-wide slot is idle. Reach enough overlap to prove this burst is being
+	// held back, then verify the hard ceiling itself and that every waiter eventually gets a real answer.
+	deadline := time.Now().Add(2 * time.Second)
+	for active.Load() < maxTorboxOutbound/2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := active.Load(); got < maxTorboxOutbound/2 {
+		close(gate)
+		t.Fatalf("only %d calls overlapped; the saturation test did not reach the limiter", got)
+	}
+	if got := active.Load(); got >= maxTorboxOutbound+extra {
+		close(gate)
+		t.Fatalf("all %d calls entered at once; outbound work was not backpressured", got)
+	}
+	close(gate)
+	for i := 0; i < maxTorboxOutbound+extra; i++ {
+		if !<-results {
+			t.Fatal("backpressure turned a successful answer into an unknown result")
+		}
+	}
+	if got := peak.Load(); got > maxTorboxOutbound {
+		t.Fatalf("peak outbound concurrency = %d, limit %d", got, maxTorboxOutbound)
 	}
 }
 

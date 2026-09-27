@@ -694,7 +694,7 @@ func TestKnownTorrentID_aPackMismatchDoesNotReBuyThePack(t *testing.T) {
 	}
 }
 
-// Every cache key that carries account state is scoped by the token.
+// Every cache key that carries account state is scoped by the account identity.
 //
 // The comments say what happens otherwise — "would let one user's cached torrent_id be used with another
 // user's token → wrong/other-account content" — and the cache is process-global, so it is reachable.
@@ -718,9 +718,6 @@ func TestCacheKeys_areScopedToTheAccount(t *testing.T) {
 			}
 			if strings.Contains(mine, "my-token") {
 				t.Errorf("the raw token is in the key: %q", mine)
-			}
-			if !strings.Contains(mine, keyHash("my-token")) {
-				t.Errorf("the key is not derived from the account: %q", mine)
 			}
 		})
 	}

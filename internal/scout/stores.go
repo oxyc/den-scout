@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,93 @@ const (
 	statusDownloading
 	statusUnknown
 )
+
+// Status polling is shared by every viewer waiting on the same account torrent. A five-second snapshot
+// turns the old one-request-per-two-second-poll shape (30 TorBox calls/minute/viewer) into at most twelve
+// calls/minute/target, independent of viewer count. singleflight closes the cold/stale race; the bounded
+// cache owns retention, so there is no per-target worker or timer left behind after readers disappear.
+var torboxStatusFlights singleflight.Group
+var torboxCheckFlights singleflight.Group
+var torboxStatusSlots = make(chan struct{}, 128)
+
+// One process-wide ceiling for every TorBox request, including the microbatch overflow path. The
+// coordinators bound how much work they retain, but their old overflow fallback called the API directly:
+// once the demand channels filled, the exact traffic spike they were meant to absorb became unbounded
+// outbound concurrency. Waiting here preserves truth (a caller that runs out of context gets "unknown",
+// never a fabricated miss) while preventing an outage from being amplified by more sockets and requests.
+const maxTorboxOutbound = 64
+
+var torboxOutboundSlots = make(chan struct{}, maxTorboxOutbound)
+
+const (
+	torboxDemandWindow = 7 * time.Millisecond
+	maxTorboxBatchers  = 64
+	maxTorboxDemands   = 64
+)
+
+type torboxCheckDemand struct {
+	hashes []string
+	reply  chan torboxCheckResult
+}
+
+type torboxCheckBatcher struct {
+	store   *torBoxStore
+	demands chan torboxCheckDemand
+}
+
+var torboxBatchers = struct {
+	sync.Mutex
+	items map[string]*torboxCheckBatcher
+}{items: make(map[string]*torboxCheckBatcher)}
+
+const (
+	torboxStatusTTL        = 5 * time.Second
+	torboxUnknownStatusTTL = 2 * time.Second
+)
+
+type cachedStatusAnswer struct {
+	Status StoreStatus  `json:"status"`
+	Answer statusAnswer `json:"answer"`
+}
+
+const torboxIdentityPrefix = "torbox-account:v2:"
+
+// torboxAccountIdentity is the canonical identity of one TorBox account. The API is part of it: test,
+// proxy and future TorBox-compatible endpoints may legitimately reuse a token string while naming
+// completely different accounts. The v2 marker also makes every old token-only persistent fact miss
+// safely after upgrade rather than being trusted under an arbitrary endpoint.
+func torboxAccountIdentity(api, token string) string {
+	return torboxIdentityPrefix + keyHash(api) + ":" + token
+}
+
+// Tests and old internal call sites commonly pass a raw token to key builders. Interpret that as the
+// canonical production API, while preserving an identity already assembled by a store.
+func canonicalTorboxIdentity(identity string) string {
+	if strings.HasPrefix(identity, torboxIdentityPrefix) {
+		return identity
+	}
+	return torboxAccountIdentity(torboxAPI, identity)
+}
+
+// serviceAccountIdentity normalises generic account-scoped state too. This keeps callers which pass a
+// raw TorBox token on the production API compatible while ensuring a store configured for another API
+// never shares facts with it. Other debrid services have no configurable API identity.
+func serviceAccountIdentity(svc DebridService, identity string) string {
+	if svc == ServiceTorBox {
+		return canonicalTorboxIdentity(identity)
+	}
+	return identity
+}
+
+func (s *torBoxStore) accountIdentity() string { return torboxAccountIdentity(s.api, s.token) }
+
+func torboxStatusKey(identity, infoHash string) string {
+	return "torbox:status:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + strings.ToLower(infoHash)
+}
+
+func clearTorboxStatus(cache Cache, identity, infoHash string) {
+	cachePut(cache, torboxStatusKey(identity, infoHash), "", time.Nanosecond, CacheVolatile)
+}
 
 // maxListingEntries bounds what the listing RETAINS, which the byte cap does not: the map holds one
 // entry per torrent, and 60 MiB of minimal entries is roughly a million of them. Fifty thousand is an
@@ -315,7 +403,60 @@ func (s *torBoxStore) get(ctx context.Context, u string) (*http.Response, error)
 	}
 	req.Header.Set("authorization", "Bearer "+s.token)
 	req.Header.Set("accept", "application/json")
-	return s.client.Do(req)
+	resp, err := s.do(ctx, req)
+	endpoint := torboxEndpoint(req.URL)
+	metrics.torboxCall(endpoint, err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
+	return resp, err
+}
+
+func (s *torBoxStore) do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	select {
+	case torboxOutboundSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	release := func() { <-torboxOutboundSlots }
+	resp, err := s.client.Do(req)
+	if err != nil || resp == nil || resp.Body == nil {
+		release()
+		return resp, err
+	}
+	// A request is still consuming an upstream connection while its body is being read. Releasing at
+	// headers would bound only dial/header latency and let slow or hostile bodies accumulate without a
+	// ceiling. Every caller already closes its response; couple the slot to that lifetime.
+	resp.Body = &torboxSlotBody{ReadCloser: resp.Body, release: release}
+	return resp, nil
+}
+
+type torboxSlotBody struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (b *torboxSlotBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
+}
+
+func torboxEndpoint(u *url.URL) string {
+	switch {
+	case strings.HasSuffix(u.Path, "/torrents/checkcached"):
+		return "checkcached"
+	case strings.HasSuffix(u.Path, "/torrents/mylist") && u.Query().Get("id") != "":
+		return "mylist_id"
+	case strings.HasSuffix(u.Path, "/torrents/mylist"):
+		return "mylist_account"
+	case strings.HasSuffix(u.Path, "/torrents/requestdl"):
+		return "requestdl"
+	case strings.HasSuffix(u.Path, "/torrents/createtorrent"):
+		return "createtorrent"
+	case strings.HasSuffix(u.Path, "/user/me"):
+		return "user"
+	default:
+		return ""
+	}
 }
 
 // cachedTTL — how long "this account holds it" answers for.
@@ -329,7 +470,7 @@ func (s *torBoxStore) get(ctx context.Context, u string) (*http.Response, error)
 const cachedTTL = 60 * time.Second
 
 func cachedKey(svc DebridService, token, infoHash string) string {
-	return string(svc) + ":cached:" + keyHash(token) + ":" + infoHash
+	return string(svc) + ":cached:" + keyHash(serviceAccountIdentity(svc, token)) + ":" + infoHash
 }
 
 // knownCached splits hashes into those already known to be held and those still worth asking about.
@@ -356,13 +497,13 @@ func rememberCached(cache Cache, svc DebridService, token string, result map[str
 	}
 	for h, held := range result {
 		if held {
-			cache.Put(cachedKey(svc, token, h), "1", cachedTTL)
+			cachePut(cache, cachedKey(svc, token, h), "1", cachedTTL, CacheVolatile)
 		}
 	}
 }
 
 func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[string]bool, error) {
-	result, hashes := knownCached(s.cache, ServiceTorBox, s.token, hashes)
+	result, hashes := knownCached(s.cache, ServiceTorBox, s.accountIdentity(), hashes)
 	if len(hashes) == 0 {
 		return result, nil
 	}
@@ -377,28 +518,13 @@ func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[stri
 		}
 		g.Go(func() error {
 			batch := hashes[start:end]
-			u := fmt.Sprintf("%s/torrents/checkcached?hash=%s&format=object&list_files=false", s.api, strings.Join(batch, ","))
-			resp, err := s.get(gctx, u)
-			if err != nil {
-				return nil
-			}
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != http.StatusOK {
-				return nil
-			}
-			var body struct {
-				Data map[string]json.RawMessage `json:"data"`
-			}
-			if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+			answer, ok := s.checkCachedBatch(gctx, batch)
+			if !ok {
 				return nil
 			}
 			batchOK[start/cacheBatch] = true
 			for i, h := range batch {
-				if _, ok := body.Data[h]; ok {
-					cached[start+i] = true
-				} else if _, ok := body.Data[strings.ToUpper(h)]; ok {
-					cached[start+i] = true
-				}
+				cached[start+i] = answer[strings.ToLower(h)]
 			}
 			return nil
 		})
@@ -414,8 +540,160 @@ func (s *torBoxStore) CacheCheck(ctx context.Context, hashes []string) (map[stri
 			result[h] = cached[i]
 		}
 	}
-	rememberCached(s.cache, ServiceTorBox, s.token, result)
+	rememberCached(s.cache, ServiceTorBox, s.accountIdentity(), result)
 	return result, batchesFailed(batchOK)
+}
+
+type torboxCheckResult struct {
+	cached map[string]bool
+	ok     bool
+}
+
+func (s *torBoxStore) checkCachedBatch(ctx context.Context, hashes []string) (map[string]bool, bool) {
+	set := append([]string(nil), hashes...)
+	for i := range set {
+		set[i] = strings.ToLower(set[i])
+	}
+	sort.Strings(set)
+	key := keyHash(s.accountIdentity()) + ":" + keyHash(strings.Join(set, ","))
+	ch := torboxCheckFlights.DoChan(key, func() (any, error) {
+		return s.demandCheckCached(set), nil
+	})
+	select {
+	case <-ctx.Done():
+		return nil, false
+	case result := <-ch:
+		if result.Err != nil {
+			return nil, false
+		}
+		if result.Shared {
+			metrics.torboxAvoid("checkcached_singleflight")
+		}
+		answer := result.Val.(torboxCheckResult)
+		return answer.cached, answer.ok
+	}
+}
+
+func (s *torBoxStore) demandCheckCached(hashes []string) torboxCheckResult {
+	key := keyHash(s.accountIdentity())
+	demand := torboxCheckDemand{hashes: hashes, reply: make(chan torboxCheckResult, 1)}
+	torboxBatchers.Lock()
+	batcher := torboxBatchers.items[key]
+	if batcher == nil && len(torboxBatchers.items) < maxTorboxBatchers {
+		batcher = &torboxCheckBatcher{store: s, demands: make(chan torboxCheckDemand, maxTorboxDemands)}
+		torboxBatchers.items[key] = batcher
+		go batcher.run(key)
+	}
+	if batcher != nil {
+		select {
+		case batcher.demands <- demand:
+			torboxBatchers.Unlock()
+			return <-demand.reply
+		default:
+		}
+	}
+	torboxBatchers.Unlock()
+	shared, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return s.fetchCached(shared, hashes)
+}
+
+func (b *torboxCheckBatcher) run(key string) {
+	timer := time.NewTimer(torboxDemandWindow)
+	defer timer.Stop()
+	var demands []torboxCheckDemand
+	for len(demands) < maxTorboxDemands {
+		select {
+		case demand := <-b.demands:
+			demands = append(demands, demand)
+		case <-timer.C:
+			goto collected
+		}
+	}
+collected:
+	torboxBatchers.Lock()
+	// A sender may have found this batcher just as the timer fired. Every sender holds the same lock
+	// while enqueueing, so draining under it closes that race before the coordinator is unpublished.
+	for len(demands) < maxTorboxDemands {
+		select {
+		case demand := <-b.demands:
+			demands = append(demands, demand)
+		default:
+			goto drained
+		}
+	}
+drained:
+	if torboxBatchers.items[key] == b {
+		delete(torboxBatchers.items, key)
+	}
+	torboxBatchers.Unlock()
+
+	union := make(map[string]struct{})
+	for _, demand := range demands {
+		for _, hash := range demand.hashes {
+			union[hash] = struct{}{}
+		}
+	}
+	all := make([]string, 0, len(union))
+	for hash := range union {
+		all = append(all, hash)
+	}
+	sort.Strings(all)
+	if avoided := len(demands) - (len(all)+cacheBatch-1)/cacheBatch; avoided > 0 {
+		for range avoided {
+			metrics.torboxAvoid("checkcached_batch")
+		}
+	}
+	answers := make(map[string]bool, len(all))
+	shared, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for start := 0; start < len(all); start += cacheBatch {
+		end := min(start+cacheBatch, len(all))
+		answer := b.store.fetchCached(shared, all[start:end])
+		if !answer.ok {
+			continue
+		}
+		for hash, cached := range answer.cached {
+			answers[hash] = cached
+		}
+	}
+	for _, demand := range demands {
+		answer := make(map[string]bool, len(demand.hashes))
+		ok := true
+		for _, hash := range demand.hashes {
+			if cached, known := answers[hash]; known {
+				answer[hash] = cached
+			} else {
+				ok = false
+			}
+		}
+		demand.reply <- torboxCheckResult{cached: answer, ok: ok}
+	}
+}
+
+func (s *torBoxStore) fetchCached(ctx context.Context, hashes []string) torboxCheckResult {
+	u := fmt.Sprintf("%s/torrents/checkcached?hash=%s&format=object&list_files=false", s.api, strings.Join(hashes, ","))
+	resp, err := s.get(ctx, u)
+	if err != nil {
+		return torboxCheckResult{}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return torboxCheckResult{}
+	}
+	var body struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+		return torboxCheckResult{}
+	}
+	answer := make(map[string]bool, len(hashes))
+	for _, hash := range hashes {
+		_, lower := body.Data[hash]
+		_, upper := body.Data[strings.ToUpper(hash)]
+		answer[hash] = lower || upper
+	}
+	return torboxCheckResult{cached: answer, ok: true}
 }
 
 // batchesFailed reports errCheckFailed only when every batch failed (none returned usable data). A
@@ -431,15 +709,15 @@ func batchesFailed(batchOK []bool) error {
 
 // The torrent id alone, kept apart from the resolve entry so a queued torrent (no file list) is still
 // addressable by `Status`.
-// resolveKey — the cached (torrent id + file list) for a hash on this account. Scoped by the debrid
-// token: the value is an account-scoped torrent id, so an infohash-only key would let one user's id be
-// used with another user's token.
-func resolveKey(token, infoHash string) string {
-	return "torbox:resolve:" + keyHash(token) + ":" + infoHash
+// resolveKey — the cached (torrent id + file list) for a hash on this account. Scoped by TorBox API and
+// token: the value is an account-scoped torrent id, so an infohash-only key would let one account's id
+// be used with another account.
+func resolveKey(identity, infoHash string) string {
+	return "torbox:resolve:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + infoHash
 }
 
-func torrentIDKey(token, infoHash string) string {
-	return "torbox:torrent:" + keyHash(token) + ":" + infoHash
+func torrentIDKey(identity, infoHash string) string {
+	return "torbox:torrent:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + infoHash
 }
 
 // Remembering that the account has NO torrent for a hash, briefly.
@@ -454,8 +732,8 @@ func torrentIDKey(token, infoHash string) string {
 // is unaffected either way, since it writes the id and the id is checked first.
 const torrentMissTTL = 15 * time.Second
 
-func torrentMissKey(token, infoHash string) string {
-	return "torbox:notorrent:" + keyHash(token) + ":" + infoHash
+func torrentMissKey(identity, infoHash string) string {
+	return "torbox:notorrent:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + infoHash
 }
 
 // An add we SENT but never got an answer to.
@@ -472,7 +750,7 @@ func torrentMissKey(token, infoHash string) string {
 const addAttemptTTL = 90 * time.Second
 
 func addAttemptKey(svc DebridService, token, infoHash string) string {
-	return string(svc) + ":adding:" + keyHash(token) + ":" + infoHash
+	return string(svc) + ":adding:" + keyHash(serviceAccountIdentity(svc, token)) + ":" + infoHash
 }
 
 // addInFlight reports an add this process sent and never heard back about.
@@ -523,14 +801,14 @@ func noteAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
 	if cache == nil {
 		return
 	}
-	cache.Put(addAttemptKey(svc, token, infoHash), "1", addAttemptTTL)
+	cachePut(cache, addAttemptKey(svc, token, infoHash), "1", addAttemptTTL, CacheVolatile)
 	// Clear the torrent-miss marker too. It suppresses the account listing for 15s, and that listing is
 	// the only thing that can discover the torrent this add just created — so leaving it kept the next
 	// poll on the "nothing is queued" path instead of "it is downloading". The negative cache and the add
 	// loop feed each other. This line was dropped when these helpers were made shared, along with the
 	// paragraph saying why, and nothing failed: hence the test that now covers it.
 	if svc == ServiceTorBox {
-		cache.Put(torrentMissKey(token, infoHash), "", time.Nanosecond)
+		cachePut(cache, torrentMissKey(token, infoHash), "", time.Nanosecond, CacheVolatile)
 	}
 }
 
@@ -558,7 +836,7 @@ const pendingGiveUp = 10 * time.Minute
 // poll never ages, and a claim that never ages is not a wait, it is a promise nothing can withdraw.
 func noteQueued(cache Cache, token, infoHash string) {
 	if cache != nil {
-		cache.Put(pmQueuedKey(token, infoHash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL)
+		cachePut(cache, pmQueuedKey(token, infoHash), strconv.FormatInt(time.Now().Unix(), 10), queuedTTL, CacheVolatile)
 	}
 }
 
@@ -580,7 +858,7 @@ func pendingTooLong(cache Cache, token, infoHash string) bool {
 // and a later request must be free to pay for it again if it is ever evicted.
 func settleQueuedTransfer(cache Cache, token, infoHash string) {
 	if cache != nil {
-		cache.Put(pmQueuedKey(token, infoHash), "", time.Nanosecond)
+		cachePut(cache, pmQueuedKey(token, infoHash), "", time.Nanosecond, CacheVolatile)
 	}
 }
 
@@ -595,7 +873,7 @@ func pmHeldKey(token, infoHash string) string {
 
 func noteHeld(cache Cache, token, infoHash string) {
 	if cache != nil {
-		cache.Put(pmHeldKey(token, infoHash), "1", resolveCacheTTL)
+		cachePut(cache, pmHeldKey(token, infoHash), "1", resolveCacheTTL, CacheDurable)
 	}
 }
 
@@ -606,7 +884,7 @@ func noteHeld(cache Cache, token, infoHash string) {
 // change under it at any moment.
 func forgetHeld(cache Cache, token, infoHash string) {
 	if cache != nil {
-		cache.Put(pmHeldKey(token, infoHash), "", time.Nanosecond)
+		cachePut(cache, pmHeldKey(token, infoHash), "", time.Nanosecond, CacheVolatile)
 	}
 }
 
@@ -634,9 +912,9 @@ func alreadyQueued(cache Cache, token, infoHash string) bool {
 // does. Keeping it would block the legitimate retry when the add succeeded but the follow-up did not.
 func settleAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
 	if cache != nil {
-		cache.Put(addAttemptKey(svc, token, infoHash), "", time.Nanosecond)
+		cachePut(cache, addAttemptKey(svc, token, infoHash), "", time.Nanosecond, CacheVolatile)
 		// An outcome, of any kind, ends the run of not knowing.
-		cache.Put(unknownOutcomeKey(svc, token, infoHash), "", time.Nanosecond)
+		cachePut(cache, unknownOutcomeKey(svc, token, infoHash), "", time.Nanosecond, CacheVolatile)
 	}
 }
 
@@ -651,7 +929,7 @@ func settleAddAttempt(cache Cache, svc DebridService, token, infoHash string) {
 // with a deadline… refreshing the marker made it an absorbing state" — applied to the sibling marker
 // that never got one.
 func unknownOutcomeKey(svc DebridService, token, infoHash string) string {
-	return string(svc) + ":unknown:" + keyHash(token) + ":" + infoHash
+	return string(svc) + ":unknown:" + keyHash(serviceAccountIdentity(svc, token)) + ":" + infoHash
 }
 
 // How long "we do not know yet" stays a wait rather than a verdict. Past it the release reads as dead so
@@ -669,7 +947,7 @@ func noteUnknownOutcome(cache Cache, svc DebridService, token, infoHash string) 
 	if raw, ok := cache.Get(key); ok && raw != "" {
 		return
 	}
-	cache.Put(key, strconv.FormatInt(time.Now().Unix(), 10), unknownOutcomeTTL)
+	cachePut(cache, key, strconv.FormatInt(time.Now().Unix(), 10), unknownOutcomeTTL, CacheVolatile)
 }
 
 // unknownTooLong reports that the outcome has been unknown for longer than anyone should be asked to wait.
@@ -836,7 +1114,7 @@ func (p *StorePool) AccountRefusal() (DebridService, string, bool) {
 }
 
 func (s *torBoxStore) AccountRefused() (string, bool) {
-	return accountBackedOff(s.cache, ServiceTorBox, s.token)
+	return accountBackedOff(s.cache, ServiceTorBox, s.accountIdentity())
 }
 func (s *realDebridStore) AccountRefused() (string, bool) {
 	return accountBackedOff(s.cache, ServiceRealDebrid, s.token)
@@ -894,11 +1172,15 @@ func (p *StorePool) ScoutBusyFor(prefetch bool) time.Duration {
 	return soonest
 }
 
-func (s *torBoxStore) budgetAccount() string     { return budgetAccount(ServiceTorBox, s.token) }
+func (s *torBoxStore) budgetAccount() string {
+	return budgetAccount(ServiceTorBox, s.accountIdentity())
+}
 func (s *realDebridStore) budgetAccount() string { return budgetAccount(ServiceRealDebrid, s.token) }
 func (s *premiumizeStore) budgetAccount() string { return budgetAccount(ServicePremiumize, s.token) }
 
-func (s *torBoxStore) ScoutBudgetSpent() bool { return scoutBudgetSpent(ServiceTorBox, s.token) }
+func (s *torBoxStore) ScoutBudgetSpent() bool {
+	return scoutBudgetSpent(ServiceTorBox, s.accountIdentity())
+}
 func (s *realDebridStore) ScoutBudgetSpent() bool {
 	return scoutBudgetSpent(ServiceRealDebrid, s.token)
 }
@@ -1045,7 +1327,7 @@ func addWouldMissTheClock(ctx context.Context, svc DebridService) error {
 }
 
 func (s *torBoxStore) AddInFlight(infoHash string) bool {
-	return addStillBelievable(s.cache, ServiceTorBox, s.token, infoHash)
+	return addStillBelievable(s.cache, ServiceTorBox, s.accountIdentity(), infoHash)
 }
 
 func (s *realDebridStore) AddInFlight(infoHash string) bool {
@@ -1101,7 +1383,7 @@ func (s *premiumizeStore) AddInFlight(infoHash string) bool {
 }
 
 func (s *torBoxStore) RecentRefusal(infoHash string) (string, bool) {
-	return backedOff(s.cache, ServiceTorBox, s.token, infoHash)
+	return backedOff(s.cache, ServiceTorBox, s.accountIdentity(), infoHash)
 }
 
 func (s *realDebridStore) RecentRefusal(infoHash string) (string, bool) {
@@ -1115,7 +1397,7 @@ func (s *premiumizeStore) RecentRefusal(infoHash string) (string, bool) {
 // refusedKey marks a hash the service just declined to add for this account, so polls stop re-asking.
 // Per service, because a refusal by one says nothing about another.
 func refusedKey(svc DebridService, token, infoHash string) string {
-	return string(svc) + ":refused:" + keyHash(token) + ":" + infoHash
+	return string(svc) + ":refused:" + keyHash(serviceAccountIdentity(svc, token)) + ":" + infoHash
 }
 
 // accountRefusedKey — the service turned this ACCOUNT away, whatever was asked for.
@@ -1125,7 +1407,7 @@ func refusedKey(svc DebridService, token, infoHash string) string {
 // fifty calls, the whole hourly allowance gone, and replacing the key did not restore service because
 // the budget stayed spent for the rest of the hour.
 func accountRefusedKey(svc DebridService, token string) string {
-	return string(svc) + ":refused-account:" + keyHash(token)
+	return string(svc) + ":refused-account:" + keyHash(serviceAccountIdentity(svc, token))
 }
 
 // backedOff — this account was turned away a moment ago, for this hash or outright.
@@ -1195,12 +1477,12 @@ func recordRefusal(cache Cache, svc DebridService, token, infoHash string, err e
 		return
 	}
 	if refusalIsAboutTheAccount(err) {
-		cache.Put(accountRefusedKey(svc, token), refusalReason(err), refusalBackoff)
+		cachePut(cache, accountRefusedKey(svc, token), refusalReason(err), refusalBackoff, CacheVolatile)
 		logLimited("account-refused:"+string(svc), "%s refused the account itself (%s) — check the key",
 			svc, refusalReason(err))
 		return
 	}
-	cache.Put(refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff)
+	cachePut(cache, refusedKey(svc, token, infoHash), refusalReason(err), refusalBackoff, CacheVolatile)
 }
 
 // How long to stop asking after the service refuses. Long enough that a poll loop can't sustain a
@@ -1222,14 +1504,14 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// Scope by the debrid token: the cached value is a TorBox torrent_id, which is account-scoped.
 	// Every per-install store shares one process-global cache, so an infohash-only key would let one
 	// user's cached torrent_id be used with another user's token (→ wrong/other-account content).
-	key := resolveKey(s.token, t.InfoHash)
+	key := resolveKey(s.accountIdentity(), t.InfoHash)
 
 	// A rejected key makes every request pointless, reads included — the same gate RD and Premiumize have.
 	// It sits ABOVE the warm fast path, not below it: any pack played in the last six hours resolves
 	// straight out of that entry and returns without ever reaching a gate placed after it, which is the
 	// normal state during a binge. Ten polls meant ten requestdl calls on a key TorBox had already
 	// rejected, and that branch records no refusal either, so it could not even set the key it skipped.
-	if reason, ok := accountBackedOff(s.cache, ServiceTorBox, s.token); ok {
+	if reason, ok := accountBackedOff(s.cache, ServiceTorBox, s.accountIdentity()); ok {
 		return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 	}
 
@@ -1256,8 +1538,8 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	//
 	// addStillBelievable rather than the bare marker, so past addGiveUp the refusal is heard again
 	// instead of being suppressed by a marker nothing will ever settle.
-	if !t.NoAdd && !addStillBelievable(s.cache, ServiceTorBox, s.token, t.InfoHash) {
-		if reason, ok := backedOff(s.cache, ServiceTorBox, s.token, t.InfoHash); ok {
+	if !t.NoAdd && !addStillBelievable(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash) {
+		if reason, ok := backedOff(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash); ok {
 			return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 		}
 	}
@@ -1289,7 +1571,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 				// probe route, which reads the backoff, reported nothing queued.
 				var unavailable *StoreUnavailableError
 				if errors.As(err, &unavailable) {
-					recordRefusalFor(s.cache, ServiceTorBox, s.token, t.InfoHash, err, t.NoAdd)
+					recordRefusalFor(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash, err, t.NoAdd)
 					return "", err
 				}
 			}
@@ -1334,7 +1616,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// Scout's own bookkeeping first, the store's verdict second — the order Premiumize already uses. An
 	// add we sent and never heard back about is a 202 "downloading", and asking backedOff ahead of it let
 	// any refusal recorded in the meantime answer 503 instead, naming a store that had said nothing.
-	if err := addInFlight(s.cache, ServiceTorBox, s.token, t.InfoHash); err != nil {
+	if err := addInFlight(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash); err != nil {
 		return "", err
 	}
 	// A client polls /play every few seconds for the whole fetch, and every poll that got this far ran a
@@ -1342,7 +1624,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// fails, nothing is cached, and the next poll adds again. Back off for a minute after a refusal so a
 	// wait costs one call rather than one per poll.
 	if s.cache != nil {
-		if reason, ok := backedOff(s.cache, ServiceTorBox, s.token, t.InfoHash); ok {
+		if reason, ok := backedOff(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash); ok {
 			return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 		}
 	}
@@ -1361,7 +1643,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		// deliberately leaves set says the outcome is unknown, and filing that here made backedOff, which
 		// this store consults FIRST, pre-empt it on the next poll: errAddInFlight became unreachable and
 		// the client was told its debrid was refusing for a release scout had an add out for.
-		if addOutcomeUnknown(s.cache, ServiceTorBox, s.token, t.InfoHash) {
+		if addOutcomeUnknown(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash) {
 			// Not on a cancellation. /play runs on the client's context and a focus change is enough, so
 			// a viewer backing out wrote a give-up stamp that outlived them: past addGiveUp every resolve
 			// of that release answered a dead link for the rest of unknownOutcomeTTL, with no upstream
@@ -1373,10 +1655,10 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 			// body-read branch, which is not recognisably a cancellation out here, so stamping again
 			// undid the guard one layer down.
 			if !isCancellation(err) && !errors.Is(err, errAddInFlight) {
-				noteUnknownOutcome(s.cache, ServiceTorBox, s.token, t.InfoHash)
+				noteUnknownOutcome(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash)
 			}
 		} else {
-			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
+			recordRefusal(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash, err)
 		}
 		return "", err
 	}
@@ -1394,7 +1676,7 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 	// to THIS poll stays a dead link so the client can move on to another release rather than sit on a
 	// service error for a release that may be fine elsewhere.
 	if errors.Is(err, errTorrentGone) {
-		recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, &StoreUnavailableError{
+		recordRefusal(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash, &StoreUnavailableError{
 			Service: ServiceTorBox, Reason: "created this torrent and then denied holding it"})
 		return "", &DeadLinkError{"torbox created this torrent and then denied holding it"}
 	}
@@ -1427,9 +1709,10 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 			// report a download in progress. Returning above that write dropped an id createtorrent had
 			// just handed us, so the next poll knew of no torrent and bought another one.
 			if s.cache != nil {
-				s.cache.Put(torrentIDKey(s.token, t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
+				s.cache.Put(torrentIDKey(s.accountIdentity(), t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
+				clearTorboxStatus(s.cache, s.accountIdentity(), t.InfoHash)
 			}
-			recordRefusal(s.cache, ServiceTorBox, s.token, t.InfoHash, err)
+			recordRefusal(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash, err)
 			return "", err
 		}
 	}
@@ -1443,7 +1726,8 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	// the case the entry above refuses to write: a just-queued torrent has no file list yet, and that is
 	// what makes an episode's first /play look "dead" instead of "downloading".
 	if s.cache != nil {
-		s.cache.Put(torrentIDKey(s.token, t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
+		s.cache.Put(torrentIDKey(s.accountIdentity(), t.InfoHash), strconv.Itoa(torrentID), resolveCacheTTL)
+		clearTorboxStatus(s.cache, s.accountIdentity(), t.InfoHash)
 	}
 	// No list, and an episode to pick out of a pack: refuse rather than guess — but only after the id
 	// above is remembered, or a just-queued episode stops reporting as "downloading" and reads as dead.
@@ -1481,7 +1765,7 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 		// The same rule as the warm path one branch up: this is reached BEFORE Resolve's NoAdd return,
 		// so a probe poll landed here and wrote the add-path backoff its own contract says it cannot
 		// cause — the sentence two lines above says exactly that and the code did it anyway.
-		recordRefusalFor(s.cache, ServiceTorBox, s.token, t.InfoHash, err, t.NoAdd)
+		recordRefusalFor(s.cache, ServiceTorBox, s.accountIdentity(), t.InfoHash, err, t.NoAdd)
 	}
 	if errors.Is(err, errTorrentGone) {
 		// The id we were just handed is not one TorBox has. Undo the two writes above: leaving them
@@ -1494,25 +1778,26 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 
 func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch bool) (int, error) {
 	// An add we already sent and never heard back about must not be sent again — see addAttemptKey.
-	if err := addInFlight(s.cache, ServiceTorBox, s.token, infoHash); err != nil {
+	if err := addInFlight(s.cache, ServiceTorBox, s.accountIdentity(), infoHash); err != nil {
 		return 0, err
 	}
 	if err := addWouldMissTheClock(ctx, ServiceTorBox); err != nil {
 		return 0, err
 	}
-	if err := spendAdd(ServiceTorBox, s.token, infoHash, prefetch); err != nil {
+	if err := spendAdd(ServiceTorBox, s.accountIdentity(), infoHash, prefetch); err != nil {
 		return 0, err
 	}
 	form := url.Values{"magnet": {magnetFor(infoHash)}, "seed": {"3"}, "allow_zip": {"false"}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/torrents/createtorrent", strings.NewReader(form.Encode()))
 	if err != nil {
-		refundAdd(ServiceTorBox, s.token, errRequestNotSent)
+		refundAdd(ServiceTorBox, s.accountIdentity(), errRequestNotSent)
 		return 0, err
 	}
 	req.Header.Set("authorization", "Bearer "+s.token)
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
-	noteAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
-	resp, err := s.client.Do(req)
+	noteAddAttempt(s.cache, ServiceTorBox, s.accountIdentity(), infoHash)
+	resp, err := s.do(ctx, req)
+	metrics.torboxCall("createtorrent", err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
 	if err != nil {
 		// No response, so the outcome is genuinely unknown: the marker STAYS, and the next poll finds it
 		// rather than sending the same add again.
@@ -1529,9 +1814,9 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 	if readErr != nil {
 		// Marker left set on purpose: the next poll answers 202 from it rather than buying the torrent
 		// again. The charge stays too — the add was written to the wire.
-		return 0, unknownOutcome(s.cache, ServiceTorBox, s.token, infoHash, readErr)
+		return 0, unknownOutcome(s.cache, ServiceTorBox, s.accountIdentity(), infoHash, readErr)
 	}
-	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
+	settleAddAttempt(s.cache, ServiceTorBox, s.accountIdentity(), infoHash)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// TorBox explains itself in the body — an account at its active-download limit and a malformed
 		// magnet are both a bare 400, and only the text says which. Discarding it left the status code as
@@ -1545,7 +1830,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 		// TorBox answered and created nothing, so the charge goes back — the rule RD and Premiumize
 		// already follow on their own answered failures. Kept here, a repeatedly polled bad magnet ate
 		// this account's hourly allowance where the other two were already immune.
-		refundUnusedAdd(ServiceTorBox, s.token)
+		refundUnusedAdd(ServiceTorBox, s.accountIdentity())
 		if storeRefusedUs(resp.StatusCode) {
 			return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
@@ -1575,7 +1860,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 		// simply does not fit this struct, and either may describe a torrent that exists. Only a body
 		// that is not JSON at all — a proxy or gateway page — proves nothing was created.
 		if !json.Valid(raw) || (body.Success != nil && !*body.Success) {
-			refundUnusedAdd(ServiceTorBox, s.token)
+			refundUnusedAdd(ServiceTorBox, s.accountIdentity())
 		}
 		return 0, &DeadLinkError{"torbox no torrent_id"}
 	}
@@ -1601,6 +1886,60 @@ func (s *torBoxStore) Status(ctx context.Context, t ResolveTarget) (StoreStatus,
 }
 
 func (s *torBoxStore) StatusAnswer(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer) {
+	key := torboxStatusKey(s.accountIdentity(), t.InfoHash)
+	if s.cache != nil {
+		if raw, ok := s.cache.Get(key); ok {
+			var hit cachedStatusAnswer
+			if json.Unmarshal([]byte(raw), &hit) == nil {
+				metrics.torboxStatusAvoided.Add(1)
+				metrics.torboxAvoid("status_snapshot")
+				return hit.Status, hit.Answer
+			}
+		}
+	}
+	ch := torboxStatusFlights.DoChan(key, func() (any, error) {
+		select {
+		case torboxStatusSlots <- struct{}{}:
+			defer func() { <-torboxStatusSlots }()
+		default:
+			return cachedStatusAnswer{Answer: statusUnknown}, nil
+		}
+		metrics.torboxStatusActive.Add(1)
+		defer metrics.torboxStatusActive.Add(-1)
+		// Shared work cannot inherit one waiter's cancellation: another viewer may still need the answer.
+		shared, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		status, answer := s.statusAnswerUncached(shared, t)
+		ttl := torboxStatusTTL
+		if answer == statusUnknown {
+			ttl = torboxUnknownStatusTTL
+		}
+		if s.cache != nil && answer != statusUnknown {
+			if raw, err := json.Marshal(cachedStatusAnswer{Status: status, Answer: answer}); err == nil {
+				cachePut(s.cache, key, string(raw), ttl, CacheVolatile)
+			}
+		}
+		return cachedStatusAnswer{Status: status, Answer: answer}, nil
+	})
+	metrics.torboxStatusWaiters.Add(1)
+	defer metrics.torboxStatusWaiters.Add(-1)
+	select {
+	case <-ctx.Done():
+		return StoreStatus{}, statusUnknown
+	case result := <-ch:
+		if result.Err != nil {
+			return StoreStatus{}, statusUnknown
+		}
+		answer := result.Val.(cachedStatusAnswer)
+		if result.Shared {
+			metrics.torboxStatusAvoided.Add(1)
+			metrics.torboxAvoid("status_snapshot")
+		}
+		return answer.Status, answer.Answer
+	}
+}
+
+func (s *torBoxStore) statusAnswerUncached(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer) {
 	torrentID, ok, authoritative := s.torrentID(ctx, t.InfoHash)
 	if !ok {
 		// A miss here is only trustworthy when the listing was actually read. torrentID declines to
@@ -1715,7 +2054,7 @@ func (s *torBoxStore) knownTorrentID(infoHash string) (int, bool) {
 	if s.cache == nil {
 		return 0, false
 	}
-	raw, ok := s.cache.Get(torrentIDKey(s.token, infoHash))
+	raw, ok := s.cache.Get(torrentIDKey(s.accountIdentity(), infoHash))
 	if !ok {
 		return 0, false
 	}
@@ -1729,8 +2068,9 @@ func (s *torBoxStore) forgetTorrentID(infoHash string) {
 	if s.cache == nil {
 		return
 	}
-	s.cache.Put(torrentIDKey(s.token, infoHash), "", time.Nanosecond)
-	s.cache.Put(resolveKey(s.token, infoHash), "", time.Nanosecond)
+	s.cache.Put(torrentIDKey(s.accountIdentity(), infoHash), "", time.Nanosecond)
+	s.cache.Put(resolveKey(s.accountIdentity(), infoHash), "", time.Nanosecond)
+	clearTorboxStatus(s.cache, s.accountIdentity(), infoHash)
 }
 
 // torrentID finds the account's torrent id for an infohash: from the cache Resolve wrote, and failing
@@ -1751,14 +2091,14 @@ func (s *torBoxStore) forgetTorrentID(infoHash string) {
 // marker exists to prevent.
 func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool, bool) {
 	if s.cache != nil {
-		if raw, ok := s.cache.Get(torrentIDKey(s.token, infoHash)); ok {
+		if raw, ok := s.cache.Get(torrentIDKey(s.accountIdentity(), infoHash)); ok {
 			if id, err := strconv.Atoi(raw); err == nil {
 				return id, true, true
 			}
 		}
 	}
 	if s.cache != nil {
-		if _, missed := s.cache.Get(torrentMissKey(s.token, infoHash)); missed {
+		if _, missed := s.cache.Get(torrentMissKey(s.accountIdentity(), infoHash)); missed {
 			return 0, false, true // remembered, and only an authoritative miss is ever remembered
 		}
 	}
@@ -1770,18 +2110,18 @@ func (s *torBoxStore) torrentID(ctx context.Context, infoHash string) (int, bool
 		// rediscover a queued torrent for the next fifteen seconds, on /play as well as the probe route.
 		// The probe now runs on an eight-second budget, so this is easier to hit than it was.
 		if s.cache != nil && authoritative {
-			s.cache.Put(torrentMissKey(s.token, infoHash), "1", torrentMissTTL)
+			cachePut(s.cache, torrentMissKey(s.accountIdentity(), infoHash), "1", torrentMissTTL, CacheVolatile)
 		}
 		return 0, false, authoritative
 	}
 	// Remember it, so the next poll of this wait is a single-id lookup again rather than another list.
 	if s.cache != nil {
-		s.cache.Put(torrentIDKey(s.token, infoHash), strconv.Itoa(id), resolveCacheTTL)
+		s.cache.Put(torrentIDKey(s.accountIdentity(), infoHash), strconv.Itoa(id), resolveCacheTTL)
 	}
 	// Finding the torrent settles any add we had in flight for it — that add plainly landed. Without
 	// this the marker outlives the fact it stood in for, and a release stays "awaiting the result" long
 	// after the result is sitting in the account listing.
-	settleAddAttempt(s.cache, ServiceTorBox, s.token, infoHash)
+	settleAddAttempt(s.cache, ServiceTorBox, s.accountIdentity(), infoHash)
 	return id, true, true
 }
 
@@ -1806,7 +2146,9 @@ func (s *torBoxStore) findTorrentByHash(ctx context.Context, infoHash string) (i
 const listingTTL = 15 * time.Second
 
 // torrentListKey — the account's hash → torrent-id map. Account-scoped like every other key here.
-func torrentListKey(token string) string { return "torbox:list:" + keyHash(token) }
+func torrentListKey(identity string) string {
+	return "torbox:list:" + keyHash(canonicalTorboxIdentity(identity))
+}
 
 // listingFlight collapses concurrent fetches of one account's listing into a single round trip. The
 // cache alone only helps SEQUENTIAL callers, and the case this exists for — a poster grid probing eight
@@ -1831,10 +2173,10 @@ var listingFlight singleflight.Group
 // other's memo, and neither do two tests. Keyed on the interface value, so every Cache implementation
 // must stay comparable — all three are pointers.
 //
-// Not a claim that two such handlers share nothing: listingFlight is keyed on the token alone, so
+// Not a claim that two such handlers share nothing: listingFlight is keyed on the API+token identity, so
 // concurrent fetches for one account still collapse into one round trip across caches. That is correct —
-// the token IS the account, and the answer does not depend on who asked — and it is only the memo that
-// is scoped, so it is worth saying rather than implying otherwise.
+// the endpoint and token together identify the account, and the answer does not depend on who asked —
+// and it is only the memo that is cache-scoped, so it is worth saying rather than implying otherwise.
 //
 // Comparability is CHECKED rather than assumed. Cache is exported and Deps.Cache takes any
 // implementation, so a value-typed one with a map or slice field would panic on the map insert — inside a
@@ -1881,7 +2223,7 @@ type listingMemoEntry struct {
 // of it; a coarse sweep makes it look like a margin and there is none.
 //
 // The condition is total torrents across every TorBox account the process has seen, not a few large ones:
-// the memo is keyed on (cache, token) and the cache is process-wide, so fifty-one ordinary users at the
+// the memo is keyed on (cache, API+token) and the cache is process-wide, so fifty-one ordinary users at the
 // 2,000 this package has actually measured trips it just as well as three 34,000-torrent accounts. Fifty
 // at 2,000 is exactly the ceiling and still hits 100%; the boundary is that sharp. That is all still past
 // what a self-hosted install is, which is why the policy stays simple — but the thing to watch is the
@@ -1990,7 +2332,7 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	if s.client == nil {
 		return nil, false
 	}
-	key := torrentListKey(s.token)
+	key := torrentListKey(s.accountIdentity())
 	if ids, hit := cachedListing(s.cache, key); hit {
 		return ids, true
 	}
@@ -2030,7 +2372,7 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 	// the leader's shorter attempt, so an escalated read that joins a poll's in-flight fetch can be told
 	// "could not find out" while it still had time. That answer is indeterminate, so it costs a retry
 	// rather than a false "nobody is fetching it" — and the flight is per token, so it needs a second
-	// concurrent request against the same account in the window between the two reads.
+	// concurrent request against the same API+token account in the window between the two reads.
 	ch := listingFlight.DoChan(key, func() (any, error) {
 		// This closure is a BACKGROUND goroutine now, and DoChan makes a panic in it fatal to the process:
 		// singleflight re-raises it with `go panic(e)` on a fresh goroutine whenever anyone is waiting on a
@@ -2053,7 +2395,7 @@ func (s *torBoxStore) accountListing(ctx context.Context) (map[string]int, bool)
 		ids, ok, persistent := s.fetchAccountListing(leaderCtx)
 		if !ok {
 			if persistent && s.cache != nil {
-				s.cache.Put(key+":oversized", "1", listingTTL)
+				cachePut(s.cache, key+":oversized", "1", listingTTL, CacheVolatile)
 			}
 			return nil, nil
 		}
@@ -4077,6 +4419,15 @@ func (p *StorePool) StatusDetail(ctx context.Context, t ResolveTarget) (StoreSta
 func hasCacheTruth(config *Config) bool {
 	for _, d := range config.Debrid {
 		if isCacheTruthService(d.Service) {
+			return true
+		}
+	}
+	return false
+}
+
+func configHasService(config *Config, service DebridService) bool {
+	for _, account := range config.Debrid {
+		if account.Service == service {
 			return true
 		}
 	}
