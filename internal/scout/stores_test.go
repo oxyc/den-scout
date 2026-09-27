@@ -35,6 +35,37 @@ func TestTorBoxCacheCheck(t *testing.T) {
 	}
 }
 
+func TestTorBoxCacheCheck_batchesConcurrentDemandAcrossRequests(t *testing.T) {
+	var calls atomic.Int32
+	client := mockDoer{fn: func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return resp(200, `{"data":{}}`), nil
+	}}
+	cache := NewMemoryCache(1 << 20)
+	const token = "demand-batch-test"
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			hash := fmt.Sprintf("%040x", i+1)
+			store := &torBoxStore{token: token, client: client, cache: cache, api: torboxAPI}
+			answer, err := store.CacheCheck(context.Background(), []string{hash})
+			if err != nil || len(answer) != 1 {
+				t.Errorf("answer=%v err=%v", answer, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("20 overlapping checks made %d API calls, want 1", got)
+	}
+}
+
 // A batch that failed leaves its hashes OUT of the map rather than marking them uncached.
 //
 // Checks go out in batches of 100 and up to 500 hashes are checked, so one timed-out batch used to
@@ -1086,6 +1117,42 @@ func TestTorBoxStatusAnswer_takesItsDoubtFromTheLookupItAlreadyDid(t *testing.T)
 				t.Errorf("listed the account %d times over two polls, want %d", fetches, tc.wantFetches)
 			}
 		})
+	}
+}
+
+func TestTorBoxStatusAnswer_coalescesViewersAndReusesSnapshot(t *testing.T) {
+	const token = "status-coordination-test"
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(torrentIDKey(token, H), "77", time.Hour)
+	var calls atomic.Int32
+	store := &torBoxStore{token: token, api: torboxAPI, cache: cache,
+		client: mockDoer{func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			time.Sleep(20 * time.Millisecond)
+			return resp(200, `{"data":{"progress":0.5,"download_finished":false}}`), nil
+		}}}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, answer := store.StatusAnswer(context.Background(), ResolveTarget{InfoHash: H}); answer != statusDownloading {
+				t.Errorf("answer = %v, want downloading", answer)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("20 concurrent viewers made %d status calls, want 1", got)
+	}
+	if _, answer := store.StatusAnswer(context.Background(), ResolveTarget{InfoHash: H}); answer != statusDownloading {
+		t.Fatalf("snapshot answer = %v", answer)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("warm snapshot made another call: %d", got)
 	}
 }
 

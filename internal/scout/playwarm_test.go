@@ -138,9 +138,8 @@ func TestPlay_theHeldStepNeverAddsEvenForAStaleID(t *testing.T) {
 	}
 }
 
-// A download in progress keeps its one-call poll. The held step would cost a failing link request on
-// every poll, so once /play has answered "downloading" it goes straight to the status read until the
-// wait is over.
+// A download in progress reuses the bounded status snapshot. The held step would cost a failing link
+// request on every poll, while asking mylist every two seconds used 30 calls/minute/viewer.
 func TestPlay_aDownloadInProgressIsPolledWithTheStatusReadAlone(t *testing.T) {
 	hash := repeat("a", 40)
 	h, calls := heldTorBoxPlay(hash, func(r *http.Request) *http.Response {
@@ -164,7 +163,7 @@ func TestPlay_aDownloadInProgressIsPolledWithTheStatusReadAlone(t *testing.T) {
 	if rr := do(h, playPath, nil); rr.Code != http.StatusAccepted {
 		t.Fatalf("second poll: %d, want 202", rr.Code)
 	}
-	if want := []string{"mylist"}; !sameCalls(*calls, want) {
-		t.Errorf("second poll calls = %v, want %v", *calls, want)
+	if len(*calls) != 0 {
+		t.Errorf("second poll calls = %v, want the shared snapshot with no upstream call", *calls)
 	}
 }

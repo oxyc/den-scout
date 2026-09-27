@@ -1484,11 +1484,27 @@ func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) 
 		cache.Put(key, joinCached(complete, time.Now().Add(-past).Unix(), etag, body), 24*time.Hour)
 	}
 
-	// A healthy rebuild past the stale window answers with the new list, not the held one.
+	// A useful complete list answers immediately throughout its retained window; a healthy rebuild lands
+	// behind that response, so the next request gets the fresh list.
 	age(5 * time.Minute)
 	rebuilt := do(h, path, nil)
-	if got := rebuilt.Header().Get("X-Den-Degraded"); got != "" || !strings.Contains(rebuilt.Header().Get("cache-control"), "max-age=300") {
-		t.Errorf("healthy rebuild: degraded %q, cache-control %q", got, rebuilt.Header().Get("cache-control"))
+	if got := rebuilt.Header().Get("X-Den-Degraded"); got != "stale_list" {
+		t.Errorf("healthy background rebuild: degraded %q", got)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, freshUntil, _, _ := splitCached(func() string { v, _ := cache.Get(key); return v }()); freshUntil > time.Now().Unix() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("healthy background rebuild did not land")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if fresh := do(h, path, nil); fresh.Header().Get("X-Den-Degraded") != "" ||
+		!strings.Contains(fresh.Header().Get("cache-control"), "max-age=300") {
+		t.Errorf("fresh response after rebuild: degraded %q, cache-control %q",
+			fresh.Header().Get("X-Den-Degraded"), fresh.Header().Get("cache-control"))
 	}
 
 	down.Store(true)
@@ -1513,6 +1529,10 @@ func TestStreamList_servesTheLastCompleteListWhenNoIndexerAnswers(t *testing.T) 
 	}
 	if cc := stale.Header().Get("cache-control"); cc != "private, max-age=60" {
 		t.Errorf("cache-control = %q, want private, max-age=60", cc)
+	}
+	deadline = time.Now().Add(time.Second)
+	for scrapes.Load() != before+1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
 	if scrapes.Load() != before+1 {
 		t.Errorf("scraped %d times for the outage answer, want 1", scrapes.Load()-before)

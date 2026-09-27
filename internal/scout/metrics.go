@@ -36,6 +36,12 @@ var (
 	}
 )
 
+var (
+	metricTorboxEndpoints = []string{"checkcached", "mylist_account", "mylist_id", "requestdl", "createtorrent", "user"}
+	metricTorboxOutcomes  = []string{"ok", "error"}
+	metricTorboxAvoided   = []string{"availability_default", "status_snapshot", "checkcached_singleflight", "checkcached_batch", "probe_frontier"}
+)
+
 type metricSet struct {
 	listCacheHit   atomic.Int64
 	listCacheStale atomic.Int64
@@ -55,8 +61,14 @@ type metricSet struct {
 
 	// Adds scout's own budget refused, by intent: a viewer waiting (the budget spent) or a prefetch (held
 	// back by the reserve kept for Play).
-	addRefusedPlay     atomic.Int64
-	addRefusedPrefetch atomic.Int64
+	addRefusedPlay      atomic.Int64
+	addRefusedPrefetch  atomic.Int64
+	torboxStatusAvoided atomic.Int64
+	torboxStatusActive  atomic.Int64
+	torboxStatusWaiters atomic.Int64
+
+	torboxCalls   map[string]map[string]*atomic.Int64
+	torboxAvoided map[string]*atomic.Int64
 
 	// Fixed keys, populated once at construction and never written again, so concurrent reads need no
 	// lock. Every indexer this build knows about gets an entry whether or not any install names it —
@@ -91,6 +103,11 @@ func newMetricSet() *metricSet {
 		indexerFailures: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
 		indexerReleases: make(map[Indexer]*atomic.Int64, len(metricIndexers)),
 		sourceCoverage:  make(map[Indexer]map[string]*atomic.Int64, len(metricIndexers)),
+		torboxCalls:     make(map[string]map[string]*atomic.Int64, len(metricTorboxEndpoints)),
+		torboxAvoided:   fixedSeries(metricTorboxAvoided),
+	}
+	for _, endpoint := range metricTorboxEndpoints {
+		m.torboxCalls[endpoint] = fixedSeries(metricTorboxOutcomes)
 	}
 	for _, id := range metricIndexers {
 		m.indexerRequests[id] = new(atomic.Int64)
@@ -102,6 +119,22 @@ func newMetricSet() *metricSet {
 	m.releaseResolution = fixedSeries(metricResolutions)
 	m.releaseAudio = fixedSeries(metricAudioCodecs)
 	return m
+}
+
+func (m *metricSet) torboxCall(endpoint string, ok bool) {
+	outcome := "error"
+	if ok {
+		outcome = "ok"
+	}
+	if c := m.torboxCalls[endpoint][outcome]; c != nil {
+		c.Add(1)
+	}
+}
+
+func (m *metricSet) torboxAvoid(reason string) {
+	if c := m.torboxAvoided[reason]; c != nil {
+		c.Add(1)
+	}
 }
 
 // fixedSeries is one counter per value, built once so the request path only ever reads this map.
@@ -184,6 +217,23 @@ func (m *metricSet) render(cachePersistent int) string {
 		})
 	counter(&b, "scout_background_panics_total", "Panics recovered on a background goroutine (probe fan-out, stale list rebuild, account listing fetch).",
 		[][2]string{{"", num(m.backgroundPanic.Load())}})
+
+	torboxCalls := make([][2]string, 0, len(metricTorboxEndpoints)*len(metricTorboxOutcomes))
+	for _, endpoint := range metricTorboxEndpoints {
+		for _, outcome := range metricTorboxOutcomes {
+			torboxCalls = append(torboxCalls, [2]string{`endpoint="` + endpoint + `",outcome="` + outcome + `"`,
+				num(m.torboxCalls[endpoint][outcome].Load())})
+		}
+	}
+	counter(&b, "scout_debrid_calls_total", "Debrid API calls by fixed endpoint and outcome.", torboxCalls)
+	counter(&b, "scout_debrid_calls_avoided_total", "Debrid API calls avoided by coordination or request policy.",
+		series(m.torboxAvoided, metricTorboxAvoided, "reason"))
+	b.WriteString("# HELP scout_debrid_status_active Active shared status reads.\n")
+	b.WriteString("# TYPE scout_debrid_status_active gauge\n")
+	b.WriteString("scout_debrid_status_active " + num(m.torboxStatusActive.Load()) + "\n")
+	b.WriteString("# HELP scout_debrid_status_waiters Requests waiting on shared status reads.\n")
+	b.WriteString("# TYPE scout_debrid_status_waiters gauge\n")
+	b.WriteString("scout_debrid_status_waiters " + num(m.torboxStatusWaiters.Load()) + "\n")
 
 	reqs := make([][2]string, 0, len(metricIndexers))
 	fails := make([][2]string, 0, len(metricIndexers))

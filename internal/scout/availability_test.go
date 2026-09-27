@@ -66,6 +66,79 @@ func TestAvailability_checksBehindTheReply(t *testing.T) {
 	waitForVerdict(t, h, validBlob, "tt1234567", "available")
 }
 
+type availabilityCountingStore struct{ checks *atomic.Int32 }
+
+func (s availabilityCountingStore) Service() DebridService { return ServiceTorBox }
+func (s availabilityCountingStore) CacheCheck(context.Context, []string) (map[string]bool, error) {
+	s.checks.Add(1)
+	return map[string]bool{}, nil
+}
+func (availabilityCountingStore) Resolve(context.Context, ResolveTarget) (string, error) {
+	return "", errors.New("unused")
+}
+func (availabilityCountingStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}
+
+func TestAvailability_defaultCostsNoDebridCacheCheck(t *testing.T) {
+	var checks atomic.Int32
+	config := blob(`{"debrid":[{"service":"torbox","token":"tb"}],"indexers":["torrentio"],"cachedOnly":false}`)
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = countingScraper(new(atomic.Int32), testSeeds(), nil)
+		d.MakeStores = func(*Config) []Store { return []Store{availabilityCountingStore{checks: &checks}} }
+	}))
+	waitForVerdict(t, h, config, "tt1234567", "available")
+	if got := checks.Load(); got != 0 {
+		t.Fatalf("default availability made %d debrid cache checks, want zero", got)
+	}
+}
+
+type availabilityTruthStore struct {
+	checks *atomic.Int32
+	seen   chan []string
+	held   string
+}
+
+func (s availabilityTruthStore) Service() DebridService { return ServiceTorBox }
+func (s availabilityTruthStore) CacheCheck(_ context.Context, hashes []string) (map[string]bool, error) {
+	s.checks.Add(1)
+	s.seen <- append([]string(nil), hashes...)
+	out := make(map[string]bool, len(hashes))
+	for _, hash := range hashes {
+		out[hash] = hash == s.held
+	}
+	return out, nil
+}
+func (availabilityTruthStore) Resolve(context.Context, ResolveTarget) (string, error) {
+	return "", errors.New("unused")
+}
+func (availabilityTruthStore) Status(context.Context, ResolveTarget) (StoreStatus, bool) {
+	return StoreStatus{}, false
+}
+
+func TestAvailability_cachedOnlyFiltersBeforeItsFirstCacheCheck(t *testing.T) {
+	var checks atomic.Int32
+	held := strings.Repeat("f", 40)
+	streams := make([]RawStream, 0, 121)
+	for i := 0; i < 120; i++ {
+		streams = append(streams, RawStream{InfoHash: fmt.Sprintf("%040x", i+1), Title: "CAM release"})
+	}
+	streams = append(streams, RawStream{InfoHash: held, Title: "Movie.2026.1080p.WEB-DL"})
+	seen := make(chan []string, 2)
+	store := availabilityTruthStore{checks: &checks, seen: seen, held: held}
+	h := NewHandler(testDeps(func(d *Deps) {
+		d.MakeScrapers = countingScraper(new(atomic.Int32), streams, nil)
+		d.MakeStores = func(*Config) []Store { return []Store{store} }
+	}))
+	waitForVerdict(t, h, validBlob, "tt1234567", "available")
+	if got := checks.Load(); got != 1 {
+		t.Fatalf("cache checks = %d, want one batch ending at the first positive", got)
+	}
+	if hashes := <-seen; len(hashes) != 1 || hashes[0] != held {
+		t.Fatalf("cache check saw %d hashes (%v), want only the one release surviving filters", len(hashes), hashes)
+	}
+}
+
 // Every indexer answering with nothing is a verdict. A failed scrape is not: it stays unknown, and holds
 // off the next check rather than scraping again on every ask.
 func TestAvailability_emptyIsUnavailableButAFailureIsUnknown(t *testing.T) {

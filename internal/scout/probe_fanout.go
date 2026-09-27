@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -14,6 +16,7 @@ import (
 // the ones a viewer actually considers are at the top — probing all twenty would spend a debrid resolve
 // apiece to describe releases nobody scrolls to.
 const probeTopN = 6
+const browserProbeFrontier = 3
 
 // How long the whole fan-out may take. It runs BEHIND the response now, so this bounds the background
 // work rather than the client's wait — see probeTop.
@@ -38,20 +41,64 @@ const probeTTL = 720 * time.Hour
 // nobody parses — all leave the entry exactly as the indexer described it.
 //
 // It reports whether probing is on at all, so Server-Timing names the phase only when there was one.
+func (h *handler) hydrateProbeFacts(streams []RawStream, sid *StreamID) {
+	if h.deps.Cache == nil {
+		return
+	}
+	for i := range streams {
+		if streams[i].InfoHash == "" {
+			continue
+		}
+		if raw, ok := h.deps.Cache.Get(probeCacheKey(&streams[i], sid)); ok {
+			var probe Probe
+			if json.Unmarshal([]byte(raw), &probe) == nil {
+				streams[i].Probe = &probe
+				metrics.probeCacheHit.Add(1)
+			}
+		}
+	}
+}
+
 func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStream, sid *StreamID,
 	truth CacheTruth) bool {
+	h.hydrateProbeFacts(streams, sid)
+	return h.probeTopForClient(ctx, config, streams, sid, truth, nil)
+}
+
+func (h *handler) probeTopForClient(ctx context.Context, config *Config, streams []RawStream, sid *StreamID,
+	truth CacheTruth, client *ClientPlayable) bool {
 	// Opt-in: no client, no probing. Probing costs a debrid RESOLVE per release, so it must never happen
 	// by accident — a caller that hasn't asked for it (a test, an embedder) gets the old behaviour
 	// exactly, and the stream list is built without touching the debrid account at all.
 	if h.deps.ProbeClient == nil || h.deps.MakeStores == nil {
 		return false
 	}
+	frontier := make(map[int]bool)
+	// For a browser, probes exist to settle the compatibility decision at the head of the ranked list,
+	// not to annotate everything below it. Only an unresolved release whose optimistic (zero conversion
+	// cost) score can displace the current winner belongs to that decision. Three contenders bound the
+	// cold fan-out at half the former six calls; cached facts for every candidate were already hydrated
+	// before ranking. The TV keeps the six-release validation window because it provides no client
+	// capability report from which to define a narrower frontier.
+	if client != nil {
+		frontier = browserProbeCandidates(streams, config, client)
+	} else {
+		for i := 0; i < min(len(streams), probeTopN); i++ {
+			frontier[i] = true
+		}
+	}
 	var pending []probeJob
 	for i := range streams {
-		if i >= probeTopN {
-			break
+		if !frontier[i] {
+			if streams[i].Cached && streams[i].Probe == nil {
+				metrics.torboxAvoid("probe_frontier")
+			}
+			continue
 		}
 		s := &streams[i]
+		if s.Probe != nil {
+			continue
+		}
 		// Only probe what the store ALREADY holds. Probing resolves, and resolving a release the account
 		// does not hold ADDS it — so this read path was queueing up to six torrents per newly-viewed
 		// title, against a sixty-an-hour ceiling. Browsing did it; opening a ten-episode season did it
@@ -69,14 +116,6 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 			continue
 		}
 		key := probeCacheKey(s, sid)
-		if raw, ok := h.deps.Cache.Get(key); ok {
-			metrics.probeCacheHit.Add(1)
-			var p Probe
-			if json.Unmarshal([]byte(raw), &p) == nil {
-				s.Probe = &p
-			}
-			continue
-		}
 		metrics.probeCacheMiss.Add(1)
 		// WHICH services hold it, not just that one does. `s.Cached` is the union across accounts, so on a
 		// two-account install a release only the second holds still reads as cached here — and resolving
@@ -102,6 +141,51 @@ func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStr
 		h.probeBehind(config, pending)
 	}
 	return true
+}
+
+func browserProbeCandidates(streams []RawStream, config *Config, client *ClientPlayable) map[int]bool {
+	frontier := make(map[int]bool, browserProbeFrontier)
+	if len(streams) == 0 {
+		return frontier
+	}
+	type candidate struct {
+		index      int
+		optimistic int
+	}
+	score := func(stream RawStream, includeClient bool) int {
+		lower := strings.ToLower(stream.Title)
+		out := qualityScoreLower(lower, stream, junkClassOf(lower))
+		if prefer := config.Filters.PreferResolution; prefer != "" {
+			if resolution := detectResolutionLower(lower); resolution != "" && resolution != prefer {
+				out -= preferenceSink
+			}
+		}
+		if includeClient {
+			out -= client.cost(stream, streamAttributes(stream))
+		}
+		return out
+	}
+	winner := score(streams[0], true)
+	var candidates []candidate
+	for i, stream := range streams {
+		if stream.Probe != nil {
+			continue
+		}
+		if i == 0 {
+			frontier[0] = true
+			continue
+		}
+		optimistic := score(stream, false)
+		if optimistic > winner {
+			candidates = append(candidates, candidate{index: i, optimistic: optimistic})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].optimistic > candidates[j].optimistic })
+	remaining := browserProbeFrontier - len(frontier)
+	for _, candidate := range candidates[:min(len(candidates), remaining)] {
+		frontier[candidate.index] = true
+	}
+	return frontier
 }
 
 // probeJob is a copy, deliberately: the background work must not reach into the response's slice, which

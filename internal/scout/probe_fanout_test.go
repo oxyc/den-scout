@@ -37,8 +37,7 @@ func TestProbeTop_optIn(t *testing.T) {
 	}
 }
 
-// Only the top of the list is probed. The order is the one the viewer sees, so probing all twenty would
-// spend a resolve apiece describing releases nobody scrolls to.
+// Every already-cached fact is hydrated before ranking; this is local cache IO, not a debrid probe.
 func TestProbeTop_capsAtTopN(t *testing.T) {
 	streams := make([]RawStream, 20)
 	for i := range streams {
@@ -60,8 +59,8 @@ func TestProbeTop_capsAtTopN(t *testing.T) {
 			probed++
 		}
 	}
-	if probed != probeTopN {
-		t.Fatalf("probed %d releases, want the top %d only", probed, probeTopN)
+	if probed != len(streams) {
+		t.Fatalf("hydrated %d cached probe facts, want all %d", probed, len(streams))
 	}
 }
 
@@ -81,6 +80,24 @@ func TestProbeTop_cacheHitSkipsResolve(t *testing.T) {
 	}
 	if streams[0].Probe == nil || len(streams[0].Probe.Audio) != 1 || streams[0].Probe.Audio[0] != "it" {
 		t.Fatalf("cache hit not applied: %+v", streams[0].Probe)
+	}
+}
+
+func TestBrowserProbeFrontier_isDecisionDirectedAndBounded(t *testing.T) {
+	client := &ClientPlayable{H264: 51}
+	streams := []RawStream{{Title: "Movie.1080p.x264"}}
+	for i := 0; i < 8; i++ {
+		streams = append(streams, RawStream{Title: "Movie.2160p.REMUX.HEVC", Seeders: intp(100 - i)})
+	}
+	frontier := browserProbeCandidates(streams, &Config{}, client)
+	if len(frontier) != browserProbeFrontier {
+		t.Fatalf("frontier has %d candidates, want the bound %d: %v", len(frontier), browserProbeFrontier, frontier)
+	}
+	if !frontier[0] {
+		t.Fatal("the unresolved current winner is absent from its own decision frontier")
+	}
+	if !frontier[1] {
+		t.Fatal("a compatibility-sunk 4K contender that can displace the winner was not selected")
 	}
 }
 

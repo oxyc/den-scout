@@ -103,9 +103,9 @@ func verdictPrefix(config *Config) string {
 
 func (h *handler) recordVerdict(key string, available bool) {
 	if available {
-		h.deps.Cache.Put(key, verdictAvailable, availableTTL)
+		cachePut(h.deps.Cache, key, verdictAvailable, availableTTL, CacheDurable)
 	} else {
-		h.deps.Cache.Put(key, verdictUnavailable, unavailableTTL)
+		cachePut(h.deps.Cache, key, verdictUnavailable, unavailableTTL, CacheVolatile)
 	}
 }
 
@@ -113,7 +113,7 @@ func (h *handler) recordVerdict(key string, available bool) {
 // covers a nonempty scrape whose surviving releases were all removed by the viewer's filters.
 func (h *handler) recordListVerdict(key string, list rankedList) {
 	if list.degraded != "" || (len(list.ranked) == 0 && !list.complete) {
-		h.deps.Cache.Put(key, verdictUndetermined, availabilityRetryAfter)
+		cachePut(h.deps.Cache, key, verdictUndetermined, availabilityRetryAfter, CacheVolatile)
 		return
 	}
 	h.recordVerdict(key, len(list.ranked) > 0)
@@ -146,7 +146,55 @@ func (h *handler) checkBehind(config *Config, imdb, key string) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
-		list := h.rankList(ctx, config, &StreamID{Type: "movie", IMDb: imdb}, nil, nil)
+		// Cache truth only changes ordering unless the install explicitly asks for cached-only results.
+		// Availability is a boolean, so the default path can answer without spending a debrid cache check.
+		if !config.CachedOnly && configHasService(config, ServiceTorBox) {
+			metrics.torboxAvoid("availability_default")
+		}
+		list := h.rankAvailability(ctx, config, &StreamID{Type: "movie", IMDb: imdb})
 		h.recordListVerdict(key, list)
 	}()
+}
+
+func (h *handler) rankAvailability(ctx context.Context, config *Config, sid *StreamID) rankedList {
+	if !config.CachedOnly || !hasCacheTruth(config) {
+		return h.rankList(ctx, config, sid, nil, nil, false)
+	}
+	// Apply every ordinary filter before asking the debrid, but do not let the display cap hide a lower
+	// ranked held release: availability asks whether ANY playable candidate exists, not which twenty to
+	// show. Cache truth is then read one provider-sized batch at a time and stops on the first certain yes.
+	filterConfig := *config
+	filterConfig.CachedOnly = false
+	filterConfig.ResultCap = maxSeeds
+	list := h.rankList(ctx, &filterConfig, sid, nil, nil, false)
+	if list.degraded != "" || len(list.ranked) == 0 {
+		return list
+	}
+	pool := &StorePool{stores: h.deps.MakeStores(config)}
+	unknown := false
+	for start := 0; start < len(list.ranked); start += cacheBatch {
+		end := min(start+cacheBatch, len(list.ranked))
+		hashes := make([]string, end-start)
+		for i := start; i < end; i++ {
+			hashes[i-start] = list.ranked[i].InfoHash
+		}
+		truth, ok := pool.CacheCheck(ctx, hashes)
+		for i, hash := range hashes {
+			if truth.Cached(hash) {
+				stream := list.ranked[start+i]
+				stream.Cached, stream.CacheKnown = true, true
+				list.ranked = []RawStream{stream}
+				list.truth = truth
+				return list
+			}
+		}
+		if !ok || !truth.Complete() {
+			unknown = true
+		}
+	}
+	list.ranked = nil
+	if unknown {
+		list.degraded = "cache-check"
+	}
+	return list
 }

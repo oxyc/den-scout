@@ -698,6 +698,21 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		// Past the stale window a complete list is held only as a last resort: rebuild in the foreground, as on
 		// a miss, and fall back to it only if no indexer answers.
 		if complete && freshUntil > 0 && time.Now().Unix() >= freshUntil+int64(staleWindowFor(h.deps.ListTTL)/time.Second) {
+			// A useful complete list stays immediately usable throughout its ticket-safe hold. Refresh it
+			// behind the response exactly like ordinary SWR; an empty answer still rebuilds in front because
+			// stale emptiness is not useful and may hide a newly released title.
+			if cachedListNonempty(body) && time.Now().Before(time.Unix(freshUntil, 0).Add(h.outageHold)) {
+				metrics.listCacheHit.Add(1)
+				metrics.listCacheStale.Add(1)
+				h.rebuildBehind(r, configBlob, sid, origin, cacheKey)
+				w.Header().Set("X-Den-Degraded", "stale_list")
+				if relabelled, ok := staleBody(body, "stale_list"); ok {
+					body, etag = relabelled, etagFor(relabelled)
+				}
+				w.Header().Set("server-timing", "cache;desc=stale_list, total;dur="+msDur(time.Since(start)))
+				h.conditional(w, r, body, etag, jsonType, staleListCache)
+				return
+			}
 			metrics.listCacheMiss.Add(1)
 			h.lastResort(w, r, start, configBlob, sid, origin, cacheKey, freshUntil, etag, body)
 			return
@@ -747,6 +762,13 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil, client), nil
 	})
 	h.writeBuilt(w, r, start, v.(buildResult))
+}
+
+func cachedListNonempty(body string) bool {
+	var answer struct {
+		Streams []json.RawMessage `json:"streams"`
+	}
+	return json.Unmarshal([]byte(body), &answer) == nil && len(answer.Streams) > 0
 }
 
 // lastResort answers a request for a complete list that is past its stale window: a foreground build, as on
@@ -906,7 +928,7 @@ type buildResult struct {
 // the result is NOT cached — a debug build is a diagnostic, not an entry other viewers should be served.
 func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin,
 	cacheKey string, dbg *rankDebug, client *ClientPlayable) buildResult {
-	list := h.rankList(ctx, config, sid, dbg, client)
+	list := h.rankList(ctx, config, sid, dbg, client, true)
 	// A movie's list answers the availability route's question too, so a title someone opened needs no
 	// check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one, nor
 	// one ranked for a browser, whose cap may have kept different releases.
@@ -921,6 +943,7 @@ func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlo
 type rankedList struct {
 	ranked []RawStream
 	truth  CacheTruth
+	client *ClientPlayable
 	// degraded — why the list cannot be trusted, "" when it can (buildResult's vocabulary).
 	degraded string
 	complete bool
@@ -932,7 +955,8 @@ type rankedList struct {
 // changes anything on the debrid: the cache check is a read. Both answers are cached on their own (each
 // indexer's in scrapeAllCached, each held release in the stores), so ranking the same title another way asks
 // nobody again.
-func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, dbg *rankDebug, client *ClientPlayable) rankedList {
+func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, dbg *rankDebug,
+	client *ClientPlayable, checkCache bool) rankedList {
 	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
 	phase := time.Now()
 	scraped := scrapeCovered(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout, h.deps.Cache, h.deps.ListTTL)
@@ -958,23 +982,27 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 		seeds = capSeeds(seeds, maxSeeds)
 	}
 
-	pool := &StorePool{stores: h.deps.MakeStores(config)}
-	hashes := make([]string, len(seeds))
-	for i, s := range seeds {
-		hashes[i] = s.InfoHash
-	}
-	phase = time.Now()
-	truth, truthOK := pool.CacheCheck(ctx, hashes)
-	timing += ", cache-check;dur=" + msDur(time.Since(phase))
-	for i := range seeds {
-		hash := seeds[i].InfoHash
-		seeds[i].Cached = truth.Cached(hash)
-		// Whether that false means "not held" or "nobody could ask" is decided here, once, and carried —
-		// rather than being re-guessed by every consumer from a header they may not have. Per HASH, not
-		// per request: the checks are batched, so one failed batch leaves 100 releases unknown while the
-		// rest of the list is perfectly well known. Stamping the request-wide `truthOK` on all of them
-		// asserted the answer for exactly the hashes nobody had an answer for.
-		seeds[i].CacheKnown = truth.Known(hash)
+	truth := CacheTruth{holders: map[string][]DebridService{}, known: map[string]bool{}, complete: true}
+	truthOK := true
+	if checkCache {
+		pool := &StorePool{stores: h.deps.MakeStores(config)}
+		hashes := make([]string, len(seeds))
+		for i, s := range seeds {
+			hashes[i] = s.InfoHash
+		}
+		phase = time.Now()
+		truth, truthOK = pool.CacheCheck(ctx, hashes)
+		timing += ", cache-check;dur=" + msDur(time.Since(phase))
+		for i := range seeds {
+			hash := seeds[i].InfoHash
+			seeds[i].Cached = truth.Cached(hash)
+			// Whether that false means "not held" or "nobody could ask" is decided here, once, and carried —
+			// rather than being re-guessed by every consumer from a header they may not have. Per HASH, not
+			// per request: the checks are batched, so one failed batch leaves 100 releases unknown while the
+			// rest of the list is perfectly well known. Stamping the request-wide `truthOK` on all of them
+			// asserted the answer for exactly the hashes nobody had an answer for.
+			seeds[i].CacheKnown = truth.Known(hash)
+		}
 	}
 	// A degraded upstream (every indexer failed, or every cache-truth store's check failed) yields a
 	// misleading empty/partial list; return it for this request but don't cache it, so the next request
@@ -1007,12 +1035,12 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 	// A cache-truth store being entirely OUT is an outage too, even when the others answer normally:
 	// their replies cannot rule anything out on its behalf. Treating that as an ordinary answer let a
 	// cachedOnly request return an empty list, with no degraded header, cached for the full TTL.
-	truthOut := hasCacheTruth(config) && (!truthOK || !truth.Complete())
+	truthOut := checkCache && hasCacheTruth(config) && (!truthOK || !truth.Complete())
 	// audit #4: with no cache-truth store (RD-only), the cached-only filter would drop everything. Also
 	// skip it when the cache-truth stores are unreachable ENTIRELY (don't drop everything on a blip). A
 	// partial failure keeps the filter on — the per-hash CacheKnown check inside it drops only what is
 	// known not to be held, and keeps what nobody could ask about.
-	effCachedOnly := config.CachedOnly && hasCacheTruth(config) && !truthOut
+	effCachedOnly := checkCache && config.CachedOnly && hasCacheTruth(config) && !truthOut
 	// RD-only: drop releases RD blocks by filename (they'd 404 at resolve).
 	if rdOnly(config) {
 		var kept []RawStream
@@ -1044,6 +1072,10 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 		}
 	}
 
+	// Probe facts are ranking inputs, not decorations. Hydrate every locally-known fact before the
+	// client compatibility cost is computed; the old order ranked first and discovered the fact only
+	// afterward, so a warm probe could not affect the list it was attached to.
+	h.hydrateProbeFacts(seeds, sid)
 	ranked := rankStreams(seeds, rankFilters{
 		ExcludeCam:          config.Filters.ExcludeCam,
 		Resolutions:         config.Filters.Resolutions,
@@ -1067,7 +1099,7 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 	// still marked the response degraded — which means not cached, which means the next /stream re-runs
 	// the whole eight-second scrape. That is a user-visible cost paid for a fact about nothing.
 	unchecked := 0
-	if hasCacheTruth(config) {
+	if checkCache && hasCacheTruth(config) {
 		for i := range ranked {
 			if !ranked[i].CacheKnown {
 				unchecked++
@@ -1101,7 +1133,7 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 			config.Filters.Resolutions, config.Filters.MinSeeders, config.Filters.MaxSizeGB,
 			config.Filters.ExcludeCam, config.Filters.HDROnly)
 	}
-	return rankedList{ranked: ranked, truth: truth, degraded: degradedReason, complete: scrapeComplete, coverage: cov,
+	return rankedList{ranked: ranked, truth: truth, client: client, degraded: degradedReason, complete: scrapeComplete, coverage: cov,
 		timing: timing}
 }
 
@@ -1114,7 +1146,7 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 	// Ask the top few releases what they actually contain. After ranking, so the probe follows the order
 	// the viewer will see; before serialisation, so a cached probe rides along in this same response.
 	phase := time.Now()
-	if h.probeTop(ctx, config, ranked, sid, truth) {
+	if h.probeTopForClient(ctx, config, ranked, sid, truth, list.client) {
 		timing += ", probe;dur=" + msDur(time.Since(phase))
 	}
 
