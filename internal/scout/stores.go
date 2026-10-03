@@ -2323,7 +2323,7 @@ func (s *torBoxStore) countActiveTorrents(ctx context.Context) (int, error) {
 	}
 	n := 0
 	for _, e := range body.Data {
-		if e.Active != nil && *e.Active && !(e.DownloadFinished != nil && *e.DownloadFinished) {
+		if e.Active != nil && *e.Active && (e.DownloadFinished == nil || !*e.DownloadFinished) {
 			n++
 		}
 	}
