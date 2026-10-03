@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"runtime"
 	"strings"
@@ -680,6 +681,115 @@ func TestTorBoxStatus(t *testing.T) {
 		t.Error("an unknown infohash must not report a download")
 	}
 }
+
+// TorBox's documented download states collapse onto the stable set the 202 body carries. A failed download
+// must never read as a stall, and anything unrecognised stays "downloading", the value old clients know.
+func TestTorboxFetchState(t *testing.T) {
+	cases := map[string]string{
+		"downloading":         fetchDownloading,
+		"Downloading":         fetchDownloading,
+		"stalled (no seeds)":  fetchStalled,
+		"Stalled (No Seeds)":  fetchStalled,
+		"paused":              fetchStalled,
+		"metaDL":              fetchFetching,
+		"checkingResumeData":  fetchFetching,
+		"queued":              fetchQueued,
+		"failed":              fetchFailed,
+		"Failed (Processing)": fetchFailed,
+		"error":               fetchFailed,
+		"expired":             fetchFailed,
+		"(Reported) Missing":  fetchFailed,
+		"incomplete":          fetchFailed,
+		"uploading":           fetchDownloading,
+		"completed":           fetchDownloading,
+		"":                    fetchDownloading,
+		"something new":       fetchDownloading,
+	}
+	for raw, want := range cases {
+		if got := torboxFetchState(raw); got != want {
+			t.Errorf("torboxFetchState(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestRDFetchState(t *testing.T) {
+	cases := map[string]string{
+		"queued":            fetchQueued,
+		"magnet_conversion": fetchFetching,
+		"downloading":       fetchDownloading,
+		"compressing":       fetchDownloading,
+		"uploading":         fetchDownloading,
+	}
+	for raw, want := range cases {
+		if got := rdFetchState(raw); got != want {
+			t.Errorf("rdFetchState(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+// Status carries TorBox's state and swarm through, rather than reducing every wait to a percentage.
+func TestTorBoxStatusCarriesStateAndSwarm(t *testing.T) {
+	cases := []struct {
+		name, body, wantState string
+		wantSeeds, wantPeers  *int
+	}{
+		{"stalled, empty swarm",
+			`{"data":{"progress":0,"download_finished":false,"eta":8640000,"download_speed":0,` +
+				`"download_state":"stalled (no seeds)","seeds":0,"peers":0}}`, fetchStalled, ptr(0), ptr(0)},
+		{"failed", `{"data":{"progress":0.3,"download_finished":false,"download_state":"failed"}}`,
+			fetchFailed, nil, nil},
+		{"metadata", `{"data":{"progress":0,"download_finished":false,"download_state":"metaDL","seeds":4}}`,
+			fetchFetching, ptr(4), nil},
+		{"no state named", `{"data":{"progress":0.4,"download_finished":false}}`, "", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCache(1 << 16)
+			cache.Put(torrentIDKey("t", H), "7", time.Hour)
+			s := &torBoxStore{token: "t", cache: cache, api: torboxAPI, client: mockDoer{
+				fn: func(*http.Request) (*http.Response, error) { return resp(200, tc.body), nil },
+			}}
+			got, ok := s.Status(context.Background(), ResolveTarget{InfoHash: H})
+			if !ok {
+				t.Fatal("a download TorBox reports on must be a wait")
+			}
+			if got.State != tc.wantState {
+				t.Errorf("state = %q, want %q", got.State, tc.wantState)
+			}
+			if !sameCount(got.Seeds, tc.wantSeeds) || !sameCount(got.Peers, tc.wantPeers) {
+				t.Errorf("seeds/peers = %v/%v, want %v/%v", got.Seeds, got.Peers, tc.wantSeeds, tc.wantPeers)
+			}
+		})
+	}
+}
+
+// The 202 body names the state and the swarm when the store knew them, and omits the counts when it didn't.
+func TestQueuedBodyCarriesStateAndSwarm(t *testing.T) {
+	decode := func(status StoreStatus) map[string]any {
+		rr := httptest.NewRecorder()
+		writeQueuedBody(rr, status)
+		var body map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	stalled := decode(StoreStatus{State: fetchStalled, Seeds: ptr(0), Peers: ptr(2)})
+	if stalled["state"] != "stalled" || stalled["seeds"] != 0.0 || stalled["peers"] != 2.0 {
+		t.Errorf("stalled body: %v", stalled)
+	}
+	plain := decode(StoreStatus{Progress: 0.5})
+	if plain["state"] != "downloading" {
+		t.Errorf("a store naming no state must still answer downloading: %v", plain)
+	}
+	if _, ok := plain["seeds"]; ok {
+		t.Errorf("unknown seeds must be omitted, not zero: %v", plain)
+	}
+}
+
+func ptr(n int) *int { return &n }
+
+func sameCount(a, b *int) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
 
 // Losing the cached torrent id is not losing the download: a redeploy or a pruned cache used to turn a
 // perfectly healthy fetch into a 404, which a client can only read as a dead link. The id is rediscovered

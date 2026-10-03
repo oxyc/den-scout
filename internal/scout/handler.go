@@ -1226,14 +1226,42 @@ func writeQueued(w http.ResponseWriter, hash string, status StoreStatus) {
 	if status.ETASeconds != nil {
 		eta = fmt.Sprintf("%ds", *status.ETASeconds)
 	}
+	swarm := ""
+	if status.Seeds != nil || status.Peers != nil {
+		swarm = fmt.Sprintf(", seeds %s, peers %s", optionalCount(status.Seeds), optionalCount(status.Peers))
+	}
 	// A waiting client polls every two seconds for the whole fetch, so this is a sample, a line a minute.
-	logLimited("downloading", "play %s → 202 downloading %.1f%% at %s, eta %s",
-		shortHash(hash), status.Progress*100, rate, eta)
+	logLimited("downloading", "play %s → 202 %s %.1f%% at %s, eta %s%s",
+		shortHash(hash), queuedState(status), status.Progress*100, rate, eta, swarm)
 	writeQueuedBody(w, status)
 }
 
+func optionalCount(n *int) string {
+	if n == nil {
+		return "?"
+	}
+	return strconv.Itoa(*n)
+}
+
+// queuedState — the body's `state`: the store's mapped fetch state, or "downloading" when it named none.
+func queuedState(status StoreStatus) string {
+	if status.State == "" {
+		return fetchDownloading
+	}
+	return status.State
+}
+
 func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
-	body := map[string]any{"state": "downloading", "progress": status.Progress}
+	body := map[string]any{"state": queuedState(status), "progress": status.Progress}
+	if status.Service != "" {
+		body["service"] = status.Service
+	}
+	if status.Seeds != nil {
+		body["seeds"] = *status.Seeds
+	}
+	if status.Peers != nil {
+		body["peers"] = *status.Peers
+	}
 	if status.ETASeconds != nil {
 		body["etaSeconds"] = *status.ETASeconds
 	}

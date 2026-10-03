@@ -507,9 +507,10 @@ func TestRoutesPlay(t *testing.T) {
 		State      string  `json:"state"`
 		Progress   float64 `json:"progress"`
 		ETASeconds *int    `json:"etaSeconds"`
+		Service    string  `json:"service"`
 	}
 	if json.Unmarshal(rr.Body.Bytes(), &queuedBody) != nil || queuedBody.State != "downloading" ||
-		queuedBody.Progress != 0.34 {
+		queuedBody.Progress != 0.34 || queuedBody.Service != "torbox" {
 		t.Errorf("queued body: %s", rr.Body.String())
 	}
 	if queuedBody.ETASeconds == nil || *queuedBody.ETASeconds != 420 {
