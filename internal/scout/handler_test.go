@@ -292,7 +292,7 @@ func TestRoutesRejectNonReadMethods(t *testing.T) {
 
 	// HEAD is refused, not answered: what a caller wants here is a `location`, and a HEAD that starts
 	// nothing cannot produce one — so answering it would spend upstream reads for a useless reply.
-	for _, method := range []string{http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete} {
+	for _, method := range []string{http.MethodHead, http.MethodPost, http.MethodPut} {
 		got := doMethod(h, method, playPath, nil)
 		if got.Code != http.StatusMethodNotAllowed {
 			t.Errorf("%s /play: %d, want 405", method, got.Code)
@@ -300,6 +300,11 @@ func TestRoutesRejectNonReadMethods(t *testing.T) {
 		if got.Header().Get("allow") == "" {
 			t.Errorf("%s /play: 405 without an Allow header", method)
 		}
+	}
+	// DELETE is den#204's cancel route, not a plain read: it is handled, never 405'd — and against a
+	// store that cannot cancel (the fake here has no Cancel method) it answers 501, not a resolve.
+	if got := doMethod(h, http.MethodDelete, playPath, nil); got.Code != http.StatusNotImplemented {
+		t.Errorf("DELETE /play: %d, want 501", got.Code)
 	}
 	if resolves != 1 {
 		t.Fatalf("a non-GET verb reached the debrid: %d resolves, want 1", resolves)
@@ -327,7 +332,7 @@ func TestCORS(t *testing.T) {
 		hdr := rr.Header()
 		if rr.Code != http.StatusNoContent || rr.Body.Len() != 0 ||
 			hdr.Get("access-control-allow-origin") != "*" ||
-			hdr.Get("access-control-allow-methods") != "GET, HEAD, POST, OPTIONS" ||
+			hdr.Get("access-control-allow-methods") != "GET, HEAD, POST, DELETE, OPTIONS" ||
 			hdr.Get("access-control-allow-headers") != "*" ||
 			hdr.Get("access-control-max-age") != "86400" {
 			t.Errorf("OPTIONS %s: %d %v", path, rr.Code, hdr)

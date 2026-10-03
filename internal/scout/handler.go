@@ -475,11 +475,18 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	// does nothing but name what may follow, so it cannot reach /play's resolve.
 	if r.Method == http.MethodOptions {
 		hdr := w.Header()
-		hdr.Set("access-control-allow-methods", "GET, HEAD, POST, OPTIONS")
+		hdr.Set("access-control-allow-methods", "GET, HEAD, POST, DELETE, OPTIONS")
 		hdr.Set("access-control-allow-headers", "*")
 		// A day, so a browser stops re-preflighting every request.
 		hdr.Set("access-control-max-age", "86400")
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// DELETE cancels (or, with ?op=reannounce, reannounces) the release a ticket or a legacy play token
+	// names — den#204. Matched ahead of the GET/HEAD-only gate below, which otherwise answers every other
+	// verb with 405; cancel is the one route besides /validate and /availability that is not a read.
+	if r.Method == http.MethodDelete {
+		h.handleCancel(w, r)
 		return
 	}
 	// /validate is the one route that is not a read: it takes a pasted token and asks the service whether
@@ -604,6 +611,8 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		h.handleStream(w, r, configBlob, parts)
 	case "play":
 		h.handlePlay(w, r, configBlob, parts)
+	case "account":
+		h.handleAccount(w, r, configBlob)
 	default:
 		writeJSON(w, http.StatusNotFound, errBody("not_found"), noStore)
 	}
@@ -1737,6 +1746,14 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 			h.writePlayQueued(w, pendingKey, target.InfoHash, StoreStatus{})
 			return
 		}
+		// TorBox parked the add in its own queue (queued_id, not torrent_id — see errAddQueued). Also
+		// "coming", not dead: before this decode existed, the same answer fell through to the final 404
+		// below and the client blacklisted a release TorBox was about to fetch.
+		if errors.Is(err, errAddQueued) {
+			logLimited("play-add-queued", "play %s → 202, queued behind the account's slot limit", shortHash(target.InfoHash))
+			h.writePlayQueued(w, pendingKey, target.InfoHash, StoreStatus{State: fetchQueued})
+			return
+		}
 		// A refusal SCOUT made — its hourly allowance — is not the debrid refusing, and must not be
 		// reported as one. errScoutSide was added to keep these apart in the refusal memory, and then the
 		// route went on saying "torbox" anyway: the app told the viewer the debrid was refusing while
@@ -1862,6 +1879,192 @@ func writePlayRedirect(w http.ResponseWriter, link string) {
 	w.Header().Set("cache-control", noStore)
 	w.Header().Set("content-length", "0")
 	w.WriteHeader(http.StatusFound)
+}
+
+// handleCancel is DELETE /p/<ticket> (and, for parity, DELETE /<config>/play/<token>) — den#204. Both
+// routes open to the same target as their GET siblings and share resolveCancel.
+func (h *handler) handleCancel(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path)
+	if len(parts) == 2 && parts[0] == ticketRoute && h.tickets != nil {
+		h.handleTicketCancel(w, r, parts[1])
+		return
+	}
+	if len(parts) == 3 && parts[1] == "play" {
+		h.handleLegacyCancel(w, r, parts[0], parts[2])
+		return
+	}
+	w.Header().Set("allow", "GET, HEAD")
+	writeJSON(w, http.StatusMethodNotAllowed, errBody("method_not_allowed"), noStore)
+}
+
+func (h *handler) handleTicketCancel(w http.ResponseWriter, r *http.Request, ticket string) {
+	config, target, err := h.tickets.open(ticket, time.Now())
+	if errors.Is(err, errTicketExpired) {
+		writeJSON(w, http.StatusGone, errBody("ticket_expired"), noStore)
+		return
+	}
+	if err != nil || !h.admitInstall(config) {
+		writeJSON(w, http.StatusBadRequest, errBody("bad_ticket"), noStore)
+		return
+	}
+	h.resolveCancel(w, r, config, target)
+}
+
+func (h *handler) handleLegacyCancel(w http.ResponseWriter, r *http.Request, configBlob, token string) {
+	if h.tickets != nil && !h.deps.LegacyPlayUntil.IsZero() && !time.Now().Before(h.deps.LegacyPlayUntil) {
+		writeJSON(w, http.StatusForbidden, errBody("legacy_play_closed"), noStore)
+		return
+	}
+	target, ok := decodePlayToken(token)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, errBody("bad_token"), noStore)
+		return
+	}
+	config, ok := h.openConfig(configBlob)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
+		return
+	}
+	if h.refuseScoped(w, r, config) {
+		return
+	}
+	h.resolveCancel(w, r, config, target)
+}
+
+// resolveCancel is the cancel route's work once a target and its config are admitted. It asks every
+// configured debrid account that can cancel, in configured order, and answers with the first one that has
+// an opinion about this hash — see storeCanceller's own comment for why only TorBox implements it.
+func (h *handler) resolveCancel(w http.ResponseWriter, r *http.Request, config *Config, target *PlayTarget) {
+	reannounce := r.URL.Query().Get("op") == "reannounce"
+	ctx, cancel := context.WithTimeout(r.Context(), statusBudget)
+	defer cancel()
+	stores := h.deps.MakeStores(config)
+	sawCanceller := false
+	for _, st := range stores {
+		c, ok := st.(storeCanceller)
+		if !ok {
+			continue
+		}
+		sawCanceller = true
+		outcome, err := c.Cancel(ctx, target.InfoHash, reannounce)
+		if err != nil {
+			var unavailable *StoreUnavailableError
+			if errors.As(err, &unavailable) {
+				logLimited("cancel-store-unavailable", "cancel %s → 503, %v", shortHash(target.InfoHash), err)
+				writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": unavailable.Service})
+				return
+			}
+			logLimited("cancel-error", "cancel %s → 503, %v", shortHash(target.InfoHash), err)
+			writeUnavailable(w, storeRefusalWait, errBody("store_unavailable"))
+			return
+		}
+		if outcome.Reason == "not_queued" {
+			// This account has no opinion; the hash may still belong to another configured account.
+			continue
+		}
+		writeCancelOutcome(w, target.InfoHash, reannounce, outcome)
+		return
+	}
+	if !sawCanceller {
+		logLimited("cancel-unsupported", "cancel %s → 501, no configured account supports it", shortHash(target.InfoHash))
+		writeJSON(w, http.StatusNotImplemented, errBody("unsupported"), noStore)
+		return
+	}
+	logLimited("cancel", "cancel %s → 404, nothing queued", shortHash(target.InfoHash))
+	writeJSON(w, http.StatusNotFound, errBody("not_queued"), noStore)
+}
+
+func writeCancelOutcome(w http.ResponseWriter, hash string, reannounce bool, outcome CancelOutcome) {
+	switch outcome.Reason {
+	case "finished":
+		logLimited("cancel", "cancel %s → 409 finished", shortHash(hash))
+		writeJSON(w, http.StatusConflict, errBody("finished"), noStore)
+		return
+	case "not_ours":
+		logLimited("cancel", "cancel %s → 409 not_ours", shortHash(hash))
+		writeJSON(w, http.StatusConflict, errBody("not_ours"), noStore)
+		return
+	}
+	if outcome.Reannounced {
+		logLimited("cancel", "cancel %s → 202 reannounced", shortHash(hash))
+		writeQueuedBody(w, outcome.Status)
+		return
+	}
+	logLimited("cancel", "cancel %s → 204", shortHash(hash))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAccount is GET /<config>/account — den#204: one quiet line of slot and allowance usage per
+// configured debrid account, in configured order. A non-TorBox account answers with its service name and
+// nothing else: Real-Debrid and Premiumize publish no comparable facts.
+func (h *handler) handleAccount(w http.ResponseWriter, r *http.Request, configBlob string) {
+	config, ok := h.openConfig(configBlob)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, errBody("bad_config"), noStore)
+		return
+	}
+	if h.refuseScoped(w, r, config) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), statusBudget)
+	defer cancel()
+	stores := h.deps.MakeStores(config)
+	out := make([]map[string]any, 0, len(stores))
+	for _, st := range stores {
+		out = append(out, accountBody(ctx, st))
+	}
+	writeJSON(w, http.StatusOK, out, noStore)
+}
+
+// accountBody is one configured account's answer within /<config>/account's array. A TorBox read that
+// fails degrades to the bare service name — the add budget below is scout's own and always answerable,
+// but without slots/queued there is nothing else honest to report.
+func accountBody(ctx context.Context, st Store) map[string]any {
+	ts, ok := st.(*torBoxStore)
+	if !ok {
+		return map[string]any{"service": string(st.Service())}
+	}
+	sum, err := ts.AccountSummary(ctx)
+	if err != nil {
+		logLimited("account-unavailable", "account %s: %v", ts.Service(), err)
+		return map[string]any{"service": string(ts.Service())}
+	}
+	acct := budgetAccount(ServiceTorBox, ts.accountIdentity())
+	adds := map[string]any{"left": globalAddBudget.remaining(acct)}
+	if freesIn := globalAddBudget.freesIn(acct, false); freesIn > 0 {
+		adds["freesAt"] = time.Now().Add(freesIn).UTC().Format(time.RFC3339)
+	}
+	body := map[string]any{
+		"service": string(ts.Service()),
+		"plan":    torboxPlanName(sum.Plan),
+		"slots":   map[string]any{"active": sum.Active},
+		"queued":  sum.Queued,
+		"adds":    adds,
+	}
+	if sum.CooldownUntil != nil {
+		body["cooldownUntil"] = sum.CooldownUntil.UTC().Format(time.RFC3339)
+	}
+	if sum.PremiumExpiresAt != nil {
+		body["expiresAt"] = sum.PremiumExpiresAt.UTC().Format(time.RFC3339)
+	}
+	return body
+}
+
+// torboxPlanName maps TorBox's plan code (user/me's `plan`) to a name for the account line. No slot-count
+// table — den#204's owner decision was to show "N active" alone rather than guess a plan's slot ceiling.
+func torboxPlanName(plan int) string {
+	switch plan {
+	case 0:
+		return "free"
+	case 1:
+		return "essential"
+	case 2:
+		return "pro"
+	case 3:
+		return "standard"
+	default:
+		return "unknown"
+	}
 }
 
 // playTiming stamps Server-Timing on whatever /play answers, as the status is written: the route has a
