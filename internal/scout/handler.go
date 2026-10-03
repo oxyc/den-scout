@@ -1253,6 +1253,9 @@ func queuedState(status StoreStatus) string {
 
 func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 	body := map[string]any{"state": queuedState(status), "progress": status.Progress}
+	if status.Service != "" {
+		body["service"] = status.Service
+	}
 	if status.Seeds != nil {
 		body["seeds"] = *status.Seeds
 	}

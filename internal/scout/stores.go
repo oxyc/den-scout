@@ -295,6 +295,8 @@ type StoreStatus struct {
 	// The swarm as the service reports it: zero seeds is what tells a dead swarm from a slow one.
 	Seeds *int
 	Peers *int
+	// Service is the store that answered, set by the pool; the 503 body names a store the same way.
+	Service DebridService
 }
 
 // The stable fetch states the 202 body carries. "downloading" stays the default so a client that
@@ -4468,6 +4470,7 @@ func (p *StorePool) StatusDetail(ctx context.Context, t ResolveTarget) (StoreSta
 			cancel()
 		}
 		if answer == statusDownloading {
+			status.Service = st.Service()
 			return status, true, nil
 		}
 	}
