@@ -37,9 +37,10 @@ var (
 )
 
 var (
-	metricTorboxEndpoints = []string{"checkcached", "mylist_account", "mylist_id", "requestdl", "createtorrent", "user"}
-	metricTorboxOutcomes  = []string{"ok", "error"}
-	metricTorboxAvoided   = []string{"availability_default", "status_snapshot", "checkcached_singleflight", "checkcached_batch", "probe_frontier"}
+	metricTorboxEndpoints = []string{"checkcached", "mylist_account", "mylist_id", "requestdl", "createtorrent", "user",
+		"controltorrent", "controlqueued", "getqueued"}
+	metricTorboxOutcomes = []string{"ok", "error"}
+	metricTorboxAvoided  = []string{"availability_default", "status_snapshot", "checkcached_singleflight", "checkcached_batch", "probe_frontier"}
 )
 
 type metricSet struct {

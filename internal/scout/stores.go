@@ -247,6 +247,12 @@ var errTorrentGone = &DeadLinkError{"torbox no longer has this torrent"}
 // scout had itself queued moments earlier.
 var errAddInFlight = errors.New("an add for this release is already in flight")
 
+// errAddQueued — createtorrent answered with a queued_id rather than a torrent_id: TorBox accepted the
+// add but parked it behind the account's slot limit (`queued` setting on). The release IS being fetched,
+// eventually, same as errAddInFlight — the two are told apart only so callers can log which happened. The
+// route maps this to the same 202 "coming" a client already knows how to wait on.
+var errAddQueued = errors.New("torbox queued this add behind the account's slot limit")
+
 // Store is a debrid backend.
 //
 // CacheCheck returns ONLY what it learned: a hash it could not check is ABSENT from the map, which the
@@ -502,6 +508,12 @@ func torboxEndpoint(u *url.URL) string {
 		return "requestdl"
 	case strings.HasSuffix(u.Path, "/torrents/createtorrent"):
 		return "createtorrent"
+	case strings.HasSuffix(u.Path, "/torrents/controltorrent"):
+		return "controltorrent"
+	case strings.HasSuffix(u.Path, "/queued/controlqueued"):
+		return "controlqueued"
+	case strings.HasSuffix(u.Path, "/queued/getqueued"):
+		return "getqueued"
 	case strings.HasSuffix(u.Path, "/user/me"):
 		return "user"
 	default:
@@ -1656,6 +1668,20 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 		logLimited("torbox-gone", "torbox no longer has %s — re-adding", shortHash(t.InfoHash))
 	}
 
+	// A parked add from an earlier poll: TorBox had handed back a queued_id rather than a torrent_id. Find
+	// out, at the cost of one read rather than another add, whether it has since been promoted to a real
+	// torrent — the account listing is what Status already uses to discover one.
+	if _, parked := s.knownQueuedID(t.InfoHash); parked {
+		if id, ok, _ := s.torrentID(ctx, t.InfoHash); ok {
+			s.forgetQueuedID(t.InfoHash)
+			return s.resolveHeldTorrent(ctx, id, key, needFiles, t)
+		}
+		if t.NoAdd {
+			return "", errWouldAdd
+		}
+		return "", errAddQueued
+	}
+
 	// From here on, resolving MEANS queueing — so a caller that forbade that is answered now, before the
 	// add-backoff below. That backoff describes a state a read-only caller cannot have caused and must
 	// not be blocked by.
@@ -1678,7 +1704,17 @@ func (s *torBoxStore) Resolve(ctx context.Context, t ResolveTarget) (string, err
 			return "", &StoreUnavailableError{Service: ServiceTorBox, Reason: reason + " (backing off)"}
 		}
 	}
-	torrentID, err := s.addMagnet(ctx, t.InfoHash, t.Prefetch)
+	// Believed cached ALREADY, from the checkcached read the stream list or the cache check ahead of this
+	// resolve already paid for (knownCached's 60s memo — see cachedTTL) — not a fresh call, a cache read.
+	// If TorBox's earlier answer was stale, add_only_if_cached makes the add refuse rather than silently
+	// spend the separate 60-an-hour UNCACHED allowance on a release that turned out not to be cached.
+	onlyIfCached, _ := knownCached(s.cache, ServiceTorBox, s.accountIdentity(), []string{t.InfoHash})
+	torrentID, queuedID, err := s.addMagnet(ctx, t.InfoHash, t.Prefetch, onlyIfCached[t.InfoHash])
+	if err == nil && torrentID == 0 && queuedID != 0 {
+		// Parked, not dead — see errAddQueued. Nothing more to do with this id until a later poll's
+		// knownQueuedID branch (above) finds it promoted.
+		return "", errAddQueued
+	}
 	if err != nil {
 		// Every refused add backs off, not only a 429. The refusal that caused the incident was a 400 —
 		// TorBox's answer for an account at its download limit — which is a `DeadLinkError`, so keying the
@@ -1826,22 +1862,29 @@ func (s *torBoxStore) resolveHeldTorrent(ctx context.Context, torrentID int, key
 	return link, err
 }
 
-func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch bool) (int, error) {
+// addMagnet asks TorBox to fetch a hash. It returns either a torrent id (fetching now) or a queued id
+// (parked behind the account's slot limit, TorBox's `queued` setting on) — never both — plus whichever
+// `add_only_if_cached` asks for: true restricts the add to a release TorBox already has cached, so it
+// cannot silently turn into an uncached download that counts against the 60-an-hour cap.
+func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch, onlyIfCached bool) (torrentID, queuedID int, err error) {
 	// An add we already sent and never heard back about must not be sent again — see addAttemptKey.
 	if err := addInFlight(s.cache, ServiceTorBox, s.accountIdentity(), infoHash); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := addWouldMissTheClock(ctx, ServiceTorBox); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := spendAdd(ServiceTorBox, s.accountIdentity(), infoHash, prefetch); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	form := url.Values{"magnet": {magnetFor(infoHash)}, "seed": {"3"}, "allow_zip": {"false"}}
+	if onlyIfCached {
+		form.Set("add_only_if_cached", "true")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+"/torrents/createtorrent", strings.NewReader(form.Encode()))
 	if err != nil {
 		refundAdd(ServiceTorBox, s.accountIdentity(), errRequestNotSent)
-		return 0, err
+		return 0, 0, err
 	}
 	req.Header.Set("authorization", "Bearer "+s.token)
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
@@ -1851,7 +1894,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 	if err != nil {
 		// No response, so the outcome is genuinely unknown: the marker STAYS, and the next poll finds it
 		// rather than sending the same add again.
-		return 0, err
+		return 0, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Read the body BEFORE settling, because the read is the last thing that can fail: a status line
@@ -1864,7 +1907,7 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 	if readErr != nil {
 		// Marker left set on purpose: the next poll answers 202 from it rather than buying the torrent
 		// again. The charge stays too — the add was written to the wire.
-		return 0, unknownOutcome(s.cache, ServiceTorBox, s.accountIdentity(), infoHash, readErr)
+		return 0, 0, unknownOutcome(s.cache, ServiceTorBox, s.accountIdentity(), infoHash, readErr)
 	}
 	settleAddAttempt(s.cache, ServiceTorBox, s.accountIdentity(), infoHash)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1882,18 +1925,21 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 		// this account's hourly allowance where the other two were already immune.
 		refundUnusedAdd(ServiceTorBox, s.accountIdentity())
 		if storeRefusedUs(resp.StatusCode) {
-			return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			return 0, 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
 				Reason: fmt.Sprintf("createtorrent http %d%s", resp.StatusCode, detail)}
 		}
-		return 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d%s", resp.StatusCode, detail)}
+		return 0, 0, &DeadLinkError{fmt.Sprintf("torbox createtorrent http %d%s", resp.StatusCode, detail)}
 	}
 	var body struct {
 		Success *bool `json:"success"`
 		Data    *struct {
 			TorrentID *int `json:"torrent_id"`
+			// QueuedID is set instead of TorrentID when the account is at its slot limit and TorBox's
+			// `queued` setting parks the add rather than refusing it outright.
+			QueuedID *int `json:"queued_id"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(raw, &body) != nil || body.Data == nil || body.Data.TorrentID == nil {
+	if json.Unmarshal(raw, &body) != nil || body.Data == nil || (body.Data.TorrentID == nil && body.Data.QueuedID == nil) {
 		// Answered, and created nothing — the same rule as the non-2xx branch above, and the same one RD
 		// applies to `added.ID == ""`. Keeping the charge walked the whole hourly allowance in a single
 		// sitting: this branch answers a dead link, which is exactly what makes the client fall through to
@@ -1903,18 +1949,410 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch b
 		// But only when nothing was created is what the ANSWER says. TorBox reports errors as HTTP 200
 		// with `success:false`, and a proxy page served as 200 does not parse at all — those two are the
 		// cases this branch exists for. A body that parses, says nothing about success and simply carries
-		// an id under a name this struct does not know (`queued_id`, a string id, a one-element array)
-		// may well describe a torrent that WAS created, and refunding there would manufacture allowance
-		// against a real add. Unrecognised is not the same as failed.
+		// an id under a name this struct does not know (a string id, a one-element array) may well
+		// describe a torrent that WAS created, and refunding there would manufacture allowance against a
+		// real add. Unrecognised is not the same as failed.
 		// `readable` is the wrong test for that: a string id or a one-element array is VALID JSON that
 		// simply does not fit this struct, and either may describe a torrent that exists. Only a body
 		// that is not JSON at all — a proxy or gateway page — proves nothing was created.
 		if !json.Valid(raw) || (body.Success != nil && !*body.Success) {
 			refundUnusedAdd(ServiceTorBox, s.accountIdentity())
 		}
-		return 0, &DeadLinkError{"torbox no torrent_id"}
+		return 0, 0, &DeadLinkError{"torbox no torrent_id"}
 	}
-	return *body.Data.TorrentID, nil
+	if body.Data.TorrentID != nil {
+		markAddedByUs(s.cache, s.accountIdentity(), infoHash)
+		return *body.Data.TorrentID, 0, nil
+	}
+	// Queued: remembered so the next poll answers "queued" instead of sending createtorrent again, and so
+	// a cancel can find it via /queued/controlqueued rather than /torrents/controltorrent.
+	markAddedByUs(s.cache, s.accountIdentity(), infoHash)
+	cachePut(s.cache, torboxQueuedKey(s.accountIdentity(), infoHash), strconv.Itoa(*body.Data.QueuedID), resolveCacheTTL, CacheVolatile)
+	return 0, *body.Data.QueuedID, nil
+}
+
+// CancelOutcome is what a cancel (or reannounce) attempt found. Done is true for a successful delete or
+// reannounce; otherwise Reason says why nothing was done — "not_queued" (nothing of ours to cancel),
+// "finished" (it already completed, so it is kept), or "not_ours" (the account held this before scout
+// ever asked for it). Status carries the current wait, for a reannounce's 202 answer.
+type CancelOutcome struct {
+	Done        bool
+	Reannounced bool
+	Reason      string
+	Status      StoreStatus
+}
+
+// storeCanceller is the optional half of Store that can cancel (or reannounce) a release it is fetching.
+// Only TorBox implements it — Real-Debrid's delete exists but is unbuilt until someone uses RD (see
+// den#204), and Premiumize has no equivalent at all — so the route answers 501 "unsupported" for either.
+type storeCanceller interface {
+	Cancel(ctx context.Context, infoHash string, reannounce bool) (CancelOutcome, error)
+}
+
+// torboxEntryState is the subset of one mylist-by-id entry Cancel needs: whether TorBox has finished
+// with the torrent (kept, never cancelled) and, for a reannounce's answer, the swarm it reports now.
+type torboxEntryState struct {
+	ID               *int    `json:"id"`
+	DownloadFinished *bool   `json:"download_finished"`
+	DownloadState    *string `json:"download_state"`
+	Seeds            *int    `json:"seeds"`
+	Peers            *int    `json:"peers"`
+}
+
+// torboxIsFinished reports whether a mylist entry describes a completed download — kept on a cancel,
+// never deleted, because it holds no slot and is what plays instantly. download_finished is the primary
+// signal; the state names are TorBox's own words for "nothing left to fetch", checked too because a
+// finished torrent does not always carry the flag on every reply.
+func torboxIsFinished(finished *bool, state *string) bool {
+	if finished != nil && *finished {
+		return true
+	}
+	if state == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(*state)) {
+	case "completed", "cached", "uploading":
+		return true
+	}
+	return false
+}
+
+// fetchEntry asks TorBox for one torrent's current mylist entry by id. ok=false with err=nil is TorBox
+// saying it no longer has this torrent (success:false, or the id missing from a listing-shaped answer);
+// err != nil is a service refusal or an unreadable response, which the caller must not read as "gone" —
+// the same distinction statusAnswerUncached draws on the same endpoint.
+func (s *torBoxStore) fetchEntry(ctx context.Context, torrentID int) (torboxEntryState, bool, error) {
+	resp, err := s.get(ctx, fmt.Sprintf("%s/torrents/mylist?id=%d&bypass_cache=true", s.api, torrentID))
+	if err != nil {
+		return torboxEntryState{}, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		detail := redactToken(readStoreError(resp), s.token)
+		return torboxEntryState{}, false, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("mylist http %d%s", resp.StatusCode, detail)}
+	}
+	var body struct {
+		Success *bool           `json:"success"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+		return torboxEntryState{}, false, &StoreUnavailableError{Service: ServiceTorBox, Reason: "mylist: unreadable body"}
+	}
+	if body.Success != nil && !*body.Success {
+		return torboxEntryState{}, false, nil
+	}
+	describesOurs := func(e torboxEntryState) bool { return e.ID == nil || *e.ID == torrentID }
+	var st torboxEntryState
+	if len(body.Data) == 0 || json.Unmarshal(body.Data, &st) != nil {
+		var arr []torboxEntryState
+		if json.Unmarshal(body.Data, &arr) != nil || len(arr) == 0 {
+			return torboxEntryState{}, false, nil
+		}
+		st = torboxEntryState{}
+		found, fallback := false, -1
+		for i, e := range arr {
+			if e.ID != nil && *e.ID == torrentID {
+				st, found = e, true
+				break
+			}
+			if e.ID == nil && fallback < 0 {
+				fallback = i
+			}
+		}
+		if !found && fallback >= 0 {
+			st, found = arr[fallback], true
+		}
+		if !found {
+			return torboxEntryState{}, false, nil
+		}
+	}
+	if !describesOurs(st) {
+		return torboxEntryState{}, false, nil
+	}
+	return st, true, nil
+}
+
+// controlRequest is controltorrent/controlqueued's shared shape: a form POST answered with a bare
+// success flag. Any non-2xx, or a 2xx carrying success:false, is a service refusal (503) — never silently
+// swallowed, since a cancel the caller believes happened would leave a torrent running against the
+// account's slot, and the memo cleared under it.
+func (s *torBoxStore) controlRequest(ctx context.Context, path, metric string, form url.Values) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.api+path, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("authorization", "Bearer "+s.token)
+	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	resp, err := s.do(ctx, req)
+	metrics.torboxCall(metric, err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
+	if err != nil {
+		return &StoreUnavailableError{Service: ServiceTorBox, Reason: metric + ": " + err.Error()}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxStoreBytes))
+	if readErr != nil {
+		return &StoreUnavailableError{Service: ServiceTorBox, Reason: metric + ": unreadable response"}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		detail := redactToken(storeErrorText(raw), s.token)
+		return &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("%s http %d%s", metric, resp.StatusCode, detail)}
+	}
+	var body struct {
+		Success *bool `json:"success"`
+	}
+	if json.Unmarshal(raw, &body) == nil && body.Success != nil && !*body.Success {
+		detail := redactToken(storeErrorText(raw), s.token)
+		return &StoreUnavailableError{Service: ServiceTorBox, Reason: metric + " refused" + detail}
+	}
+	return nil
+}
+
+func (s *torBoxStore) controlTorrent(ctx context.Context, torrentID int, operation string) error {
+	form := url.Values{"torrent_id": {strconv.Itoa(torrentID)}, "operation": {operation}}
+	return s.controlRequest(ctx, "/torrents/controltorrent", "controltorrent", form)
+}
+
+func (s *torBoxStore) controlQueued(ctx context.Context, queuedID int, operation string) error {
+	form := url.Values{"queued_id": {strconv.Itoa(queuedID)}, "type": {"torrent"}, "operation": {operation}}
+	return s.controlRequest(ctx, "/queued/controlqueued", "controlqueued", form)
+}
+
+// Cancel drops (or reannounces) the release this account is fetching for infoHash. See CancelOutcome for
+// what each answer means, and den#204 for the safety rules the route layers on top: never a torrent scout
+// did not add, never one already finished — both checked here — and never one a sibling queue entry
+// still needs, which only the CLIENT can know and so is not this store's job.
+func (s *torBoxStore) Cancel(ctx context.Context, infoHash string, reannounce bool) (CancelOutcome, error) {
+	infoHash = strings.ToLower(infoHash)
+	identity := s.accountIdentity()
+
+	// A parked add has no torrent id yet — TorBox's queue is a separate endpoint from the torrent one.
+	if qid, parked := s.knownQueuedID(infoHash); parked {
+		if !wasAddedByUs(s.cache, identity, infoHash) {
+			return CancelOutcome{Reason: "not_ours"}, nil
+		}
+		if reannounce {
+			// Nothing to reannounce — TorBox has not started fetching it, so there is no swarm to retry.
+			// Reported as still queued rather than refused: the stall-limit/2 retry costs nothing here.
+			return CancelOutcome{Done: true, Reannounced: true, Status: StoreStatus{State: fetchQueued}}, nil
+		}
+		if err := s.controlQueued(ctx, qid, "delete"); err != nil {
+			return CancelOutcome{}, err
+		}
+		s.forgetQueuedID(infoHash)
+		clearAddedByUs(s.cache, identity, infoHash)
+		return CancelOutcome{Done: true}, nil
+	}
+
+	torrentID, ok, authoritative := s.torrentID(ctx, infoHash)
+	if !ok {
+		if !authoritative {
+			return CancelOutcome{}, &StoreUnavailableError{Service: ServiceTorBox, Reason: "could not confirm this account's listing"}
+		}
+		return CancelOutcome{Reason: "not_queued"}, nil
+	}
+	if !wasAddedByUs(s.cache, identity, infoHash) {
+		return CancelOutcome{Reason: "not_ours"}, nil
+	}
+	entry, found, err := s.fetchEntry(ctx, torrentID)
+	if err != nil {
+		return CancelOutcome{}, err
+	}
+	if !found {
+		// TorBox agrees it no longer has this one either; nothing to cancel, and the stale id must not
+		// outlive the fact — the same rule Resolve's own `gone` handling follows.
+		s.forgetTorrentID(infoHash)
+		return CancelOutcome{Reason: "not_queued"}, nil
+	}
+	if torboxIsFinished(entry.DownloadFinished, entry.DownloadState) {
+		return CancelOutcome{Reason: "finished"}, nil
+	}
+	status := StoreStatus{Seeds: entry.Seeds, Peers: entry.Peers}
+	if entry.DownloadState != nil {
+		status.State = torboxFetchState(*entry.DownloadState)
+	}
+	if reannounce {
+		if err := s.controlTorrent(ctx, torrentID, "reannounce"); err != nil {
+			return CancelOutcome{}, err
+		}
+		return CancelOutcome{Done: true, Reannounced: true, Status: status}, nil
+	}
+	if err := s.controlTorrent(ctx, torrentID, "delete"); err != nil {
+		return CancelOutcome{}, err
+	}
+	s.forgetTorrentID(infoHash)
+	clearAddedByUs(s.cache, identity, infoHash)
+	return CancelOutcome{Done: true}, nil
+}
+
+// accountSummaryTTL — how long /<config>/account's answer stands before asking TorBox again. Paced like
+// validate: this is a Downloads-shelf header a viewer may glance at a few times, not the poll loop
+// checkcached/mylist/status share, so a few seconds of staleness costs nothing and 30s keeps the account
+// read off repeated renders of the same screen.
+const accountSummaryTTL = 30 * time.Second
+
+// torboxAccountSummary is the account-wide facts GET /<config>/account reports for TorBox.
+type torboxAccountSummary struct {
+	Plan             int
+	CooldownUntil    *time.Time
+	PremiumExpiresAt *time.Time
+	// Active is mylist entries with active:true that are not finished — TorBox's own definition of a
+	// download currently holding a slot.
+	Active int
+	// Queued is the length of the account's queued-torrents list (getqueued?type=torrent).
+	Queued int
+}
+
+func torboxAccountSummaryKey(identity string) string {
+	return "torbox:accountsummary:" + keyHash(canonicalTorboxIdentity(identity))
+}
+
+// AccountSummary answers /<config>/account for a TorBox account. Deliberately NOT built from
+// accountListing's hash→id map — that map is hardened to retain nothing but a hash and an id (see
+// fetchAccountListing), by design, because it is read on every poll of a two-second cadence. This route is
+// read a few times per Downloads-shelf visit, so it pays for two more TorBox reads (user/me, a plain
+// decode of mylist) rather than widening that hot path's retention to carry a field it does not need.
+func (s *torBoxStore) AccountSummary(ctx context.Context) (torboxAccountSummary, error) {
+	key := torboxAccountSummaryKey(s.accountIdentity())
+	if s.cache != nil {
+		if raw, ok := s.cache.Get(key); ok {
+			var sum torboxAccountSummary
+			if json.Unmarshal([]byte(raw), &sum) == nil {
+				return sum, nil
+			}
+		}
+	}
+	plan, cooldownUntil, premiumExpiresAt, err := s.fetchUserMe(ctx)
+	if err != nil {
+		return torboxAccountSummary{}, err
+	}
+	active, err := s.countActiveTorrents(ctx)
+	if err != nil {
+		return torboxAccountSummary{}, err
+	}
+	queued, err := s.countQueuedTorrents(ctx)
+	if err != nil {
+		return torboxAccountSummary{}, err
+	}
+	sum := torboxAccountSummary{Plan: plan, CooldownUntil: cooldownUntil, PremiumExpiresAt: premiumExpiresAt,
+		Active: active, Queued: queued}
+	if raw, e := json.Marshal(sum); e == nil {
+		cachePut(s.cache, key, string(raw), accountSummaryTTL, CacheVolatile)
+	}
+	return sum, nil
+}
+
+// parseTorboxTime parses one of TorBox's nullable RFC3339 timestamps. An unparseable or absent value is
+// nil rather than an error — a field TorBox adds or reformats later degrades to "unknown", not a failure
+// of the whole read.
+func parseTorboxTime(raw *string) *time.Time {
+	if raw == nil || *raw == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, *raw)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
+// fetchUserMe reads the account-level facts /<config>/account needs beyond what mylist and the add
+// budget already cover: the plan code and the two account-wide deadlines.
+func (s *torBoxStore) fetchUserMe(ctx context.Context) (plan int, cooldownUntil, premiumExpiresAt *time.Time, err error) {
+	resp, err := s.get(ctx, s.api+"/user/me")
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		detail := redactToken(readStoreError(resp), s.token)
+		return 0, nil, nil, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("user/me http %d%s", resp.StatusCode, detail)}
+	}
+	var body struct {
+		Success *bool `json:"success"`
+		Data    *struct {
+			Plan             *int    `json:"plan"`
+			CooldownUntil    *string `json:"cooldown_until"`
+			PremiumExpiresAt *string `json:"premium_expires_at"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil || body.Data == nil {
+		return 0, nil, nil, &StoreUnavailableError{Service: ServiceTorBox, Reason: "user/me: unreadable body"}
+	}
+	if body.Data.Plan != nil {
+		plan = *body.Data.Plan
+	}
+	return plan, parseTorboxTime(body.Data.CooldownUntil), parseTorboxTime(body.Data.PremiumExpiresAt), nil
+}
+
+// countActiveTorrents counts mylist entries that are active and not finished — see torboxAccountSummary.
+// A plain decode, capped at the listing size: see AccountSummary for why this does not reuse
+// accountListing's hardened streaming walk.
+func (s *torBoxStore) countActiveTorrents(ctx context.Context) (int, error) {
+	resp, err := s.get(ctx, s.api+"/torrents/mylist?bypass_cache=true")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		detail := redactToken(readStoreError(resp), s.token)
+		return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("mylist http %d%s", resp.StatusCode, detail)}
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxListingBytes+1))
+	if err != nil {
+		return 0, &StoreUnavailableError{Service: ServiceTorBox, Reason: "mylist: unreadable body"}
+	}
+	if len(raw) > maxListingBytes {
+		return 0, &StoreUnavailableError{Service: ServiceTorBox, Reason: "mylist: account listing too large to count"}
+	}
+	var body struct {
+		Success *bool `json:"success"`
+		Data    []struct {
+			Active           *bool `json:"active"`
+			DownloadFinished *bool `json:"download_finished"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		return 0, &StoreUnavailableError{Service: ServiceTorBox, Reason: "mylist: unreadable body"}
+	}
+	if body.Success != nil && !*body.Success {
+		return 0, nil
+	}
+	n := 0
+	for _, e := range body.Data {
+		if e.Active != nil && *e.Active && (e.DownloadFinished == nil || !*e.DownloadFinished) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// countQueuedTorrents counts the account's parked-torrent queue.
+func (s *torBoxStore) countQueuedTorrents(ctx context.Context) (int, error) {
+	resp, err := s.get(ctx, s.api+"/queued/getqueued?type=torrent")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		detail := redactToken(readStoreError(resp), s.token)
+		return 0, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("getqueued http %d%s", resp.StatusCode, detail)}
+	}
+	var body struct {
+		Success *bool             `json:"success"`
+		Data    []json.RawMessage `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+		return 0, &StoreUnavailableError{Service: ServiceTorBox, Reason: "getqueued: unreadable body"}
+	}
+	if body.Success != nil && !*body.Success {
+		return 0, nil
+	}
+	return len(body.Data), nil
 }
 
 // Status — progress for a torrent this account has already been asked to fetch. Resolve records the
@@ -2133,6 +2571,62 @@ func (s *torBoxStore) forgetTorrentID(infoHash string) {
 	s.cache.Put(torrentIDKey(s.accountIdentity(), infoHash), "", time.Nanosecond)
 	s.cache.Put(resolveKey(s.accountIdentity(), infoHash), "", time.Nanosecond)
 	clearTorboxStatus(s.cache, s.accountIdentity(), infoHash)
+	clearAddedByUs(s.cache, s.accountIdentity(), infoHash)
+}
+
+// torboxAddedKey records that THIS process is the one that asked TorBox to fetch a hash, as opposed to
+// discovering a hold the account already had (a torrent the owner added by hand, or one from before this
+// scout existed). Cancel reads it to refuse deleting a torrent scout never added — the owner may still
+// want it — and it is written only at the moment a fresh add (or a queued add TorBox later promotes)
+// resolves to a real torrent id, never on the "already held" fast path that merely discovers one.
+func torboxAddedKey(identity, infoHash string) string {
+	return "torbox:addedbyus:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + strings.ToLower(infoHash)
+}
+
+func markAddedByUs(cache Cache, identity, infoHash string) {
+	cachePut(cache, torboxAddedKey(identity, infoHash), "1", resolveCacheTTL, CacheVolatile)
+}
+
+func wasAddedByUs(cache Cache, identity, infoHash string) bool {
+	if cache == nil {
+		return false
+	}
+	_, ok := cache.Get(torboxAddedKey(identity, infoHash))
+	return ok
+}
+
+func clearAddedByUs(cache Cache, identity, infoHash string) {
+	cachePut(cache, torboxAddedKey(identity, infoHash), "", time.Nanosecond, CacheVolatile)
+}
+
+// torboxQueuedKey remembers a `queued_id` createtorrent handed back instead of a torrent_id: the add
+// landed in TorBox's own queue (the account was at its slot limit), not yet a fetchable torrent. Without
+// this, the next poll finds no torrent id and no "add in flight" marker (the add already settled — it
+// succeeded) and sends createtorrent again, once per poll, until the hourly allowance is gone.
+func torboxQueuedKey(identity, infoHash string) string {
+	return "torbox:queuedid:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + strings.ToLower(infoHash)
+}
+
+// knownQueuedID answers "is this account's add for this hash parked in TorBox's queue?" from cache alone,
+// mirroring knownTorrentID.
+func (s *torBoxStore) knownQueuedID(infoHash string) (int, bool) {
+	if s.cache == nil {
+		return 0, false
+	}
+	raw, ok := s.cache.Get(torboxQueuedKey(s.accountIdentity(), infoHash))
+	if !ok {
+		return 0, false
+	}
+	id, err := strconv.Atoi(raw)
+	return id, err == nil
+}
+
+// forgetQueuedID drops the queued marker once the add is promoted to a real torrent id or cancelled.
+func (s *torBoxStore) forgetQueuedID(infoHash string) {
+	if s.cache == nil {
+		return
+	}
+	s.cache.Put(torboxQueuedKey(s.accountIdentity(), infoHash), "", time.Nanosecond)
 }
 
 // torrentID finds the account's torrent id for an infohash: from the cache Resolve wrote, and failing
@@ -4275,7 +4769,12 @@ func (p *StorePool) ResolvePreferring(ctx context.Context, t ResolveTarget,
 		// verdict: TorBox throttled with RD fetching answered 503 naming TorBox, while the same two facts
 		// in the other order answered 202. The 503 tells the viewer their debrid is refusing and stops the
 		// client trying other sources — for a release scout has an add out for.
-		if coming == nil && errors.Is(err, errAddInFlight) {
+		// errAddQueued ranks with errAddInFlight for the same reason: TorBox accepted this add too, it is
+		// merely parked behind the account's slot limit rather than unanswered — "coming", not refused and
+		// not dead. Without this a parked add fell through to the generic dead_link below the moment any
+		// OTHER configured store also failed, which is exactly the regression den#204 decoding queued_id
+		// was meant to remove.
+		if coming == nil && (errors.Is(err, errAddInFlight) || errors.Is(err, errAddQueued)) {
 			coming = err
 		}
 		// A service refusing US outranks a dead link as an explanation: if even one store was throttled

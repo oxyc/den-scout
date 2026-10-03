@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 const leakToken = "tb-super-secret-token-do-not-log"
@@ -45,6 +46,37 @@ func TestRequestDownload_transportErrorNeverCarriesTheToken(t *testing.T) {
 	// And the cause survives, or the redaction has cost the diagnosis it was meant to preserve.
 	if !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("the reason was lost along with the URL: %v", err)
+	}
+}
+
+// den#204's cancel route authenticates controltorrent/controlqueued/mylist by header, not query string —
+// unlike requestdl above, the token is never on the URL at all. But a misbehaving proxy can still echo it
+// into a response BODY, and every error path here must redact that the same way addMagnet already does.
+func TestCancel_neverLeaksTheToken(t *testing.T) {
+	hash := repeat("a", 40)
+	doer := mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "mylist"):
+			return resp(200, `{"success":true,"data":{"id":42,"download_finished":false}}`), nil
+		case strings.Contains(r.URL.Path, "controltorrent"):
+			return resp(503, `{"error":"proxy_error","detail":"upstream rejected Bearer `+leakToken+`"}`), nil
+		}
+		return resp(404, `{}`), nil
+	}}
+	s := &torBoxStore{token: leakToken, client: doer, api: "https://api.torbox.example/v1/api", cache: NewMemoryCache(1 << 20)}
+	markAddedByUs(s.cache, s.accountIdentity(), hash)
+	s.cache.Put(torrentIDKey(s.accountIdentity(), hash), "42", time.Hour)
+
+	_, err := s.Cancel(context.Background(), hash, false)
+	if err == nil {
+		t.Fatal("a 503 from controltorrent must be an error")
+	}
+	// The token really was in the body — otherwise this test would pass for the wrong reason.
+	if !strings.Contains(err.Error(), "proxy_error") {
+		t.Fatalf("precondition failed: the refusal detail did not reach the error: %v", err)
+	}
+	if strings.Contains(err.Error(), leakToken) {
+		t.Fatalf("the token leaked into the cancel error: %v", err)
 	}
 }
 
