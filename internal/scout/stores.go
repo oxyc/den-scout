@@ -289,6 +289,54 @@ type StoreStatus struct {
 	// has stopped look identical for minutes; the rate says which immediately, and zero says "stalled"
 	// while there is still time to pick something else.
 	BytesPerSecond *int64
+	// State is one of the fetch states below, mapped from the service's own vocabulary; empty means the
+	// service named none, and is answered as "downloading" — the only value clients before it knew.
+	State string
+	// The swarm as the service reports it: zero seeds is what tells a dead swarm from a slow one.
+	Seeds *int
+	Peers *int
+}
+
+// The stable fetch states the 202 body carries. "downloading" stays the default so a client that
+// only ever saw that value reads every new one as the wait it already was.
+const (
+	fetchQueued      = "queued"      // waiting for a slot at the service
+	fetchFetching    = "fetching"    // fetching the torrent's metadata, or checking what it has
+	fetchDownloading = "downloading" // moving bytes, or a state the service named that maps to nothing else
+	fetchStalled     = "stalled"     // alive but not moving: no seeds, or paused
+	fetchFailed      = "failed"      // the service gave up on it; no amount of waiting fetches it
+)
+
+// torboxFetchState maps TorBox's `download_state` — documented as "downloading", "stalled (no seeds)",
+// "uploading (no peers)", "metaDL", "paused", "completed", "cached", "failed", "failed (processing)",
+// "expired", "missing", "incomplete" (gave up after two days of too few seeds) — onto the stable set. Matched
+// on lowercase prefixes because the documented spellings carry parenthesised qualifiers and casing varies.
+// Anything unrecognised is "downloading", which is what every wait was called before this existed.
+func torboxFetchState(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	switch {
+	case strings.HasPrefix(s, "failed"), strings.HasPrefix(s, "error"), strings.HasPrefix(s, "expired"),
+		strings.Contains(s, "missing"), strings.HasPrefix(s, "incomplete"):
+		return fetchFailed
+	case strings.HasPrefix(s, "stalled"), strings.HasPrefix(s, "paused"):
+		return fetchStalled
+	case strings.HasPrefix(s, "metadl"), strings.HasPrefix(s, "checking"):
+		return fetchFetching
+	case strings.HasPrefix(s, "queued"):
+		return fetchQueued
+	}
+	return fetchDownloading
+}
+
+// rdFetchState maps a Real-Debrid status Status already accepted as fetching (rdFetching).
+func rdFetchState(status string) string {
+	switch status {
+	case "queued":
+		return fetchQueued
+	case "magnet_conversion":
+		return fetchFetching
+	}
+	return fetchDownloading
 }
 
 // errCheckFailed marks a cache check that could not reach the store at all.
@@ -1983,6 +2031,9 @@ func (s *torBoxStore) statusAnswerUncached(ctx context.Context, t ResolveTarget)
 		DownloadFinished *bool    `json:"download_finished"`
 		ETA              *int     `json:"eta"`
 		DownloadSpeed    *int64   `json:"download_speed"`
+		DownloadState    *string  `json:"download_state"`
+		Seeds            *int     `json:"seeds"`
+		Peers            *int     `json:"peers"`
 	}
 	// describesOurs — an entry with no id is taken at its word, since the single-entry answer to a
 	// by-id query need not repeat it; one that names a DIFFERENT torrent never is.
@@ -2038,6 +2089,15 @@ func (s *torBoxStore) statusAnswerUncached(ctx context.Context, t ResolveTarget)
 	// Zero is meaningful here — it is the stall — so only a missing or negative figure is dropped.
 	if st.DownloadSpeed != nil && *st.DownloadSpeed >= 0 {
 		out.BytesPerSecond = st.DownloadSpeed
+	}
+	if st.DownloadState != nil {
+		out.State = torboxFetchState(*st.DownloadState)
+	}
+	if st.Seeds != nil && *st.Seeds >= 0 {
+		out.Seeds = st.Seeds
+	}
+	if st.Peers != nil && *st.Peers >= 0 {
+		out.Peers = st.Peers
 	}
 	return out, statusDownloading
 }
@@ -3159,7 +3219,7 @@ func (s *realDebridStore) Status(ctx context.Context, t ResolveTarget) (StoreSta
 	if len(info.Links) > 0 || !rdFetching(info.Status) {
 		return StoreStatus{}, false
 	}
-	return StoreStatus{Progress: info.Progress / 100}, true
+	return StoreStatus{Progress: info.Progress / 100, State: rdFetchState(info.Status)}, true
 }
 
 func (s *realDebridStore) Resolve(ctx context.Context, t ResolveTarget) (string, error) {
