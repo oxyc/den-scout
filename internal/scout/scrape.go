@@ -38,6 +38,9 @@ type scrapeQuery struct {
 	Season  int
 	Episode int
 	HasEp   bool
+	// Rid is the request's X-Request-Id, carried through for the per-indexer decision line
+	// (scrapeOnce) so a failure joins back to the request that hit it. Not part of any cache key.
+	Rid string
 }
 
 type scraper interface {
@@ -330,20 +333,27 @@ func (s *stremioScraper) scrapeOnce(ctx context.Context, q scrapeQuery) ([]RawSt
 	// Torrentio (and peers) 403 the default Go-http-client User-Agent as a bot signature — send a
 	// browser UA so the scrape isn't rejected. Without this every indexer returns 403 → zero streams.
 	req.Header.Set("user-agent", scrapeUserAgent)
+	start := time.Now()
 	resp, err := s.client.Do(req)
 	if err != nil {
 		// Log the indexer name + reason (never the URL — MediaFusion's carries its encrypted config) so a
 		// scrape outage is visible in the server log instead of silently becoming an empty stream list.
 		// Once a minute per indexer: an outage fails every scrape, and the line only has to say it is down.
-		logLimited("indexer-unreachable:"+string(s.indexer), "%s indexer unreachable", s.name())
+		// outcome is classifyScrape's own vocabulary (unreachable/timeout/refused — coverage.go), never the
+		// error itself: Go's http.Client wraps a *url.Error carrying the full request URL, which for a
+		// debrid-backed indexer carries the account token in its query string (see token_leak_test.go).
+		logLimited("indexer-unreachable:"+string(s.indexer),
+			decisionLine("scrape", classifyScrape(s, err), "no response", s.name(), time.Since(start), q.Rid, scrapeIdentity(q)))
 		// A refused address will be refused again; a retry would only spend the budget.
 		return nil, err, !errors.Is(err, errNotPublic)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		logLimited("indexer-status:"+string(s.indexer), "%s indexer returned http %d", s.name(), resp.StatusCode)
-		return nil, &httpStatusError{name: s.name(), code: resp.StatusCode},
-			retryableScrapeStatus(resp.StatusCode)
+		statusErr := &httpStatusError{name: s.name(), code: resp.StatusCode}
+		logLimited("indexer-status:"+string(s.indexer),
+			decisionLine("scrape", classifyScrape(s, statusErr), fmt.Sprintf("http %d", resp.StatusCode), s.name(),
+				time.Since(start), q.Rid, scrapeIdentity(q)))
+		return nil, statusErr, retryableScrapeStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeBytes))
 	if err != nil {

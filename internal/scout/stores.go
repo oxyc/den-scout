@@ -225,6 +225,11 @@ type ResolveTarget struct {
 	// sets it only after a movie link served a file far smaller than the release. Real-Debrid and
 	// Premiumize always pick from a list already and ignore it.
 	ListFiles bool
+	// Title and IMDb are carried from the PlayTarget that named this resolve, diagnostic only — a store
+	// never reads them. They are what lets a play/probe/cancel decision line (decisionlog.go) name the
+	// release it is about instead of keying on shortHash(InfoHash) alone.
+	Title string
+	IMDb  string
 }
 
 // errWouldAdd — a NoAdd target could only be resolved by queueing the torrent, so it was not resolved.

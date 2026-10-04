@@ -125,6 +125,31 @@ func TestPlayTicket_carriesTheReleaseSize(t *testing.T) {
 	}
 }
 
+// A ticket carries the release title and title id purely for the play/probe/cancel decision lines
+// (decisionlog.go) — round-tripped like every other field, and absent (zero value) on a ticket minted
+// before they existed, the same backward-compat shape the release size above already has.
+func TestPlayTicket_carriesTitleAndIMDbForLogging(t *testing.T) {
+	tk := newTicketKeys(ticketKeyring(t))
+	config := &Config{Debrid: []DebridAccount{{ServiceTorBox, "tb"}}}
+	exp := time.Now().Add(time.Hour)
+	target := PlayTarget{InfoHash: repeat("a", 40), FileIdx: intp(0), Title: "Movie.2024.2160p.BluRay.REMUX", IMDb: "tt1234567"}
+	_, got, err := tk.open(tk.mint(config, target, exp), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(*got, target) {
+		t.Errorf("got %+v, want %+v", *got, target)
+	}
+
+	old, _ := json.Marshal(map[string]any{"h": repeat("a", 40), "f": 0, "d": [][2]string{{"torbox", "tb"}},
+		"x": exp.Unix()})
+	nonce := make([]byte, chacha20poly1305.NonceSizeX)
+	_, got, err = tk.open(b64urlEncode(tk.aeads[0].Seal(nonce, nonce, old, nil)), time.Now())
+	if err != nil || got.Title != "" || got.IMDb != "" {
+		t.Errorf("a ticket minted before title/imdb existed should open with both empty: %+v err=%v", got, err)
+	}
+}
+
 // Anything that is not a ticket this addon minted, unaltered, is refused.
 func TestPlayTicket_refusesWhatDoesNotOpen(t *testing.T) {
 	tk := newTicketKeys(ticketKeyring(t))

@@ -382,11 +382,14 @@ type rankFilters struct {
 }
 
 // rankDebug records where a list went: how many releases each filter removed, and what the survivors
-// scored. Answering that meant reading a log line and guessing, which is why handler.go logs
-// "scraped N → ranked M" at all — this is the same question answered exactly, on demand.
+// scored. Answering that used to mean reading a log line and guessing; now it is also what the
+// per-build rank decision line (handler.go's rankList, decisionlog.go's logRankDecision) reads its drop
+// counts and picks from.
 //
-// Collected only when ?debug=1 asked for it. Every method is nil-safe so the normal path pays one
-// not-taken branch per filter and allocates nothing.
+// Every method is nil-safe, which still matters: the ?debug=1 payload this struct also serialises stays
+// nil on a normal request (never reaches the client), even though rankList now always passes a non-nil
+// instance into rankStreams for the decision line's sake — so the "nil-safe" methods are exercised on
+// that caller's OWN accounting value, not on the response one.
 type rankDebug struct {
 	// Releases the indexers returned, after dedupe by infohash and BEFORE anything trims them — the
 	// 500-seed cap and the RD filename filter both run outside rankStreams and both report into

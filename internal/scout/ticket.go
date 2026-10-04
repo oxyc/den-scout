@@ -78,6 +78,11 @@ type ticketWire struct {
 	// The indexer's release size in bytes. Absent from tickets minted before it existed, and from releases
 	// whose size no indexer stated; both open with a size of 0, which the link check reads as unknown.
 	Z int64 `json:"z,omitempty"`
+	// Rt (release title) and Tt (the title id, IMDb) ride along for the play/probe/cancel decision lines
+	// (decisionlog.go) that resolve this ticket later — never read by `open`'s caller for anything else, and
+	// never the install id (that's `I`, config.IID, a different field already).
+	Rt string `json:"rt,omitempty"`
+	Tt string `json:"tt,omitempty"`
 }
 
 // mint seals a ticket for one release of this config, good until exp.
@@ -85,6 +90,7 @@ func (t *ticketKeys) mint(config *Config, target PlayTarget, exp time.Time) stri
 	w := ticketWire{
 		playWire: playWire{H: target.InfoHash, F: target.FileIdx, S: target.Season, E: target.Episode},
 		X:        exp.Unix(), I: config.IID, P: config.Epoch, Scope: config.Scope, Z: target.ReleaseSize,
+		Rt: target.Title, Tt: target.IMDb,
 	}
 	for _, d := range config.Debrid {
 		w.D = append(w.D, [2]string{string(d.Service), d.Token})
@@ -144,5 +150,6 @@ func (t *ticketKeys) open(ticket string, now time.Time) (*Config, *PlayTarget, e
 	if len(config.Debrid) == 0 {
 		return nil, nil, errTicketBad
 	}
-	return config, &PlayTarget{InfoHash: h, FileIdx: w.F, Season: w.S, Episode: w.E, ReleaseSize: max(w.Z, 0)}, nil
+	return config, &PlayTarget{InfoHash: h, FileIdx: w.F, Season: w.S, Episode: w.E, ReleaseSize: max(w.Z, 0),
+		Title: w.Rt, IMDb: w.Tt}, nil
 }
