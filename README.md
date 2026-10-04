@@ -239,6 +239,7 @@ only tunes runtime behaviour; every variable is listed, commented, in `.env.exam
 | `MEMORY_CACHE_BYTES` | `50331648` (48 MiB) | in-memory cache byte budget |
 | `CACHE_DIR` | `/cache` in the image (else `$TMPDIR/den-scout-cache`) | durable cache tier; **must be writable** or persistence disables itself after one log line |
 | `LOG_REQUESTS` | `0` | any value but empty or `0` logs one line per response, `<METHOD> <path> <status> <ms>ms`, with the config segment, `/play` token and `/p/` ticket replaced by `<config>`/`<token>`/`<ticket>` and the query string dropped |
+| `LOG_IDENTITY` | `1` | on by default; `0` or `false` drops the identity fields (title id, season/episode, release name, infohash, file index/size, runner-ups) from every rank/scrape/play/probe/cancel decision line, keeping only `event=… outcome=… reason=… upstream=… dur_ms=… rid=…` |
 | `CINEMETA_URL` | `https://v3-cinemeta.strem.io` | metadata source for the mistagged-torrent filter |
 | `METRICS_TOKEN` | — | bearer token for `/metrics`; unset = the route 404s (the counters reveal when the install is being watched) |
 | `CONFIG_KEY` | — | base64 X25519 private key enabling **sealed** config URLs; unset = plaintext only |

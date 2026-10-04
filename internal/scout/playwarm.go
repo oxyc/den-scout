@@ -19,7 +19,7 @@ func playPendingKey(memoKey string) string { return "play:pending:" + memoKey }
 func warmResolveBudget() time.Duration { return statusBudget / 2 }
 
 // writePlayQueued is /play's 202, noting that this file is being waited on.
-func (h *handler) writePlayQueued(w http.ResponseWriter, pendingKey, hash string, status StoreStatus) {
+func (h *handler) writePlayQueued(w http.ResponseWriter, pendingKey string, rt ResolveTarget, rid string, dur time.Duration, status StoreStatus) {
 	cachePut(h.deps.Cache, pendingKey, "1", playPendingTTL, CacheVolatile)
-	writeQueued(w, hash, status)
+	writeQueued(w, rt, rid, dur, status)
 }

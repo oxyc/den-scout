@@ -157,8 +157,10 @@ func (h *handler) checkBehind(config *Config, imdb, key string) {
 }
 
 func (h *handler) rankAvailability(ctx context.Context, config *Config, sid *StreamID) rankedList {
+	// No rid: this runs detached from any request (checkBehind), well after the one that triggered it has
+	// answered. The rank decision line simply omits it, like reqlog.go's own line does when one is absent.
 	if !config.CachedOnly || !hasCacheTruth(config) {
-		return h.rankList(ctx, config, sid, nil, nil, false)
+		return h.rankList(ctx, config, sid, nil, nil, false, "")
 	}
 	// Apply every ordinary filter before asking the debrid, but do not let the display cap hide a lower
 	// ranked held release: availability asks whether ANY playable candidate exists, not which twenty to
@@ -166,7 +168,7 @@ func (h *handler) rankAvailability(ctx context.Context, config *Config, sid *Str
 	filterConfig := *config
 	filterConfig.CachedOnly = false
 	filterConfig.ResultCap = maxSeeds
-	list := h.rankList(ctx, &filterConfig, sid, nil, nil, false)
+	list := h.rankList(ctx, &filterConfig, sid, nil, nil, false, "")
 	if list.degraded != "" || len(list.ranked) == 0 {
 		return list
 	}

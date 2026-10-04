@@ -19,6 +19,12 @@ type PlayTarget struct {
 	// it — the legacy token's encoding is pinned — and /play uses it to notice a movie link that serves a
 	// file far smaller than the release (see verifyLink).
 	ReleaseSize int64
+	// Title and IMDb are diagnostic only — never decoded from a wire format shared with another encoder,
+	// never used to decide anything a store does. Only a ticket carries them (ticket.go); the legacy
+	// token's encoding is pinned to the TS encoder and stays h/f/s/e. Empty on the legacy path, which a
+	// decision line simply omits (see decisionlog.go) rather than asserting an identity it does not have.
+	Title string
+	IMDb  string
 }
 
 // playWire fixes field order (h,f,s,e) + omitempty so the encoded token matches the TS encoder.

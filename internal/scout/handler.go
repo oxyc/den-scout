@@ -685,8 +685,9 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 		buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()),
 			h.deps.ScrapeTimeout+listBuildSlack)
 		defer cancel()
+		rid := requestID(r.Header.Get("X-Request-Id"))
 		v, _, _ := h.sf.Do(cacheKey+":debug", func() (any, error) {
-			return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, &rankDebug{}, client), nil
+			return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, &rankDebug{}, client, rid), nil
 		})
 		res := v.(buildResult)
 		if res.degraded != "" {
@@ -767,8 +768,9 @@ func (h *handler) handleStream(w http.ResponseWriter, r *http.Request, configBlo
 	// to every follower. WithoutCancel keeps request values; the timeout bounds the work.
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
+	rid := requestID(r.Header.Get("X-Request-Id"))
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil, client), nil
+		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil, client, rid), nil
 	})
 	h.writeBuilt(w, r, start, v.(buildResult))
 }
@@ -818,8 +820,9 @@ func (h *handler) lastResort(w http.ResponseWriter, r *http.Request, start time.
 	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.deps.ScrapeTimeout+listBuildSlack)
 	defer cancel()
 	client, _ := clientPlayable(r)
+	rid := requestID(r.Header.Get("X-Request-Id"))
 	v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil, client), nil
+		return h.buildStreamList(buildCtx, config, configBlob, sid, origin, cacheKey, nil, client, rid), nil
 	})
 	res := v.(buildResult)
 	if res.degraded == "indexers" && usable {
@@ -899,6 +902,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 	}
 	parent := context.WithoutCancel(r.Context())
 	client, _ := clientPlayable(r)
+	rid := requestID(r.Header.Get("X-Request-Id"))
 	go func() {
 		// The same lesson as the probe fan-out: this is a background goroutine, so the recover() on the
 		// request goroutine cannot see a panic raised here, and an unrecovered one takes the process down.
@@ -909,7 +913,7 @@ func (h *handler) rebuildBehind(r *http.Request, configBlob string, sid *StreamI
 		ctx, cancel := context.WithTimeout(parent, budget)
 		defer cancel()
 		v, _, _ := h.sf.Do(cacheKey, func() (any, error) {
-			return h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil, client), nil
+			return h.buildStreamList(ctx, config, configBlob, sid, origin, cacheKey, nil, client, rid), nil
 		})
 		// A degraded build caches nothing, so the entry is still stale and the next request would book
 		// another rebuild at once. Hold the key until there is some prospect of a different answer.
@@ -936,8 +940,8 @@ type buildResult struct {
 // dbg is nil on every normal request. When it is not, the accounting rides along in the response body and
 // the result is NOT cached — a debug build is a diagnostic, not an entry other viewers should be served.
 func (h *handler) buildStreamList(ctx context.Context, config *Config, configBlob string, sid *StreamID, origin,
-	cacheKey string, dbg *rankDebug, client *ClientPlayable) buildResult {
-	list := h.rankList(ctx, config, sid, dbg, client, true)
+	cacheKey string, dbg *rankDebug, client *ClientPlayable, rid string) buildResult {
+	list := h.rankList(ctx, config, sid, dbg, client, true, rid)
 	// A movie's list answers the availability route's question too, so a title someone opened needs no
 	// check of its own there. Not from a degraded build, which knows nothing either way, nor a debug one, nor
 	// one ranked for a browser, whose cap may have kept different releases.
@@ -965,8 +969,8 @@ type rankedList struct {
 // indexer's in scrapeAllCached, each held release in the stores), so ranking the same title another way asks
 // nobody again.
 func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, dbg *rankDebug,
-	client *ClientPlayable, checkCache bool) rankedList {
-	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp}
+	client *ClientPlayable, checkCache bool, rid string) rankedList {
+	q := scrapeQuery{Type: sid.Type, IMDb: sid.IMDb, Season: sid.Season, Episode: sid.Episode, HasEp: sid.HasEp, Rid: rid}
 	phase := time.Now()
 	scraped := scrapeCovered(ctx, h.deps.MakeScrapers(config), q, h.deps.ScrapeTimeout, h.deps.Cache, h.deps.ListTTL)
 	seeds, scrapeOK, scrapeComplete := scraped.seeds, scraped.anyOK, scraped.complete
@@ -1085,6 +1089,16 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 	// client compatibility cost is computed; the old order ranked first and discovered the fact only
 	// afterward, so a warm probe could not affect the list it was attached to.
 	h.hydrateProbeFacts(seeds, sid)
+	// logDbg always collects drop counts and the served order — unlike dbg (the ?debug=1 JSON payload,
+	// nil on every normal request), it is never serialised to a client. When dbg is set, the two are the
+	// SAME object, so ?debug=1's existing accounting is unchanged; otherwise this is the only place the
+	// rank decision line below gets its drop reasons and picks from.
+	logDbg := dbg
+	if logDbg == nil {
+		logDbg = &rankDebug{}
+	}
+	candidates := len(seeds)
+	rankStart := time.Now()
 	ranked := rankStreams(seeds, rankFilters{
 		ExcludeCam:          config.Filters.ExcludeCam,
 		Resolutions:         config.Filters.Resolutions,
@@ -1098,8 +1112,9 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 		ExpectedYear:        expectedYear,
 		ExpectedTitleTokens: expectedTitleTokens,
 		Client:              client,
-		Debug:               dbg,
+		Debug:               logDbg,
 	})
+	logRankDecision(sid, candidates, ranked, logDbg, time.Since(rankStart), rid)
 
 	// Degraded is judged on what is actually SERVED, not on what was scraped.
 	//
@@ -1224,7 +1239,7 @@ func (h *handler) finishStreamList(ctx context.Context, config *Config, configBl
 
 // writeQueued — the "it's coming" answer: 202 plus whatever the store actually reported. `etaSeconds` is
 // omitted rather than guessed when the service doesn't supply one.
-func writeQueued(w http.ResponseWriter, hash string, status StoreStatus) {
+func writeQueued(w http.ResponseWriter, rt ResolveTarget, rid string, dur time.Duration, status StoreStatus) {
 	// The wait, as the viewer sees it. A percentage alone can't distinguish a slow fetch from a dead
 	// swarm, so the rate is logged beside it — this is the line to read when someone says "it's stuck".
 	rate := "unknown"
@@ -1240,8 +1255,9 @@ func writeQueued(w http.ResponseWriter, hash string, status StoreStatus) {
 		swarm = fmt.Sprintf(", seeds %s, peers %s", optionalCount(status.Seeds), optionalCount(status.Peers))
 	}
 	// A waiting client polls every two seconds for the whole fetch, so this is a sample, a line a minute.
-	logLimited("downloading", "play %s → 202 %s %.1f%% at %s, eta %s%s",
-		shortHash(hash), queuedState(status), status.Progress*100, rate, eta, swarm)
+	// Progress/rate/eta/swarm are operational, not identity, and stay outside LOG_IDENTITY's gate.
+	reason := fmt.Sprintf("%s %.1f%% at %s, eta %s%s", queuedState(status), status.Progress*100, rate, eta, swarm)
+	logLimited("downloading", playDecision("play", "fallback", reason, string(status.Service), dur, rid, rt))
 	writeQueuedBody(w, status)
 }
 
@@ -1284,10 +1300,11 @@ func writeQueuedBody(w http.ResponseWriter, status StoreStatus) {
 // client reads one set of statuses: 202 while downloading, 200 once the store holds it, 404 when neither
 // is true — which here means "nothing has been queued", not "this release is dead".
 func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config *Config, pool *StorePool,
-	infoHash string, rt ResolveTarget) {
+	infoHash string, rt ResolveTarget, rid string) {
+	start := time.Now()
 	status, ok, unknown := pool.Status(ctx, rt)
 	if ok {
-		writeQueued(w, infoHash, status)
+		writeQueued(w, rt, rid, time.Since(start), status)
 		return
 	}
 	// "Ready" has to mean the ACCOUNT can serve it without queueing anything, which a cache check cannot
@@ -1310,7 +1327,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 		readOnly.NoAdd = true
 		_, err := pool.ResolveCachedOnly(ctx, readOnly, holders)
 		if err == nil {
-			logLimited("probe-ready", "probe %s → 200 ready", shortHash(infoHash))
+			logLimited("probe-ready", playDecision("probe", "served", "ready", "", time.Since(start), rid, rt))
 			writeJSON(w, http.StatusOK, map[string]any{"state": "ready"}, noStore)
 			return
 		}
@@ -1342,8 +1359,8 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// expired and Real-Debrid fetching, the probe answered 503 naming torbox while /play answered 202
 	// downloading. AddInFlight now applies the per-store rule per store, so both hold at once.
 	if pool.AddInFlight(infoHash) {
-		logLimited("probe-add-in-flight", "probe %s → 202, an add is already in flight", shortHash(infoHash))
-		writeQueued(w, infoHash, StoreStatus{})
+		logLimited("probe-add-in-flight", playDecision("probe", "fallback", "add already in flight", "", time.Since(start), rid, rt))
+		writeQueued(w, rt, rid, time.Since(start), StoreStatus{})
 		return
 	}
 	// No store with a usable key is fetching it, so a rejected key is now the best explanation there is.
@@ -1351,7 +1368,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// Account-level only, deliberately. The per-release backoff belongs below, where RecentRefusal reads
 	// it, because that one is an add-path guard a read-only caller is exempt from.
 	if svc, reason, refused := pool.AccountRefusal(); refused {
-		logLimited("probe-account-refused", "probe %s → 503, %s refused the account (%s)", shortHash(infoHash), svc, reason)
+		logLimited("probe-account-refused", playDecision("probe", "refused", "account refused: "+reason, string(svc), time.Since(start), rid, rt))
 		writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": svc})
 		return
 	}
@@ -1371,8 +1388,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// /play answered 503 scout_busy while ?probe=1 answered 404, for the same release at the same
 	// instant, for the rest of the rolling hour.
 	if pool.EveryAddRefusedByScout() {
-		logLimited("probe-scout-busy", "probe %s → 503 (scout-side), the hourly add allowance is spent",
-			shortHash(infoHash))
+		logLimited("probe-scout-busy", playDecision("probe", "refused", "scout's hourly add allowance is spent", "", time.Since(start), rid, rt))
 		writeAddBudgetSpent(w, pool.ScoutBusyFor(false), map[string]any{
 			"error":  "scout_busy",
 			"detail": "scout's own hourly add budget for this account is spent",
@@ -1380,7 +1396,7 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 		return
 	}
 	if refusedUs != nil {
-		logLimited("probe-refused", "probe %s → 503, %s %s", shortHash(infoHash), refusedUs.Service, refusedUs.Reason)
+		logLimited("probe-refused", playDecision("probe", "refused", refusedUs.Reason, string(refusedUs.Service), time.Since(start), rid, rt))
 		writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": refusedUs.Service})
 		return
 	}
@@ -1389,14 +1405,14 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// condemns a perfectly good one. This still matters for a refusal recorded by an EARLIER poll, whose
 	// store the probe may not reach again.
 	if svc, reason, ok := pool.RecentRefusal(infoHash); ok {
-		logLimited("probe-refused", "probe %s → 503, %s %s", shortHash(infoHash), svc, reason)
+		logLimited("probe-refused", playDecision("probe", "refused", reason, string(svc), time.Since(start), rid, rt))
 		writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": svc})
 		return
 	}
 	// With the cache check down we do not know whether anything is queued, and 404 "not_queued" is a
 	// claim, not a shrug — the client reads it as a release nobody has. Say the store could not be asked.
 	if !truthOK && hasCacheTruth(config) {
-		logLimited("probe-cache-check-down", "probe %s → 503, cache check unavailable", shortHash(infoHash))
+		logLimited("probe-cache-check-down", playDecision("probe", "degraded", "cache check unavailable", "", time.Since(start), rid, rt))
 		writeUnavailable(w, storeUnansweredWait, errBody("cache_check_unavailable"))
 		return
 	}
@@ -1404,11 +1420,11 @@ func (h *handler) handleProbe(w http.ResponseWriter, ctx context.Context, config
 	// queued. 404 here is what makes a client blacklist a release, which is the single failure this route
 	// exists to prevent, so an indeterminate read gets the "ask again" answer rather than the claim.
 	if unknown {
-		logLimited("probe-status-unknown", "probe %s → 503, a store could not answer", shortHash(infoHash))
+		logLimited("probe-status-unknown", playDecision("probe", "degraded", "a store could not answer", "", time.Since(start), rid, rt))
 		writeUnavailable(w, storeUnansweredWait, errBody("status_unavailable"))
 		return
 	}
-	logLimited("probe-not-queued", "probe %s → 404 not queued", shortHash(infoHash))
+	logLimited("probe-not-queued", playDecision("probe", "skipped", "not queued", "", time.Since(start), rid, rt))
 	writeJSON(w, http.StatusNotFound, errBody("not_queued"), noStore)
 }
 
@@ -1492,11 +1508,13 @@ func (h *handler) handleTicketPlay(w http.ResponseWriter, r *http.Request, ticke
 // resolvePlay is the play route's work once a request is admitted, whichever route admitted it.
 func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, target *PlayTarget) {
 	var w http.ResponseWriter = tw
+	start := time.Now()
 	pool := &StorePool{stores: h.deps.MakeStores(config)}
 	ctx, cancel := context.WithTimeout(r.Context(), resolveBudget)
 	defer cancel()
+	rid := requestID(r.Header.Get("X-Request-Id"))
 	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode,
-		ReleaseSize: target.ReleaseSize,
+		ReleaseSize: target.ReleaseSize, Title: target.Title, IMDb: target.IMDb,
 		// ?prefetch=1 — nobody is waiting on this add, so it may not spend the adds kept for Play.
 		Prefetch: r.URL.Query().Get("prefetch") == "1"}
 
@@ -1530,7 +1548,7 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// too short to answer in. Left alone deliberately; revisit if a real account is seen hitting it.
 		probeCtx, probeCancel := context.WithTimeout(r.Context(), statusBudget)
 		defer probeCancel()
-		h.handleProbe(w, probeCtx, config, pool, target.InfoHash, rt)
+		h.handleProbe(w, probeCtx, config, pool, target.InfoHash, rt, rid)
 		return
 	}
 
@@ -1557,8 +1575,8 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 			if verdict == linkPlayable {
 				h.links.markChecked(memoKey, hit.link)
 			}
-			logLimited("play-memo-hit", "play %s → 302 from a link minted in the last %s",
-				shortHash(target.InfoHash), linkMemoTTL)
+			logLimited("play-memo-hit", playDecision("play", "served", "link minted in the last "+linkMemoTTL.String(),
+				"", time.Since(start), rid, rt))
 			writePlayRedirect(w, hit.link)
 			return
 		}
@@ -1600,8 +1618,8 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 				h.servePlayLink(w, r, pool, rt, memoKey, link)
 				return
 			}
-			logLimited("play-held-miss", "play %s: the held resolve could not serve (%v), asking status",
-				shortHash(target.InfoHash), err)
+			logLimited("play-held-miss", playDecision("play", "fallback", fmt.Sprintf("held resolve failed (%v), asking status", err),
+				"", time.Since(start), rid, rt))
 		}
 	}
 
@@ -1618,7 +1636,7 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 	defer statusCancel()
 	status, ok, unknown := pool.StatusDetail(statusCtx, rt)
 	if ok {
-		h.writePlayQueued(w, pendingKey, target.InfoHash, status)
+		h.writePlayQueued(w, pendingKey, rt, rid, time.Since(start), status)
 		return
 	}
 
@@ -1659,9 +1677,9 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		if slowCtx, slowCancel, ok := escalatedStatusCtx(ctx); ok {
 			defer slowCancel()
 			if status, ok, _ := (&StorePool{stores: unknown}).StatusDetail(slowCtx, rt); ok {
-				logLimited("play-slow-status", "play %s → 202, status needed longer than %s to answer",
-					shortHash(target.InfoHash), statusBudget)
-				h.writePlayQueued(w, pendingKey, target.InfoHash, status)
+				logLimited("play-slow-status", playDecision("play", "fallback", "status needed longer than "+statusBudget.String()+" to answer",
+					"", time.Since(start), rid, rt))
+				h.writePlayQueued(w, pendingKey, rt, rid, time.Since(start), status)
 				return
 			}
 		}
@@ -1735,23 +1753,23 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(r.Context()), statusBudget)
 		defer statusCancel()
 		if status, ok, _ := pool.Status(statusCtx, rt); ok {
-			h.writePlayQueued(w, pendingKey, target.InfoHash, status)
+			h.writePlayQueued(w, pendingKey, rt, rid, time.Since(start), status)
 			return
 		}
 		// An add scout already sent is not a refusal at all — the release is being fetched, by us, right
 		// now. Answering 503 made the client tell the viewer their debrid was refusing AND stop trying
 		// other sources, for a release scout had queued moments earlier. 202 is simply what is true.
 		if errors.Is(err, errAddInFlight) {
-			logLimited("play-add-in-flight", "play %s → 202, an add is already in flight", shortHash(target.InfoHash))
-			h.writePlayQueued(w, pendingKey, target.InfoHash, StoreStatus{})
+			logLimited("play-add-in-flight", playDecision("play", "fallback", "add already in flight", "", time.Since(start), rid, rt))
+			h.writePlayQueued(w, pendingKey, rt, rid, time.Since(start), StoreStatus{})
 			return
 		}
 		// TorBox parked the add in its own queue (queued_id, not torrent_id — see errAddQueued). Also
 		// "coming", not dead: before this decode existed, the same answer fell through to the final 404
 		// below and the client blacklisted a release TorBox was about to fetch.
 		if errors.Is(err, errAddQueued) {
-			logLimited("play-add-queued", "play %s → 202, queued behind the account's slot limit", shortHash(target.InfoHash))
-			h.writePlayQueued(w, pendingKey, target.InfoHash, StoreStatus{State: fetchQueued})
+			logLimited("play-add-queued", playDecision("play", "fallback", "queued behind the account's slot limit", "", time.Since(start), rid, rt))
+			h.writePlayQueued(w, pendingKey, rt, rid, time.Since(start), StoreStatus{State: fetchQueued})
 			return
 		}
 		// A refusal SCOUT made — its hourly allowance — is not the debrid refusing, and must not be
@@ -1763,13 +1781,13 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// treats it differently from a spent budget: a queued download pauses until Retry-After and resumes,
 		// and nothing about the release is held against it.
 		if errors.Is(err, errPlayReserve) {
-			logLimited("play-reserved", "play %s → 503 (scout-side), prefetch refused: %v", shortHash(target.InfoHash), err)
+			logLimited("play-reserved", playDecision("play", "refused", "prefetch refused: "+scoutSideReason(err), "", time.Since(start), rid, rt))
 			writeUnavailable(w, pool.ScoutBusyFor(true),
 				map[string]any{"error": "reserved_for_play", "detail": scoutSideReason(err)})
 			return
 		}
 		if errors.Is(err, errScoutSide) {
-			logLimited("play-scout-busy", "play %s → 503 (scout-side), %v", shortHash(target.InfoHash), err)
+			logLimited("play-scout-busy", playDecision("play", "refused", scoutSideReason(err), "", time.Since(start), rid, rt))
 			writeAddBudgetSpent(w, pool.ScoutBusyFor(false),
 				map[string]any{"error": "scout_busy", "detail": scoutSideReason(err)})
 			return
@@ -1779,7 +1797,7 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// waited indefinitely on a download nothing had started. 503 says whose problem it is.
 		var unavailable *StoreUnavailableError
 		if errors.As(err, &unavailable) {
-			logLimited("play-store-unavailable", "play %s → 503, %v", shortHash(target.InfoHash), err)
+			logLimited("play-store-unavailable", playDecision("play", "refused", unavailable.Reason, string(unavailable.Service), time.Since(start), rid, rt))
 			writeUnavailable(w, storeRefusalWait,
 				map[string]any{"error": "store_unavailable", "service": unavailable.Service})
 			return
@@ -1788,8 +1806,7 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// there, so it is worth saying which of the two happened: no store could add it, and no store
 		// admits to downloading it either. A wait with nothing behind it is the one case a spinner
 		// cannot distinguish from a slow release.
-		logLimited("play-dead", "play %s → 404, no store resolved it and none reports a download: %v",
-			shortHash(target.InfoHash), err)
+		logLimited("play-dead", playDecision("play", "skipped", "no store resolved it and none reports a download", "", time.Since(start), rid, rt))
 		writeJSON(w, http.StatusNotFound, errBody("dead_link"), noStore)
 		return
 	}
@@ -1852,20 +1869,22 @@ func (h *handler) servePlayLink(w http.ResponseWriter, r *http.Request, pool *St
 //
 // Any failure is linkBroken, on which servePlayLink serves the first link as it did before this existed.
 func (h *handler) relistMovie(r *http.Request, pool *StorePool, rt ResolveTarget) (string, linkVerdict) {
+	start := time.Now()
+	rid := requestID(r.Header.Get("X-Request-Id"))
 	listed := rt
 	listed.NoAdd, listed.ListFiles = true, true
 	ctx, cancel := context.WithTimeout(r.Context(), statusBudget)
 	defer cancel()
 	link, err := pool.ResolveCachedOnly(ctx, listed, pool.HoldingServices(rt))
 	if err != nil {
-		logLimited("play-relist-failed", "play %s: the re-resolve with a file list could not serve (%v)",
-			shortHash(rt.InfoHash), err)
+		logLimited("play-relist-failed", playDecision("play", "fallback", fmt.Sprintf("re-resolve with a file list failed: %v", err),
+			"", time.Since(start), rid, rt))
 		return "", linkBroken
 	}
 	verdict := h.verifyLink(r.Context(), pool, rt, link)
 	if verdict == linkPlayable || verdict == linkUnverified {
-		logLimited("play-relist-served", "play %s: the re-resolve with a file list picked another file",
-			shortHash(rt.InfoHash))
+		logLimited("play-relist-served", playDecision("play", "served", "re-resolve with a file list picked another file",
+			"", time.Since(start), rid, rt))
 	}
 	return link, verdict
 }
@@ -1935,6 +1954,10 @@ func (h *handler) handleLegacyCancel(w http.ResponseWriter, r *http.Request, con
 // configured debrid account that can cancel, in configured order, and answers with the first one that has
 // an opinion about this hash — see storeCanceller's own comment for why only TorBox implements it.
 func (h *handler) resolveCancel(w http.ResponseWriter, r *http.Request, config *Config, target *PlayTarget) {
+	start := time.Now()
+	rid := requestID(r.Header.Get("X-Request-Id"))
+	rt := ResolveTarget{InfoHash: target.InfoHash, FileIdx: target.FileIdx, Season: target.Season, Episode: target.Episode,
+		Title: target.Title, IMDb: target.IMDb}
 	reannounce := r.URL.Query().Get("op") == "reannounce"
 	ctx, cancel := context.WithTimeout(r.Context(), statusBudget)
 	defer cancel()
@@ -1950,11 +1973,11 @@ func (h *handler) resolveCancel(w http.ResponseWriter, r *http.Request, config *
 		if err != nil {
 			var unavailable *StoreUnavailableError
 			if errors.As(err, &unavailable) {
-				logLimited("cancel-store-unavailable", "cancel %s → 503, %v", shortHash(target.InfoHash), err)
+				logLimited("cancel-store-unavailable", playDecision("cancel", "refused", unavailable.Reason, string(unavailable.Service), time.Since(start), rid, rt))
 				writeUnavailable(w, storeRefusalWait, map[string]any{"error": "store_unavailable", "service": unavailable.Service})
 				return
 			}
-			logLimited("cancel-error", "cancel %s → 503, %v", shortHash(target.InfoHash), err)
+			logLimited("cancel-error", playDecision("cancel", "degraded", fmt.Sprintf("%v", err), "", time.Since(start), rid, rt))
 			writeUnavailable(w, storeRefusalWait, errBody("store_unavailable"))
 			return
 		}
@@ -1962,35 +1985,35 @@ func (h *handler) resolveCancel(w http.ResponseWriter, r *http.Request, config *
 			// This account has no opinion; the hash may still belong to another configured account.
 			continue
 		}
-		writeCancelOutcome(w, target.InfoHash, reannounce, outcome)
+		writeCancelOutcome(w, rt, rid, start, reannounce, outcome)
 		return
 	}
 	if !sawCanceller {
-		logLimited("cancel-unsupported", "cancel %s → 501, no configured account supports it", shortHash(target.InfoHash))
+		logLimited("cancel-unsupported", playDecision("cancel", "skipped", "no configured account supports it", "", time.Since(start), rid, rt))
 		writeJSON(w, http.StatusNotImplemented, errBody("unsupported"), noStore)
 		return
 	}
-	logLimited("cancel", "cancel %s → 404, nothing queued", shortHash(target.InfoHash))
+	logLimited("cancel", playDecision("cancel", "skipped", "nothing queued", "", time.Since(start), rid, rt))
 	writeJSON(w, http.StatusNotFound, errBody("not_queued"), noStore)
 }
 
-func writeCancelOutcome(w http.ResponseWriter, hash string, reannounce bool, outcome CancelOutcome) {
+func writeCancelOutcome(w http.ResponseWriter, rt ResolveTarget, rid string, start time.Time, reannounce bool, outcome CancelOutcome) {
 	switch outcome.Reason {
 	case "finished":
-		logLimited("cancel", "cancel %s → 409 finished", shortHash(hash))
+		logLimited("cancel", playDecision("cancel", "refused", "finished", "", time.Since(start), rid, rt))
 		writeJSON(w, http.StatusConflict, errBody("finished"), noStore)
 		return
 	case "not_ours":
-		logLimited("cancel", "cancel %s → 409 not_ours", shortHash(hash))
+		logLimited("cancel", playDecision("cancel", "refused", "not_ours", "", time.Since(start), rid, rt))
 		writeJSON(w, http.StatusConflict, errBody("not_ours"), noStore)
 		return
 	}
 	if outcome.Reannounced {
-		logLimited("cancel", "cancel %s → 202 reannounced", shortHash(hash))
+		logLimited("cancel", playDecision("cancel", "served", "reannounced", "", time.Since(start), rid, rt))
 		writeQueuedBody(w, outcome.Status)
 		return
 	}
-	logLimited("cancel", "cancel %s → 204", shortHash(hash))
+	logLimited("cancel", playDecision("cancel", "served", "cancelled", "", time.Since(start), rid, rt))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2114,7 +2137,10 @@ type streamsResponse struct {
 }
 
 func toStremioStream(s RawStream, sid *StreamID, playURL func(PlayTarget) string) streamOut {
-	target := PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid)}
+	target := PlayTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonPtr(sid), Episode: episodePtr(sid),
+		// Diagnostic only (play.go) — rides in the ticket so a later /play or /p/ decision line can name
+		// the release instead of keying on shortHash(InfoHash) alone.
+		Title: s.Title, IMDb: sid.IMDb}
 	if s.SizeBytes != nil && *s.SizeBytes > 0 {
 		target.ReleaseSize = int64(*s.SizeBytes)
 	}

@@ -112,7 +112,7 @@ func TestHandleProbe_reportsWithoutQueueing(t *testing.T) {
 	}}
 	rec := httptest.NewRecorder()
 	pool := &StorePool{stores: h.deps.MakeStores(&Config{})}
-	h.handleProbe(rec, context.Background(), probeConfig(), pool, "abc", ResolveTarget{InfoHash: "abc"})
+	h.handleProbe(rec, context.Background(), probeConfig(), pool, "abc", ResolveTarget{InfoHash: "abc"}, "")
 
 	if resolves != 0 {
 		t.Errorf("a probe resolved %d times — resolving adds the torrent", resolves)
@@ -134,7 +134,7 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 			MakeStores: func(*Config) []Store { return stores }}}
 		rec := httptest.NewRecorder()
 		h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: stores}, "abc",
-			ResolveTarget{InfoHash: "abc"})
+			ResolveTarget{InfoHash: "abc"}, "")
 		return rec
 	}
 
@@ -168,7 +168,7 @@ func TestHandleProbe_distinguishesItsAnswers(t *testing.T) {
 		MakeStores: func(*Config) []Store { return []Store{refusedStore} }}}
 	rec := httptest.NewRecorder()
 	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{refusedStore}}, "abc",
-		ResolveTarget{InfoHash: "abc"})
+		ResolveTarget{InfoHash: "abc"}, "")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("a refused account should be 503, got %d", rec.Code)
 	}
@@ -358,7 +358,7 @@ func TestHandleProbe_neverQueuesAndSaysWhenItCannotTell(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{held}}, "abc",
-		ResolveTarget{InfoHash: "abc"})
+		ResolveTarget{InfoHash: "abc"}, "")
 	if rec.Code == http.StatusOK {
 		t.Error("cached-but-not-held answered 200 ready; playing it would start with a download")
 	}
@@ -370,7 +370,7 @@ func TestHandleProbe_neverQueuesAndSaysWhenItCannotTell(t *testing.T) {
 	down := fakeStore{svc: ServiceTorBox, checkErr: errCheckFailed}
 	rec = httptest.NewRecorder()
 	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{down}}, "abc",
-		ResolveTarget{InfoHash: "abc"})
+		ResolveTarget{InfoHash: "abc"}, "")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("an unreachable cache check should be 503, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -397,7 +397,7 @@ func TestHandleProbe_anIndeterminateStatusIsNotAnAbsence(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{uncertain}}, "abc",
-		ResolveTarget{InfoHash: "abc"})
+		ResolveTarget{InfoHash: "abc"}, "")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("an indeterminate status read should be 503, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -411,7 +411,7 @@ func TestHandleProbe_anIndeterminateStatusIsNotAnAbsence(t *testing.T) {
 	definitive.answer = statusNo
 	rec = httptest.NewRecorder()
 	h.handleProbe(rec, context.Background(), probeConfig(), &StorePool{stores: []Store{definitive}}, "abc",
-		ResolveTarget{InfoHash: "abc"})
+		ResolveTarget{InfoHash: "abc"}, "")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("a store that answered should still be able to say nothing is queued, got %d: %s",
 			rec.Code, rec.Body.String())

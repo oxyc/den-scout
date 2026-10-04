@@ -57,6 +57,11 @@ type Settings struct {
 	// PLAY_RESERVE_ADDS: how many of the hourly adds a prefetch (/play?prefetch=1) may not spend, so a viewer
 	// pressing Play still has them. 0 turns the reserve off.
 	PlayReserveAdds int
+	// LOG_IDENTITY: whether a decision line (rank/scrape/play/probe/cancel) carries identity fields — title
+	// id, season/episode, release name, infohash, file index/size, runner-ups. Default ON: an operator who
+	// wants logs that never name a release turns it off; event/outcome/reason/upstream/dur_ms/rid stay
+	// either way. See decisionlog.go.
+	LogIdentity bool
 }
 
 // StartupSummary is the one line an operator reads to confirm what this process is running with. Nothing
@@ -91,6 +96,7 @@ func StartupSummary(s Settings, persistent bool) string {
 	// The fleet's one startup shape: `den-<addon> <version> listening on :<port> — <shared k=v> <own k=v>`.
 	return "den-scout " + manifestVersion + " listening on :" + s.Port +
 		" — metrics=" + onOff(s.MetricsToken != "") + " log_requests=" + onOff(s.LogRequests) +
+		" log_identity=" + onOff(s.LogIdentity) +
 		" sealed=" + onOff(s.ConfigKey != "") +
 		" revoked=" + strconv.Itoa(len(s.RevokedInstalls)) + " epoch=" + strconv.Itoa(s.ConfigEpoch) +
 		" require_iid=" + onOff(s.RequireInstallID) + " remux=" + onOff(s.RemuxKey != "") +
@@ -124,6 +130,7 @@ func SettingsFromEnv(get func(string) string) Settings {
 		MintIndexerConfigs: strings.EqualFold(get("MINT_INDEXER_CONFIGS"), "true") ||
 			get("MINT_INDEXER_CONFIGS") == "1",
 		LogRequests:      get("LOG_REQUESTS") != "" && get("LOG_REQUESTS") != "0",
+		LogIdentity:      boolEnvOr(get("LOG_IDENTITY"), true),
 		RevokedInstalls:  parseRevokedInstalls(get("REVOKED_INSTALLS")),
 		ConfigEpoch:      parseConfigEpoch(get("CONFIG_EPOCH")),
 		RequireInstallID: get("REQUIRE_INSTALL_ID") != "" && get("REQUIRE_INSTALL_ID") != "0",
@@ -251,6 +258,7 @@ func BuildDeps(settings Settings, client *http.Client, cache Cache) Deps {
 	// Decided once, at startup, from the operator's environment — never from a request.
 	EnableIndexerConfigMinting(settings.MintIndexerConfigs)
 	SetPlayReserve(settings.PlayReserveAdds)
+	SetLogIdentity(settings.LogIdentity)
 	revoked := make(map[string]bool, len(settings.RevokedInstalls))
 	for _, iid := range settings.RevokedInstalls {
 		revoked[iid] = true
@@ -326,4 +334,14 @@ func strEnvOr(v, d string) string {
 		return d
 	}
 	return v
+}
+
+// boolEnvOr reads a boolean env var that defaults to ON (unlike LogRequests's off-by-default check):
+// unset or blank keeps the default, "0" or "false" (any case) is off, anything else is on.
+func boolEnvOr(v string, d bool) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return d
+	}
+	return v != "0" && !strings.EqualFold(v, "false")
 }
