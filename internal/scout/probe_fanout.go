@@ -86,6 +86,52 @@ func applyProbedSize(s *RawStream, sid *StreamID) {
 	s.SizeBytes = &probed
 }
 
+// hydrateKnownSizes corrects a stream's size from what a store already knows about the file it
+// resolves to — read off a torrent's own file list, which a store caches while picking that file for
+// /play or a cache check, never a fresh network call of its own. It runs on every request, not just the
+// probe's topN frontier, and does not wait on the probe fan-out's own resolve to succeed: the Fauda S1E3
+// install's TorBox mylist kept answering "no usable answer" to that resolve, so the ranged-GET probe
+// never warmed, while an EARLIER attempt had already gone far enough to list the pack's files and cached
+// them. This reads that cache. The probe is still the only source of track/language facts, so it keeps
+// running regardless of what this corrects.
+//
+// Movie-only guard, same reasoning as applyProbedSize: there is no pack for a movie's title size to have
+// been confused with, so a movie is never given a lookup at all.
+func (h *handler) hydrateKnownSizes(config *Config, streams []RawStream, sid *StreamID) {
+	if sid == nil || !sid.HasEp || h.deps.MakeStores == nil {
+		return
+	}
+	var pool *StorePool
+	for i := range streams {
+		s := &streams[i]
+		if s.InfoHash == "" || s.PackSizeBytes != nil {
+			continue // already named a pack, by a probe or an earlier hit of this very path
+		}
+		if pool == nil {
+			pool = &StorePool{stores: h.deps.MakeStores(config)}
+		}
+		target := ResolveTarget{InfoHash: s.InfoHash, FileIdx: s.FileIdx, Season: seasonOf(sid), Episode: episodeOf(sid)}
+		if known, ok := pool.KnownFileSize(target); ok {
+			applyKnownSize(s, known)
+		}
+	}
+}
+
+// applyKnownSize is applyProbedSize's twin for a size a store's own file list already gave, rather than
+// one read off a ranged GET: the same gap-check, so the two paths agree on when a number is worth naming
+// as a pack rather than a rounding difference.
+func applyKnownSize(s *RawStream, known int64) {
+	if known <= 0 {
+		return
+	}
+	n := int(known)
+	if s.SizeBytes != nil && float64(*s.SizeBytes) >= float64(n)*packSizeRatio {
+		pack := *s.SizeBytes
+		s.PackSizeBytes = &pack
+	}
+	s.SizeBytes = &n
+}
+
 func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStream, sid *StreamID,
 	truth CacheTruth) bool {
 	h.hydrateProbeFacts(streams, sid)

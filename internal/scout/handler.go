@@ -1089,6 +1089,9 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 	// client compatibility cost is computed; the old order ranked first and discovered the fact only
 	// afterward, so a warm probe could not affect the list it was attached to.
 	h.hydrateProbeFacts(seeds, sid)
+	// A store's own file list, cached from an earlier resolve attempt, corrects a pack-sized episode for
+	// free — and does not depend on the probe fan-out's own resolve succeeding (see hydrateKnownSizes).
+	h.hydrateKnownSizes(config, seeds, sid)
 	// logDbg always collects drop counts and the served order — unlike dbg (the ?debug=1 JSON payload,
 	// nil on every normal request), it is never serialised to a client. When dbg is set, the two are the
 	// SAME object, so ?debug=1's existing accounting is unchanged; otherwise this is the only place the

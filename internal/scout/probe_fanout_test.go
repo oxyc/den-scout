@@ -108,6 +108,56 @@ func TestHydrateProbeFacts_seasonPackSizeCorrectsToTheEpisode(t *testing.T) {
 	}
 }
 
+// Fauda S1E3, again: the Fauda install never got a corrected size because its TorBox mylist kept
+// refusing the probe's own resolve ("mylist gave no usable answer", the exact error den-scout's logs
+// showed for this release). The probe is not the only place that already knows the file's size, though:
+// TorBox's resolve entry was cached from an EARLIER attempt that got as far as listing the pack's files
+// before the final link request failed, and that listing names the episode's own bytes. Hydrating known
+// sizes must correct SizeBytes from it without needing a fresh resolve to succeed at all.
+func TestHydrateKnownSizes_correctsFromAStoresFileListWithNoProbe(t *testing.T) {
+	const packHint = 68 << 30         // what "💾 68 GB" in the title parsed to
+	const episodeSize = 1_136_580_921 // what TorBox's own file listing gives for the episode
+	cache := NewMemoryCache(1 << 20)
+	cache.Put(resolveKey("t", H), fmt.Sprintf(
+		`{"torrentId":9,"files":[{"Index":0,"Name":"Fauda.S01E03.WEB-DL.1080p.mkv","SizeBytes":%d}]}`,
+		episodeSize), resolveCacheTTL)
+	sid := &StreamID{Type: "series", Season: 1, Episode: 3, HasEp: true}
+	size := packHint
+	streams := []RawStream{{InfoHash: H, SizeBytes: &size}}
+	h := &handler{deps: Deps{
+		MakeStores: func(*Config) []Store {
+			return []Store{&torBoxStore{token: "t", cache: cache, api: torboxAPI}}
+		},
+	}}
+
+	h.hydrateKnownSizes(&Config{}, streams, sid)
+
+	if streams[0].SizeBytes == nil || *streams[0].SizeBytes != episodeSize {
+		t.Fatalf("SizeBytes = %v, want the store's own %d", streams[0].SizeBytes, episodeSize)
+	}
+	if streams[0].PackSizeBytes == nil || *streams[0].PackSizeBytes != packHint {
+		t.Fatalf("PackSizeBytes = %v, want the indexer's pack size %d kept as context", streams[0].PackSizeBytes, packHint)
+	}
+}
+
+// A movie never gets a KnownFileSize lookup at all — there is no pack for its title size to have been
+// confused with, and a movie resolves without listing files in the first place.
+func TestHydrateKnownSizes_moviesAreSkipped(t *testing.T) {
+	resolves := 0
+	size := 18 << 30
+	streams := []RawStream{{InfoHash: H, SizeBytes: &size}}
+	h := &handler{deps: Deps{MakeStores: func(*Config) []Store { resolves++; return nil }}}
+
+	h.hydrateKnownSizes(&Config{}, streams, &StreamID{Type: "movie"})
+
+	if resolves != 0 {
+		t.Fatal("built a store pool for a movie, which has no pack to correct")
+	}
+	if streams[0].SizeBytes == nil || *streams[0].SizeBytes != 18<<30 {
+		t.Fatalf("SizeBytes changed for a movie: %v", streams[0].SizeBytes)
+	}
+}
+
 // A movie's title size and its probed size agree to the byte (or close enough to be rounding); there is
 // no pack behind a single-file release, so no PackSizeBytes should appear.
 func TestHydrateProbeFacts_movieGetsNoPackSize(t *testing.T) {
