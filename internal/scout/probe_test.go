@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -118,11 +119,43 @@ func TestProbeTracks_readsOnlyTheHeadWhenRangeIsIgnored(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := ProbeTracks(context.Background(), srv.Client(), srv.URL); err != nil {
+	p, err := ProbeTracks(context.Background(), srv.Client(), srv.URL)
+	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
 	if got := served.Load(); got > 8<<20 {
 		t.Fatalf("pulled %d bytes for a 1 MiB probe — the drain is unbounded", got)
+	}
+	// The server ignored Range and is sending the whole file: Content-Length IS the file's total size,
+	// unlike a 206's (which names only the chunk asked for).
+	if p.SizeBytes != fileSize {
+		t.Fatalf("SizeBytes = %d, want %d (the Content-Length of the ignored-Range response)", p.SizeBytes, fileSize)
+	}
+}
+
+// ProbeTracks resolves the EXACT file this stream plays — for an episode picked out of a season pack,
+// that is the episode alone — so the total it reads off the response is the episode's own size, never
+// the pack's. Mirrors den-remux's own log for a real Fauda S1E3 release: the indexer's title claimed a
+// 68 GB season pack, and the file actually served was 1,136,580,921 bytes.
+func TestProbeTracks_sizeBytesIsTheEpisodeNotThePack(t *testing.T) {
+	head, err := os.ReadFile("testdata/tracks.mkv")
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	const episodeSize = 1_136_580_921
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(head)-1, episodeSize))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(head)
+	}))
+	defer srv.Close()
+
+	p, err := ProbeTracks(context.Background(), srv.Client(), srv.URL)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if p.SizeBytes != episodeSize {
+		t.Fatalf("SizeBytes = %d, want %d (the episode's own size)", p.SizeBytes, episodeSize)
 	}
 }
 

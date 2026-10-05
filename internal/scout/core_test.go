@@ -294,6 +294,17 @@ func TestCleanLabelAndSize(t *testing.T) {
 	}
 }
 
+// Fauda S1E3: the picker must say what this stream actually is (1.1 GB) and name the pack only as
+// context, never the other way round.
+func TestCleanLabel_packSizeIsContextNotTheHeadline(t *testing.T) {
+	episodeSize, packSize := 1_136_580_921, 68*gib
+	s := RawStream{Title: "Fauda.S01E03.1080p.WEB-DL", SizeBytes: &episodeSize, PackSizeBytes: &packSize}
+	want := "1080p • WEB-DL • 1.1 GB · from a 68 GB pack"
+	if got := cleanLabel(s); got != want {
+		t.Errorf("cleanLabel=%q, want %q", got, want)
+	}
+}
+
 func TestStreamAttributes(t *testing.T) {
 	a := streamAttributes(RawStream{Title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos", SizeBytes: intp(40 * gib),
 		Seeders: intp(12), Cached: true, CacheKnown: true})

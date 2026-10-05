@@ -28,7 +28,14 @@ type StreamAttributes struct {
 	// Burned-in (hardcoded) subtitles — korsub/HC. A real gotcha, so the client can surface it.
 	HardcodedSubs bool `json:"hardcodedSubs"`
 	ThreeD        bool `json:"threeD"`
-	SizeBytes     *int `json:"sizeBytes"`
+	// The size of the file this stream actually plays — an episode's own size, never the season pack's,
+	// once a probe has read it (see applyProbedSize in probe_fanout.go). Before that first probe it is
+	// still the indexer's number, which for a season pack names the whole torrent.
+	SizeBytes *int `json:"sizeBytes"`
+	// The season pack's own total, present only once a probe has shown this episode's real size is
+	// meaningfully smaller than it — context for a label ("1.1 GB · from a 68 GB pack"), never a size to
+	// rank or filter on.
+	PackSizeBytes *int `json:"packSizeBytes,omitempty"`
 	Seeders       *int `json:"seeders"`
 	// Whether the debrid already holds this release. A POINTER, because there are three answers and the
 	// third one matters: it holds it, it does not, or nobody could ask. When the cache check failed a flat
@@ -247,6 +254,7 @@ func streamAttributes(s RawStream) StreamAttributes {
 		HardcodedSubs: reKorsubHC.match(t),
 		ThreeD:        re3D.match(t),
 		SizeBytes:     s.SizeBytes,
+		PackSizeBytes: s.PackSizeBytes,
 		Seeders:       s.Seeders,
 		Cached:        cachedClaim(s),
 		Label:         cleanLabelLower(t, s), // reuse the title we already lowercased

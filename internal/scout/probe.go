@@ -56,6 +56,12 @@ type Probe struct {
 	// down, and "2 untagged audio tracks" is a different, more useful statement than "no audio".
 	UntaggedAudio     int `json:"untaggedAudioTracks"`
 	UntaggedSubtitles int `json:"untaggedSubtitleTracks"`
+	// The resolved link's own total size, read off the ranged GET's Content-Range (or Content-Length when a
+	// server ignores Range and sends the whole file). The link is the exact file this stream plays — for an
+	// episode picked out of a season pack, that is the episode alone, never the pack — so this is the one
+	// size den-scout ever measures rather than takes an indexer's title's word for. 0 when the response gave
+	// no usable total.
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
 }
 
 // Matroska EBML ids. Only the handful needed to walk Tracks -> TrackEntry -> the descriptive children.
@@ -131,7 +137,29 @@ func ProbeTracks(ctx context.Context, client *http.Client, url string) (Probe, e
 	if err != nil {
 		return Probe{}, err
 	}
-	return ParseHead(head)
+	p, err := ParseHead(head)
+	if err != nil {
+		return Probe{}, err
+	}
+	p.SizeBytes = probedTotalSize(resp)
+	return p, nil
+}
+
+// probedTotalSize reads the FILE's size off the response to the ranged GET ProbeTracks just made: the
+// Content-Range total on a 206, or Content-Length on a 200 (a server that ignored the Range and is
+// sending the whole thing). 0 when neither says — a CDN that gives no total leaves the caller with
+// nothing to correct the indexer's number with, same as never having probed.
+func probedTotalSize(resp *http.Response) int64 {
+	if resp.StatusCode == http.StatusPartialContent {
+		if total, ok := contentRangeTotal(resp.Header.Get("content-range")); ok {
+			return total
+		}
+		return 0
+	}
+	if resp.ContentLength > 0 {
+		return resp.ContentLength
+	}
+	return 0
 }
 
 // ParseHead reads whatever the container will tell us: languages where the format records them, and the
