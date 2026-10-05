@@ -141,8 +141,14 @@ func cleanLabelLower(t string, s RawStream) string {
 	if reAtmos.match(t) {
 		parts = append(parts, "Atmos")
 	}
-	if s.SizeBytes != nil {
+	switch {
+	case s.SizeBytes != nil:
 		parts = append(parts, sizeLabel(*s.SizeBytes))
+	case s.PackSizeBytes != nil:
+		// The episode's own size is unknown — unresolvedSeasonPack (season.go) left SizeBytes nil rather
+		// than keep the indexer's pack-wide number as if it were this file's. State what the number
+		// actually is instead of staying silent or, worse, naming it plainly as this release's size.
+		parts = append(parts, sizeLabel(*s.PackSizeBytes)+" pack")
 	}
 	label := "Stream"
 	if len(parts) > 0 {
@@ -150,8 +156,9 @@ func cleanLabelLower(t string, s RawStream) string {
 	}
 	// The pack is context, not a correction — this stream still plays the file sized above. Appended after
 	// the bullets rather than folded into them, so a client that wants only the short form can cut the
-	// string at " · " instead of re-parsing bullets.
-	if s.PackSizeBytes != nil {
+	// string at " · " instead of re-parsing bullets. Only when SizeBytes is ITSELF known: an unknown
+	// episode size already named the pack as the headline bullet above, and repeating it here is noise.
+	if s.SizeBytes != nil && s.PackSizeBytes != nil {
 		label += " · from a " + sizeLabel(*s.PackSizeBytes) + " pack"
 	}
 	return label

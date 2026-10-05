@@ -305,6 +305,19 @@ func TestCleanLabel_packSizeIsContextNotTheHeadline(t *testing.T) {
 	}
 }
 
+// A never-opened pack (unresolvedSeasonPack left SizeBytes nil): the label must name the number as a
+// pack in the headline itself, never as a plain, unqualified "68 GB" that reads as the episode's own —
+// and must not also repeat it as trailing "· from a 68 GB pack" context, since there is no separate,
+// trusted episode number for that context to sit beside.
+func TestCleanLabel_unknownEpisodeSizeNamesThePackInTheHeadline(t *testing.T) {
+	packSize := 68 * gib
+	s := RawStream{Title: "Fauda.S01.COMPLETE.1080p.WEB-DL", PackSizeBytes: &packSize}
+	want := "1080p • WEB-DL • 68 GB pack"
+	if got := cleanLabel(s); got != want {
+		t.Errorf("cleanLabel=%q, want %q", got, want)
+	}
+}
+
 func TestStreamAttributes(t *testing.T) {
 	a := streamAttributes(RawStream{Title: "Movie.2160p.BluRay.REMUX.DV.HDR.HEVC.Atmos", SizeBytes: intp(40 * gib),
 		Seeders: intp(12), Cached: true, CacheKnown: true})

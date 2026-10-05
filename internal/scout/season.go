@@ -3,6 +3,7 @@ package scout
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,6 +120,43 @@ func episodeChain(tail string) []chainedEpisode {
 // that contains it.
 func namesEpisode(name string, season, episode int) bool {
 	return newEpisodeNamer(season, episode).names(name)
+}
+
+// unresolvedSeasonPack reports whether a release's OWN title gives no reason to trust its declared size
+// as this episode's: a plain single SxxEyy label (or an explicit two-episode label naming this one) is
+// trusted as it always was, but a title that names the season generically with no episode at all
+// ("Show.S01.COMPLETE.1080p", "Show.Season.1.1080p") or by a multi-episode range that merely happens to
+// span this one ("Show.S01E01-12.1080p" for episode 3) is a pack, not a per-episode file, whatever its
+// declared size names.
+func unresolvedSeasonPack(title string, season, episode int) bool {
+	if matchesEpisode(title, cachedEpisodePatterns(season, episode)) {
+		return false
+	}
+	lower := strings.ToLower(title)
+	if rangeHoldsEpisode(baseName(lower), season, episode) {
+		return true
+	}
+	return seasonOnlyPattern(season).MatchString(lower)
+}
+
+var (
+	seasonOnlyMu    sync.Mutex
+	seasonOnlyCache = map[int]*regexp.Regexp{}
+)
+
+// seasonOnlyPattern matches a bare season marker — s01, season 1, season.01 — that episodePatterns
+// itself never anchors on, since none of its patterns fire without an episode number right beside it.
+// Word-bounded so it does not fire inside "s01e03" itself: digits run straight into a glued-on episode
+// marker with no boundary between them, so a true per-episode name never matches this.
+func seasonOnlyPattern(season int) *regexp.Regexp {
+	seasonOnlyMu.Lock()
+	defer seasonOnlyMu.Unlock()
+	if re, ok := seasonOnlyCache[season]; ok {
+		return re
+	}
+	re := regexp.MustCompile(fmt.Sprintf(`\bs0*%d\b|\bseason[ ._-]*0*%d\b`, season, season))
+	seasonOnlyCache[season] = re
+	return re
 }
 
 // episodeNamer holds the compiled patterns for ONE (season, episode) so a pick pays for them once

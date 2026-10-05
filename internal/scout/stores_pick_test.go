@@ -1173,3 +1173,39 @@ func TestCachedEpisodePatterns_answersForTheEpisodeAskedAbout(t *testing.T) {
 		t.Error("the pick that filled the cache was answered with someone else's patterns")
 	}
 }
+
+// unresolvedSeasonPack: a title that never names this episode, with the season either generic or named
+// only by a range that happens to span it, is a pack whatever its declared size claims. A title that
+// does name this episode — plainly or by an explicit list — is trusted exactly as namesEpisode trusts it.
+func TestUnresolvedSeasonPack(t *testing.T) {
+	cases := []struct {
+		name  string
+		title string
+		want  bool
+	}{
+		{"bare season, no episode at all", "Fauda.S01.COMPLETE.1080p.NF.WEB-DL", true},
+		{"worded season, no episode", "Fauda.Season.1.1080p.BluRay", true},
+		{"a range spanning this episode", "Fauda.S01E01-12.1080p.NF.WEB-DL.ITA-ENG-HEB.AAC2.0.H.265-G66", true},
+		{"a range NOT spanning this episode", "Fauda.S02E01-12.1080p.NF.WEB-DL", false},
+		{"names exactly this episode", "Fauda.S01E03.WEB-DL.1080p.mkv", false},
+		{"names exactly this episode, HEBREW tagged", "Fauda (2015) S01E03 (1080p HEBREW NF WEB-DL x265) [UTR].mkv", false},
+		{"an explicit double naming this one", "Fauda.S01E02E03.1080p.mkv", false},
+		{"a movie, unrelated to any season wording", "Some.Other.Movie.2019.1080p.mkv", false},
+	}
+	for _, tc := range cases {
+		if got := unresolvedSeasonPack(tc.title, 1, 3); got != tc.want {
+			t.Errorf("%s: unresolvedSeasonPack(%q, 1, 3) = %v, want %v", tc.name, tc.title, got, tc.want)
+		}
+	}
+}
+
+// s01e03 itself must never trip the bare season pattern: there is no boundary between a season's digits
+// and an episode marker glued straight onto them.
+func TestSeasonOnlyPattern_doesNotFireInsideAnEpisodeMarker(t *testing.T) {
+	if seasonOnlyPattern(1).MatchString("fauda.s01e03.web-dl.1080p.mkv") {
+		t.Error(`"s01e03" matched the bare-season pattern for season 1`)
+	}
+	if !seasonOnlyPattern(1).MatchString("fauda.s01.complete.1080p") {
+		t.Error(`"s01" alone did not match the bare-season pattern for season 1`)
+	}
+}
