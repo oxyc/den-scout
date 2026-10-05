@@ -159,7 +159,7 @@ func TestCinemetaMeta_cachesAnswersAndFailures(t *testing.T) {
 	if n := asked.Load(); n != 1 {
 		t.Errorf("asked Cinemeta %d times for one film, want 1", n)
 	}
-	if ttl := cache.ttls["cinemeta:movie:tt100"]; ttl != cinemetaHitTTL {
+	if ttl := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "tt100")]; ttl != cinemetaHitTTL {
 		t.Errorf("an answer is kept for %s, want %s", ttl, cinemetaHitTTL)
 	}
 
@@ -172,15 +172,40 @@ func TestCinemetaMeta_cachesAnswersAndFailures(t *testing.T) {
 	if n := asked.Load(); n != 2 {
 		t.Errorf("asked Cinemeta %d times in all, want a failure to be remembered too", n)
 	}
-	if ttl := cache.ttls["cinemeta:movie:tt200"]; ttl != cinemetaMissTTL {
+	if ttl := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "tt200")]; ttl != cinemetaMissTTL {
 		t.Errorf("a failure is kept for %s, want %s", ttl, cinemetaMissTTL)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	meta(ctx, "movie", "tt300")
-	if _, kept := cache.ttls["cinemeta:movie:tt300"]; kept {
+	if _, kept := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "tt300")]; kept {
 		t.Error("a lookup its caller cancelled was remembered as a failure")
+	}
+}
+
+func TestCinemetaMeta_keepsConfiguredProvidersApart(t *testing.T) {
+	cache := NewMemoryCache(1 << 20)
+	var askedA, askedB atomic.Int32
+	meta := func(base, name string, asked *atomic.Int32) func(context.Context, string, string) (cineMeta, bool) {
+		return cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) {
+			asked.Add(1)
+			return resp(200, `{"meta":{"name":"`+name+`","year":"2026"}}`), nil
+		}}, base, cache)
+	}
+	a := meta("https://a.example/", "Provider A", &askedA)
+	b := meta("https://b.example", "Provider B", &askedB)
+
+	first, okA := a(context.Background(), "movie", "tt-same")
+	second, okB := b(context.Background(), "movie", "tt-same")
+	if !okA || !okB || first.Title != "Provider A" || second.Title != "Provider B" {
+		t.Fatalf("provider answers crossed: A=%+v/%v B=%+v/%v", first, okA, second, okB)
+	}
+	if askedA.Load() != 1 || askedB.Load() != 1 {
+		t.Fatalf("provider requests A=%d B=%d, want one each", askedA.Load(), askedB.Load())
+	}
+	if again, _ := a(context.Background(), "movie", "tt-same"); again.Title != "Provider A" || askedA.Load() != 1 {
+		t.Fatalf("provider A cache changed: %+v, calls=%d", again, askedA.Load())
 	}
 }
 

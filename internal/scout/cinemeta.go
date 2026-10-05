@@ -68,7 +68,7 @@ func cinemetaMeta(client doer, base string, cache Cache) func(context.Context, s
 		if typ != "movie" {
 			return cineMeta{}, false
 		}
-		key := "cinemeta:movie:" + imdb
+		key := cinemetaCacheKey(base, imdb)
 		if v, ok := cache.Get(key); ok {
 			var m cineMeta
 			if v != cinemetaMissValue && json.Unmarshal([]byte(v), &m) == nil {
@@ -92,6 +92,12 @@ func cinemetaMeta(client doer, base string, cache Cache) func(context.Context, s
 		m := v.(cineMeta)
 		return m, m.Year != 0 || m.Title != ""
 	}
+}
+
+// Cinemeta-compatible providers are not interchangeable. A configured mirror may differ from the public service,
+// so its settled answer and its live flight are keyed by the normalized base without exposing that URL in storage.
+func cinemetaCacheKey(base, imdb string) string {
+	return "cinemeta:v2:" + keyHash(strings.TrimRight(base, "/")) + ":movie:" + imdb
 }
 
 // fetchCinemeta asks Cinemeta for one film.
