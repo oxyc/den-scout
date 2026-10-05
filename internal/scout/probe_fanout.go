@@ -53,10 +53,37 @@ func (h *handler) hydrateProbeFacts(streams []RawStream, sid *StreamID) {
 			var probe Probe
 			if json.Unmarshal([]byte(raw), &probe) == nil {
 				streams[i].Probe = &probe
+				applyProbedSize(&streams[i], sid)
 				metrics.probeCacheHit.Add(1)
 			}
 		}
 	}
+}
+
+// packSizeRatio is how much bigger the indexer's number has to be than the probe's before it is worth
+// naming as a pack. A movie's title size and its probed size routinely differ by a rounding byte or two;
+// a season pack's differs by the other ninety percent of the torrent.
+const packSizeRatio = 1.3
+
+// applyProbedSize promotes the probe's own reading of the resolved file over whatever the indexer's title
+// or behaviorHints claimed. For an episode picked out of a season pack, that claim named the whole
+// torrent — Fauda's "💾 68 GB" was the season, not the 1.1 GB episode den-remux actually streamed — so
+// every size-based decision downstream (the label, ranking's size bonus, a MaxSizeGB budget filter) would
+// otherwise judge an episode by its pack's weight. The indexer's number survives as PackSizeBytes, purely
+// as label context, and only for an episode request whose pack is actually bigger than the file by enough
+// to matter; a movie is never given one, since there is no pack for its title size to have been
+// confused with.
+func applyProbedSize(s *RawStream, sid *StreamID) {
+	if s.Probe == nil || s.Probe.SizeBytes <= 0 {
+		return
+	}
+	probed := int(s.Probe.SizeBytes)
+	if sid != nil && sid.HasEp && s.SizeBytes != nil &&
+		float64(*s.SizeBytes) >= float64(probed)*packSizeRatio {
+		pack := *s.SizeBytes
+		s.PackSizeBytes = &pack
+	}
+	s.SizeBytes = &probed
 }
 
 func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStream, sid *StreamID,

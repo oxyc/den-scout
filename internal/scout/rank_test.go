@@ -222,6 +222,21 @@ func TestRankStreams(t *testing.T) {
 		t.Errorf("combined filters: got %v", titles(filtered))
 	}
 
+	// MaxSizeGB is a budget on what this stream actually plays, not on the season pack it came from. A
+	// probed episode (Fauda S1E3: a 68 GB pack, a 1.1 GB file) must clear a 20 GB cap on its OWN size —
+	// rankStreams never reads PackSizeBytes, so a stale, unrelated pack figure sitting beside it changes
+	// nothing.
+	pack := 68 * gib
+	episode := 1136580921
+	bySize := rankStreams([]RawStream{
+		rs("Fauda S01E03 1080p WEB-DL", func(s *RawStream) {
+			s.Cached, s.Seeders, s.SizeBytes, s.PackSizeBytes = true, intp(10), &episode, &pack
+		}),
+	}, rankFilters{ExcludeCam: true, CachedOnly: true, ResultCap: 5, MaxSizeGB: intp(20)})
+	if len(bySize) != 1 {
+		t.Errorf("maxSizeGB judged a probed episode by its pack's weight: got %v", titles(bySize))
+	}
+
 	// malformed excludeRegex is ignored, not fatal.
 	ok := rankStreams([]RawStream{rs("A 1080p WEB-DL", func(s *RawStream) { s.Cached = true })}, rankFilters{ExcludeCam: true, CachedOnly: true, ResultCap: 5, ExcludeRegex: "("})
 	if len(ok) != 1 {

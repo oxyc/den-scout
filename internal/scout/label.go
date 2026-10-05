@@ -144,8 +144,15 @@ func cleanLabelLower(t string, s RawStream) string {
 	if s.SizeBytes != nil {
 		parts = append(parts, sizeLabel(*s.SizeBytes))
 	}
-	if len(parts) == 0 {
-		return "Stream"
+	label := "Stream"
+	if len(parts) > 0 {
+		label = strings.Join(parts, " • ")
 	}
-	return strings.Join(parts, " • ")
+	// The pack is context, not a correction — this stream still plays the file sized above. Appended after
+	// the bullets rather than folded into them, so a client that wants only the short form can cut the
+	// string at " · " instead of re-parsing bullets.
+	if s.PackSizeBytes != nil {
+		label += " · from a " + sizeLabel(*s.PackSizeBytes) + " pack"
+	}
+	return label
 }

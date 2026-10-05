@@ -17,12 +17,21 @@ const gib = 1_073_741_824
 
 // RawStream is a scrape result before ranking — the raw torrent fact plus the debrid cache truth.
 type RawStream struct {
-	InfoHash  string
-	FileIdx   *int
-	Title     string
+	InfoHash string
+	FileIdx  *int
+	Title    string
+	// The size of what this stream actually plays. For a single-file release this is the indexer's number;
+	// for an episode picked out of a season pack it starts as the indexer's number too (which names the
+	// whole pack) and is corrected to the episode's own size the moment a probe reads it — see
+	// applyProbedSize. Every size-based decision (ranking's bonus, a budget filter) reads this field, never
+	// PackSizeBytes, so a 68 GB pack is never mistaken for a 68 GB episode.
 	SizeBytes *int
-	Seeders   *int
-	Cached    bool
+	// The season pack's own total, kept only once a probe has shown it differs from SizeBytes for an
+	// episode request — nil for a single-file release, and nil until the probe runs. Display-only: nothing
+	// ranks or filters on it.
+	PackSizeBytes *int
+	Seeders       *int
+	Cached        bool
 	// Whether anyone could answer the cachedness question this request. False means the check failed, so
 	// `Cached` is a default rather than an observation — and must not be reported to a client as one.
 	CacheKnown bool

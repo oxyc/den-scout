@@ -2,6 +2,7 @@ package scout
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -80,6 +81,70 @@ func TestProbeTop_cacheHitSkipsResolve(t *testing.T) {
 	}
 	if streams[0].Probe == nil || len(streams[0].Probe.Audio) != 1 || streams[0].Probe.Audio[0] != "it" {
 		t.Fatalf("cache hit not applied: %+v", streams[0].Probe)
+	}
+}
+
+// Fauda S1E3: the indexer's title gave the season pack's 68 GB, and a probe of the resolved link read
+// the episode's own 1.1 GB. Hydrating that cached probe fact must correct SizeBytes to the episode and
+// keep the pack's number only as context.
+func TestHydrateProbeFacts_seasonPackSizeCorrectsToTheEpisode(t *testing.T) {
+	const packHint = 68 << 30         // what "💾 68 GB" in the title parsed to
+	const episodeSize = 1_136_580_921 // what den-remux actually served
+	cache := NewMemoryCache(1 << 20)
+	sid := &StreamID{Type: "series", Season: 1, Episode: 3, HasEp: true}
+	size := packHint
+	s := RawStream{InfoHash: "fauda-s1e3", SizeBytes: &size}
+	cache.Put(probeCacheKey(&s, sid), fmt.Sprintf(`{"sizeBytes":%d}`, episodeSize), probeTTL)
+	h := &handler{deps: Deps{Cache: cache}}
+	streams := []RawStream{s}
+
+	h.hydrateProbeFacts(streams, sid)
+
+	if streams[0].SizeBytes == nil || *streams[0].SizeBytes != episodeSize {
+		t.Fatalf("SizeBytes = %v, want the probed episode size %d", streams[0].SizeBytes, episodeSize)
+	}
+	if streams[0].PackSizeBytes == nil || *streams[0].PackSizeBytes != packHint {
+		t.Fatalf("PackSizeBytes = %v, want the indexer's pack size %d kept as context", streams[0].PackSizeBytes, packHint)
+	}
+}
+
+// A movie's title size and its probed size agree to the byte (or close enough to be rounding); there is
+// no pack behind a single-file release, so no PackSizeBytes should appear.
+func TestHydrateProbeFacts_movieGetsNoPackSize(t *testing.T) {
+	const size = 18 << 30
+	cache := NewMemoryCache(1 << 20)
+	sid := &StreamID{Type: "movie"}
+	titleSize := size
+	s := RawStream{InfoHash: "movie-hash", SizeBytes: &titleSize}
+	cache.Put(probeCacheKey(&s, sid), fmt.Sprintf(`{"sizeBytes":%d}`, size), probeTTL)
+	h := &handler{deps: Deps{Cache: cache}}
+	streams := []RawStream{s}
+
+	h.hydrateProbeFacts(streams, sid)
+
+	if streams[0].PackSizeBytes != nil {
+		t.Fatalf("PackSizeBytes = %v, want nil for a movie", *streams[0].PackSizeBytes)
+	}
+	if streams[0].SizeBytes == nil || *streams[0].SizeBytes != size {
+		t.Fatalf("SizeBytes = %v, want %d", streams[0].SizeBytes, size)
+	}
+}
+
+// A small, ordinary mismatch between the title's claim and the probe's reading (rounding, a muxer's
+// padding) is not a "pack" even on a series request — only a gap wide enough that the title was plainly
+// describing something else is worth surfacing.
+func TestApplyProbedSize_closeMismatchIsNotCalledAPack(t *testing.T) {
+	titleSize := 1_100_000_000
+	s := RawStream{SizeBytes: &titleSize, Probe: &Probe{SizeBytes: 1_080_000_000}}
+	sid := &StreamID{Type: "series", HasEp: true}
+
+	applyProbedSize(&s, sid)
+
+	if s.PackSizeBytes != nil {
+		t.Fatalf("PackSizeBytes = %v, want nil for a close, non-pack mismatch", *s.PackSizeBytes)
+	}
+	if s.SizeBytes == nil || *s.SizeBytes != 1_080_000_000 {
+		t.Fatalf("SizeBytes = %v, want the probed 1.08 GB", s.SizeBytes)
 	}
 }
 
