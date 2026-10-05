@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // Indexer scrapers (ported from src/scrape/*). One shared Stremio-protocol client; fan-out with a
@@ -485,6 +486,10 @@ type cacheableScraper interface{ answerKey() string }
 
 func (s *stremioScraper) answerKey() string { return keyHash(strings.TrimRight(s.baseURL, "/")) }
 
+// One upstream question per provider identity and title at a time. The settled-answer cache collapses later
+// requests, but without this gate every list variant that missed it concurrently still reached the indexer.
+var answerFlights singleflight.Group
+
 func answerCacheKey(sc scraper, q scrapeQuery) (string, bool) {
 	c, ok := sc.(cacheableScraper)
 	if !ok {
@@ -523,6 +528,73 @@ func keepAnswer(cache Cache, ttl time.Duration, sc scraper, q scrapeQuery, r []R
 	}
 }
 
+type scrapeAttempt struct {
+	streams    []RawStream
+	err        error
+	cached     bool
+	latencyMS  int64
+	observedAt time.Time
+}
+
+// scrapeOneCached answers one provider question from the settled cache or the one identical request already in
+// flight. The shared request has its own timeout: a page leaving stops waiting, but does not cancel useful work for
+// another page or prevent the answer from warming the cache.
+func scrapeOneCached(ctx context.Context, sc scraper, q scrapeQuery, timeout time.Duration, cache Cache,
+	ttl time.Duration) scrapeAttempt {
+	if r, ok := keptAnswer(cache, sc, q); ok {
+		return scrapeAttempt{streams: r, cached: true}
+	}
+	key, shareable := answerCacheKey(sc, q)
+	ask := func(detached bool) scrapeAttempt {
+		// A request may have filled the cache between this caller's first read and its turn in the flight.
+		if r, ok := keptAnswer(cache, sc, q); ok {
+			return scrapeAttempt{streams: r, cached: true}
+		}
+		parent := ctx
+		if detached {
+			parent = context.WithoutCancel(ctx)
+		}
+		cctx, cancel := context.WithTimeout(parent, timeout)
+		defer cancel()
+		start := time.Now()
+		r, err := sc.scrape(cctx, q)
+		attempt := scrapeAttempt{
+			streams: r, err: err, latencyMS: time.Since(start).Milliseconds(),
+			observedAt: time.Now().UTC().Truncate(time.Millisecond),
+		}
+		if err == nil {
+			keepAnswer(cache, ttl, sc, q, r)
+		}
+		metrics.indexerResult(sc.id(), err == nil, len(r))
+		return attempt
+	}
+	if !shareable {
+		return ask(false)
+	}
+	waiting := time.Now()
+	if err := ctx.Err(); err != nil {
+		return scrapeAttempt{err: err, observedAt: waiting.UTC().Truncate(time.Millisecond)}
+	}
+	answer := answerFlights.DoChan(key, func() (any, error) { return ask(true), nil })
+	select {
+	case <-ctx.Done():
+		return scrapeAttempt{err: ctx.Err(), latencyMS: time.Since(waiting).Milliseconds(),
+			observedAt: time.Now().UTC().Truncate(time.Millisecond)}
+	case result := <-answer:
+		attempt, _ := result.Val.(scrapeAttempt)
+		// Cached answers are decoded for each caller. Preserve that ownership for a shared live answer too: later
+		// phases annotate RawStream values with cache and probe facts.
+		if result.Shared {
+			attempt.streams = append([]RawStream(nil), attempt.streams...)
+		}
+		if !attempt.cached {
+			attempt.latencyMS = time.Since(waiting).Milliseconds()
+			attempt.observedAt = time.Now().UTC().Truncate(time.Millisecond)
+		}
+		return attempt
+	}
+}
+
 // scrapeAllCached is scrapeAll answering from each indexer's kept answer where there is one, and keeping
 // each new one for ttl.
 func scrapeAllCached(ctx context.Context, scrapers []scraper, q scrapeQuery, timeout time.Duration, cache Cache,
@@ -550,30 +622,17 @@ func scrapeCovered(ctx context.Context, scrapers []scraper, q scrapeQuery, timeo
 		i, sc := i, sc
 		reports[i] = reportFor(sc)
 		g.Go(func() error {
-			// Not counted in the indexer metrics below: nothing was asked.
-			if r, ok := keptAnswer(cache, sc, q); ok {
-				results[i] = r
-				reports[i].Outcome, reports[i].Items, reports[i].Cached = outcomeAnswered, len(r), true
-				return nil
-			}
-			cctx, cancel := context.WithTimeout(gctx, timeout)
-			defer cancel()
-			start := time.Now()
-			r, err := sc.scrape(cctx, q)
-			reports[i].Outcome = classifyScrape(sc, err)
+			attempt := scrapeOneCached(gctx, sc, q, timeout, cache, ttl)
+			r, err := attempt.streams, attempt.err
+			reports[i].Outcome, reports[i].Cached = classifyScrape(sc, err), attempt.cached
 			if _, unasked := sc.(unaskableScraper); !unasked {
-				reports[i].LatencyMS = time.Since(start).Milliseconds()
-				reports[i].ObservedAt = time.Now().UTC().Truncate(time.Millisecond)
+				reports[i].LatencyMS = attempt.latencyMS
+				reports[i].ObservedAt = attempt.observedAt
 			}
 			if err == nil {
 				results[i] = r
 				reports[i].Items = len(r)
-				keepAnswer(cache, ttl, sc, q, r)
 			}
-			// Counted here because this is where the answer is already known. An unaskable scraper is
-			// counted too: "asked nobody, so nobody answered" is a state worth being able to see, and
-			// its failure ratio being exactly 1 is how it looks.
-			metrics.indexerResult(sc.id(), err == nil, len(r))
 			return nil // never fail the group — gather what responded
 		})
 	}
