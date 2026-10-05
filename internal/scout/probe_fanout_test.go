@@ -141,6 +141,41 @@ func TestHydrateKnownSizes_correctsFromAStoresFileListWithNoProbe(t *testing.T) 
 	}
 }
 
+// A ranged probe measured the file the playback URL actually serves. Store metadata is useful only
+// before that measurement exists: an older or mistaken cached file-list choice must not replace the
+// probe with another file's size merely because the difference was too small to be called a pack.
+func TestHydrateKnownSizes_doesNotReplaceAProbedSize(t *testing.T) {
+	const indexerSize = 1_200_000_000
+	const probedSize = 1_100_000_000
+	const staleStoreSize = 10_000_000_000
+	cache := NewMemoryCache(1 << 20)
+	sid := &StreamID{Type: "series", Season: 1, Episode: 3, HasEp: true}
+	size := indexerSize
+	stream := RawStream{InfoHash: H, SizeBytes: &size}
+	cache.Put(probeCacheKey(&stream, sid), fmt.Sprintf(`{"sizeBytes":%d}`, probedSize), probeTTL)
+	cache.Put(resolveKey("t", H), fmt.Sprintf(
+		`{"torrentId":9,"files":[{"Index":0,"Name":"Show.S01E03.mkv","SizeBytes":%d}]}`,
+		staleStoreSize), resolveCacheTTL)
+	h := &handler{deps: Deps{
+		Cache: cache,
+		MakeStores: func(*Config) []Store {
+			return []Store{&torBoxStore{token: "t", cache: cache, api: torboxAPI}}
+		},
+	}}
+	streams := []RawStream{stream}
+
+	h.hydrateProbeFacts(streams, sid)
+	h.hydrateKnownSizes(&Config{}, streams, sid)
+
+	if streams[0].Probe == nil || streams[0].Probe.SizeBytes != probedSize {
+		t.Fatalf("Probe = %+v, want the ranged measurement %d", streams[0].Probe, probedSize)
+	}
+	if streams[0].SizeBytes == nil || *streams[0].SizeBytes != probedSize {
+		t.Fatalf("SizeBytes = %v, want the probed size %d to win over cached %d",
+			streams[0].SizeBytes, probedSize, staleStoreSize)
+	}
+}
+
 // A movie never gets a KnownFileSize lookup at all — there is no pack for its title size to have been
 // confused with, and a movie resolves without listing files in the first place.
 func TestHydrateKnownSizes_moviesAreSkipped(t *testing.T) {
