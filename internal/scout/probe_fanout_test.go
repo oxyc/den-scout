@@ -389,10 +389,7 @@ func TestProbeBehind_logsAFailedResolve(t *testing.T) {
 	h.probeTop(context.Background(), &Config{}, streams, nil, heldOnTorBox("held-hash"))
 
 	deadline := time.After(5 * time.Second)
-	for {
-		if strings.Contains(out.String(), "could not resolve held-hash") {
-			break
-		}
+	for !strings.Contains(out.String(), "could not resolve held-hash") {
 		select {
 		case <-deadline:
 			t.Fatalf("no failed-resolve line logged: %q", out.String())
