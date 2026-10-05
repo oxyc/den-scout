@@ -104,8 +104,10 @@ func (h *handler) hydrateKnownSizes(config *Config, streams []RawStream, sid *St
 	var pool *StorePool
 	for i := range streams {
 		s := &streams[i]
-		if s.InfoHash == "" || s.PackSizeBytes != nil {
-			continue // already named a pack, by a probe or an earlier hit of this very path
+		if s.InfoHash == "" || s.PackSizeBytes != nil || (s.Probe != nil && s.Probe.SizeBytes > 0) {
+			// A ranged probe measured what the playback URL actually serves, so it is more authoritative
+			// than an older store file listing even when their difference was too small to name a pack.
+			continue
 		}
 		if pool == nil {
 			pool = &StorePool{stores: h.deps.MakeStores(config)}
