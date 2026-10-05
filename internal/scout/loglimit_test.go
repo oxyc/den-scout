@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+// ageLogLimit pushes a condition's last-seen time back a full interval, so a test that checks for its
+// exact line is not silenced by unrelated coverage of the same condition moments earlier in this run —
+// the same trick TestLogLimited below applies to its own key.
+func ageLogLimit(key string) {
+	limitedLog.mu.Lock()
+	defer limitedLog.mu.Unlock()
+	if e, ok := limitedLog.last[key]; ok {
+		e.at = e.at.Add(-logInterval)
+		limitedLog.last[key] = e
+	}
+}
+
 // /health's flip is logged as a change of state: one line going degraded however many builds keep
 // failing, and one coming back however many succeed.
 func TestHealthFlipIsLoggedOnceEachWay(t *testing.T) {

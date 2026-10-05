@@ -302,6 +302,44 @@ func TestTorBoxListFiles_saysWhyItHasNoFiles(t *testing.T) {
 	}
 }
 
+// Fauda S1E3 hit errNoFileList repeatedly with nothing more specific anywhere in the log — every branch
+// behind it shares one identity by design, so a transport blip, a bad shape and a genuine id mismatch
+// were indistinguishable from the log alone. Each branch now writes its own line; this is what finds the
+// cause the NEXT time this happens, rather than only ever rediscovering it as "no usable answer" again.
+func TestTorBoxListFiles_logsWhichBranchFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  string
+		fn   func() (*http.Response, error)
+		want string
+	}{
+		{"a transport blip", "mylist-transport", boom, "torbox mylist 1: connection reset"},
+		{"a 400", "mylist-status", status(400), "torbox mylist 1: http 400"},
+		{"an unreadable body", "mylist-decode", ok(`garbage`), "torbox mylist 1: unreadable body"},
+		{"a body with no data field", "mylist-empty", ok(`{}`), "torbox mylist 1: no data field"},
+		{"an answer naming another torrent", "mylist-other-id", ok(`{"data":{"id":2}}`),
+			"torbox mylist 1: answer named torrent 2"},
+		{"neither an object nor an array", "mylist-shape", ok(`{"data":"garbage"}`),
+			"answer is neither an object nor an array"},
+		{"an array with no matching entry", "mylist-no-match", ok(`{"data":[{"id":5}]}`),
+			"torbox mylist 1: 1 entries, none named it"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureLog(t)
+			// Every one of these shares its key with TestTorBoxListFiles_saysWhyItHasNoFiles, which
+			// exercises the same branches for the ERROR identity rather than the log line — ageLogLimit
+			// (loglimit_test.go's own trick) keeps that earlier coverage from silencing this one under
+			// logLimited's one-line-a-minute rule.
+			ageLogLimit(tc.key)
+			s := &torBoxStore{token: "k", api: torboxAPI, client: routed{fallbk: tc.fn}}
+			_, _ = s.listFiles(t.Context(), 1)
+			if !strings.Contains(out.String(), tc.want) {
+				t.Errorf("log = %q, want it to contain %q", out.String(), tc.want)
+			}
+		})
+	}
+}
+
 // A name RD's matcher rejects, asserted to actually be one so the test and the block list can't drift
 // apart into a test that passes for the wrong reason.
 func blockedName(t *testing.T) string {

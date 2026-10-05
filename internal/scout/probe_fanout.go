@@ -132,6 +132,32 @@ func applyKnownSize(s *RawStream, known int64) {
 	s.SizeBytes = &n
 }
 
+// hydratePackOnlySizes runs last of the three size passes, for whatever hydrateProbeFacts and
+// hydrateKnownSizes left untouched: a release whose declared size has NOT been shown to be the episode's
+// own by either a probe or a store's file list. Most such releases are a genuine single-episode file and
+// the indexer's number for them is correct, as it always was — this only acts on the ones whose own
+// title says otherwise (unresolvedSeasonPack, season.go): a season named with no episode at all, or a
+// multi-episode range that merely spans this one. For those, the number is demonstrably the PACK's, not
+// the episode's, and showing it as a plain "68 GB" states something false. SizeBytes becomes unknown
+// (nil) — which rank.go already treats as "don't know", earning no size bonus and never tripping a
+// MaxSizeGB budget — rather than wrong, and PackSizeBytes keeps the number as what it actually is.
+func hydratePackOnlySizes(streams []RawStream, sid *StreamID) {
+	if sid == nil || !sid.HasEp {
+		return
+	}
+	for i := range streams {
+		s := &streams[i]
+		if s.SizeBytes == nil || s.PackSizeBytes != nil {
+			continue // nothing to demote, or already named a pack by an earlier pass
+		}
+		if unresolvedSeasonPack(s.Title, sid.Season, sid.Episode) {
+			pack := *s.SizeBytes
+			s.PackSizeBytes = &pack
+			s.SizeBytes = nil
+		}
+	}
+}
+
 func (h *handler) probeTop(ctx context.Context, config *Config, streams []RawStream, sid *StreamID,
 	truth CacheTruth) bool {
 	h.hydrateProbeFacts(streams, sid)
@@ -292,6 +318,13 @@ func (h *handler) probeBehind(config *Config, jobs []probeJob) {
 				_, _, _ = h.sf.Do("probe:"+job.key, func() (any, error) {
 					link, err := pool.ResolveCachedOnly(gctx, job.target, job.holders)
 					if err != nil || link == "" {
+						// Silent until now: a resolve failure here left no trace anywhere, so a release
+						// whose correction never arrived was indistinguishable from one nobody had viewed
+						// yet (den-scout#23) — this is exactly what Fauda S1E3 hit, repeatedly, with
+						// nothing in the log to say so. Key is a fixed literal, never the hash: logLimited
+						// keys a condition, not an instance.
+						logLimited("probe-resolve-failed", "probe could not resolve %s to read its size/tracks: %v",
+							shortHash(job.target.InfoHash), err)
 						return nil, nil
 					}
 					p, err := ProbeTracks(gctx, h.deps.ProbeClient, link)

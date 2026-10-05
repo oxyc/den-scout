@@ -3406,6 +3406,12 @@ var errNoFileList = &StoreUnavailableError{Service: ServiceTorBox, Reason: "myli
 func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFile, error) {
 	resp, err := s.get(ctx, fmt.Sprintf("%s/torrents/mylist?id=%d&bypass_cache=true", s.api, torrentID))
 	if err != nil {
+		// Logged per CAUSE, not per torrent: errNoFileList itself is one shared identity for several
+		// branches below, by design (every caller treats them alike), which also means every caller's
+		// own log line reads "mylist gave no usable answer" with no way to tell a transport blip from a
+		// shape TorBox has never sent before. A Fauda S1E3 install hit this repeatedly with nothing more
+		// specific anywhere in the log; these lines are what distinguishes the branch next time.
+		logLimited("mylist-transport", "torbox mylist %d: %v", torrentID, err)
 		return nil, errNoFileList
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -3420,6 +3426,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 			Reason: fmt.Sprintf("mylist http %d", resp.StatusCode)}
 	}
 	if resp.StatusCode != http.StatusOK {
+		logLimited("mylist-status", "torbox mylist %d: http %d", torrentID, resp.StatusCode)
 		return nil, errNoFileList
 	}
 	var body struct {
@@ -3427,6 +3434,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		Data    json.RawMessage `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+		logLimited("mylist-decode", "torbox mylist %d: unreadable body", torrentID)
 		return nil, errNoFileList
 	}
 	// TorBox answers 200 with success:false / data:null for an id it no longer holds — the same shape
@@ -3442,6 +3450,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 	// `gone` paid an add to re-buy a torrent nobody said was missing. The two shapes that really do say
 	// so are handled above, so nothing is lost by being careful here.
 	if len(body.Data) == 0 {
+		logLimited("mylist-empty", "torbox mylist %d: no data field", torrentID)
 		return nil, errNoFileList
 	}
 	type tbFile struct {
@@ -3459,6 +3468,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		// The object form gets the same test. An entry naming a different torrent is not an answer about
 		// ours, whichever shape it arrives in; one carrying no id is taken at its word, since a
 		// single-entry answer to a by-id query need not repeat it.
+		logLimited("mylist-other-id", "torbox mylist %d: answer named torrent %d", torrentID, e.ID)
 		return nil, errNoFileList
 	}
 	if json.Unmarshal(body.Data, &e) != nil {
@@ -3470,6 +3480,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 		// with arrays. Read as "no answer" it kept the stale id, re-stamped its six hours on every poll,
 		// and never re-added, so the series path wedged at a permanent 503 while movies still healed.
 		if json.Unmarshal(body.Data, &arr) != nil {
+			logLimited("mylist-shape", "torbox mylist %d: answer is neither an object nor an array", torrentID)
 			return nil, errNoFileList
 		}
 		if len(arr) == 0 {
@@ -3500,6 +3511,7 @@ func (s *torBoxStore) listFiles(ctx context.Context, torrentID int) ([]TorrentFi
 			match = unlabelled
 		}
 		if match < 0 {
+			logLimited("mylist-no-match", "torbox mylist %d: %d entries, none named it", torrentID, len(arr))
 			return nil, errNoFileList
 		}
 		e = arr[match]
