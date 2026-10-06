@@ -1293,11 +1293,20 @@ func TestTorBoxStatusAnswer_takesItsDoubtFromTheLookupItAlreadyDid(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fetches := 0
+			// A definitive "no" from mylist now also checks TorBox's OWN QUEUE before settling on
+			// statusNo (see statusAnswerUncached) — a separate listing, answered empty here so this test
+			// stays about the torrent listing's own doubt/certainty contract. An unreadable mylist (the
+			// second case) must never reach that check at all: authoritative=false returns before it.
+			queueFetches := 0
 			s := &torBoxStore{token: "t", api: torboxAPI, cache: NewMemoryCache(1 << 20),
 				client: mockDoer{func(r *http.Request) (*http.Response, error) {
-					if strings.Contains(r.URL.Path, "mylist") && r.URL.Query().Get("id") == "" {
+					switch {
+					case strings.Contains(r.URL.Path, "mylist") && r.URL.Query().Get("id") == "":
 						fetches++
 						return tc.listing(), nil
+					case strings.Contains(r.URL.Path, "getqueued"):
+						queueFetches++
+						return resp(200, `{"success":true,"data":[]}`), nil
 					}
 					t.Errorf("unexpected request: %s", r.URL)
 					return resp(404, "{}"), nil
@@ -1309,6 +1318,9 @@ func TestTorBoxStatusAnswer_takesItsDoubtFromTheLookupItAlreadyDid(t *testing.T)
 			}
 			if fetches != tc.wantFetches {
 				t.Errorf("listed the account %d times over two polls, want %d", fetches, tc.wantFetches)
+			}
+			if queueFetches > 1 {
+				t.Errorf("checked TorBox's own queue %d times over two polls, want at most 1", queueFetches)
 			}
 		})
 	}
