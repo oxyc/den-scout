@@ -1925,6 +1925,23 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch, 
 		// a header here rather than the URL, so a leak needs the service to echo the header back — but
 		// this was the one call site not following the rule, which is reason enough.
 		detail := redactToken(storeErrorText(raw), s.token)
+		// "Download already queued" (TorBox's DIFF_ISSUE) means this exact hash already has an entry in
+		// the account's OWN queue — not a refusal, and not a dead link. Previously this fell straight
+		// through to the DeadLinkError below, which the client read as a release nobody could deliver:
+		// the add that put it there (very likely scout's own, from before this hash had a queued-id
+		// marker, or one whose marker's TTL lapsed) is undiscoverable from createtorrent's error body
+		// alone, so the queue's own listing is asked to find it.
+		if resp.StatusCode == http.StatusBadRequest && torboxAlreadyQueuedError(raw) {
+			if qid, found, qerr := s.findQueuedByHash(ctx, infoHash); qerr == nil && found {
+				refundUnusedAdd(ServiceTorBox, s.accountIdentity())
+				markAddedByUs(s.cache, s.accountIdentity(), infoHash)
+				cachePut(s.cache, torboxQueuedKey(s.accountIdentity(), infoHash), strconv.Itoa(qid), resolveCacheTTL, CacheVolatile)
+				logLimited("torbox-already-queued",
+					"torbox: %s already queued (queued_id %d) — reporting queued, not a dead link",
+					shortHash(infoHash), qid)
+				return 0, qid, nil
+			}
+		}
 		// TorBox answered and created nothing, so the charge goes back — the rule RD and Premiumize
 		// already follow on their own answered failures. Kept here, a repeatedly polled bad magnet ate
 		// this account's hourly allowance where the other two were already immune.
@@ -1974,6 +1991,65 @@ func (s *torBoxStore) addMagnet(ctx context.Context, infoHash string, prefetch, 
 	markAddedByUs(s.cache, s.accountIdentity(), infoHash)
 	cachePut(s.cache, torboxQueuedKey(s.accountIdentity(), infoHash), strconv.Itoa(*body.Data.QueuedID), resolveCacheTTL, CacheVolatile)
 	return 0, *body.Data.QueuedID, nil
+}
+
+// torboxAlreadyQueuedError reports whether createtorrent's error body is TorBox's DIFF_ISSUE for a hash
+// that already has an entry in the account's queue — "Download already queued." — as opposed to any
+// other 400 (a malformed magnet, an account past its active-download limit). The error CODE is checked,
+// but is not required on its own: the detail text is matched too, in case TorBox ever answers the same
+// fact under a different code, and either is enough.
+func torboxAlreadyQueuedError(raw []byte) bool {
+	var body struct {
+		Error  any    `json:"error"`
+		Detail string `json:"detail"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		return false
+	}
+	if code, ok := body.Error.(string); ok && strings.EqualFold(code, "DIFF_ISSUE") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(body.Detail), "already queued")
+}
+
+// findQueuedByHash looks up one hash in the account's own queued-torrents list (getqueued?type=torrent) —
+// the only way to learn a queue entry's id when createtorrent answers DIFF_ISSUE "already queued" rather
+// than handing one back directly in a success body (see addMagnet), or when a release was queued before
+// this account had a remembered queued-id marker at all (see statusAnswerUncached). found=false with
+// err=nil means the listing was read and the hash was not in it; err != nil means the listing itself
+// could not be read, which the caller must not mistake for "not queued" — the same distinction
+// findTorrentByHash draws on the torrent listing.
+func (s *torBoxStore) findQueuedByHash(ctx context.Context, infoHash string) (id int, found bool, err error) {
+	resp, err := s.get(ctx, s.api+"/queued/getqueued?type=torrent&bypass_cache=true")
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		detail := redactToken(readStoreError(resp), s.token)
+		return 0, false, &StoreUnavailableError{Service: ServiceTorBox, Status: resp.StatusCode,
+			Reason: fmt.Sprintf("getqueued http %d%s", resp.StatusCode, detail)}
+	}
+	var body struct {
+		Success *bool `json:"success"`
+		Data    []struct {
+			ID   *int   `json:"id"`
+			Hash string `json:"hash"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxStoreBytes)).Decode(&body) != nil {
+		return 0, false, &StoreUnavailableError{Service: ServiceTorBox, Reason: "getqueued: unreadable body"}
+	}
+	if body.Success != nil && !*body.Success {
+		return 0, false, nil
+	}
+	needle := strings.ToLower(infoHash)
+	for _, e := range body.Data {
+		if e.ID != nil && strings.ToLower(e.Hash) == needle {
+			return *e.ID, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 // CancelOutcome is what a cancel (or reannounce) attempt found. Done is true for a successful delete or
@@ -2157,9 +2233,10 @@ func (s *torBoxStore) Cancel(ctx context.Context, infoHash string, reannounce bo
 		}
 		return CancelOutcome{Reason: "not_queued"}, nil
 	}
-	if !wasAddedByUs(s.cache, identity, infoHash) {
-		return CancelOutcome{Reason: "not_ours"}, nil
-	}
+	// The entry is fetched before the ownership check now, not after it, because the one exception to
+	// "never a torrent scout did not add" (below) needs to know the torrent's own state to decide —
+	// and because "finished" must win over "not ours" the same way it wins over "ours": a completed
+	// download is kept either way.
 	entry, found, err := s.fetchEntry(ctx, torrentID)
 	if err != nil {
 		return CancelOutcome{}, err
@@ -2172,6 +2249,21 @@ func (s *torBoxStore) Cancel(ctx context.Context, infoHash string, reannounce bo
 	}
 	if torboxIsFinished(entry.DownloadFinished, entry.DownloadState) {
 		return CancelOutcome{Reason: "finished"}, nil
+	}
+	if !wasAddedByUs(s.cache, identity, infoHash) {
+		// The narrow exception: a torrent with no addedByUs marker — added before ownership tracking
+		// existed, or by some other path entirely — that is stalled dead (torboxFetchState's own
+		// "stalled" rule: no seeds, or paused) and not finished. Left alone, this held a TorBox slot
+		// forever: the client's fallback had already abandoned the release for this exact hash, and
+		// `not_ours` meant no cancel ever reached TorBox, so the stalled torrent outlived every episode
+		// that tried the next release instead. A healthy (not stalled) torrent with no marker is still
+		// refused — this is not a general ownership override, only a drain for dead weight.
+		if entry.DownloadState == nil || torboxFetchState(*entry.DownloadState) != fetchStalled {
+			return CancelOutcome{Reason: "not_ours"}, nil
+		}
+		logLimited("torbox-stalled-cancel",
+			"cancelling a stalled torrent with no addedByUs marker (%s, state %q) — abandoned by the client's fallback",
+			shortHash(infoHash), *entry.DownloadState)
 	}
 	status := StoreStatus{Seeds: entry.Seeds, Peers: entry.Peers}
 	if entry.DownloadState != nil {
@@ -2433,6 +2525,13 @@ func (s *torBoxStore) StatusAnswer(ctx context.Context, t ResolveTarget) (StoreS
 }
 
 func (s *torBoxStore) statusAnswerUncached(ctx context.Context, t ResolveTarget) (StoreStatus, statusAnswer) {
+	// A parked add, the warm case: Resolve already recorded the queued-id marker (from a success body
+	// or, now, from addMagnet's DIFF_ISSUE branch), so this is a cache read, not an upstream call. Checked
+	// before torrentID below, which only ever finds a TORRENT — asking it alone answered "nothing here"
+	// for a release that was waiting in TorBox's own queue, never a torrent at all yet.
+	if _, parked := s.knownQueuedID(t.InfoHash); parked {
+		return StoreStatus{State: fetchQueued, Service: ServiceTorBox}, statusDownloading
+	}
 	torrentID, ok, authoritative := s.torrentID(ctx, t.InfoHash)
 	if !ok {
 		// A miss here is only trustworthy when the listing was actually read. torrentID declines to
@@ -2440,6 +2539,27 @@ func (s *torBoxStore) statusAnswerUncached(ctx context.Context, t ResolveTarget)
 		// already happened rather than by asking again, which was a second full account fetch.
 		if !authoritative {
 			return StoreStatus{}, statusUnknown
+		}
+		// Not an active torrent — but mylist and TorBox's own queue are two different listings, and a
+		// release parked in the queue (with no cached marker yet: a cold hash, or one whose marker's TTL
+		// lapsed) answers mylist exactly like one TorBox never heard of at all. Without this, the probe
+		// route read a genuinely queued download as "not queued" forever, which is what made it drop out
+		// of Home's in-flight states once the fallback's earlier release gave up. Found here, the marker
+		// is written so the next poll takes the cheap `knownQueuedID` path above instead.
+		//
+		// Gated by its own remembered miss, same as torrentMissKey above it: a release that is genuinely
+		// nowhere — neither listing holds it — must not pay for the queue listing again on every poll of
+		// a two-second cadence, which is exactly the cost torrentMissKey already exists to keep off this
+		// path for the torrent listing.
+		if _, missed := s.cache.Get(torboxQueuedMissKey(s.accountIdentity(), t.InfoHash)); missed {
+			return StoreStatus{}, statusNo
+		}
+		if qid, found, qerr := s.findQueuedByHash(ctx, t.InfoHash); qerr == nil {
+			if found {
+				cachePut(s.cache, torboxQueuedKey(s.accountIdentity(), t.InfoHash), strconv.Itoa(qid), resolveCacheTTL, CacheVolatile)
+				return StoreStatus{State: fetchQueued, Service: ServiceTorBox}, statusDownloading
+			}
+			cachePut(s.cache, torboxQueuedMissKey(s.accountIdentity(), t.InfoHash), "1", torrentMissTTL, CacheVolatile)
 		}
 		return StoreStatus{}, statusNo
 	}
@@ -2610,6 +2730,14 @@ func clearAddedByUs(cache Cache, identity, infoHash string) {
 // succeeded) and sends createtorrent again, once per poll, until the hourly allowance is gone.
 func torboxQueuedKey(identity, infoHash string) string {
 	return "torbox:queuedid:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + strings.ToLower(infoHash)
+}
+
+// torboxQueuedMissKey remembers that findQueuedByHash read the account's queue listing and the hash was
+// not in it — the queue-listing equivalent of torrentMissKey, and gated by the same short TTL for the
+// same reason: a release that is genuinely nowhere must not pay for a fresh getqueued on every poll of a
+// two-second cadence.
+func torboxQueuedMissKey(identity, infoHash string) string {
+	return "torbox:noqueue:" + keyHash(canonicalTorboxIdentity(identity)) + ":" + strings.ToLower(infoHash)
 }
 
 // knownQueuedID answers "is this account's add for this hash parked in TorBox's queue?" from cache alone,

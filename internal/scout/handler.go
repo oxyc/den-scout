@@ -1774,8 +1774,11 @@ func (h *handler) resolvePlay(tw *playTiming, r *http.Request, config *Config, t
 		// "coming", not dead: before this decode existed, the same answer fell through to the final 404
 		// below and the client blacklisted a release TorBox was about to fetch.
 		if errors.Is(err, errAddQueued) {
-			logLimited("play-add-queued", playDecision("play", "fallback", "queued behind the account's slot limit", "", time.Since(start), rid, rt))
-			h.writePlayQueued(w, pendingKey, rt, rid, time.Since(start), StoreStatus{State: fetchQueued})
+			// Only TorBox hands back queued_id/errAddQueued at all (see storeCanceller's sibling comment on
+			// addMagnet), so naming it here is accurate rather than a guess — and the client needs it to
+			// show "Queued at TorBox" rather than a bare, serviceless "queued".
+			logLimited("play-add-queued", playDecision("play", "fallback", "queued behind the account's slot limit", string(ServiceTorBox), time.Since(start), rid, rt))
+			h.writePlayQueued(w, pendingKey, rt, rid, time.Since(start), StoreStatus{State: fetchQueued, Service: ServiceTorBox})
 			return
 		}
 		// A refusal SCOUT made — its hourly allowance — is not the debrid refusing, and must not be

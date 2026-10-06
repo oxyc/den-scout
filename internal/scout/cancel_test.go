@@ -93,10 +93,14 @@ func TestCancel_finished(t *testing.T) {
 	}
 }
 
-// 409 not_ours: the account held this hash before scout ever added it (no addedByUs marker).
+// 409 not_ours: the account held this hash before scout ever added it (no addedByUs marker), and it is
+// healthy — downloading fine, just not scout's to touch.
 func TestCancel_notOurs(t *testing.T) {
 	hash := repeat("a", 40)
 	h, _ := cancelTorBoxHandler(func(r *http.Request) *http.Response {
+		if path.Base(r.URL.Path) == "mylist" {
+			return resp(200, `{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":5,"peers":3}}`)
+		}
 		return resp(404, `{}`)
 	}, func(cache Cache) {
 		cache.Put(torrentIDKey("tb-secret", hash), "42", resolveCacheTTL)
@@ -105,6 +109,80 @@ func TestCancel_notOurs(t *testing.T) {
 	rr := doMethod(h, http.MethodDelete, cancelPath(hash), nil)
 	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "not_ours") {
 		t.Fatalf("cancel not-ours: %d %s, want 409 not_ours", rr.Code, rr.Body.String())
+	}
+}
+
+// The narrow ownership exception: a torrent with no addedByUs marker that is stalled dead (no seeds, no
+// peers — TorBox's own "stalled" vocabulary) and not finished IS cancelled. This is den's actual incident:
+// a pack hash held a TorBox slot forever because the client's fallback had already abandoned it for
+// every episode, and `not_ours` meant no cancel ever reached TorBox since scout had never recorded adding
+// it (added before ownership tracking existed, or by some other path).
+func TestCancel_notOursButStalledIsCancelled(t *testing.T) {
+	hash := repeat("a", 40)
+	h, calls := cancelTorBoxHandler(func(r *http.Request) *http.Response {
+		switch path.Base(r.URL.Path) {
+		case "mylist":
+			return resp(200, `{"success":true,"data":{"id":42,"download_finished":false,"download_state":"stalled (no seeds)","seeds":0,"peers":0}}`)
+		case "controltorrent":
+			return resp(200, `{"success":true}`)
+		}
+		return resp(404, `{}`)
+	}, func(cache Cache) {
+		cache.Put(torrentIDKey("tb-secret", hash), "42", resolveCacheTTL)
+		// Deliberately no markAddedByUs.
+	})
+	rr := doMethod(h, http.MethodDelete, cancelPath(hash), nil)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("cancel not-ours-but-stalled: %d %s, want 204", rr.Code, rr.Body.String())
+	}
+	if !sameCalls(*calls, []string{"mylist", "controltorrent"}) {
+		t.Errorf("upstream calls = %v", *calls)
+	}
+}
+
+// The same torrent, not stalled (an active, healthy swarm) and still with no addedByUs marker: the
+// exception must not widen into "any unmarked torrent may be cancelled" — only a dead one.
+func TestCancel_notOursAndNotStalledIsRefused(t *testing.T) {
+	hash := repeat("a", 40)
+	h, calls := cancelTorBoxHandler(func(r *http.Request) *http.Response {
+		if path.Base(r.URL.Path) == "mylist" {
+			return resp(200, `{"success":true,"data":{"id":42,"download_finished":false,"download_state":"downloading","seeds":12,"peers":4}}`)
+		}
+		return resp(404, `{}`)
+	}, func(cache Cache) {
+		cache.Put(torrentIDKey("tb-secret", hash), "42", resolveCacheTTL)
+	})
+	rr := doMethod(h, http.MethodDelete, cancelPath(hash), nil)
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "not_ours") {
+		t.Fatalf("cancel not-ours, healthy: %d %s, want 409 not_ours", rr.Code, rr.Body.String())
+	}
+	for _, c := range *calls {
+		if c == "controltorrent" {
+			t.Fatalf("a healthy torrent with no addedByUs marker must never be deleted: calls = %v", *calls)
+		}
+	}
+}
+
+// A finished torrent with no addedByUs marker is still kept — "finished" outranks the stalled exception
+// the same way it outranks "ours": torboxIsFinished is checked before either ownership question.
+func TestCancel_notOursAndFinishedIsRefused(t *testing.T) {
+	hash := repeat("a", 40)
+	h, calls := cancelTorBoxHandler(func(r *http.Request) *http.Response {
+		if path.Base(r.URL.Path) == "mylist" {
+			return resp(200, `{"success":true,"data":{"id":42,"download_finished":true,"download_state":"completed"}}`)
+		}
+		return resp(404, `{}`)
+	}, func(cache Cache) {
+		cache.Put(torrentIDKey("tb-secret", hash), "42", resolveCacheTTL)
+	})
+	rr := doMethod(h, http.MethodDelete, cancelPath(hash), nil)
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "finished") {
+		t.Fatalf("cancel not-ours, finished: %d %s, want 409 finished", rr.Code, rr.Body.String())
+	}
+	for _, c := range *calls {
+		if c == "controltorrent" {
+			t.Fatalf("a finished torrent must never be deleted: calls = %v", *calls)
+		}
 	}
 }
 
