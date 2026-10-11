@@ -1076,8 +1076,8 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 	var expectedTitleTokens, showTokens map[string]bool
 	if h.deps.Meta != nil {
 		if m, ok := h.deps.Meta(ctx, sid.Type, sid.IMDb); ok {
-			switch {
-			case sid.Type == "series":
+			switch sid.Type {
+			case "series":
 				if m.Title != "" {
 					showTokens = titleTokens(m.Title)
 				}
