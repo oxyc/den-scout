@@ -1,19 +1,24 @@
 name: ci
 
+# Every exact main commit produces a scanned, immutable candidate image while its checks run. A release tag only
+# promotes that already-tested digest (docker-publish.yml); it never recompiles or reruns this workflow.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-  # docker-publish.yml calls this as its gate, so a tag cannot publish an image CI would reject.
-  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR revisions are disposable. A main SHA is a potential release and its candidate must finish even
+  # when another merge follows it, otherwise a tag could name a commit whose exact image was cancelled midway.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/den-scout
 
 jobs:
   test:
@@ -63,20 +68,145 @@ jobs:
             echo "coverage ${pct}% is below the 90% gate"; exit 1;
           }
 
-  # The image is what actually ships (cross-compiled, distroless). Catching a Dockerfile break on the
-  # PR rather than at `git tag` time, without pushing, for amd64 — the only arch the box runs. A tag's
-  # publish job builds it anyway.
+  # The image is what actually ships (cross-compiled, distroless). A PR proves the same build main will publish,
+  # for amd64 — the only arch the box runs. It reads main's cache but does not push an image or overwrite the
+  # release cache with an unmerged revision. It runs beside `test`, not after it: the build shares nothing with it.
   build-pr:
-    needs: test
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read release metadata
+        id: source
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::VERSION is not X.Y.Z: $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          push: false
           platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          pull: true
+          outputs: type=cacheonly
+          build-args: |
+            DEN_VERSION=${{ steps.source.outputs.version }}
+            GIT_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=release-image
+
+  # Main builds, probes and scans an immutable candidate while the checks above run. It is deliberately unsigned
+  # and never receives :latest here; docker-publish promotes its digest only after this exact workflow succeeded.
+  candidate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write  # Trivy's report goes to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read release metadata
+        id: source
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::VERSION is not X.Y.Z: $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Build and push the candidate
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:candidate-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.source.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            DEN_VERSION=${{ steps.source.outputs.version }}
+            GIT_REVISION=${{ github.sha }}
+          # Re-pull every FROM: a base image served from the build cache is how a release inherits an old
+          # Go toolchain or distroless base.
+          pull: true
+          cache-from: type=gha,scope=release-image
+          cache-to: type=gha,mode=max,scope=release-image
+          # SLSA provenance and an SBOM, attached to the image index and so covered by its signature.
+          provenance: mode=max
+          sbom: true
+      - name: Prove the image reports its release version
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE@$DIGEST" >/dev/null
+          id=$(docker run --rm -d -p 127.0.0.1:18080:8080 "$IMAGE@$DIGEST")
+          trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
+          body=""
+          for _ in $(seq 1 20); do
+            body=$(curl -fsS http://127.0.0.1:18080/manifest.json 2>/dev/null) && break
+            sleep 1
+          done
+          got=$(jq -r .version <<<"$body")
+          test "$got" = "$VERSION" || { echo "::error::image /manifest.json version is '$got', expected $VERSION"; exit 1; }
+          curl -fsS http://127.0.0.1:18080/health | jq -e '.status == "ok"' >/dev/null
+      # One scan, of fixable HIGH and CRITICAL findings, which the report and the gate below both read.
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          version: v0.74.0
+          format: json
+          output: trivy.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+      # Gate: a CRITICAL with a fixed version available fails here, so no digest record is saved and a tag
+      # cannot promote this commit. Unfixed CVEs are ignored. A finding that does not apply goes in
+      # .trivyignore with a reason.
+      - name: Scan gate
+        run: trivy convert --severity CRITICAL --exit-code 1 --format table trivy.json
+      - name: Bind this CI run to its candidate digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          jq -n --arg image "$DIGEST" '{image: $image}' > candidate-digests.json
+      - name: Save candidate identity for release promotion
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-candidate-${{ github.sha }}
+          path: candidate-digests.json
+          if-no-files-found: error
+          retention-days: 30
+      # Report: those findings go to the repository's code scanning. Advisory — it never fails the job.
+      - name: Report for code scanning
+        continue-on-error: true
+        run: trivy convert --format sarif --output trivy.sarif trivy.json
+      - name: Upload scan to code scanning
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        # The report is advisory: a code-scanning outage must not hold a release.
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image

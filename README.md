@@ -274,7 +274,7 @@ go build -o den-scout ./cmd/den-scout
 Docker — distroless/static, ~15 MB, non-root:
 
 ```
-docker build -t den-scout .
+docker build --build-arg DEN_VERSION="$(cat VERSION)" -t den-scout .
 docker run -p 8080:8080 den-scout
 ```
 
@@ -287,10 +287,18 @@ http), a 256 MiB memory cap, read-only rootfs, uid 65532, and the cache bind-mou
 Provisioning, env rendering, releases and rollback are in that repo's `deploy/README.md`. No secrets
 belong in the env file; the debrid token rides in each install's URL.
 
-**Release images.** `docker-publish` builds on a `v*` tag, and again every Monday: the weekly run
+**Releases.** Run `scripts/release.sh X.Y.Z`. It changes only `VERSION`, pushes that commit, waits for
+that exact commit's main CI, and only then creates `vX.Y.Z`. Do not put the version in the Go source: the
+image carries it as `DEN_VERSION` (read in `internal/scout/manifest.go`), so a release never recompiles
+the binary. Main CI builds, probes and scans a `candidate-<sha>` image for every main commit and saves its
+digest; the tag's `docker-publish` run verifies that digest, signs it and moves the version tags and
+`:latest`. It does not rebuild or rerun the suite.
+
+**Release images.** `docker-publish` also runs every Monday: the weekly run
 rebuilds the newest `v*` tag (never `main`) with the base images re-pulled and no build cache, and
 publishes it as `:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Go or distroless security fix
-reaches the box between releases — through `den-update`'s probe and rollback like any release. Trivy
+reaches the box between releases — through `den-update`'s probe and rollback like any release. It fails
+until one release has been cut with the candidate pipeline. Trivy
 scans each image before `:latest` moves: a CRITICAL with a fix available fails the run (on the weekly
 rebuild only in OS packages, the part a rebuild can fix), and fixable HIGH and CRITICAL findings go to
 code scanning. A finding that does not apply goes in `.trivyignore` with a reason. Every image carries

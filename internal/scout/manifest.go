@@ -1,6 +1,9 @@
 package scout
 
-import "strings"
+import (
+	"os"
+	"strings"
+)
 
 // Stremio manifest (SCOUT-01, ported from src/manifest.ts). Field order + values match the golden.
 type manifestJSON struct {
@@ -23,7 +26,22 @@ type manifestHints struct {
 	ConfigurationRequired bool `json:"configurationRequired"`
 }
 
-const manifestVersion = "0.36.0"
+// devVersion is what a binary reports when nothing told it which release it is: `go run`, tests, a plain
+// `docker build`. Release builds never see it — the Dockerfile refuses an image without DEN_VERSION.
+const devVersion = "0.0.0-dev"
+
+// manifestVersion is the release this process reports in the manifest, /metrics and the startup line. It
+// comes from DEN_VERSION, which the image carries from the VERSION file, rather than from a constant in the
+// source: a constant changes the compiled package on every release, which recompiled the binary for a
+// release that changed nothing else.
+var manifestVersion = versionFrom(os.Getenv)
+
+func versionFrom(get func(string) string) string {
+	if v := get("DEN_VERSION"); v != "" {
+		return v
+	}
+	return devVersion
+}
 
 // buildManifest returns the manifest for a config (nil = unconfigured).
 func buildManifest(config *Config) manifestJSON {
