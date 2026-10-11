@@ -39,9 +39,11 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.1
+          version: v2.14.0
           # Build golangci-lint from source with this job's Go — a prebuilt binary built with an older Go
-          # refuses a module whose go directive targets a newer one.
+          # refuses a module whose go directive targets a newer one. Building it is not enough on its own: the
+          # x/tools it vendors must read this Go's export data too, and v2.13.1's could not read Go 1.27.2's
+          # (export data version 5), which failed typecheck on every standard-library import.
           install-mode: goinstall
 
       - name: build
