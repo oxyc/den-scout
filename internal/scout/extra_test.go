@@ -74,9 +74,8 @@ func TestRankDropsYearMistag(t *testing.T) {
 // unavailable and the check would judge nearly everything. These are real shows, and every one of them
 // would come back as an empty list.
 func TestTitleTokens_wouldEmptyRealSeries(t *testing.T) {
+	// Shōgun and Pokémon were cases here until titleTokens folded diacritics; these two cannot be folded away.
 	cases := []struct{ show, release, why string }{
-		{"Shōgun", "Shogun.S01E01.1080p.WEB-DL.mkv", `[a-z0-9]+ cannot match "ō", so the tokens are {sh, gun}`},
-		{"Pokémon", "Pokemon.S01E01.720p.mkv", "same, for é"},
 		{"Attack on Titan", "[Erai-raws] Shingeki no Kyojin - 01 [1080p].mkv", "anime released under romaji"},
 		{"Money Heist", "La.Casa.de.Papel.S01E01.1080p.WEB-DL.mkv", "released under its original title"},
 	}
@@ -102,19 +101,18 @@ func TestCinemetaMeta(t *testing.T) {
 	if m, found := ok(context.Background(), "movie", "tt15047880"); !found || m.Year != 2026 || m.Title != "Disclosure Day" {
 		t.Errorf("movie meta: %+v found=%v", m, found)
 	}
-	// A series is not looked up at all, and no request is made for one. Both halves of the mistag filter
-	// are unsafe for series — see the reasoning at the top of cinemeta.go and
-	// TestTitleTokens_wouldEmptyRealSeries.
-	asked := false
-	series := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) {
-		asked = true
+	// A series is looked up at its own path, for the title that sinks another show's releases. The handler
+	// keeps it out of both mistag filters — see cinemeta.go and TestTitleTokens_wouldEmptyRealSeries.
+	var path string
+	series := cinemetaMeta(mockDoer{fn: func(r *http.Request) (*http.Response, error) {
+		path = r.URL.Path
 		return resp(200, `{"meta":{"id":"tt1","name":"The Bear","releaseInfo":"2022–2025"}}`), nil
 	}}, "https://cinemeta.example", NewMemoryCache(1<<20))
-	if _, found := series(context.Background(), "series", "tt1"); found {
-		t.Error("series should return found=false")
+	if m, found := series(context.Background(), "series", "tt1"); !found || m.Title != "The Bear" {
+		t.Errorf("series meta: %+v found=%v", m, found)
 	}
-	if asked {
-		t.Error("a series was looked up — the result cannot be used, so the request is waste")
+	if path != "/meta/series/tt1.json" {
+		t.Errorf("a series was asked for at %s", path)
 	}
 	// upstream failure → found=false (list served unfiltered)
 	bad := cinemetaMeta(mockDoer{fn: func(*http.Request) (*http.Response, error) { return resp(500, ""), nil }}, "x", NewMemoryCache(1<<20))
@@ -159,7 +157,7 @@ func TestCinemetaMeta_cachesAnswersAndFailures(t *testing.T) {
 	if n := asked.Load(); n != 1 {
 		t.Errorf("asked Cinemeta %d times for one film, want 1", n)
 	}
-	if ttl := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "tt100")]; ttl != cinemetaHitTTL {
+	if ttl := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "movie", "tt100")]; ttl != cinemetaHitTTL {
 		t.Errorf("an answer is kept for %s, want %s", ttl, cinemetaHitTTL)
 	}
 
@@ -172,14 +170,14 @@ func TestCinemetaMeta_cachesAnswersAndFailures(t *testing.T) {
 	if n := asked.Load(); n != 2 {
 		t.Errorf("asked Cinemeta %d times in all, want a failure to be remembered too", n)
 	}
-	if ttl := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "tt200")]; ttl != cinemetaMissTTL {
+	if ttl := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "movie", "tt200")]; ttl != cinemetaMissTTL {
 		t.Errorf("a failure is kept for %s, want %s", ttl, cinemetaMissTTL)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	meta(ctx, "movie", "tt300")
-	if _, kept := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "tt300")]; kept {
+	if _, kept := cache.ttls[cinemetaCacheKey("https://cinemeta.example", "movie", "tt300")]; kept {
 		t.Error("a lookup its caller cancelled was remembered as a failure")
 	}
 }
