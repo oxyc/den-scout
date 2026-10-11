@@ -10,7 +10,10 @@ ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+# Only what the compiler reads. `COPY . .` also carried VERSION (and the docs and workflows), so a release
+# bump changed this layer's input and recompiled a binary that was byte-for-byte the same.
+COPY cmd ./cmd
+COPY internal ./internal
 # Trim the binary (-s -w strips the symbol/DWARF tables).
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags='-s -w' -o /den-scout ./cmd/den-scout
@@ -21,8 +24,25 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
 # did before it had a volume at all. Distroless has no shell, so the mkdir must happen here.
 RUN mkdir -p /cache
 
+# The release the image reports. It only reaches the runtime configuration, below, so changing it never
+# invalidates the compile above. The runtime copies the marker this stage writes, which makes a missing or
+# malformed DEN_VERSION fail the build before anything can be pushed. Reuses the builder image already pulled.
+FROM --platform=$BUILDPLATFORM golang:1.27-trixie AS release-metadata
+ARG DEN_VERSION
+RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
+    printf '%s' "$DEN_VERSION" > /den-version
+
 # :nonroot runs as uid 65532 and carries CA certs for the outbound HTTPS scrape/debrid calls.
 FROM gcr.io/distroless/static-debian13:nonroot AS runtime
+ARG DEN_VERSION
+ARG GIT_REVISION
+# The service reads DEN_VERSION at run time (internal/scout/manifest.go) for the manifest, /metrics and the
+# startup line.
+ENV DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION \
+      org.opencontainers.image.revision=$GIT_REVISION
+COPY --from=release-metadata /den-version /den-version
 COPY --from=build /den-scout /den-scout
 COPY --from=build --chown=65532:65532 /cache /cache
 # Stated rather than inherited from the :nonroot tag, so the uid the cache is chowned to above is
