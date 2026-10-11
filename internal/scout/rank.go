@@ -363,6 +363,18 @@ func realDebridBlocked(title string) bool {
 // never lift a CAM.
 const preferenceSink = 5000
 
+// wrongShowSink is what an episode release costs when its own name says it is another show or another
+// episode (otherShow, otherEpisode). Indexers answer a series id with every release whose name shares a
+// word with it: for Pokémon S1E1 that is Pokémon Horizons S01E01, Master Journeys S01E01 and a S00E82
+// special, and a cached Horizons release was auto-played as the 1997 show's first episode.
+//
+// It sinks, rather than drops, because the evidence is the release name alone: a season's own name
+// ("Pokémon Indigo League E01") or another numbering scheme (anime packed by scene season) reads the same
+// way and is sometimes the right file. So it clears everything a matching release can earn — cached
+// (+8000), the quality spread (~7000), a video conversion (2 x 6000) — so any release that names this
+// show and episode outranks it, and stays above a release that cannot play at all and above junk.
+const wrongShowSink = 30_000
+
 type rankFilters struct {
 	ExcludeCam  bool
 	Resolutions []string
@@ -384,6 +396,12 @@ type rankFilters struct {
 	// real releases, while keeping foreign-language releases (which carry the year, or a name/number
 	// token). Empty = no title filter (best-effort; a Cinemeta lookup failure serves unfiltered).
 	ExpectedTitleTokens map[string]bool
+	// Episode (series): the requested season and episode, so a release naming another episode sinks by
+	// wrongShowSink. nil for a movie.
+	Episode *[2]int
+	// ShowTokens (series): significant tokens of the show's title, so a release naming another show sinks
+	// by wrongShowSink. Never a filter (cinemeta.go). Empty = not judged.
+	ShowTokens map[string]bool
 	// Client is the browser a list is ranked for (X-Den-Playable), nil for the Apple TV. See ClientPlayable.cost.
 	Client *ClientPlayable
 	// Debug collects drop counts and scores when ?debug=1 asked for them. nil on every normal request.
@@ -458,7 +476,7 @@ var titleStop = map[string]bool{
 // bare years and single-letter noise dropped). Used to sanity-check a year-less release against the request.
 func titleTokens(s string) map[string]bool {
 	out := map[string]bool{}
-	for _, tok := range titleTokenRe.FindAllString(strings.ToLower(s), -1) {
+	for _, tok := range titleTokenRe.FindAllString(foldDiacritics.Replace(strings.ToLower(s)), -1) {
 		if titleStop[tok] {
 			continue
 		}
@@ -471,6 +489,55 @@ func titleTokens(s string) map[string]bool {
 		out[tok] = true
 	}
 	return out
+}
+
+// foldDiacritics maps the accented Latin letters titles carry onto their plain forms before tokenising.
+// Tokens are [a-z0-9] runs, so without it "Pokémon" split into "pok" and "mon" and shared nothing with a
+// release spelled "Pokemon".
+var foldDiacritics = strings.NewReplacer(
+	"á", "a", "à", "a", "â", "a", "ä", "a", "ã", "a", "å", "a",
+	"é", "e", "è", "e", "ê", "e", "ë", "e",
+	"í", "i", "ì", "i", "î", "i", "ï", "i",
+	"ó", "o", "ò", "o", "ô", "o", "ö", "o", "õ", "o", "ø", "o",
+	"ú", "u", "ù", "u", "û", "u", "ü", "u",
+	"ñ", "n", "ç", "c", "ý", "y", "ÿ", "y",
+	"ā", "a", "ē", "e", "ī", "i", "ō", "o", "ū", "u", // romaji: Shōgun
+)
+
+// releasePrefixRe is what comes before a release's show name and is not part of it: group tags in
+// brackets ("[DragsterPS] ") and a site stamp ("www.UIndex.org - ").
+var releasePrefixRe = regexp.MustCompile(`^(\s*(\[[^\]]*\]|\([^)]*\)|www\.\S+\s*-))+`)
+
+// showEndRe finds where a release's show name ends: an SxxEyy or 1x02 label, an anime " - 01", or an
+// E01/EP01 tag.
+var showEndRe = regexp.MustCompile(`(?i)(\bs\d{1,2}[ ._-]*e\d{1,4}|\b\d{1,2}x\d{2,3}\b|\s-\s\d{1,4}\b|\bep?\d{1,4}\b)`)
+
+// showNoise are words a release puts between the show and the episode that name neither.
+var showNoise = map[string]bool{
+	"season": true, "temporada": true, "saison": true, "staffel": true, "complete": true,
+}
+
+// otherShow reports whether a release names a show with a word the requested title does not have: a
+// spin-off or a sequel series, "Pokémon Horizons The Series S01E01" for Pokémon. A name with no episode
+// marker, or one that starts with it, says nothing about the show and is not judged.
+func otherShow(title string, expected map[string]bool) bool {
+	name := releasePrefixRe.ReplaceAllString(title, "")
+	end := showEndRe.FindStringIndex(name)
+	if end == nil || end[0] == 0 {
+		return false
+	}
+	for tok := range titleTokens(name[:end[0]]) {
+		if !expected[tok] && !showNoise[tok] && strings.Trim(tok, "0123456789") != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// otherEpisode reports whether a release's name labels an episode, and not this one: "Pokemon S00E82"
+// answered for S1E1. A range that holds the episode names it (namesEpisode).
+func otherEpisode(title string, season, episode int) bool {
+	return labelledEpisodeRe.match(strings.ToLower(baseName(title))) && !namesEpisode(title, season, episode)
 }
 
 // titleOverlap reports whether the release shares at least one significant token with the expected title.
@@ -614,6 +681,10 @@ func rankStreams(streams []RawStream, f rankFilters) []RawStream {
 		// keeps unknown sizes. Punishing an unknown would be asserting something nobody measured.
 		if f.PreferResolution != "" && res != "" && res != f.PreferResolution {
 			score -= preferenceSink
+		}
+		if f.Episode != nil && ((len(f.ShowTokens) > 0 && otherShow(s.Title, f.ShowTokens)) ||
+			otherEpisode(s.Title, f.Episode[0], f.Episode[1])) {
+			score -= wrongShowSink
 		}
 		out = append(out, scored{s, i, score, intOr(s.Seeders, 0)})
 	}

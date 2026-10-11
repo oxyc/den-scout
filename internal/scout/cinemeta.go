@@ -17,7 +17,11 @@ import (
 // torrents a tracker mistagged with another title's id. It's a best-effort side lookup: any failure
 // returns ok=false and the stream list is served unfiltered.
 //
-// MOVIES ONLY, for two reasons. The first is the obvious one: Cinemeta gives a series a span —
+// A series is looked up for its title alone, and that title only SINKS a release naming another show
+// (rank.go's otherShow, wrongShowSink) — it never drops one. Sinking is safe where dropping is not: when
+// every release is named in romaji or the original title, they all sink together and keep their order.
+//
+// The DROP filters are movies only, for two reasons. The first is the obvious one: Cinemeta gives a series a span —
 // "2019–2023" — of which firstYear can only take the start, and rank.go's year check allows ±1 around
 // it, so a correctly named Show.S04.2023.1080p carrying the SEASON's air year would be dropped as a
 // mistag.
@@ -30,14 +34,12 @@ import (
 // structurally unavailable and the token check would judge nearly every release. Measured against real
 // naming, that empties whole shows:
 //
-//	Shōgun          → tokens {sh, gun}  ([a-z0-9]+ cannot match "ō") vs Shogun.S01E01…     → dropped
-//	Pokémon         → tokens {pok, mon}                              vs Pokemon.S01E01…    → dropped
 //	Attack on Titan → vs [Erai-raws] Shingeki no Kyojin - 01          (romaji)              → dropped
 //	Money Heist     → vs La.Casa.de.Papel.S01E01…                     (original title)      → dropped
 //
-// An episode-marker escape hatch would rescue the first three but not anime numbered "- 01", and the
-// whole filter is speculative for series: the junk it was written to remove has only ever been observed
-// on movies. So series are not looked up at all, and no filter is applied to them.
+// (Shōgun and Pokémon were dropped too, until titleTokens folded diacritics.) The whole filter is
+// speculative for series: the junk it was written to remove has only ever been observed on movies. So no
+// drop filter is applied to them.
 
 const cinemetaBase = "https://v3-cinemeta.strem.io"
 
@@ -65,10 +67,10 @@ var cinemetaFlight singleflight.Group
 func cinemetaMeta(client doer, base string, cache Cache) func(context.Context, string, string) (cineMeta, bool) {
 	base = strings.TrimRight(base, "/")
 	return func(ctx context.Context, typ, imdb string) (cineMeta, bool) {
-		if typ != "movie" {
+		if typ != "movie" && typ != "series" {
 			return cineMeta{}, false
 		}
-		key := cinemetaCacheKey(base, imdb)
+		key := cinemetaCacheKey(base, typ, imdb)
 		if v, ok := cache.Get(key); ok {
 			var m cineMeta
 			if v != cinemetaMissValue && json.Unmarshal([]byte(v), &m) == nil {
@@ -77,7 +79,7 @@ func cinemetaMeta(client doer, base string, cache Cache) func(context.Context, s
 			return cineMeta{}, false
 		}
 		v, _, _ := cinemetaFlight.Do(key, func() (any, error) {
-			m, ok := fetchCinemeta(ctx, client, base, imdb)
+			m, ok := fetchCinemeta(ctx, client, base, typ, imdb)
 			switch {
 			case ok:
 				b, _ := json.Marshal(m)
@@ -96,13 +98,13 @@ func cinemetaMeta(client doer, base string, cache Cache) func(context.Context, s
 
 // Cinemeta-compatible providers are not interchangeable. A configured mirror may differ from the public service,
 // so its settled answer and its live flight are keyed by the normalized base without exposing that URL in storage.
-func cinemetaCacheKey(base, imdb string) string {
-	return "cinemeta:v2:" + keyHash(strings.TrimRight(base, "/")) + ":movie:" + imdb
+func cinemetaCacheKey(base, typ, imdb string) string {
+	return "cinemeta:v2:" + keyHash(strings.TrimRight(base, "/")) + ":" + typ + ":" + imdb
 }
 
-// fetchCinemeta asks Cinemeta for one film.
-func fetchCinemeta(ctx context.Context, client doer, base, imdb string) (cineMeta, bool) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/meta/movie/%s.json", base, imdb), nil)
+// fetchCinemeta asks Cinemeta for one film or series.
+func fetchCinemeta(ctx context.Context, client doer, base, typ, imdb string) (cineMeta, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/meta/%s/%s.json", base, typ, imdb), nil)
 	if err != nil {
 		return cineMeta{}, false
 	}

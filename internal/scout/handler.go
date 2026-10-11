@@ -1070,17 +1070,25 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 	}
 
 	// Expected title, plus a release year for movies → drop torrents mistagged with another title's id.
+	// A series' title only sinks a release naming another show (cinemeta.go says why it never drops).
 	// Best-effort: a lookup failure just means no year/title filter.
 	var expectedYear *int
-	var expectedTitleTokens map[string]bool
+	var expectedTitleTokens, showTokens map[string]bool
 	if h.deps.Meta != nil {
 		if m, ok := h.deps.Meta(ctx, sid.Type, sid.IMDb); ok {
-			if m.Year != 0 {
-				y := m.Year
-				expectedYear = &y
-			}
-			if m.Title != "" {
-				expectedTitleTokens = titleTokens(m.Title)
+			switch {
+			case sid.Type == "series":
+				if m.Title != "" {
+					showTokens = titleTokens(m.Title)
+				}
+			default:
+				if m.Year != 0 {
+					y := m.Year
+					expectedYear = &y
+				}
+				if m.Title != "" {
+					expectedTitleTokens = titleTokens(m.Title)
+				}
 			}
 		}
 	}
@@ -1103,6 +1111,10 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 	if logDbg == nil {
 		logDbg = &rankDebug{}
 	}
+	var episode *[2]int
+	if sid.HasEp {
+		episode = &[2]int{sid.Season, sid.Episode}
+	}
 	candidates := len(seeds)
 	rankStart := time.Now()
 	ranked := rankStreams(seeds, rankFilters{
@@ -1117,6 +1129,8 @@ func (h *handler) rankList(ctx context.Context, config *Config, sid *StreamID, d
 		ResultCap:           config.ResultCap,
 		ExpectedYear:        expectedYear,
 		ExpectedTitleTokens: expectedTitleTokens,
+		Episode:             episode,
+		ShowTokens:          showTokens,
 		Client:              client,
 		Debug:               logDbg,
 	})
